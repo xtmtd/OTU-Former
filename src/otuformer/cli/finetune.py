@@ -54,7 +54,12 @@ def finetune(
         "vit_tiny_patch16_224", "--model-name", help="timm backbone."
     ),
     metric_embed_dim: int = typer.Option(
-        256, "--metric-embed-dim", help="Embedding dimension."
+        256,
+        "--metric-embed-dim",
+        help=(
+            "Projector embedding dimension used by ArcFace (not raw CLS dimension). "
+            "If checkpoint provides config.out_dim, that value is used by default."
+        ),
     ),
     finetune_epochs: int = typer.Option(
         20, "--finetune-epochs", help="Fine-tuning epochs."
