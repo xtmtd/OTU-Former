@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.eggs/
+
+# OS
+.DS_Store
+
+# Project runtime outputs
+runs/
+
+# Reference scripts (large, not part of main project)
+ref/
+
+# IDE
+.idea/
+.vscode/
+*.swp
