@@ -1,0 +1,24 @@
+#计算多样性指数
+#XXX0指真实多样性指标，XXX1是指聚类的多样性指标，XXX2是指聚类去除singleton之后的指标
+for partition in $(cut -f1 ${work_dir}/results_distance_cutoffs/${dir_model}/cutoff_min_max.txt)
+  do
+    mkdir temp
+    echo cutoff,richness0,shannon0,simpson0,richness1,shannon1,simpson1,richness2,shannon2,simpson2,richness3,shannon3,simpson3 > temp/diversity.csv
+
+    for cutoff in $(csvtk cut -f1 ${work_dir}/results_distance_cutoffs/${dir_model}/partitions/UPGMA/metrics.csv | sed 1d)
+      do
+        sed "s/label,/#OTU ID\t/g;s/,/\t/g" ${work_dir}/datasets/Dun0${genus}/class_count/class.count > temp/t0.txt
+        usearch -alpha_div temp/t0.txt -output temp/alpha0.txt
+        csvtk cut -f1,2 ${work_dir}/results_distance_cutoffs/${dir_model}/partitions/UPGMA/partitions/tables/partition_${cutoff}_summary.csv | sed "s/cluster,/#OTU ID\t/g;s/,/\t/g" > temp/t1.txt
+        usearch -alpha_div temp/t1.txt -output temp/alpha1.txt
+        csvtk cut -f1,2 ${work_dir}/results_distance_cutoffs/${dir_model}/partitions/UPGMA/partitions/tables/partition_${cutoff}_summary.csv | csvtk filter -f "2>1" | sed "s/cluster,/#OTU ID\t/g;s/,/\t/g" > temp/t2.txt
+        usearch -alpha_div temp/t2.txt -output temp/alpha2.txt
+        csvtk cut -f1,2 ${work_dir}/results_distance_cutoffs/${dir_model}/partitions/UPGMA/partitions/tables/partition_${cutoff}_summary.csv | csvtk filter -f "2>4" | sed "s/cluster,/#OTU ID\t/g;s/,/\t/g" > temp/t3.txt
+        usearch -alpha_div temp/t3.txt -output temp/alpha3.txt
+        csvtk concat temp/alpha*txt | csvtk cut -t -f "richness,shannon_e,simpson" | sed 1d | tr "\n" "," | sed "s/\t/,/g;s/,$/\n/g;s/^/${cutoff},/g" >> temp/diversity.csv
+        rm temp/*.txt
+      done
+
+    csvtk join -f "cutoff" ${work_dir}/results_distance_cutoffs/${dir_model}/partitions/UPGMA/metrics.csv temp/diversity.csv > ${work_dir}/results_distance_cutoffs/${dir_model}/partitions/metrics_with_diversity.csv
+    rm -r temp
+done
