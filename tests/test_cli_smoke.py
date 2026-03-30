@@ -29,7 +29,6 @@ def test_doctor():
         ["pretrain", "--help"],
         ["finetune", "--help"],
         ["extract", "--help"],
-        ["evaluate", "--help"],
         ["cluster", "--help"],
         ["annotate", "--help"],
         ["diversity", "--help"],
@@ -47,8 +46,16 @@ def test_subcommand_help(cmd):
     [
         ("pretrain", ["--train-data", "--model-name", "--mask-ratio"]),
         ("finetune", ["--checkpoint", "--freeze-ratio", "--loss"]),
-        ("extract", ["--checkpoint", "--token-mode", "--topk-patches"]),
-        ("evaluate", ["--embeddings", "--labels", "--knn-k"]),
+        (
+            "extract",
+            [
+                "--checkpoint",
+                "--token-mode",
+                "--topk-patches",
+                "--umap-metric",
+                "--disable-umap",
+            ],
+        ),
         ("cluster", ["--embeddings", "--distance", "--custom-cutoffs"]),
         ("annotate", ["--assignments", "--corrections", "--out-dir"]),
         ("diversity", ["--assignments", "--min-abundance", "--phylo"]),
@@ -315,29 +322,6 @@ def _make_embeddings_and_labels(tmp_path):
     emb.to_csv(emb_path, index=False)
     labels.to_csv(labels_path, index=False)
     return emb_path, labels_path
-
-
-def test_evaluate_command(tmp_path):
-    emb_path, labels_path = _make_embeddings_and_labels(tmp_path)
-    result = runner.invoke(
-        app,
-        [
-            "evaluate",
-            "--embeddings",
-            str(emb_path),
-            "--labels",
-            str(labels_path),
-            "--out-dir",
-            str(tmp_path / "evaluate_out"),
-            "--knn-k",
-            "1,2",
-            "--umap-dims",
-            "2",
-        ],
-    )
-    assert result.exit_code == 0
-    assert (tmp_path / "evaluate_out" / "metrics.json").exists()
-    assert (tmp_path / "evaluate_out" / "metrics.csv").exists()
 
 
 def test_cluster_command(tmp_path):

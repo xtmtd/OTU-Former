@@ -9,8 +9,9 @@ import pandas as pd
 import torch
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
-from torchvision import transforms
+from tqdm import tqdm
 
+from otuformer.training.dataset import _make_eval_transform
 from otuformer.training.model import OTUFormerEncoder
 from otuformer.utils.checkpoint import load_checkpoint
 from otuformer.utils.device import resolve_device
@@ -27,14 +28,8 @@ class ImageFolderDataset(Dataset):
             for p in images_dir.rglob("*")
             if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
         )
-        self.transform = transforms.Compose(
-            [
-                transforms.Resize(int(extract_size * 1.14)),
-                transforms.CenterCrop(extract_size),
-                transforms.ToTensor(),
-                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-            ]
-        )
+        # Use the same eval transform as pretrain/finetune: direct BICUBIC resize
+        self.transform = _make_eval_transform(extract_size)
 
     def __len__(self) -> int:
         return len(self.paths)
@@ -56,15 +51,38 @@ def detect_batch_mode(images_dir: Path) -> bool:
 
 
 def _load_model(
-    checkpoint_path: Path, model_name: str, device: torch.device
+    checkpoint_path: Path,
+    model_name: str,
+    device: torch.device,
+    use_student: bool = False,
 ) -> OTUFormerEncoder:
+    """Load model from checkpoint.
+
+    For SSL pretrain checkpoints the teacher is the EMA-averaged model and
+    produces better embeddings for downstream analysis (consistent with ref
+    script and DINO/iBOT convention).  Pass ``use_student=True`` to load the
+    student weights instead.
+
+    Priority for weight selection:
+      - ``use_student=True``  → ``ckpt["student"]`` → ``ckpt["model_state_dict"]``
+      - ``use_student=False`` → ``ckpt["teacher"]`` → ``ckpt["model_state_dict"]``
+    """
     ckpt = load_checkpoint(checkpoint_path)
     cfg = ckpt.get("config", {})
     out_dim = cfg.get("out_dim") or cfg.get("metric_embed_dim", 256)
     resolved_model = cfg.get("model_name", model_name)
     model = OTUFormerEncoder(model_name=resolved_model, out_dim=out_dim)
-    model.load_state_dict(ckpt["model_state_dict"], strict=False)
+
+    if use_student:
+        state_dict = ckpt.get("student") or ckpt.get("model_state_dict")
+        source = "student" if "student" in ckpt else "model_state_dict"
+    else:
+        state_dict = ckpt.get("teacher") or ckpt.get("model_state_dict")
+        source = "teacher" if "teacher" in ckpt else "model_state_dict"
+
+    model.load_state_dict(state_dict, strict=False)
     model.eval().to(device)
+    print(f"[Info] Loaded weights from checkpoint key: '{source}'")
     return model
 
 
@@ -85,8 +103,9 @@ def _extract_one_dir(
     )
     all_ids: list[str] = []
     all_embs: list[np.ndarray] = []
+    desc = f"Extract {images_dir.name}" if images_dir.name else "Extract"
     with torch.no_grad():
-        for imgs, names in loader:
+        for imgs, names in tqdm(loader, desc=desc, ncols=120):
             imgs = imgs.to(device)
             if use_projector_output:
                 # projector output: L2-normalised 256-d embedding
@@ -125,20 +144,24 @@ def extract_embeddings(
     device: str = "auto",
     num_workers: int = 0,
     use_projector_output: bool = False,
+    use_student: bool = False,
 ) -> pd.DataFrame:
     """Extract embeddings and return DataFrame.
 
-    By default extracts the raw CLS token from the backbone, matching the ref
-    script behaviour (``--use_projector_output`` defaults to ``False`` in ref).
-    Pass ``use_projector_output=True`` to use the L2-normalised projector output.
+    For SSL pretrain checkpoints the teacher (EMA model) is loaded by default,
+    consistent with the ref script and DINO/iBOT convention.  Pass
+    ``use_student=True`` to load the student weights instead.
+
+    By default extracts the raw CLS token from the backbone.  Pass
+    ``use_projector_output=True`` to use the L2-normalised projector output.
     """
     dev = resolve_device(device)
-    model = _load_model(checkpoint_path, model_name, dev)
+    model = _load_model(checkpoint_path, model_name, dev, use_student=use_student)
 
     if detect_batch_mode(images_dir):
         subdirs = sorted(p for p in images_dir.iterdir() if p.is_dir())
         frames = []
-        for sub in subdirs:
+        for sub in tqdm(subdirs, desc="Batch dirs", ncols=120):
             df = _extract_one_dir(
                 model,
                 sub,

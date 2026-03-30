@@ -1113,7 +1113,7 @@ def run_pretrain(args: argparse.Namespace) -> None:
             ckpt = {
                 "epoch": epoch,
                 "iteration": global_step,
-                "model_state_dict": student.state_dict(),
+                "model_state_dict": teacher.state_dict(),
                 "student": student.state_dict(),
                 "teacher": teacher.state_dict(),
                 "optimizer": optimizer.state_dict(),

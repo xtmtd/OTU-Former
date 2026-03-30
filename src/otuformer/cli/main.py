@@ -9,7 +9,6 @@ from otuformer.cli import cam as _cam_mod
 from otuformer.cli import cluster as _cluster_mod
 from otuformer.cli import diversity as _diversity_mod
 from otuformer.cli import doctor as _doctor_mod
-from otuformer.cli import evaluate as _evaluate_mod
 from otuformer.cli import export as _export_mod
 from otuformer.cli import extract as _extract_mod
 from otuformer.cli import finetune as _finetune_mod
@@ -33,7 +32,6 @@ app.add_typer(_doctor_mod.app, name="doctor")
 app.add_typer(_pretrain_mod.app, name="pretrain")
 app.add_typer(_finetune_mod.app, name="finetune")
 app.add_typer(_extract_mod.app, name="extract")
-app.add_typer(_evaluate_mod.app, name="evaluate")
 app.add_typer(_cluster_mod.app, name="cluster")
 app.add_typer(_annotate_mod.app, name="annotate")
 app.add_typer(_diversity_mod.app, name="diversity")

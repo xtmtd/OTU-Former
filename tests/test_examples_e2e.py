@@ -39,18 +39,29 @@ def _prepare_example_subset(tmp_path: Path) -> tuple[Path, Path]:
 
     labels = pd.DataFrame(
         {
-            "id": [dst_a.name, dst_b.name],
+            "image": [dst_a.name, dst_b.name],
             "label": ["Epidorcus_gracilis", "Epidorcus_tonkinensis"],
         }
     )
     labels_path = tmp_path / "labels.csv"
     labels.to_csv(labels_path, index=False)
-    return image_dir, labels_path
+
+    # id-based labels for cluster command (id/label columns)
+    id_labels = pd.DataFrame(
+        {
+            "id": [dst_a.name, dst_b.name],
+            "label": ["Epidorcus_gracilis", "Epidorcus_tonkinensis"],
+        }
+    )
+    id_labels_path = tmp_path / "id_labels.csv"
+    id_labels.to_csv(id_labels_path, index=False)
+
+    return image_dir, labels_path, id_labels_path
 
 
 def test_examples_epidorcus_e2e_low_memory(tmp_path: Path):
     ckpt = _make_ckpt(tmp_path)
-    image_dir, labels_path = _prepare_example_subset(tmp_path)
+    image_dir, labels_path, id_labels_path = _prepare_example_subset(tmp_path)
 
     extract_out = tmp_path / "extract_out"
     res = runner.invoke(
@@ -73,33 +84,17 @@ def test_examples_epidorcus_e2e_low_memory(tmp_path: Path):
             "0",
             "--device",
             "cpu",
+            "--label-csv",
+            str(labels_path),
+            "--metrics-sample-size",
+            "2",
+            "--disable-umap",
         ],
     )
     assert res.exit_code == 0
     emb_path = extract_out / "embeddings.csv"
     assert emb_path.exists()
-
-    eval_out = tmp_path / "evaluate_out"
-    res = runner.invoke(
-        app,
-        [
-            "evaluate",
-            "--embeddings",
-            str(emb_path),
-            "--labels",
-            str(labels_path),
-            "--out-dir",
-            str(eval_out),
-            "--knn-k",
-            "1",
-            "--umap-dims",
-            "2",
-            "--metrics-sample-size",
-            "2",
-        ],
-    )
-    assert res.exit_code == 0
-    assert (eval_out / "metrics.json").exists()
+    assert (extract_out / "metrics.csv").exists()
 
     cluster_out = tmp_path / "cluster_out"
     res = runner.invoke(
@@ -111,7 +106,7 @@ def test_examples_epidorcus_e2e_low_memory(tmp_path: Path):
             "--out-dir",
             str(cluster_out),
             "--labels",
-            str(labels_path),
+            str(id_labels_path),
             "--distance",
             "cosine",
             "--custom-cutoffs",
