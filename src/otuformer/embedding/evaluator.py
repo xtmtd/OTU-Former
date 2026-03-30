@@ -99,10 +99,12 @@ def compute_clustering_metrics(
     purity = sum(
         np.bincount(label_codes[pred == c]).max() for c in range(n_clusters)
     ) / len(label_codes)
-    if len(label_codes) > n_clusters:
-        sil = float(silhouette_score(x, label_codes))
+    if len(x) < 2 or len(np.unique(label_codes)) < 2:
+        sil = 0.0
+    elif len(label_codes) > n_clusters:
+        sil = float(silhouette_score(x, label_codes, metric="cosine"))
     else:
-        sil = float("nan")
+        sil = 0.0
     return {
         "NMI": float(normalized_mutual_info_score(label_codes, pred)),
         "ARI": float(adjusted_rand_score(label_codes, pred)),

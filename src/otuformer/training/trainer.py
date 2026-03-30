@@ -347,6 +347,7 @@ class InstantMetricsLogger:
         ax = axes[plot_idx]
         has_cos = "cosine_similarity" in df_instant.columns
         has_grad = "grad_norm" in df_instant.columns
+        second_panel_has_data = False
         if has_cos and has_grad:
             ax_twin = ax.twinx()
             ax.plot(
@@ -368,6 +369,8 @@ class InstantMetricsLogger:
             )
             ax_twin.set_ylabel("Gradient Norm", color="tab:orange")
             ax_twin.tick_params(axis="y", labelcolor="tab:orange")
+            ax.set_title("Cosine Similarity & Grad Norm")
+            second_panel_has_data = True
         elif has_cos:
             ax.plot(
                 df_instant["iteration"],
@@ -375,6 +378,8 @@ class InstantMetricsLogger:
                 label="Cosine Similarity",
                 color="tab:blue",
             )
+            ax.set_title("Cosine Similarity")
+            second_panel_has_data = True
         elif has_grad:
             ax.plot(
                 df_instant["iteration"],
@@ -382,16 +387,25 @@ class InstantMetricsLogger:
                 label="Grad Norm",
                 color="tab:orange",
             )
-        ax.set_xlabel("Iteration")
-        ax.set_title("Cosine Similarity & Grad Norm")
-        if has_cos and has_grad:
-            lines_l, labels_l = ax.get_legend_handles_labels()
-            lines_r, labels_r = ax_twin.get_legend_handles_labels()
-            ax.legend(lines_l + lines_r, labels_l + labels_r, fontsize=8, loc="best")
+            ax.set_title("Gradient Norm")
+            second_panel_has_data = True
+        if second_panel_has_data:
+            ax.set_xlabel("Iteration")
+            if has_cos and has_grad:
+                lines_l, labels_l = ax.get_legend_handles_labels()
+                lines_r, labels_r = ax_twin.get_legend_handles_labels()
+                ax.legend(
+                    lines_l + lines_r,
+                    labels_l + labels_r,
+                    fontsize=8,
+                    loc="best",
+                )
+            else:
+                ax.legend(fontsize=8)
+            ax.grid(True, alpha=0.3)
+            plot_idx += 1
         else:
-            ax.legend(fontsize=8)
-        ax.grid(True, alpha=0.3)
-        plot_idx += 1
+            ax.axis("off")
 
         ax = axes[plot_idx]
         has_left = any(
@@ -437,12 +451,14 @@ class InstantMetricsLogger:
         plot_idx += 1
 
         ax = axes[plot_idx]
+        fourth_panel_has_data = False
         if "teacher_center_norm" in df_instant.columns:
             ax.plot(
                 df_instant["iteration"],
                 df_instant["teacher_center_norm"],
                 label="Teacher center",
             )
+            fourth_panel_has_data = True
         if "lr" in df_instant.columns:
             ax_twin = ax.twinx()
             ax_twin.plot(
@@ -454,19 +470,36 @@ class InstantMetricsLogger:
             ax_twin.set_yscale("log")
             ax_twin.set_ylabel("Learning Rate", color="tab:red")
             ax_twin.tick_params(axis="y", labelcolor="tab:red")
+            fourth_panel_has_data = True
         if "teacher_center_norm" in df_instant.columns:
             ax.set_ylabel("Teacher Center Norm", color="tab:purple")
             ax.tick_params(axis="y", labelcolor="tab:purple")
-        ax.set_xlabel("Iteration")
-        ax.set_title("Teacher Center & Learning Rate")
-        if "lr" in df_instant.columns and "teacher_center_norm" in df_instant.columns:
-            lines_l, labels_l = ax.get_legend_handles_labels()
-            lines_r, labels_r = ax_twin.get_legend_handles_labels()
-            ax.legend(lines_l + lines_r, labels_l + labels_r, fontsize=8, loc="best")
+        if fourth_panel_has_data:
+            ax.set_xlabel("Iteration")
+            if (
+                "lr" in df_instant.columns
+                and "teacher_center_norm" in df_instant.columns
+            ):
+                ax.set_title("Teacher Center & Learning Rate")
+                lines_l, labels_l = ax.get_legend_handles_labels()
+                lines_r, labels_r = ax_twin.get_legend_handles_labels()
+                ax.legend(
+                    lines_l + lines_r,
+                    labels_l + labels_r,
+                    fontsize=8,
+                    loc="best",
+                )
+            elif "teacher_center_norm" in df_instant.columns:
+                ax.set_title("Teacher Center Norm")
+                ax.legend(fontsize=8)
+            else:
+                ax.set_title("Learning Rate")
+                lines_r, labels_r = ax_twin.get_legend_handles_labels()
+                ax.legend(lines_r, labels_r, fontsize=8, loc="best")
+            ax.grid(True, alpha=0.3)
+            plot_idx += 1
         else:
-            ax.legend(fontsize=8)
-        ax.grid(True, alpha=0.3)
-        plot_idx += 1
+            ax.axis("off")
 
         if df_metrics is not None and not df_metrics.empty:
             for cols, title in [
@@ -757,11 +790,12 @@ def _compute_and_log_all_metrics(
     logs_dir: Path,
     metrics_logger: EnhancedMetricsLogger,
     eval_image_size: int,
+    force_linear_probe: bool = False,
 ) -> None:
     visualize_csv = getattr(args, "visualize_data", "") or getattr(
         args, "train_data", ""
     )
-    compute_lp = ((epoch + 1) % 10) == 0
+    compute_lp = force_linear_probe or (((epoch + 1) % 10) == 0)
 
     if visualize_csv:
         try:
@@ -1112,6 +1146,7 @@ def run_pretrain(args: argparse.Namespace) -> None:
                     logs_dir=logs_dir,
                     metrics_logger=epoch_logger,
                     eval_image_size=eval_image_size,
+                    force_linear_probe=False,
                 )
 
     instant_logger.plot(
@@ -1140,7 +1175,13 @@ def run_finetune(args: argparse.Namespace) -> None:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    ckpt_path = Path(args.checkpoint)
+    resume_path = (
+        Path(getattr(args, "resume", "")) if getattr(args, "resume", "") else None
+    )
+    if resume_path is not None:
+        ckpt_path = resume_path
+    else:
+        ckpt_path = Path(args.checkpoint)
     ckpt = load_checkpoint(ckpt_path)
     cfg = ckpt.get("config", {})
     model_name = cfg.get("model_name", args.model_name)
@@ -1164,27 +1205,57 @@ def run_finetune(args: argparse.Namespace) -> None:
     loss_cls = LOSS_REGISTRY.get(args.loss, ArcFaceLoss)
     loss_fn = loss_cls(embed_dim=out_dim, num_classes=n_classes).to(device)
 
-    params = [p for p in model.parameters() if p.requires_grad]
-    params += list(loss_fn.parameters())
-    optimizer = torch.optim.AdamW(params, lr=args.finetune_lr)
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    trainable_params += list(loss_fn.parameters())
+    optimizer = torch.optim.AdamW(trainable_params, lr=args.finetune_lr)
+
+    start_epoch = 0
+    if resume_path is not None:
+        if "optimizer" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer"])
+        if "loss_state_dict" in ckpt:
+            loss_fn.load_state_dict(ckpt["loss_state_dict"], strict=False)
+        start_epoch = int(ckpt.get("epoch", -1)) + 1
+        print(
+            f"[Info] Resume from {resume_path} at epoch {start_epoch}, iteration {int(ckpt.get('iteration', 0))}"
+        )
 
     logs_dir = out_dir / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
     instant_logger = InstantMetricsLogger(
         logs_dir / "instant_metrics.finetune.csv", mode="finetune"
     )
-    epoch_logger = EnhancedMetricsLogger(
-        logs_dir / "metrics.finetune.csv", mode="pretrain"
+
+    compute_embedding_metrics = bool(getattr(args, "compute_embedding_metrics", True))
+    epoch_logger = (
+        EnhancedMetricsLogger(logs_dir / "metrics.finetune.csv", mode="pretrain")
+        if compute_embedding_metrics
+        else None
     )
 
-    best_loss = float("inf")
+    eval_image_size = (
+        int(args.extract_size)
+        if int(getattr(args, "extract_size", 0)) > 0
+        else _infer_backbone_image_size(model, fallback=224)
+    )
+    if int(getattr(args, "extract_size", 0)) <= 0:
+        print(f"[Info] Auto eval crop size from backbone: {eval_image_size}")
 
-    for epoch in range(args.finetune_epochs):
+    # Global iteration counter (mirrors ref finetune_arcface `it` variable)
+    global_step = int(ckpt.get("iteration", 0))
+
+    for epoch in range(start_epoch, args.finetune_epochs):
         model.train()
+        loss_fn.train()
         running = 0.0
         batches = 0
 
-        for imgs, labels in loader:
+        pbar = tqdm(
+            loader,
+            desc=f"Finetune Epoch {epoch + 1}/{args.finetune_epochs}",
+            ncols=120,
+        )
+        for step, (imgs, labels) in enumerate(pbar):
             batches += 1
             imgs = imgs.to(device)
             labels = labels.to(device)
@@ -1194,33 +1265,82 @@ def run_finetune(args: argparse.Namespace) -> None:
 
             optimizer.zero_grad()
             loss.backward()
-            nn.utils.clip_grad_norm_(params, max_norm=1.0)
+            grad_norm = _compute_grad_norm(model)
+            nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
             optimizer.step()
 
             running += float(loss.item())
 
+            pbar.set_postfix(
+                loss=f"{loss.item():.4f}",
+                lr=f"{optimizer.param_groups[0]['lr']:.2e}",
+            )
+
+            # Log instant metrics every N steps (mirrors ref per-iteration logging)
+            if global_step % max(1, args.log_every_n_steps) == 0:
+                with torch.no_grad():
+                    instant_metrics = _compute_instant_metrics(model, imgs, device)
+                instant_logger.log(
+                    iteration=global_step,
+                    epoch=epoch,
+                    step=step,
+                    loss=float(loss.item()),
+                    lr=float(optimizer.param_groups[0]["lr"]),
+                    grad_norm=float(grad_norm),
+                    **instant_metrics,
+                )
+
+            global_step += 1
+
         avg_loss = running / max(batches, 1)
-        # epoch_logger tracks embedding quality metrics; ArcFace training loss is
-        # not an embedding quality metric, so we only log it to instant_logger.
-        instant_logger.log(
-            iteration=epoch + 1,
-            epoch=epoch + 1,
-            step=0,
-            loss=avg_loss,
-            lr=float(optimizer.param_groups[0]["lr"]),
+        print(
+            f"[Finetune] Epoch {epoch + 1}/{args.finetune_epochs} - Avg Loss: {avg_loss:.4f}"
         )
 
-        ckpt_payload = {
-            "epoch": epoch + 1,
-            "model_state_dict": model.state_dict(),
-            "config": {
-                "model_name": model_name,
-                "metric_embed_dim": out_dim,
-                "out_dim": out_dim,
-            },
-        }
-        save_checkpoint(ckpt_payload, out_dir / "last.pt")
+        # Save checkpoint per --save-every-epochs (mirrors ref arcface_epoch_XXXX.pth)
+        should_save = (epoch + 1) % max(1, args.save_every_epochs) == 0 or (
+            epoch + 1
+        ) == args.finetune_epochs
+        if should_save:
+            ckpt_payload = {
+                "epoch": epoch,
+                "iteration": global_step,
+                "model_state_dict": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "loss_state_dict": loss_fn.state_dict(),
+                "config": {
+                    "model_name": model_name,
+                    "metric_embed_dim": out_dim,
+                    "out_dim": out_dim,
+                },
+            }
+            save_path = out_dir / f"finetune_epoch_{epoch + 1:04d}.pth"
+            save_checkpoint(ckpt_payload, save_path)
+            shutil.copy(str(save_path), out_dir / "finetune_latest.pth")
+            print(f"[Info] Saved checkpoint {save_path}")
 
-        if avg_loss < best_loss:
-            best_loss = avg_loss
-            save_checkpoint(ckpt_payload, out_dir / "best.pt")
+            keep = max(0, args.keep_last_checkpoints)
+            if keep > 0:
+                ckpts = sorted(out_dir.glob("finetune_epoch_*.pth"))
+                if len(ckpts) > keep:
+                    for old_ckpt in ckpts[:-keep]:
+                        old_ckpt.unlink(missing_ok=True)
+                        print(f"[Info] Deleted old checkpoint {old_ckpt.name}")
+
+        # Compute embedding metrics at save epochs (mirrors ref compute_and_log_all_metrics)
+        if should_save and compute_embedding_metrics and epoch_logger is not None:
+            _compute_and_log_all_metrics(
+                args=args,
+                model=model,
+                device=device,
+                epoch=epoch,
+                logs_dir=logs_dir,
+                metrics_logger=epoch_logger,
+                eval_image_size=eval_image_size,
+                force_linear_probe=True,
+            )
+
+    instant_logger.plot(
+        logs_dir, epoch_logger.path if epoch_logger is not None else None
+    )
+    print(f"[Info] ArcFace fine-tuning complete. Logs: {logs_dir}")

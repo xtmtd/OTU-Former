@@ -161,7 +161,10 @@ def pretrain(
     from otuformer.utils.logging import TeeLogger
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    tee = TeeLogger(out_dir / "logs" / "pretrain.log")
+    tee = TeeLogger(
+        out_dir / "logs" / "pretrain.log",
+        append=bool(resume),
+    )
     original_stderr = sys.stderr
     sys.stdout = tee
     sys.stderr = tee
