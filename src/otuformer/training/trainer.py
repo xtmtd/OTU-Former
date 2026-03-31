@@ -773,7 +773,9 @@ def _compute_all_metrics(
         clustering = compute_clustering_metrics(embeddings, labels)
         fields["NMI"] = clustering.get("NMI", "")
         fields["ARI"] = clustering.get("ARI", "")
-        fields["Silhouette_Score"] = clustering.get("Silhouette", "")
+        fields["Silhouette_Score"] = clustering.get(
+            "Silhouette_Score", clustering.get("Silhouette", "")
+        )
         fields["Purity"] = clustering.get("Purity", "")
         if compute_linear_probe:
             fields["Linear_Probing_Acc"] = compute_linear_probing(embeddings, labels)

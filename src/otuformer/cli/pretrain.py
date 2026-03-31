@@ -38,7 +38,10 @@ def pretrain(
     train_data: Path | None = typer.Option(
         None,
         "--train-data",
-        help="Optional CSV with 'image' column. If omitted, use all images recursively.",
+        help=(
+            "Optional CSV with an 'image' column (paths relative to --input-images-dir). "
+            "If omitted, all images under --input-images-dir are used recursively."
+        ),
     ),
     input_images_dir: Path = typer.Option(
         ..., "--input-images-dir", help="Root image directory."
@@ -47,15 +50,29 @@ def pretrain(
         Path("runs/pretrain"), "--out-dir", help="Output directory."
     ),
     model_name: str = typer.Option(
-        "vit_tiny_patch16_224", "--model-name", help="timm backbone."
+        "vit_tiny_patch16_224",
+        "--model-name",
+        help="timm backbone name used for student/teacher encoders.",
     ),
     out_dim: int = typer.Option(
         256, "--out-dim", help="SSL projector output dimension."
     ),
-    max_epochs: int = typer.Option(50, "--max-epochs", help="Pretraining epochs."),
-    lr: float = typer.Option(5e-4, "--lr", help="Base learning rate."),
-    weight_decay: float = typer.Option(0.05, "--weight-decay", help="Weight decay."),
-    warmup_epochs: int = typer.Option(3, "--warmup-epochs", help="Warmup epochs."),
+    max_epochs: int = typer.Option(
+        50, "--max-epochs", help="Total SSL pretraining epochs."
+    ),
+    lr: float = typer.Option(
+        5e-4,
+        "--lr",
+        help="Base learning rate before warmup/cosine scheduling.",
+    ),
+    weight_decay: float = typer.Option(
+        0.05, "--weight-decay", help="AdamW weight decay coefficient."
+    ),
+    warmup_epochs: int = typer.Option(
+        3,
+        "--warmup-epochs",
+        help="Warmup epochs before cosine LR decay.",
+    ),
     global_crop_size: int = typer.Option(
         224, "--global-crop-size", help="Global crop resolution."
     ),
@@ -63,12 +80,16 @@ def pretrain(
         96, "--local-crop-size", help="Local crop resolution."
     ),
     local_crops: int = typer.Option(6, "--local-crops", help="Number of local crops."),
-    mask_ratio: float = typer.Option(0.5, "--mask-ratio", help="Masked token ratio."),
+    mask_ratio: float = typer.Option(
+        0.5,
+        "--mask-ratio",
+        help="Fraction of patch tokens masked for masked-token consistency loss.",
+    ),
     lambda_local: float = typer.Option(
-        1.5, "--lambda-local", help="Weight of local loss."
+        1.5, "--lambda-local", help="Weight for local-crop SSL loss term."
     ),
     lambda_mask: float = typer.Option(
-        1.0, "--lambda-mask", help="Weight of mask loss."
+        1.0, "--lambda-mask", help="Weight for masked-token loss term."
     ),
     teacher_momentum: float = typer.Option(
         0.995, "--teacher-momentum", help="Initial EMA momentum."
@@ -93,7 +114,14 @@ def pretrain(
             "Default keeps full cross-view matching between global crops."
         ),
     ),
-    resume: str = typer.Option("", "--resume", help="Checkpoint path to resume from."),
+    resume: str = typer.Option(
+        "",
+        "--resume",
+        help=(
+            "Checkpoint path for resuming interrupted pretraining "
+            "(restores model/optimizer/scheduler state)."
+        ),
+    ),
     log_every_n_steps: int = typer.Option(
         50, "--log-every-n-steps", help="Log metrics every N iterations."
     ),
@@ -107,8 +135,8 @@ def pretrain(
         None,
         "--visualize-data",
         help=(
-            "CSV used for periodic embedding metrics + UMAP. "
-            "If omitted, reuse --train-data."
+            "CSV with 'image' and optional 'label' for periodic embedding metrics/UMAP. "
+            "If omitted, --train-data is reused when available."
         ),
     ),
     extract_size: int = typer.Option(
@@ -122,7 +150,7 @@ def pretrain(
     metrics_sample_size: int = typer.Option(
         10000,
         "--metrics-sample-size",
-        help="Max samples used for expensive periodic metrics.",
+        help="Max samples for expensive periodic metrics (<=0 means no cap).",
     ),
     umap_n_neighbors: int = typer.Option(
         15, "--umap-n-neighbors", help="UMAP n_neighbors."
@@ -144,7 +172,8 @@ def pretrain(
         False,
         "--disable-embedding-metrics",
         help=(
-            "Disable periodic embedding metrics + UMAP generation during pretraining."
+            "Disable periodic embedding metrics + UMAP generation during pretraining "
+            "to reduce runtime overhead."
         ),
     ),
     batch_size: int = typer.Option(32, "--batch-size", help="Batch size."),

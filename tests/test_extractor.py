@@ -1,10 +1,16 @@
 from pathlib import Path
 
 import pandas as pd
+import pytest
 import torch
 from PIL import Image
 
-from otuformer.embedding.extractor import detect_batch_mode, extract_embeddings
+from otuformer.embedding.extractor import (
+    GatedAttentionPooling,
+    detect_batch_mode,
+    extract_embeddings,
+    _iter_trainable_params,
+)
 
 
 def make_checkpoint(tmp_path: Path, out_dim: int = 64) -> Path:
@@ -73,3 +79,72 @@ def test_extract_batch_mode(tmp_path: Path):
     assert "sample" in out.columns
     assert len(out) == 5
     assert set(out["sample"].unique()) == {"site_a", "site_b"}
+
+
+def test_extract_patch_topk_mode_changes_embedding_shape(tmp_path: Path):
+    ckpt = make_checkpoint(tmp_path)
+    img_dir = tmp_path / "images"
+    make_images(img_dir, n=2)
+
+    cls_out = extract_embeddings(
+        checkpoint_path=ckpt,
+        images_dir=img_dir,
+        device="cpu",
+        batch_size=2,
+        token_mode="cls",
+    )
+    topk_out = extract_embeddings(
+        checkpoint_path=ckpt,
+        images_dir=img_dir,
+        device="cpu",
+        batch_size=2,
+        token_mode="patch-topk",
+        topk_patches=4,
+    )
+
+    cls_dim = len([c for c in cls_out.columns if c.startswith("dim_")])
+    topk_dim = len([c for c in topk_out.columns if c.startswith("dim_")])
+    assert topk_dim != cls_dim
+    assert topk_dim <= 512
+
+
+def test_extract_attention_pool_requires_training_csv_without_finetuned_pool(
+    tmp_path: Path,
+):
+    ckpt = make_checkpoint(tmp_path)
+    img_dir = tmp_path / "images"
+    make_images(img_dir, n=2)
+
+    with pytest.raises(ValueError, match="label-csv"):
+        extract_embeddings(
+            checkpoint_path=ckpt,
+            images_dir=img_dir,
+            device="cpu",
+            batch_size=2,
+            token_mode="attention-pool",
+        )
+
+
+def test_extract_csv_preserves_csv_order(tmp_path: Path):
+    ckpt = make_checkpoint(tmp_path)
+    img_dir = tmp_path / "images"
+    make_images(img_dir, n=3)
+
+    csv_path = tmp_path / "subset.csv"
+    pd.DataFrame({"image": ["img_2.jpg", "img_0.jpg"]}).to_csv(csv_path, index=False)
+
+    out = extract_embeddings(
+        checkpoint_path=ckpt,
+        images_dir=img_dir,
+        device="cpu",
+        batch_size=2,
+        token_mode="cls",
+        extract_csv=csv_path,
+    )
+    assert out["id"].tolist() == ["img_2.jpg", "img_0.jpg"]
+
+
+def test_gated_attention_has_trainable_params():
+    pool = GatedAttentionPooling(dim=192)
+    trainable = list(_iter_trainable_params(pool))
+    assert len(trainable) > 0

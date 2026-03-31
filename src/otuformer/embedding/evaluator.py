@@ -16,7 +16,7 @@ def _safe_cv_splits(labels: np.ndarray, max_cv: int = 5) -> int:
 def compute_knn_accuracy(
     embeddings: np.ndarray,
     labels: np.ndarray,
-    k_values: list[int] = [1, 5, 10],
+    k_values: list[int] = [1, 5, 20],
 ) -> dict[str, float]:
     from sklearn.model_selection import cross_val_score
     from sklearn.neighbors import KNeighborsClassifier
@@ -109,7 +109,7 @@ def compute_clustering_metrics(
         "NMI": float(normalized_mutual_info_score(label_codes, pred)),
         "ARI": float(adjusted_rand_score(label_codes, pred)),
         "AMI": float(adjusted_mutual_info_score(label_codes, pred)),
-        "Silhouette": sil,
+        "Silhouette_Score": sil,
         "Purity": float(purity),
     }
 

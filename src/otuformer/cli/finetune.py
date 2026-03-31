@@ -36,10 +36,19 @@ def _format_user_command(ctx: typer.Context, params: dict[str, object]) -> str:
 def finetune(
     ctx: typer.Context,
     checkpoint: str = typer.Option(
-        "", "--checkpoint", help="Pretrained checkpoint path."
+        "",
+        "--checkpoint",
+        help=(
+            "Pretrained checkpoint path (typically runs/pretrain/SSL_latest.pth). "
+            "Used as initialization when --resume is not set."
+        ),
     ),
     resume: str = typer.Option(
-        "", "--resume", help="Fine-tune checkpoint path to resume from."
+        "",
+        "--resume",
+        help=(
+            "Fine-tune checkpoint path to resume from (restores model/optimizer state)."
+        ),
     ),
     train_data: Path = typer.Option(
         ..., "--train-data", help="CSV with 'image' and 'label' columns."
@@ -51,7 +60,9 @@ def finetune(
         Path("runs/finetune"), "--out-dir", help="Output directory."
     ),
     model_name: str = typer.Option(
-        "vit_tiny_patch16_224", "--model-name", help="timm backbone."
+        "vit_tiny_patch16_224",
+        "--model-name",
+        help="timm backbone name for metric-learning encoder.",
     ),
     metric_embed_dim: int = typer.Option(
         256,
@@ -62,13 +73,23 @@ def finetune(
         ),
     ),
     finetune_epochs: int = typer.Option(
-        20, "--finetune-epochs", help="Fine-tuning epochs."
+        20, "--finetune-epochs", help="Total ArcFace fine-tuning epochs."
     ),
-    finetune_lr: float = typer.Option(1e-4, "--finetune-lr", help="Learning rate."),
+    finetune_lr: float = typer.Option(
+        1e-4,
+        "--finetune-lr",
+        help="Learning rate for ArcFace fine-tuning optimizer.",
+    ),
     freeze_ratio: float = typer.Option(
-        0.7, "--freeze-ratio", help="Fraction of blocks to freeze."
+        0.7,
+        "--freeze-ratio",
+        help="Fraction of backbone blocks to freeze (0.0=none, 1.0=all).",
     ),
-    loss: str = typer.Option("arcface", "--loss", help="Loss function."),
+    loss: str = typer.Option(
+        "arcface",
+        "--loss",
+        help="Metric-learning loss name from LOSS_REGISTRY (default: arcface).",
+    ),
     batch_size: int = typer.Option(32, "--batch-size", help="Batch size."),
     num_workers: int = typer.Option(4, "--num-workers", help="DataLoader workers."),
     cpus: int = typer.Option(12, "--cpus", help="CPU threads for PyTorch/MKL."),
@@ -91,7 +112,7 @@ def finetune(
         "--visualize-data",
         help=(
             "CSV used for periodic embedding metrics + UMAP. "
-            "If omitted, reuse --train-data."
+            "If omitted, --train-data is reused."
         ),
     ),
     extract_size: int = typer.Option(
@@ -105,7 +126,7 @@ def finetune(
     metrics_sample_size: int = typer.Option(
         10000,
         "--metrics-sample-size",
-        help="Max samples used for expensive periodic metrics.",
+        help="Max samples for expensive periodic metrics (<=0 means no cap).",
     ),
     umap_n_neighbors: int = typer.Option(
         15, "--umap-n-neighbors", help="UMAP n_neighbors."
@@ -124,7 +145,10 @@ def finetune(
     disable_embedding_metrics: bool = typer.Option(
         False,
         "--disable-embedding-metrics",
-        help="Disable periodic embedding metrics + UMAP generation during fine-tuning.",
+        help=(
+            "Disable periodic embedding metrics + UMAP generation during fine-tuning "
+            "to reduce runtime overhead."
+        ),
     ),
 ) -> None:
     if ctx.invoked_subcommand is not None:

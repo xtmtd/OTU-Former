@@ -64,25 +64,37 @@ def extract(
         ),
     ),
     token_mode: str = typer.Option(
-        "cls", "--token-mode", help="Token mode: cls | patch-topk | attention-pool."
+        "cls",
+        "--token-mode",
+        help=(
+            "Embedding token mode. cls=raw CLS token; patch-topk=top-K patch tokens + PCA; "
+            "attention-pool=learned query pooling over patch tokens."
+        ),
     ),
     topk_patches: int = typer.Option(
-        20, "--topk-patches", help="Top-K patches for patch-topk mode."
+        20,
+        "--topk-patches",
+        help="Top-K patch tokens for patch-topk mode (common: 10/20/30).",
     ),
     attention_pooling_type: str = typer.Option(
         "lightweight",
         "--attention-pooling-type",
-        help="Attention pooling type.",
+        help="Attention pooling type. Choices: lightweight | multihead | gated.",
     ),
     attention_pooling_epochs: int = typer.Option(
-        20, "--attention-pooling-epochs", help="Epochs for attention query."
+        20,
+        "--attention-pooling-epochs",
+        help=(
+            "Epochs to finetune attention query when no cached pooling checkpoint is found."
+        ),
     ),
     label_csv: Path | None = typer.Option(
         None,
         "--label-csv",
         help=(
             "CSV with 'image' and 'label' columns for evaluating embedding quality "
-            "and generating UMAP. If omitted, only extraction is performed."
+            "and generating UMAP. In attention-pool mode this CSV is also used to "
+            "train query pooling if cached pooling weights are missing."
         ),
     ),
     metrics_sample_size: int = typer.Option(
@@ -154,6 +166,12 @@ def extract(
             device=device,
             seed=seed,
         )
+        attention_pooling_checkpoint = (
+            out_dir
+            / "checkpoints"
+            / f"{checkpoint.stem}.{attention_pooling_type}_pooling.pth"
+        )
+        params["attention_pooling_checkpoint"] = str(attention_pooling_checkpoint)
         cli_command = _format_user_command(ctx, params)
         print(f"Command: {cli_command}")
         print("Parameters:")
@@ -174,6 +192,14 @@ def extract(
             num_workers=num_workers,
             use_projector_output=use_projector_output,
             use_student=use_student,
+            token_mode=token_mode,
+            topk_patches=topk_patches,
+            attention_pooling_type=attention_pooling_type,
+            attention_pooling_epochs=attention_pooling_epochs,
+            attention_train_csv=label_csv,
+            seed=seed,
+            extract_csv=label_csv,
+            attention_pooling_checkpoint_path=attention_pooling_checkpoint,
         )
         out_path = out_dir / "embeddings.csv"
         write_csv(df, out_path)

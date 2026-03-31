@@ -70,6 +70,15 @@ def test_subcommand_help_includes_key_flags(cmd, expected_flags):
         assert flag in result.output
 
 
+def test_extract_help_lists_attention_pooling_type_choices():
+    result = runner.invoke(app, ["extract", "--help"])
+    assert result.exit_code == 0
+    assert "--attention-pooling-type" in result.output
+    assert "lightweight" in result.output
+    assert "multihead" in result.output
+    assert "gated" in result.output
+
+
 def _make_tiny_pretrain_data(tmp_path):
     for i in range(4):
         Image.new("RGB", (224, 224)).save(tmp_path / f"img_{i}.jpg")
