@@ -132,13 +132,33 @@ class CSVImageDataset(Dataset):
 
         self.paths = paths
         self.ids = refs
+        self.samples: list[str] | None = None
+
+        if "sample" in df.columns:
+            self.samples = df["sample"].astype(str).tolist()
+        else:
+            inferred: list[str | None] = []
+            for path in self.paths:
+                try:
+                    rel = path.relative_to(images_dir)
+                except ValueError:
+                    inferred.append(None)
+                    continue
+                if len(rel.parts) >= 2:
+                    inferred.append(rel.parts[0])
+                else:
+                    inferred.append(None)
+            if any(v is not None for v in inferred):
+                self.samples = [v if v is not None else "" for v in inferred]
 
     def __len__(self) -> int:
         return len(self.paths)
 
     def __getitem__(self, idx: int):
         img = Image.open(self.paths[idx]).convert("RGB")
-        return self.transform(img), self.ids[idx]
+        if self.samples is None:
+            return self.transform(img), self.ids[idx]
+        return self.transform(img), self.ids[idx], self.samples[idx]
 
 
 class LightweightAttentionPooling(nn.Module):
@@ -515,10 +535,16 @@ def _extract_one_csv(
         ds, batch_size=batch_size, shuffle=False, num_workers=num_workers
     )
     all_ids: list[str] = []
+    all_samples: list[str] | None = [] if ds.samples is not None else None
     all_embs: list[np.ndarray] = []
 
     with torch.no_grad():
-        for imgs, names in tqdm(loader, desc="Extract CSV", ncols=120):
+        for batch in tqdm(loader, desc="Extract CSV", ncols=120):
+            if len(batch) == 3:
+                imgs, names, samples = batch
+            else:
+                imgs, names = batch
+                samples = None
             imgs = imgs.to(device)
             feats = (
                 model.backbone.forward_features(imgs)
@@ -562,6 +588,8 @@ def _extract_one_csv(
                         embs = embs[0]
 
             all_ids.extend(list(names))
+            if all_samples is not None and samples is not None:
+                all_samples.extend([str(v) for v in list(samples)])
             all_embs.append(embs.cpu().numpy())
 
     if not all_embs:
@@ -573,6 +601,8 @@ def _extract_one_csv(
     cols = [f"dim_{i}" for i in range(arr.shape[1])]
     out = pd.DataFrame(arr, columns=cols)
     out.insert(0, "id", all_ids)
+    if all_samples is not None:
+        out.insert(1, "sample", all_samples)
     return out
 
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -18,24 +19,46 @@ def upgma_to_newick(
     z: np.ndarray,
     ids: list[str],
     out_path: Path,
+    support_dict: dict[frozenset, float] | None = None,
 ) -> str:
-    n = len(ids)
-    nodes: dict[int, str] = {i: ids[i] for i in range(n)}
-    heights: dict[int, float] = {i: 0.0 for i in range(n)}
-
-    for step, (a, b, dist, _) in enumerate(z):
-        a, b = int(a), int(b)
-        node_id = n + step
-        height = dist / 2.0
-        branch_a = height - heights[a]
-        branch_b = height - heights[b]
-        nodes[node_id] = f"({nodes[a]}:{branch_a:.6f},{nodes[b]}:{branch_b:.6f})"
-        heights[node_id] = height
-
-    newick = nodes[n + len(z) - 1] + ";"
+    newick = upgma_to_newick_string(z, ids, support_dict=support_dict)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(newick, encoding="utf-8")
     return newick
+
+
+def upgma_to_newick_string(
+    z: np.ndarray,
+    ids: list[str],
+    support_dict: dict[frozenset, float] | None = None,
+) -> str:
+    tree = hierarchy.to_tree(z, rd=False)
+
+    def build(node, parent_dist):
+        node_dist = node.dist if node.dist is not None else 0.0
+        branch_length = max(parent_dist - node_dist, 0.0)
+
+        if node.left is None and node.right is None:
+            return f"{ids[node.id]}:{branch_length:.10f}", {ids[node.id]}
+
+        left_str, left_clade = build(node.left, node_dist)
+        right_str, right_clade = build(node.right, node_dist)
+        clade = left_clade | right_clade
+
+        support_label = ""
+        if support_dict is not None:
+            support = support_dict.get(frozenset(clade))
+            if support is not None:
+                support_label = f"{support:.1f}"
+
+        inner = f"({left_str},{right_str}){support_label}"
+        if parent_dist == node_dist:
+            return inner, clade
+        return f"{inner}:{branch_length:.10f}", clade
+
+    root_dist = tree.dist if tree.dist is not None else 0.0
+    newick, _ = build(tree, root_dist)
+    return f"{newick};"
 
 
 def _extract_clades(z: np.ndarray, ids: list[str]) -> set[frozenset]:
@@ -52,27 +75,81 @@ def _extract_clades(z: np.ndarray, ids: list[str]) -> set[frozenset]:
 
 
 def compute_bootstrap_support(
-    dist_matrix: np.ndarray,
+    x: np.ndarray,
     ids: list[str],
-    n_bootstraps: int = 100,
+    base_z: np.ndarray,
+    distance: str = "cosine",
+    support_mode: str = "subsample",
+    n_replicates: int = 100,
     subsample_ratio: float = 0.8,
     random_state: int = 42,
+    save_trees_path: Path | None = None,
+    n_jobs: int = 1,
 ) -> dict[frozenset, float]:
+    from otuformer.delineation.distance import (
+        compute_cosine_distances,
+        compute_euclidean_distances,
+    )
+
+    def ensure_nonzero_rows(arr: np.ndarray, eps: float = 1e-8) -> np.ndarray:
+        norms = np.linalg.norm(arr, axis=1)
+        zero_mask = norms < eps
+        if zero_mask.any():
+            arr = arr.copy()
+            arr[zero_mask, 0] = eps
+        return arr
+
+    def bootstrap_once(seed: int):
+        rng_local = np.random.default_rng(seed)
+        if support_mode == "bootstrap":
+            cols = rng_local.choice(x.shape[1], size=x.shape[1], replace=True)
+        else:
+            cols = rng_local.choice(x.shape[1], size=subset_size, replace=False)
+        x_sub = ensure_nonzero_rows(x[:, cols])
+        if distance == "euclidean":
+            norms = np.linalg.norm(x_sub, axis=1, keepdims=True)
+            x_sub = x_sub / np.maximum(norms, 1e-12)
+            d_sub = compute_euclidean_distances(x_sub)
+        else:
+            d_sub = compute_cosine_distances(x_sub)
+        z_boot = build_upgma(d_sub)
+        return _extract_clades(z_boot, ids), upgma_to_newick_string(z_boot, ids)
+
     rng = np.random.default_rng(random_state)
-    n_samples = dist_matrix.shape[0]
-    z_ref = build_upgma(dist_matrix)
-    ref_clades = _extract_clades(z_ref, ids)
+    subset_size = max(2, int(round(x.shape[1] * subsample_ratio)))
+    ref_clades = _extract_clades(base_z, ids)
     counts: dict[frozenset, int] = {c: 0 for c in ref_clades}
+    trees: list[str] = []
+    seeds = [int(s) for s in rng.integers(0, 2**32 - 1, size=n_replicates)]
 
-    for _ in range(n_bootstraps):
-        k = max(2, int(n_samples * subsample_ratio))
-        idx = np.sort(rng.choice(n_samples, size=k, replace=False))
-        d_boot = dist_matrix[np.ix_(idx, idx)]
-        ids_boot = [ids[i] for i in idx]
-        z_boot = build_upgma(d_boot)
-        boot_clades = _extract_clades(z_boot, ids_boot)
-        for clade in ref_clades:
-            if clade.issubset(set(ids_boot)) and clade in boot_clades:
-                counts[clade] += 1
+    progress_every = max(1, n_replicates // 20)
+    if n_jobs > 1:
+        with ThreadPoolExecutor(max_workers=n_jobs) as ex:
+            for i, (boot_clades, newick) in enumerate(
+                ex.map(bootstrap_once, seeds), start=1
+            ):
+                if save_trees_path is not None:
+                    trees.append(newick)
+                for clade in ref_clades:
+                    if clade in boot_clades:
+                        counts[clade] += 1
+                if i % progress_every == 0 or i == n_replicates:
+                    pct = int(round(i * 100 / n_replicates))
+                    print(f"  Support replicate progress: {i}/{n_replicates} ({pct}%)")
+    else:
+        for i, seed in enumerate(seeds, start=1):
+            boot_clades, newick = bootstrap_once(seed)
+            if save_trees_path is not None:
+                trees.append(newick)
+            for clade in ref_clades:
+                if clade in boot_clades:
+                    counts[clade] += 1
+            if i % progress_every == 0 or i == n_replicates:
+                pct = int(round(i * 100 / n_replicates))
+                print(f"  Support replicate progress: {i}/{n_replicates} ({pct}%)")
 
-    return {c: 100.0 * cnt / n_bootstraps for c, cnt in counts.items()}
+    if save_trees_path is not None:
+        save_trees_path.parent.mkdir(parents=True, exist_ok=True)
+        save_trees_path.write_text("\n".join(trees) + "\n", encoding="utf-8")
+
+    return {c: 100.0 * cnt / n_replicates for c, cnt in counts.items()}

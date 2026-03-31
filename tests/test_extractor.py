@@ -48,6 +48,7 @@ def test_extract_single_dir(tmp_path: Path):
     )
     assert isinstance(out, pd.DataFrame)
     assert "id" in out.columns
+    assert "sample" not in out.columns
     assert len(out) == 3
     assert out.shape[1] > 2
 
@@ -142,6 +143,32 @@ def test_extract_csv_preserves_csv_order(tmp_path: Path):
         extract_csv=csv_path,
     )
     assert out["id"].tolist() == ["img_2.jpg", "img_0.jpg"]
+
+
+def test_extract_csv_infers_sample_for_subdirs(tmp_path: Path):
+    ckpt = make_checkpoint(tmp_path)
+    parent = tmp_path / "multi"
+    make_images(parent / "site_a", n=1)
+    make_images(parent / "site_b", n=1)
+
+    csv_path = tmp_path / "subset.csv"
+    pd.DataFrame(
+        {
+            "image": ["site_a/img_0.jpg", "site_b/img_0.jpg"],
+            "label": ["x", "y"],
+        }
+    ).to_csv(csv_path, index=False)
+
+    out = extract_embeddings(
+        checkpoint_path=ckpt,
+        images_dir=parent,
+        device="cpu",
+        batch_size=2,
+        token_mode="cls",
+        extract_csv=csv_path,
+    )
+    assert "sample" in out.columns
+    assert out["sample"].tolist() == ["site_a", "site_b"]
 
 
 def test_gated_attention_has_trainable_params():

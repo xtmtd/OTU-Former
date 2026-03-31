@@ -70,6 +70,21 @@ def test_subcommand_help_includes_key_flags(cmd, expected_flags):
         assert flag in result.output
 
 
+def test_cluster_help_includes_save_bootstrap_trees_and_detailed_text():
+    result = runner.invoke(app, ["cluster", "--help"])
+    assert result.exit_code == 0
+    assert "save-bootstrap" in result.output
+    assert "--num-replicates" in result.output
+    assert "--support-mode" in result.output
+    assert "subsample" in result.output
+    assert "bootstrap" in result.output
+    assert "local-k-strategy" in result.output
+    assert "adaptive" in result.output
+    output = result.output.lower()
+    assert "bootstrap" in output
+    assert "partition" in output
+
+
 def test_extract_help_lists_attention_pooling_type_choices():
     result = runner.invoke(app, ["extract", "--help"])
     assert result.exit_code == 0
@@ -314,6 +329,7 @@ def test_export_command(tmp_path):
     )
     assert result.exit_code == 0
     assert (tmp_path / "export_out" / "encoder.onnx").exists()
+    assert (tmp_path / "export_out" / "logs" / "export.log").exists()
 
 
 def _make_embeddings_and_labels(tmp_path):
@@ -328,6 +344,24 @@ def _make_embeddings_and_labels(tmp_path):
     labels = pd.DataFrame({"id": ["a", "b", "c", "d"], "label": ["x", "x", "y", "y"]})
     emb_path = tmp_path / "embeddings.csv"
     labels_path = tmp_path / "labels.csv"
+    emb.to_csv(emb_path, index=False)
+    labels.to_csv(labels_path, index=False)
+    return emb_path, labels_path
+
+
+def _make_embeddings_with_sample_and_labels(tmp_path):
+    emb = pd.DataFrame(
+        {
+            "id": ["a", "b", "c", "d"],
+            "sample": ["s1", "s1", "s2", "s2"],
+            "dim_0": [1.0, 0.9, -1.0, -0.9],
+            "dim_1": [0.1, 0.0, -0.1, 0.0],
+            "dim_2": [0.2, 0.2, -0.2, -0.2],
+        }
+    )
+    labels = pd.DataFrame({"id": ["a", "b", "c", "d"], "label": ["x", "x", "y", "y"]})
+    emb_path = tmp_path / "embeddings_with_sample.csv"
+    labels_path = tmp_path / "labels_with_sample.csv"
     emb.to_csv(emb_path, index=False)
     labels.to_csv(labels_path, index=False)
     return emb_path, labels_path
@@ -352,7 +386,92 @@ def test_cluster_command(tmp_path):
         ],
     )
     assert result.exit_code == 0
-    assert any((tmp_path / "cluster_out").glob("partition_*_assignments.csv"))
+    assert any(
+        (tmp_path / "cluster_out" / "UPGMA" / "partitions" / "tables").glob(
+            "partition_*_assignments.csv"
+        )
+    )
+
+
+def test_cluster_accepts_label_csv_with_image_column(tmp_path):
+    emb_path, _ = _make_embeddings_and_labels(tmp_path)
+    label_csv = tmp_path / "labels_image.csv"
+    pd.DataFrame(
+        {
+            "image": ["a", "b", "c", "d"],
+            "label": ["x", "x", "y", "y"],
+        }
+    ).to_csv(label_csv, index=False)
+
+    out_dir = tmp_path / "cluster_out_label_csv"
+    result = runner.invoke(
+        app,
+        [
+            "cluster",
+            "--embeddings",
+            str(emb_path),
+            "--out-dir",
+            str(out_dir),
+            "--label-csv",
+            str(label_csv),
+            "--custom-cutoffs",
+            "0.5",
+        ],
+    )
+    assert result.exit_code == 0
+    assert (out_dir / "UPGMA" / "metrics.csv").exists()
+    assert (out_dir / "logs" / "cluster.log").exists()
+
+
+def test_cluster_bool_options_accept_true_false(tmp_path):
+    emb_path, labels_path = _make_embeddings_and_labels(tmp_path)
+    out_dir = tmp_path / "cluster_out_bools"
+    result = runner.invoke(
+        app,
+        [
+            "cluster",
+            "--embeddings",
+            str(emb_path),
+            "--out-dir",
+            str(out_dir),
+            "--labels",
+            str(labels_path),
+            "--custom-cutoffs",
+            "0.5",
+            "--distance",
+            "cosine",
+            "--pca-whitening",
+            "true",
+            "--local-scaling",
+            "false",
+            "--save-distances",
+            "true",
+        ],
+    )
+    assert result.exit_code == 0
+    assert (out_dir / "distance_statistics" / "distance_matrix.csv").exists()
+
+
+def test_cluster_bool_options_reject_invalid_values(tmp_path):
+    emb_path, _ = _make_embeddings_and_labels(tmp_path)
+    result = runner.invoke(
+        app,
+        [
+            "cluster",
+            "--embeddings",
+            str(emb_path),
+            "--out-dir",
+            str(tmp_path / "cluster_out_invalid_bool"),
+            "--custom-cutoffs",
+            "0.5",
+            "--pca-whitening",
+            "maybe",
+        ],
+    )
+    assert result.exit_code != 0
+    output = result.output.lower()
+    assert "use true or" in output
+    assert "false" in output
 
 
 def test_cluster_respects_max_distance_pairs(tmp_path):
@@ -373,6 +492,283 @@ def test_cluster_respects_max_distance_pairs(tmp_path):
     )
     assert result.exit_code != 0
     assert "max-distance-pairs" in result.output.lower()
+
+
+def test_cluster_without_label_csv_skips_partition_metrics(tmp_path):
+    emb_path, _ = _make_embeddings_and_labels(tmp_path)
+    out_dir = tmp_path / "cluster_out_no_labels"
+    result = runner.invoke(
+        app,
+        [
+            "cluster",
+            "--embeddings",
+            str(emb_path),
+            "--out-dir",
+            str(out_dir),
+            "--custom-cutoffs",
+            "0.5",
+        ],
+    )
+    assert result.exit_code == 0
+    assert not (out_dir / "partition_metrics.csv").exists()
+
+
+def test_cluster_writes_ref_like_structure_and_csv_stats(tmp_path):
+    emb_path, labels_path = _make_embeddings_and_labels(tmp_path)
+    out_dir = tmp_path / "cluster_out_ref_like"
+    result = runner.invoke(
+        app,
+        [
+            "cluster",
+            "--embeddings",
+            str(emb_path),
+            "--out-dir",
+            str(out_dir),
+            "--labels",
+            str(labels_path),
+            "--distance",
+            "cosine",
+            "--cutoff-min",
+            "0.2",
+            "--cutoff-max",
+            "0.4",
+            "--cutoff-step",
+            "0.02",
+            "--num-replicates",
+            "5",
+            "--support-mode",
+            "subsample",
+            "--subsample-ratio",
+            "0.8",
+        ],
+    )
+    assert result.exit_code == 0
+
+    root_entries = sorted(p.name for p in out_dir.iterdir())
+    assert root_entries == ["UPGMA", "distance_statistics", "logs"]
+    assert not (out_dir / "logs" / "log.txt").exists()
+    assert (out_dir / "logs" / "cluster.log").exists()
+
+    assert (out_dir / "distance_statistics" / "distance_stats.csv").exists()
+    assert (out_dir / "distance_statistics" / "distance_hist_raw_cosine.pdf").exists()
+    assert (out_dir / "distance_statistics" / "distance_cum_raw_cosine.pdf").exists()
+    assert (
+        out_dir / "distance_statistics" / "distance_hist_raw_cosine_log.pdf"
+    ).exists()
+    assert not (out_dir / "distance_statistics" / "distance_stats.json").exists()
+
+    assert (out_dir / "UPGMA" / "UPGMA_Cosine.nwk").exists()
+    assert (out_dir / "UPGMA" / "UPGMA_Cosine_bootstrap.nwk").exists()
+    assert (out_dir / "UPGMA" / "metrics_dashboard.pdf").exists()
+    assert (out_dir / "UPGMA" / "partitions" / "partition_scan.csv").exists()
+    assert (out_dir / "UPGMA" / "partitions" / "partition_scan.pdf").exists()
+    assert (out_dir / "UPGMA" / "partitions" / "UPGMA_tree_partitions.pdf").exists()
+    assert any(
+        (out_dir / "UPGMA" / "partitions" / "tables").glob(
+            "partition_*_assignments.csv"
+        )
+    )
+    assert (
+        out_dir / "UPGMA" / "partitions" / "tables" / "partition_0.4_assignments.csv"
+    ).exists()
+    assert (
+        out_dir / "UPGMA" / "partitions" / "tables" / "partition_0.4_summary.csv"
+    ).exists()
+    assert (out_dir / "UPGMA" / "metrics.csv").exists()
+    assert not (out_dir / "UPGMA" / "partition_metrics.json").exists()
+
+    bootstrap_newick = (out_dir / "UPGMA" / "UPGMA_Cosine_bootstrap.nwk").read_text(
+        encoding="utf-8"
+    )
+    assert ")" in bootstrap_newick
+    assert any(ch.isdigit() for ch in bootstrap_newick.split(")")[-2])
+
+    cluster_log = (out_dir / "logs" / "cluster.log").read_text(encoding="utf-8")
+    assert "[2/7] SKIP PCA whitening" in cluster_log
+    assert "[4/7] SKIP local scaling" in cluster_log
+
+    metrics_df = pd.read_csv(out_dir / "UPGMA" / "metrics.csv")
+    expected_cutoffs = [
+        0.2,
+        0.22,
+        0.24,
+        0.26,
+        0.28,
+        0.3,
+        0.32,
+        0.34,
+        0.36,
+        0.38,
+        0.4,
+    ]
+    assert [round(v, 2) for v in metrics_df["cutoff"].tolist()] == expected_cutoffs
+    for col in [
+        "BCubed_precision",
+        "BCubed_recall",
+        "BCubed_fscore",
+        "monophyly_proportion",
+        "v_measure",
+    ]:
+        assert col in metrics_df.columns
+
+
+def test_cluster_old_bootstrap_flag_is_rejected(tmp_path):
+    emb_path, labels_path = _make_embeddings_and_labels(tmp_path)
+    out_dir = tmp_path / "cluster_out_reject_old_bootstrap"
+    result = runner.invoke(
+        app,
+        [
+            "cluster",
+            "--embeddings",
+            str(emb_path),
+            "--out-dir",
+            str(out_dir),
+            "--labels",
+            str(labels_path),
+            "--distance",
+            "cosine",
+            "--cutoff-min",
+            "0.2",
+            "--cutoff-max",
+            "0.4",
+            "--cutoff-step",
+            "0.02",
+            "--num-bootstraps",
+            "5",
+        ],
+    )
+    assert result.exit_code != 0
+
+
+def test_cluster_cleans_old_outputs_before_writing(tmp_path):
+    emb_path, labels_path = _make_embeddings_and_labels(tmp_path)
+    out_dir = tmp_path / "cluster_out_cleanup"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stale = out_dir / "old_should_disappear.txt"
+    stale.write_text("stale", encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        [
+            "cluster",
+            "--embeddings",
+            str(emb_path),
+            "--out-dir",
+            str(out_dir),
+            "--label-csv",
+            str(labels_path),
+            "--custom-cutoffs",
+            "0.5",
+        ],
+    )
+    assert result.exit_code == 0
+    assert not stale.exists()
+
+
+def test_cluster_save_bootstrap_trees_option(tmp_path):
+    emb_path, labels_path = _make_embeddings_and_labels(tmp_path)
+    out_dir = tmp_path / "cluster_out_bootstrap_trees"
+
+    result = runner.invoke(
+        app,
+        [
+            "cluster",
+            "--embeddings",
+            str(emb_path),
+            "--out-dir",
+            str(out_dir),
+            "--label-csv",
+            str(labels_path),
+            "--custom-cutoffs",
+            "0.5",
+            "--num-replicates",
+            "3",
+            "--support-mode",
+            "subsample",
+            "--subsample-ratio",
+            "0.8",
+            "--save-bootstrap-trees",
+            "true",
+        ],
+    )
+    assert result.exit_code == 0
+    assert (out_dir / "UPGMA" / "bootstrap_trees.nwk").exists()
+
+
+def test_cluster_partition_tables_include_sample_column(tmp_path):
+    emb_path, labels_path = _make_embeddings_with_sample_and_labels(tmp_path)
+    out_dir = tmp_path / "cluster_out_sample_columns"
+    result = runner.invoke(
+        app,
+        [
+            "cluster",
+            "--embeddings",
+            str(emb_path),
+            "--out-dir",
+            str(out_dir),
+            "--label-csv",
+            str(labels_path),
+            "--custom-cutoffs",
+            "0.5",
+        ],
+    )
+    assert result.exit_code == 0
+
+    assign_path = (
+        out_dir / "UPGMA" / "partitions" / "tables" / "partition_0.5_assignments.csv"
+    )
+    summary_path = (
+        out_dir / "UPGMA" / "partitions" / "tables" / "partition_0.5_summary.csv"
+    )
+    assert assign_path.exists()
+    assert summary_path.exists()
+
+    assign_df = pd.read_csv(assign_path)
+    summary_df = pd.read_csv(summary_path)
+    assert "sample" in assign_df.columns
+    assert "sample" in summary_df.columns
+    assert set(assign_df["sample"]) == {"s1", "s2"}
+
+
+def test_cluster_euclidean_uses_l2_normalized_embeddings(tmp_path):
+    emb = pd.DataFrame(
+        {
+            "id": ["a", "b", "c"],
+            "dim_0": [100.0, 0.0, -100.0],
+            "dim_1": [0.0, 100.0, 0.0],
+        }
+    )
+    labels = pd.DataFrame({"id": ["a", "b", "c"], "label": ["x", "y", "z"]})
+    emb_path = tmp_path / "emb.csv"
+    labels_path = tmp_path / "lbl.csv"
+    emb.to_csv(emb_path, index=False)
+    labels.to_csv(labels_path, index=False)
+
+    out_dir = tmp_path / "cluster_out_euclidean_norm"
+    result = runner.invoke(
+        app,
+        [
+            "cluster",
+            "--embeddings",
+            str(emb_path),
+            "--out-dir",
+            str(out_dir),
+            "--distance",
+            "euclidean",
+            "--custom-cutoffs",
+            "0.2",
+            "--label-csv",
+            str(labels_path),
+            "--save-distances",
+            "true",
+        ],
+    )
+    assert result.exit_code == 0
+    dist = pd.read_csv(
+        out_dir / "distance_statistics" / "distance_matrix.csv", index_col=0
+    )
+    vals = dist.to_numpy()
+    assert vals.max() <= 2.000001
 
 
 def test_annotate_command(tmp_path):
@@ -397,6 +793,7 @@ def test_annotate_command(tmp_path):
     )
     assert result.exit_code == 0
     assert (tmp_path / "annotate_out" / "assignments_annotated.csv").exists()
+    assert (tmp_path / "annotate_out" / "logs" / "annotate.log").exists()
 
 
 def test_diversity_command(tmp_path):
@@ -422,6 +819,7 @@ def test_diversity_command(tmp_path):
     )
     assert result.exit_code == 0
     assert (tmp_path / "diversity_out" / "diversity_indices.csv").exists()
+    assert (tmp_path / "diversity_out" / "logs" / "diversity.log").exists()
 
 
 def test_cam_command(tmp_path):
@@ -455,6 +853,7 @@ def test_cam_command(tmp_path):
     )
     assert result.exit_code == 0
     assert (tmp_path / "cam_out" / "cam_summary.csv").exists()
+    assert (tmp_path / "cam_out" / "logs" / "cam.log").exists()
 
 
 def test_pretrain_default_model_name_and_device_auto(tmp_path, monkeypatch):

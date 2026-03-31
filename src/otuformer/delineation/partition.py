@@ -26,6 +26,7 @@ def export_partition_tables(
     partitions: OrderedDict[float, np.ndarray],
     out_dir: Path,
     prefix: str = "OTU",
+    id_to_sample: Optional[dict[str, str]] = None,
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -40,11 +41,30 @@ def export_partition_tables(
         rows_assign = []
         for idx, (_, tips) in enumerate(sorted_clusters, start=1):
             cname = f"{prefix}_{idx}" if prefix else f"OTU_{idx}"
-            rows_summary.append(
-                {"cluster": cname, "size": len(tips), "members": ";".join(tips)}
-            )
+            if id_to_sample:
+                sample_to_members: dict[str, list[str]] = defaultdict(list)
+                for tip in tips:
+                    sample_to_members[id_to_sample.get(tip, "")].append(tip)
+                for sample, members in sorted(
+                    sample_to_members.items(), key=lambda x: x[0]
+                ):
+                    rows_summary.append(
+                        {
+                            "cluster": cname,
+                            "sample": sample,
+                            "size": len(members),
+                            "members": ";".join(members),
+                        }
+                    )
+            else:
+                rows_summary.append(
+                    {"cluster": cname, "size": len(tips), "members": ";".join(tips)}
+                )
             for tip in tips:
-                rows_assign.append({"id": tip, "cluster": cname})
+                row = {"id": tip, "cluster": cname}
+                if id_to_sample:
+                    row["sample"] = id_to_sample.get(tip, "")
+                rows_assign.append(row)
 
         th_tag = f"{th:.4f}".rstrip("0").rstrip(".")
         pd.DataFrame(rows_summary).to_csv(
@@ -120,6 +140,7 @@ def compute_partition_metrics(
     partitions: OrderedDict[float, np.ndarray],
     labels_true: np.ndarray,
     x: Optional[np.ndarray] = None,
+    monophyly_proportion: Optional[float] = None,
 ) -> dict[float, dict[str, float]]:
     """Compute full set of partition quality metrics matching ref/embeddings_tree*.py.
 
@@ -139,7 +160,8 @@ def compute_partition_metrics(
         normalized_mutual_info_score,
     )
 
-    n_true_species = len(np.unique(labels_true))
+    _, labels_true_codes = np.unique(labels_true, return_inverse=True)
+    n_true_species = len(np.unique(labels_true_codes))
 
     # silhouette_species: computed once on true labels (same for all cutoffs)
     sil_species: Optional[float] = None
@@ -159,7 +181,7 @@ def compute_partition_metrics(
     results: dict[float, dict[str, float]] = {}
     for th, pred in partitions.items():
         h, c, v = homogeneity_completeness_v_measure(labels_true, pred)
-        _, _, bcubed_f = _bcubed_f_full(labels_true, pred)
+        bcubed_p, bcubed_r, bcubed_f = _bcubed_f_full(labels_true, pred)
         splitting, lumping = _splitting_lumping(labels_true, pred)
         n_otus = int(len(np.unique(pred)))
 
@@ -168,14 +190,19 @@ def compute_partition_metrics(
             "ARI": float(adjusted_rand_score(labels_true, pred)),
             "AMI": float(adjusted_mutual_info_score(labels_true, pred)),
             "V_measure": float(v),
+            "v_measure": float(v),
             "homogeneity": float(h),
             "completeness": float(c),
             "BCubed_F": float(bcubed_f),
+            "BCubed_precision": float(bcubed_p),
+            "BCubed_recall": float(bcubed_r),
+            "BCubed_fscore": float(bcubed_f),
             "purity": float(
                 sum(
-                    np.bincount(labels_true[pred == c2]).max() for c2 in np.unique(pred)
+                    np.bincount(labels_true_codes[pred == c2]).max()
+                    for c2 in np.unique(pred)
                 )
-                / len(labels_true)
+                / len(labels_true_codes)
             ),
             "n_OTUs": float(n_otus),
             "n_true_species": float(n_true_species),
@@ -188,6 +215,11 @@ def compute_partition_metrics(
             row["WSS"] = _wss(x, pred)
         if sil_species is not None:
             row["silhouette_species"] = sil_species
+        row["monophyly_proportion"] = (
+            float(monophyly_proportion)
+            if monophyly_proportion is not None
+            else float("nan")
+        )
         results[th] = row
     return results
 

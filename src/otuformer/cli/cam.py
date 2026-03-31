@@ -2,12 +2,31 @@
 
 from __future__ import annotations
 
+import json
 import sys
+import traceback
 from pathlib import Path
 
+import click
 import typer
 
 app = typer.Typer(help="Generate CAM heatmaps.")
+
+
+def _format_user_command(ctx: typer.Context, params: dict[str, object]) -> str:
+    parts = ["otuformer", "cam"]
+    for key, value in params.items():
+        source = ctx.get_parameter_source(key)
+        if source is not click.core.ParameterSource.COMMANDLINE:
+            continue
+        option = f"--{key.replace('_', '-')}"
+        if isinstance(value, bool):
+            parts.extend([option, str(value).lower()])
+            continue
+        if value in (None, ""):
+            continue
+        parts.extend([option, str(value)])
+    return " ".join(parts)
 
 
 @app.callback(invoke_without_command=True)
@@ -57,9 +76,33 @@ def cam(
     from otuformer.utils.logging import TeeLogger
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    tee = TeeLogger(out_dir / "cam.log")
+    tee = TeeLogger(out_dir / "logs" / "cam.log")
+    original_stderr = sys.stderr
     sys.stdout = tee
+    sys.stderr = tee
     try:
+        params = {
+            "checkpoint": str(checkpoint),
+            "images_dir": str(images_dir),
+            "label_csv": str(label_csv) if label_csv is not None else "",
+            "out_dir": str(out_dir),
+            "cam_method": cam_method,
+            "arch": arch or "",
+            "target_layer_name": target_layer_name or "",
+            "image_weight": image_weight,
+            "fig_format": fig_format,
+            "save_npy": save_npy,
+            "dump_model_structure": dump_model_structure,
+            "max_images": max_images if max_images is not None else "",
+            "cam_batch_size": cam_batch_size,
+            "num_workers": num_workers,
+            "device": device,
+        }
+        print(f"Command: {_format_user_command(ctx, params)}")
+        print("Parameters:")
+        print(json.dumps(params, ensure_ascii=False, indent=2, sort_keys=True))
+        print("-" * 80)
+
         from otuformer.vision.cam import run_cam
 
         run_cam(
@@ -78,8 +121,12 @@ def cam(
             cam_batch_size=max(1, min(cam_batch_size, 8)),
             device=device,
         )
+    except Exception:
+        traceback.print_exc(file=tee)
+        raise
     finally:
         sys.stdout = tee.terminal
+        sys.stderr = original_stderr
         tee.close()
     typer.echo(f"CAM heatmaps written to: {out_dir / 'figures'}")
     typer.echo(f"Summary: {out_dir / 'cam_summary.csv'}")
