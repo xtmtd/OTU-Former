@@ -10,6 +10,28 @@ import numpy as np
 import pandas as pd
 
 
+def _is_number(value: object) -> bool:
+    try:
+        float(str(value).strip())
+        return True
+    except ValueError:
+        return False
+
+
+def detect_otu_table_header(raw: pd.DataFrame, has_header: bool = False) -> bool:
+    if raw.empty or raw.shape[1] < 2:
+        raise ValueError("OTU table must have at least 2 columns.")
+    if has_header:
+        return True
+    first_row = raw.iloc[0, 1:]
+    any_non_numeric = any(
+        not pd.isna(v) and str(v).strip() != "" and not _is_number(v) for v in first_row
+    )
+    if any_non_numeric:
+        return True
+    raise ValueError("OTU IDs required: provide header row or --otu-table-has-header.")
+
+
 def filter_by_min_abundance(
     assignments: pd.DataFrame, min_abundance: int
 ) -> pd.DataFrame:

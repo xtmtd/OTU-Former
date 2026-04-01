@@ -1,7 +1,10 @@
 import pandas as pd
+import pytest
 
 from otuformer.delineation.diversity import (
+    _is_number,
     compute_alpha_diversity,
+    detect_otu_table_header,
     filter_by_min_abundance,
 )
 
@@ -51,3 +54,38 @@ def test_filter_zero_returns_all():
     df = sample_assignments()
     filtered = filter_by_min_abundance(df, min_abundance=0)
     assert len(filtered) == len(df)
+
+
+def test_detect_header_by_non_numeric_otu_ids():
+    df = pd.DataFrame(
+        [
+            ["sample", "OTU_1", "OTU_2"],
+            ["s1", 3, 0],
+        ]
+    )
+    assert detect_otu_table_header(df) is True
+
+
+def test_detect_header_numeric_without_flag_errors():
+    df = pd.DataFrame(
+        [
+            ["s1", 1, 2],
+            ["s2", 0, 3],
+        ]
+    )
+    with pytest.raises(ValueError):
+        detect_otu_table_header(df)
+
+
+def test_detect_header_numeric_with_flag_allows():
+    df = pd.DataFrame(
+        [
+            ["sample", "1", "2"],
+            ["s1", 1, 0],
+        ]
+    )
+    assert detect_otu_table_header(df, has_header=True) is True
+
+
+def test_is_number_trims_whitespace():
+    assert _is_number(" 3 ") is True
