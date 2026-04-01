@@ -35,6 +35,8 @@ Scope: Extend `otuformer diversity` input sources, per-sample outputs, and phylo
   - Enable phylogenetic metrics (MPD). Requires `--tree` to compute MPD.
 - `--tree <nwk>`
   - Newick tree file used for MPD.
+- `--otu-table-has-header` (new, optional)
+  - Explicitly marks the OTU table as having a header row. Required if OTU IDs are numeric.
 
 ### 3.3 Mutual Exclusivity
 
@@ -46,6 +48,7 @@ Exactly one of `--assignments` or `--otu-table-csv` is required. If both are pro
 
 - Must have columns: `id` (or `image`) and `cluster`.
 - Optional `sample` column.
+- Header names are matched case-insensitively with leading/trailing whitespace trimmed.
 - If `sample` exists and any value is empty:
   - Emit a warning.
   - Only compute and emit the global (all-samples) diversity table.
@@ -57,7 +60,10 @@ Exactly one of `--assignments` or `--otu-table-csv` is required. If both are pro
 - Columns 2..N must have OTU IDs.
 - Header auto-detection:
   - If the first row contains any non-numeric values from column 2 onward, treat it as a header.
-  - If columns 2..N are all numeric on the first row, fail with an error (OTU IDs required).
+  - If columns 2..N are all numeric on the first row, treat as data unless `--otu-table-has-header` is set.
+  - If no header is detected, fail with an error (OTU IDs required).
+- OTU IDs may be numeric, but then `--otu-table-has-header` must be provided.
+- CSV parsing uses comma delimiter, UTF-8 (BOM tolerated), and standard quoted fields.
 
 ## 5. Output Behavior
 
@@ -72,6 +78,7 @@ Exactly one of `--assignments` or `--otu-table-csv` is required. If both are pro
   - Create `--out-dir/per-sample/`.
   - Write one file per sample.
   - Each file matches the global table format and includes all `--min-abundance` thresholds.
+  - File naming: trim whitespace; replace path separators and whitespace with `_`; if duplicates occur, append a numeric suffix.
 - If sample labels are missing/invalid: do not create the per-sample directory.
 
 ## 6. Phylogenetic Metrics (MPD)
@@ -83,6 +90,8 @@ Exactly one of `--assignments` or `--otu-table-csv` is required. If both are pro
 - When `--phylo` and `--tree` are both set:
   - Compute MPD and populate output rows.
   - If MPD cannot be computed, warn and omit the row.
+  - If the tree is missing OTUs from the table, warn and drop those OTUs for MPD.
+  - Extra tree tips not found in the OTU table are ignored with a warning.
 
 ## 7. Help Text Requirements
 
@@ -93,12 +102,14 @@ Exactly one of `--assignments` or `--otu-table-csv` is required. If both are pro
 - Per-sample output behavior.
 - Phylo behavior and tree requirement.
 - Metric definitions, including MPD (mean pairwise phylogenetic distance).
+- Note removal of `--no-phylo` and instruct to use `--phylo` instead.
 
 ## 8. Error Handling
 
 - `--assignments` and `--otu-table-csv` both provided: error and exit.
 - OTU table without valid OTU column headers: error and exit.
 - Assignments missing required columns: error and exit.
+- `--no-phylo` used: error and exit with guidance to use `--phylo`.
 
 ## 9. Testing Plan
 
