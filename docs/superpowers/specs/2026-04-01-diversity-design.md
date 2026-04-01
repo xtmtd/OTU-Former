@@ -40,7 +40,7 @@ Scope: Extend `otuformer diversity` input sources, per-sample outputs, and phylo
 
 ### 3.3 Mutual Exclusivity
 
-Exactly one of `--assignments` or `--otu-table-csv` is required. If both are provided, exit with an error.
+Exactly one of `--assignments` or `--otu-table-csv` is required. If both or neither are provided, exit with an error.
 
 ## 4. Input Validation Rules
 
@@ -49,6 +49,7 @@ Exactly one of `--assignments` or `--otu-table-csv` is required. If both are pro
 - Must have columns: `id` (or `image`) and `cluster`.
 - Optional `sample` column.
 - Header names are matched case-insensitively with leading/trailing whitespace trimmed.
+- If both `id` and `image` columns exist, treat as an error (ambiguous identifiers).
 - If `sample` exists and any value is empty:
   - Emit a warning.
   - Only compute and emit the global (all-samples) diversity table.
@@ -63,6 +64,8 @@ Exactly one of `--assignments` or `--otu-table-csv` is required. If both are pro
   - If columns 2..N are all numeric on the first row, treat as data unless `--otu-table-has-header` is set.
   - If no header is detected, fail with an error (OTU IDs required).
 - OTU IDs may be numeric, but then `--otu-table-has-header` must be provided.
+- If `--otu-table-has-header` is set, always treat the first row as header even if numeric.
+- OTU header cells (columns 2..N) must be non-empty after trimming.
 - CSV parsing uses comma delimiter, UTF-8 (BOM tolerated), and standard quoted fields.
 
 ## 5. Output Behavior
@@ -79,7 +82,8 @@ Exactly one of `--assignments` or `--otu-table-csv` is required. If both are pro
   - Write one file per sample.
   - Each file matches the global table format and includes all `--min-abundance` thresholds.
   - File naming: trim whitespace; replace path separators and whitespace with `_`; if duplicates occur, append a numeric suffix.
-- If sample labels are missing/invalid: do not create the per-sample directory.
+- Sample validity: non-empty after trimming (no whitespace-only values).
+- If any sample value is invalid, emit a warning and do not create the per-sample directory.
 
 ## 6. Phylogenetic Metrics (MPD)
 
@@ -92,6 +96,8 @@ Exactly one of `--assignments` or `--otu-table-csv` is required. If both are pro
   - If MPD cannot be computed, warn and omit the row.
   - If the tree is missing OTUs from the table, warn and drop those OTUs for MPD.
   - Extra tree tips not found in the OTU table are ignored with a warning.
+- When `--tree` is provided without `--phylo`:
+  - Emit a warning and ignore the tree.
 
 ## 7. Help Text Requirements
 
@@ -107,6 +113,7 @@ Exactly one of `--assignments` or `--otu-table-csv` is required. If both are pro
 ## 8. Error Handling
 
 - `--assignments` and `--otu-table-csv` both provided: error and exit.
+- Neither `--assignments` nor `--otu-table-csv` provided: error and exit.
 - OTU table without valid OTU column headers: error and exit.
 - Assignments missing required columns: error and exit.
 - `--no-phylo` used: error and exit with guidance to use `--phylo`.
