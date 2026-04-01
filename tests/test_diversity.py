@@ -6,10 +6,12 @@ from pathlib import Path
 from otuformer.delineation.diversity import (
     _is_number,
     build_diversity_tables_from_otu_table,
+    build_mpd_inputs,
     build_per_sample_paths,
     compute_alpha_diversity,
     dedupe_sample_names,
     detect_otu_table_header,
+    diversity_table,
     filter_by_min_abundance,
     has_valid_samples,
     parse_otu_table,
@@ -205,3 +207,17 @@ def test_build_diversity_tables_from_otu_table_thresholds():
         set(t.columns) == {"min_abundance_0", "min_abundance_2"}
         for t in per_sample.values()
     )
+
+
+def test_build_mpd_inputs_aligns_otu_ids():
+    otu_ids = ["OTU_1", "OTU_2"]
+    counts = [3, 1]
+    ids, arr = build_mpd_inputs(otu_ids, counts)
+    assert ids == otu_ids
+    assert arr.tolist() == [3, 1]
+
+
+def test_diversity_table_no_mpd_when_tree_missing():
+    df = pd.DataFrame({"id": ["a"], "cluster": ["OTU_1"]})
+    table = diversity_table(df, [0], tree_newick_path=None)
+    assert "MPD" not in table.index

@@ -251,7 +251,17 @@ def compute_alpha_diversity(assignments: pd.DataFrame) -> dict[str, float]:
     }
 
 
-def compute_mpd(assignments: pd.DataFrame, tree_newick_path: Path) -> float:
+def build_mpd_inputs(
+    otu_ids: list[str], counts: list[int]
+) -> tuple[list[str], np.ndarray]:
+    return otu_ids, np.array(counts, dtype=int)
+
+
+def compute_mpd_from_counts(
+    otu_ids: list[str], counts: np.ndarray, tree_newick_path: Path
+) -> float:
+    import warnings
+
     try:
         from skbio import TreeNode
         from skbio.diversity import alpha_diversity
@@ -259,15 +269,39 @@ def compute_mpd(assignments: pd.DataFrame, tree_newick_path: Path) -> float:
         raise ImportError("scikit-bio required for MPD computation") from exc
 
     tree = TreeNode.read(str(tree_newick_path))
+    tip_names = set(tree.subset_nonempty_tips().names)
+    otu_set = set(otu_ids)
+    missing_from_tree = otu_set - tip_names
+    extra_in_tree = tip_names - otu_set
+    if missing_from_tree:
+        warnings.warn(f"OTUs missing from tree: {missing_from_tree}; dropped for MPD.")
+    if extra_in_tree:
+        warnings.warn(
+            f"Extra tree tips not in OTU table: {extra_in_tree}; ignored for MPD."
+        )
+    overlap = [oid for oid in otu_ids if oid in tip_names]
+    if not overlap:
+        return float("nan")
+    overlap_counts = np.array([counts[otu_ids.index(oid)] for oid in overlap])
+    tree_pruned = tree.shear(overlap)
+    result = alpha_diversity(
+        "mpd", overlap_counts.reshape(1, -1), overlap, tree=tree_pruned
+    )
+    return float(result[0])
+
+
+def compute_mpd(assignments: pd.DataFrame, tree_newick_path: Path) -> float:
+    try:
+        from skbio import TreeNode
+        from skbio.diversity import alpha_diversity
+    except Exception as exc:
+        raise ImportError("scikit-bio required for MPD computation") from exc
+
     cluster_counts = assignments["cluster"].value_counts()
     otu_ids = list(cluster_counts.index)
     counts_arr = np.array([cluster_counts.get(o, 0) for o in otu_ids], dtype=int)
     try:
-        tree_pruned = tree.shear(otu_ids)
-        result = alpha_diversity(
-            "faith_pd", counts_arr.reshape(1, -1), otu_ids, tree=tree_pruned
-        )
-        return float(result[0])
+        return compute_mpd_from_counts(otu_ids, counts_arr, tree_newick_path)
     except Exception:
         return float("nan")
 
