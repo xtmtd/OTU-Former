@@ -61,8 +61,7 @@ Exactly one of `--assignments` or `--otu-table-csv` is required. If both or neit
 - Columns 2..N must have OTU IDs.
 - Header auto-detection:
   - If the first row contains any non-numeric values from column 2 onward, treat it as a header.
-  - If columns 2..N are all numeric on the first row, treat as data unless `--otu-table-has-header` is set.
-  - If no header is detected, fail with an error (OTU IDs required).
+  - If columns 2..N are all numeric on the first row and `--otu-table-has-header` is not set, fail with an error (OTU IDs required).
 - OTU IDs may be numeric, but then `--otu-table-has-header` must be provided.
 - If `--otu-table-has-header` is set, always treat the first row as header even if numeric.
 - OTU header cells (columns 2..N) must be non-empty after trimming.
