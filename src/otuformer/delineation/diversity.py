@@ -32,6 +32,26 @@ def detect_otu_table_header(raw: pd.DataFrame, has_header: bool = False) -> bool
     raise ValueError("OTU IDs required: provide header row or --otu-table-has-header.")
 
 
+def parse_otu_table(raw: pd.DataFrame, has_header: bool) -> pd.DataFrame:
+    """Parse a raw OTU table DataFrame into a sample×OTU count matrix.
+
+    Row 0 is the header (sample name + OTU IDs in columns 2..N).
+    Subsequent rows are samples with abundance values.
+    """
+    if not detect_otu_table_header(raw, has_header=has_header):
+        raise ValueError("OTU table requires header row.")
+    if len(raw) < 2:
+        raise ValueError("OTU table must have a header row and at least one data row.")
+    otu_ids = raw.iloc[0, 1:].astype(str).str.strip().tolist()
+    if any(otu == "" for otu in otu_ids):
+        raise ValueError("OTU header cells (columns 2..N) must be non-empty.")
+    data = raw.iloc[1:, :].copy()
+    data.columns = ["sample"] + otu_ids
+    data["sample"] = data["sample"].astype(str)
+    data = data.set_index("sample")
+    return data
+
+
 def filter_by_min_abundance(
     assignments: pd.DataFrame, min_abundance: int
 ) -> pd.DataFrame:

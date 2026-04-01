@@ -6,6 +6,7 @@ from otuformer.delineation.diversity import (
     compute_alpha_diversity,
     detect_otu_table_header,
     filter_by_min_abundance,
+    parse_otu_table,
 )
 
 
@@ -89,3 +90,48 @@ def test_detect_header_numeric_with_flag_allows():
 
 def test_is_number_trims_whitespace():
     assert _is_number(" 3 ") is True
+
+
+def test_parse_otu_table_non_numeric_otu_ids():
+    df = pd.DataFrame(
+        [
+            ["", "OTU_1", "OTU_2"],
+            ["s1", 2, 0],
+            ["s2", 1, 3],
+        ]
+    )
+    otu = parse_otu_table(df, has_header=False)
+    assert list(otu.columns) == ["OTU_1", "OTU_2"]
+    assert list(otu.index) == ["s1", "s2"]
+
+
+def test_parse_otu_table_empty_otu_header_errors():
+    df = pd.DataFrame(
+        [
+            ["", "", "OTU_2"],
+            ["s1", 2, 0],
+        ]
+    )
+    with pytest.raises(ValueError):
+        parse_otu_table(df, has_header=True)
+
+
+def test_parse_otu_table_numeric_otu_ids_with_flag():
+    df = pd.DataFrame(
+        [
+            ["sample", "1", "2"],
+            ["s1", 2, 0],
+        ]
+    )
+    otu = parse_otu_table(df, has_header=True)
+    assert list(otu.columns) == ["1", "2"]
+
+
+def test_parse_otu_table_too_few_rows_errors():
+    df = pd.DataFrame(
+        [
+            ["", "OTU_1", "OTU_2"],
+        ]
+    )
+    with pytest.raises(ValueError, match="at least one data row"):
+        parse_otu_table(df, has_header=False)
