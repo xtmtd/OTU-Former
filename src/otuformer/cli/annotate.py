@@ -11,7 +11,17 @@ from pathlib import Path
 import click
 import typer
 
-app = typer.Typer(help="Apply expert corrections to cluster assignments.")
+app = typer.Typer(
+    help=(
+        "Apply expert corrections to cluster assignments.\n\n"
+        "Takes raw partition assignments from the cluster command and a corrections CSV\n"
+        "to produce refined OTU assignments with updated intra-class distance summaries\n"
+        "and annotated UPGMA tree visualizations.\n\n"
+        "Quick example:\n\n"
+        "  otuformer annotate --raw-assignments runs/cluster/UPGMA/partitions/tables/partition_0.30_assignments.csv --corrections corrections.csv\n"
+        "  otuformer annotate --raw-assignments partition_0.30_assignments.csv --corrections corrections.csv --embeddings runs/extract/embeddings.csv --show-annotation-bar\n"
+    )
+)
 
 
 def _format_user_command(ctx: typer.Context, params: dict[str, object]) -> str:

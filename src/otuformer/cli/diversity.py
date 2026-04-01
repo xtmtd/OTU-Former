@@ -34,6 +34,10 @@ app = typer.Typer(
         "  MPD_w: abundance-weighted rooted PD (rPD_w), branches weighted by "
         "relative abundance of descending taxa.\n"
         "  PD_richness_norm: Faith's PD divided by species richness (PD per species).\n\n"
+        "Quick example:\n\n"
+        "  otuformer diversity --assignments runs/cluster/UPGMA/partitions/tables/partition_0.30_assignments.csv\n"
+        "  otuformer diversity --assignments partition_0.30_assignments.csv --phylo --tree runs/cluster/UPGMA/UPGMA_Cosine.nwk\n"
+        "  otuformer diversity --otu-table-csv otu_table.csv\n\n"
         "Note: --no-phylo has been removed; omit --phylo to disable MPD."
     )
 )

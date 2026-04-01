@@ -11,7 +11,18 @@ from pathlib import Path
 import click
 import typer
 
-app = typer.Typer(help="Extract embeddings from images.")
+app = typer.Typer(
+    help=(
+        "Extract embeddings from images.\n\n"
+        "Runs a trained model (PyTorch checkpoint or ONNX) over an image directory and\n"
+        "produces a CSV with embedding vectors. Supports multiple token modes (CLS,\n"
+        "patch-topk, attention-pool) and optional UMAP visualization.\n\n"
+        "Quick example:\n\n"
+        "  otuformer extract --checkpoint runs/finetune/best.pt --input-images-dir ./images\n"
+        "  otuformer extract --checkpoint runs/finetune/best.pt --input-images-dir ./images --label-csv labels.csv --token-mode attention-pool\n"
+        "  otuformer extract --onnx-path runs/export/encoder.onnx --input-images-dir ./images\n"
+    )
+)
 
 
 def _format_user_command(ctx: typer.Context, params: dict[str, object]) -> str:

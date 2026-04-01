@@ -8,7 +8,13 @@ import sys
 
 import typer
 
-app = typer.Typer(help="Check environment and dependency health.")
+app = typer.Typer(
+    help=(
+        "Check environment and dependency health.\n\n"
+        "Quick example:\n\n"
+        "  otuformer doctor\n"
+    )
+)
 
 
 def _pkg_version(pip_name: str, import_name: str | None = None) -> str:

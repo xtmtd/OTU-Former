@@ -10,7 +10,17 @@ from pathlib import Path
 import click
 import typer
 
-app = typer.Typer(help="Export checkpoint to ONNX.")
+app = typer.Typer(
+    help=(
+        "Export a PyTorch checkpoint to ONNX format.\n\n"
+        "Converts a trained model checkpoint into a portable ONNX encoder that can be\n"
+        "used with ONNX Runtime for faster inference. The exported model outputs\n"
+        "embedding vectors directly from image inputs.\n\n"
+        "Quick example:\n\n"
+        "  otuformer export --checkpoint runs/finetune/best.pt\n"
+        "  otuformer export --checkpoint best.pt --imgsz 224 --opset 17\n"
+    )
+)
 
 
 def _format_user_command(ctx: typer.Context, params: dict[str, object]) -> str:

@@ -12,7 +12,16 @@ from pathlib import Path
 import click
 import typer
 
-app = typer.Typer(help="ArcFace metric learning fine-tuning.")
+app = typer.Typer(
+    help=(
+        "ArcFace metric learning fine-tuning.\n\n"
+        "Fine-tunes a pretrained backbone with ArcFace loss to produce discriminative\n"
+        "embeddings for OTU clustering. Requires a pretrain checkpoint and labeled data.\n\n"
+        "Quick example:\n\n"
+        "  otuformer finetune --checkpoint runs/pretrain/best.pt --train-data labels.csv --input-images-dir ./images\n"
+        "  otuformer finetune --checkpoint runs/pretrain/SSL_latest.pth --train-data labels.csv --input-images-dir ./images --finetune-epochs 50\n"
+    )
+)
 
 
 def _format_user_command(ctx: typer.Context, params: dict[str, object]) -> str:

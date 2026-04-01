@@ -12,7 +12,16 @@ import click
 import typer
 
 app = typer.Typer(
-    help="Generate CAM heatmaps for visualizing model attention on images.",
+    help=(
+        "Generate CAM heatmaps for visualizing model attention on images.\n\n"
+        "Supports multiple CAM algorithms (Grad-CAM, Grad-CAM++, LayerCAM, Score-CAM,\n"
+        "Eigen-CAM, Ablation-CAM) for both CNN and ViT architectures. Outputs overlay\n"
+        "images showing which image regions the model focuses on.\n\n"
+        "Quick example:\n\n"
+        "  otuformer cam --checkpoint runs/finetune/best.pt --images-dir ./images\n"
+        "  otuformer cam --checkpoint best.pt --images-dir ./images --cam-method gradcampp --save-npy\n"
+        "  otuformer cam --checkpoint best.pt --images-dir ./images --dump-model-structure  # list layers first\n"
+    ),
 )
 
 

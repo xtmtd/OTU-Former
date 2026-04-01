@@ -12,7 +12,17 @@ from pathlib import Path
 import click
 import typer
 
-app = typer.Typer(help="SSL self-supervised pre-training.")
+app = typer.Typer(
+    help=(
+        "SSL self-supervised pre-training (DINO/iBOT style).\n\n"
+        "Trains a student-teacher ViT backbone using global/local crops and masked-token\n"
+        "consistency. Outputs checkpoints that can be used for fine-tuning or direct\n"
+        "embedding extraction.\n\n"
+        "Quick example:\n\n"
+        "  otuformer pretrain --train-data images.csv --input-images-dir ./images\n"
+        "  otuformer pretrain --input-images-dir ./images --model-name vit_small_patch16_224 --max-epochs 100\n"
+    )
+)
 
 
 def _format_user_command(ctx: typer.Context, params: dict[str, object]) -> str:

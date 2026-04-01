@@ -6,6 +6,8 @@ import sys
 
 import typer
 
+from otuformer import __version__
+
 
 def detect_removed_no_phylo(argv: list[str]) -> bool:
     return "diversity" in argv and "--no-phylo" in argv
@@ -40,6 +42,27 @@ app = typer.Typer(
     no_args_is_help=True,
     context_settings={"help_option_names": ["-h", "--help"]},
 )
+
+
+def _version_callback(value: bool) -> None:
+    if value:
+        typer.echo(f"otuformer {__version__}")
+        raise typer.Exit()
+
+
+@app.callback()
+def main_callback(
+    version: bool = typer.Option(
+        False,
+        "--version",
+        "-v",
+        callback=_version_callback,
+        is_eager=True,
+        help="Show version and exit.",
+    ),
+) -> None:
+    pass
+
 
 app.add_typer(_doctor_mod.app, name="doctor")
 app.add_typer(_pretrain_mod.app, name="pretrain")

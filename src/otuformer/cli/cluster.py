@@ -12,7 +12,17 @@ from typing import Literal
 import click
 import typer
 
-app = typer.Typer(help="Cluster embeddings into morphOTUs (UPGMA tree)")
+app = typer.Typer(
+    help=(
+        "Cluster embeddings into morphOTUs via UPGMA hierarchical clustering.\n\n"
+        "Builds a distance matrix from embeddings, constructs a UPGMA dendrogram,\n"
+        "and partitions it at multiple distance cutoffs. Supports PCA whitening,\n"
+        "local scaling, and bootstrap support estimation.\n\n"
+        "Quick example:\n\n"
+        "  otuformer cluster --embeddings runs/extract/embeddings.csv\n"
+        "  otuformer cluster --embeddings embeddings.csv --pca-whitening true --local-scaling true --num-replicates 100\n"
+    )
+)
 
 
 def _distance_stats_frame(dist_matrix, name: str):
