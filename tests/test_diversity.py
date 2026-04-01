@@ -1,12 +1,20 @@
 import pandas as pd
 import pytest
 
+from pathlib import Path
+
 from otuformer.delineation.diversity import (
     _is_number,
+    build_diversity_tables_from_otu_table,
+    build_per_sample_paths,
     compute_alpha_diversity,
+    dedupe_sample_names,
     detect_otu_table_header,
     filter_by_min_abundance,
+    has_valid_samples,
     parse_otu_table,
+    sanitize_sample_name,
+    split_assignments_by_sample,
 )
 
 
@@ -135,3 +143,65 @@ def test_parse_otu_table_too_few_rows_errors():
     )
     with pytest.raises(ValueError, match="at least one data row"):
         parse_otu_table(df, has_header=False)
+
+
+def test_has_valid_samples_false_on_empty():
+    df = pd.DataFrame({"id": ["a"], "cluster": ["OTU"], "sample": [" "]})
+    assert has_valid_samples(df) is False
+
+
+def test_has_valid_samples_true():
+    df = pd.DataFrame({"id": ["a"], "cluster": ["OTU"], "sample": ["s1"]})
+    assert has_valid_samples(df) is True
+
+
+def test_has_valid_samples_missing_column():
+    df = pd.DataFrame({"id": ["a"], "cluster": ["OTU"]})
+    assert has_valid_samples(df) is False
+
+
+def test_has_valid_samples_nan_invalid():
+    df = pd.DataFrame({"id": ["a"], "cluster": ["OTU"], "sample": [None]})
+    assert has_valid_samples(df) is False
+
+
+def test_sanitize_sample_name_replaces_spaces():
+    assert sanitize_sample_name("A/B C") == "A_B_C"
+
+
+def test_sanitize_sample_name_replaces_tabs():
+    assert sanitize_sample_name("A\tB") == "A_B"
+
+
+def test_dedupe_sample_names():
+    names = ["s1", "s1", "s2", "s1"]
+    assert dedupe_sample_names(names) == ["s1", "s1_2", "s2", "s1_3"]
+
+
+def test_split_assignments_by_sample():
+    df = pd.DataFrame(
+        {
+            "id": ["a", "b"],
+            "cluster": ["OTU_1", "OTU_1"],
+            "sample": ["s1", "s2"],
+        }
+    )
+    parts = split_assignments_by_sample(df)
+    assert set(parts.keys()) == {"s1", "s2"}
+
+
+def test_build_per_sample_paths_dedupe():
+    samples = ["s1", "s1"]
+    paths = build_per_sample_paths(samples, Path("out"))
+    assert list(paths.values())[0].name == "s1.csv"
+    assert list(paths.values())[1].name == "s1_2.csv"
+
+
+def test_build_diversity_tables_from_otu_table_thresholds():
+    otu = pd.DataFrame({"OTU_1": [2, 0], "OTU_2": [1, 3]}, index=["s1", "s2"])
+    global_table, per_sample = build_diversity_tables_from_otu_table(otu, [0, 2], None)
+    assert set(global_table.columns) == {"min_abundance_0", "min_abundance_2"}
+    assert all(
+        set(t.columns) == {"min_abundance_0", "min_abundance_2"}
+        for t in per_sample.values()
+    )

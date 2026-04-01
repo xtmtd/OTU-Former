@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -50,6 +51,76 @@ def parse_otu_table(raw: pd.DataFrame, has_header: bool) -> pd.DataFrame:
     data["sample"] = data["sample"].astype(str)
     data = data.set_index("sample")
     return data
+
+
+def has_valid_samples(assignments: pd.DataFrame) -> bool:
+    """Return True if 'sample' column exists and no value is NaN or empty after trimming."""
+    if "sample" not in assignments.columns:
+        return False
+    col = assignments["sample"]
+    if col.isna().any():
+        return False
+    cleaned = col.astype(str).str.strip()
+    return bool(cleaned.ne("").all())
+
+
+def sanitize_sample_name(name: str) -> str:
+    """Normalize a sample name: collapse whitespace, replace / and \\."""
+    cleaned = re.sub(r"\s+", "_", name.strip())
+    return cleaned.replace("/", "_").replace("\\", "_")
+
+
+def dedupe_sample_names(names: list[str]) -> list[str]:
+    """Append numeric suffixes for duplicate names."""
+    seen: dict[str, int] = {}
+    output = []
+    for name in names:
+        count = seen.get(name, 0) + 1
+        seen[name] = count
+        output.append(name if count == 1 else f"{name}_{count}")
+    return output
+
+
+def split_assignments_by_sample(
+    assignments: pd.DataFrame,
+) -> dict[str, pd.DataFrame]:
+    """Group assignments by the 'sample' column, returning a dict of DataFrames."""
+    grouped = {}
+    for sample, chunk in assignments.groupby("sample"):
+        grouped[str(sample)] = chunk.copy()
+    return grouped
+
+
+def build_per_sample_paths(samples: list[str], out_dir: Path) -> dict[str, Path]:
+    """Return {sample: path} with sanitized, deduplicated filenames."""
+    sanitized = [sanitize_sample_name(s) for s in samples]
+    deduped = dedupe_sample_names(sanitized)
+    return {name: out_dir / f"{name}.csv" for name in deduped}
+
+
+def build_diversity_tables_from_otu_table(
+    otu_table: pd.DataFrame,
+    min_values: list[int],
+    tree_newick_path: Optional[Path],
+) -> tuple[pd.DataFrame, dict[str, pd.DataFrame]]:
+    """Compute global and per-sample diversity tables from an OTU count matrix.
+
+    Returns (global_table, {sample: per_sample_table}).
+    """
+    global_counts = otu_table.sum(axis=0)
+    global_assignments = pd.DataFrame(
+        {"cluster": global_counts.index.repeat(global_counts.values.astype(int))}
+    )
+    global_table = diversity_table(global_assignments, min_values, tree_newick_path)
+    per_sample = {}
+    for sample, row in otu_table.iterrows():
+        assignments = pd.DataFrame(
+            {"cluster": row.index.repeat(row.values.astype(int))}
+        )
+        per_sample[str(sample)] = diversity_table(
+            assignments, min_values, tree_newick_path
+        )
+    return global_table, per_sample
 
 
 def filter_by_min_abundance(
