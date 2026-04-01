@@ -34,8 +34,10 @@ def _format_user_command(ctx: typer.Context, params: dict[str, object]) -> str:
 @app.callback(invoke_without_command=True)
 def extract(
     ctx: typer.Context,
-    checkpoint: Path = typer.Option(
-        ..., "--checkpoint", help="Path to pretrain or finetune checkpoint."
+    checkpoint: Path | None = typer.Option(
+        None,
+        "--checkpoint",
+        help="Path to pretrain or finetune checkpoint. Required unless --onnx-path is provided.",
     ),
     input_images_dir: Path = typer.Option(
         ..., "--input-images-dir", help="Image directory or parent directory."
@@ -125,6 +127,16 @@ def extract(
     device: str = typer.Option(
         "auto", "--device", help="Device: auto | cpu | cuda | mps."
     ),
+    onnx_path: Path | None = typer.Option(
+        None,
+        "--onnx-path",
+        help=(
+            "Path to exported ONNX model for inference. "
+            "When provided, uses ONNX Runtime instead of PyTorch. "
+            "Only supports token-mode 'cls' (default). "
+            "Overrides --checkpoint, --model-name, --use-student, and --device."
+        ),
+    ),
     seed: int = typer.Option(42, "--seed", help="Random seed."),
 ) -> None:
     if ctx.invoked_subcommand is not None:
@@ -143,7 +155,7 @@ def extract(
     sys.stderr = tee
     try:
         params = dict(
-            checkpoint=str(checkpoint),
+            checkpoint=str(checkpoint) if checkpoint is not None else "",
             input_images_dir=str(input_images_dir),
             out_dir=str(out_dir),
             model_name=model_name,
@@ -165,12 +177,18 @@ def extract(
             num_workers=num_workers,
             device=device,
             seed=seed,
+            onnx_path=str(onnx_path) if onnx_path is not None else "",
         )
-        attention_pooling_checkpoint = (
-            out_dir
-            / "checkpoints"
-            / f"{checkpoint.stem}.{attention_pooling_type}_pooling.pth"
-        )
+        if checkpoint is not None:
+            attention_pooling_checkpoint = (
+                out_dir
+                / "checkpoints"
+                / f"{checkpoint.stem}.{attention_pooling_type}_pooling.pth"
+            )
+        else:
+            attention_pooling_checkpoint = (
+                out_dir / "checkpoints" / f"model.{attention_pooling_type}_pooling.pth"
+            )
         params["attention_pooling_checkpoint"] = str(attention_pooling_checkpoint)
         cli_command = _format_user_command(ctx, params)
         print(f"Command: {cli_command}")
@@ -200,6 +218,7 @@ def extract(
             seed=seed,
             extract_csv=label_csv,
             attention_pooling_checkpoint_path=attention_pooling_checkpoint,
+            onnx_path=onnx_path,
         )
         out_path = out_dir / "embeddings.csv"
         write_csv(df, out_path)

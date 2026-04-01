@@ -33,8 +33,12 @@ def export(
     out_dir: Path = typer.Option(
         Path("runs/export"), "--out-dir", help="Output directory."
     ),
-    imgsz: int = typer.Option(224, "--imgsz", help="Input image size for ONNX export."),
-    opset: int = typer.Option(17, "--opset", help="ONNX opset version."),
+    imgsz: int | None = typer.Option(
+        None,
+        "--imgsz",
+        help="Input image size for ONNX export. Auto-inferred from backbone if not provided.",
+    ),
+    opset: int = typer.Option(18, "--opset", help="ONNX opset version."),
 ) -> None:
     if ctx.invoked_subcommand is not None:
         return

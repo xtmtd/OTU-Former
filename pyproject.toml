@@ -25,6 +25,7 @@ dependencies = [
     "grad-cam>=1.5",
     "onnx>=1.16",
     "onnxruntime>=1.18",
+    "onnxscript>=0.1",
     "tqdm>=4.66",
 ]
 

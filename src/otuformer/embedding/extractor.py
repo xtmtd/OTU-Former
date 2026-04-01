@@ -606,8 +606,132 @@ def _extract_one_csv(
     return out
 
 
+def _extract_with_onnx(
+    onnx_path: Path,
+    images_dir: Path,
+    extract_size: int,
+    batch_size: int,
+    num_workers: int,
+    extract_csv: Path | None,
+) -> pd.DataFrame:
+    import onnxruntime as ort
+
+    session = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
+    input_name = session.get_inputs()[0].name
+
+    if extract_csv is not None:
+        return _extract_one_csv_onnx(
+            session=session,
+            input_name=input_name,
+            images_dir=images_dir,
+            csv_path=extract_csv,
+            extract_size=extract_size,
+            batch_size=batch_size,
+            num_workers=num_workers,
+        )
+
+    if detect_batch_mode(images_dir):
+        subdirs = sorted(p for p in images_dir.iterdir() if p.is_dir())
+        frames = []
+        for sub in tqdm(subdirs, desc="Batch dirs", ncols=120):
+            df = _extract_one_dir_onnx(
+                session=session,
+                input_name=input_name,
+                images_dir=sub,
+                extract_size=extract_size,
+                batch_size=batch_size,
+                num_workers=num_workers,
+            )
+            if len(df) == 0:
+                continue
+            df.insert(1, "sample", sub.name)
+            frames.append(df)
+        if len(frames) == 0:
+            return pd.DataFrame(columns=["id", "sample"])
+        return pd.concat(frames, ignore_index=True)
+
+    return _extract_one_dir_onnx(
+        session=session,
+        input_name=input_name,
+        images_dir=images_dir,
+        extract_size=extract_size,
+        batch_size=batch_size,
+        num_workers=num_workers,
+    )
+
+
+def _extract_one_dir_onnx(
+    session,
+    input_name: str,
+    images_dir: Path,
+    extract_size: int,
+    batch_size: int,
+    num_workers: int,
+) -> pd.DataFrame:
+    ds = ImageFolderDataset(images_dir, extract_size)
+    loader = DataLoader(
+        ds, batch_size=batch_size, shuffle=False, num_workers=num_workers
+    )
+    all_ids: list[str] = []
+    all_embs: list[np.ndarray] = []
+    desc = f"Extract {images_dir.name}" if images_dir.name else "Extract"
+    for imgs, names in tqdm(loader, desc=desc, ncols=120):
+        out = session.run(None, {input_name: imgs.numpy()})[0]
+        all_ids.extend(names)
+        all_embs.append(out)
+    if len(all_embs) == 0:
+        return pd.DataFrame(columns=["id"])
+    embs_array = np.concatenate(all_embs, axis=0)
+    dim_cols = [f"dim_{i}" for i in range(embs_array.shape[1])]
+    df = pd.DataFrame(embs_array, columns=dim_cols)
+    df.insert(0, "id", all_ids)
+    return df
+
+
+def _extract_one_csv_onnx(
+    session,
+    input_name: str,
+    images_dir: Path,
+    csv_path: Path,
+    extract_size: int,
+    batch_size: int,
+    num_workers: int,
+) -> pd.DataFrame:
+    ds = CSVImageDataset(
+        images_dir=images_dir, csv_path=csv_path, extract_size=extract_size
+    )
+    loader = DataLoader(
+        ds, batch_size=batch_size, shuffle=False, num_workers=num_workers
+    )
+    all_ids: list[str] = []
+    all_samples: list[str] | None = [] if ds.samples is not None else None
+    all_embs: list[np.ndarray] = []
+
+    for batch in tqdm(loader, desc="Extract CSV", ncols=120):
+        if len(batch) == 3:
+            imgs, names, samples = batch
+        else:
+            imgs, names = batch
+            samples = None
+        out = session.run(None, {input_name: imgs.numpy()})[0]
+        all_ids.extend(list(names))
+        if all_samples is not None and samples is not None:
+            all_samples.extend([str(v) for v in list(samples)])
+        all_embs.append(out)
+
+    if not all_embs:
+        return pd.DataFrame(columns=["id"])
+    arr = np.concatenate(all_embs, axis=0)
+    cols = [f"dim_{i}" for i in range(arr.shape[1])]
+    out = pd.DataFrame(arr, columns=cols)
+    out.insert(0, "id", all_ids)
+    if all_samples is not None:
+        out.insert(1, "sample", all_samples)
+    return out
+
+
 def extract_embeddings(
-    checkpoint_path: Path,
+    checkpoint_path: Path | None,
     images_dir: Path,
     model_name: str = "vit_tiny_patch16_224",
     extract_size: int = 224,
@@ -624,6 +748,7 @@ def extract_embeddings(
     seed: int = 42,
     extract_csv: Path | None = None,
     attention_pooling_checkpoint_path: Path | None = None,
+    onnx_path: Path | None = None,
 ) -> pd.DataFrame:
     """Extract embeddings and return DataFrame.
 
@@ -652,6 +777,24 @@ def extract_embeddings(
         )
     if attention_pooling_epochs < 1:
         raise ValueError("--attention-pooling-epochs must be >= 1")
+
+    if onnx_path is not None:
+        if token_mode != "cls":
+            raise ValueError(
+                f"ONNX inference only supports token-mode 'cls', got '{token_mode}'. "
+                "Use PyTorch checkpoint for patch-topk or attention-pool modes."
+            )
+        return _extract_with_onnx(
+            onnx_path=Path(onnx_path),
+            images_dir=images_dir,
+            extract_size=extract_size,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            extract_csv=extract_csv,
+        )
+
+    if checkpoint_path is None:
+        raise ValueError("--checkpoint is required when --onnx-path is not provided.")
 
     dev = resolve_device(device)
     model = _load_model(checkpoint_path, model_name, dev, use_student=use_student)

@@ -47,6 +47,24 @@ otuformer --help
 otuformer pretrain --help
 ```
 
+### Export and Extract with ONNX
+
+Export a checkpoint to ONNX for fast CPU inference:
+
+```bash
+otuformer export --checkpoint runs/finetune/finetune_latest.pth --out-dir runs/export
+```
+
+Use the exported ONNX model for embedding extraction (2-5x faster on CPU):
+
+```bash
+otuformer extract \
+  --checkpoint runs/finetune/finetune_latest.pth \
+  --input-images-dir examples/images \
+  --onnx-path runs/export/encoder.onnx \
+  --out-dir runs/extract
+```
+
 ## Run Tests
 
 ```bash

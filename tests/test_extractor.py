@@ -175,3 +175,98 @@ def test_gated_attention_has_trainable_params():
     pool = GatedAttentionPooling(dim=192)
     trainable = list(_iter_trainable_params(pool))
     assert len(trainable) > 0
+
+
+def make_onnx(tmp_path: Path, out_dim: int = 64) -> Path:
+    from otuformer.vision.export import export_to_onnx
+
+    ckpt = make_checkpoint(tmp_path, out_dim=out_dim)
+    onnx_path = tmp_path / "encoder.onnx"
+    export_to_onnx(checkpoint_path=ckpt, out_path=onnx_path, imgsz=224, opset=18)
+    return onnx_path
+
+
+def test_extract_with_onnx_produces_same_shape(tmp_path: Path):
+    ckpt = make_checkpoint(tmp_path)
+    img_dir = tmp_path / "images"
+    make_images(img_dir, n=3)
+
+    torch_out = extract_embeddings(
+        checkpoint_path=ckpt,
+        images_dir=img_dir,
+        model_name="vit_tiny_patch16_224",
+        extract_size=224,
+        batch_size=2,
+        device="cpu",
+        use_projector_output=True,
+    )
+
+    onnx_path = make_onnx(tmp_path)
+    onnx_out = extract_embeddings(
+        checkpoint_path=ckpt,
+        images_dir=img_dir,
+        model_name="vit_tiny_patch16_224",
+        extract_size=224,
+        batch_size=2,
+        device="cpu",
+        onnx_path=onnx_path,
+    )
+
+    assert isinstance(onnx_out, pd.DataFrame)
+    assert "id" in onnx_out.columns
+    assert len(onnx_out) == len(torch_out)
+    dim_cols = [c for c in onnx_out.columns if c.startswith("dim_")]
+    assert len(dim_cols) == len([c for c in torch_out.columns if c.startswith("dim_")])
+
+
+def test_extract_with_onnx_matches_pytorch_values(tmp_path: Path):
+    ckpt = make_checkpoint(tmp_path)
+    img_dir = tmp_path / "images"
+    make_images(img_dir, n=3)
+
+    onnx_path = make_onnx(tmp_path)
+
+    torch_out = extract_embeddings(
+        checkpoint_path=ckpt,
+        images_dir=img_dir,
+        model_name="vit_tiny_patch16_224",
+        extract_size=224,
+        batch_size=2,
+        device="cpu",
+        use_projector_output=True,
+    )
+
+    onnx_out = extract_embeddings(
+        checkpoint_path=ckpt,
+        images_dir=img_dir,
+        model_name="vit_tiny_patch16_224",
+        extract_size=224,
+        batch_size=2,
+        device="cpu",
+        onnx_path=onnx_path,
+    )
+
+    dim_cols = [c for c in torch_out.columns if c.startswith("dim_")]
+    torch_vals = torch_out[dim_cols].values
+    onnx_vals = onnx_out[dim_cols].values
+
+    import numpy as np
+
+    np.testing.assert_allclose(torch_vals, onnx_vals, rtol=1e-4, atol=1e-4)
+
+
+def test_extract_onnx_rejects_patch_topk(tmp_path: Path):
+    ckpt = make_checkpoint(tmp_path)
+    img_dir = tmp_path / "images"
+    make_images(img_dir, n=2)
+    onnx_path = make_onnx(tmp_path)
+
+    with pytest.raises(ValueError, match="(?i)onnx"):
+        extract_embeddings(
+            checkpoint_path=ckpt,
+            images_dir=img_dir,
+            device="cpu",
+            batch_size=2,
+            token_mode="patch-topk",
+            onnx_path=onnx_path,
+        )
