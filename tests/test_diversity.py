@@ -264,3 +264,15 @@ def test_validate_input_sources_neither_errors():
 def test_validate_input_sources_ok():
     validate_input_sources(Path("a.csv"), None)
     validate_input_sources(None, Path("b.csv"))
+
+
+def test_mpd_tree_missing_otus_warns(tmp_path: Path):
+    pytest.importorskip("skbio")
+    from otuformer.delineation.diversity import compute_mpd_from_counts
+
+    tree_path = tmp_path / "test.nwk"
+    tree_path.write_text("((OTU1:1.0,OTU2:1.0):0.5,OTU3:1.5);")
+    otu_ids = ["OTU1", "OTU3", "OTU4"]
+    counts = [3, 1, 2]
+    with pytest.warns(UserWarning, match="missing from tree"):
+        compute_mpd_from_counts(otu_ids, counts, tree_path)

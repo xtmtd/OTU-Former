@@ -288,7 +288,7 @@ def compute_mpd_from_counts(
         raise ImportError("scikit-bio required for MPD computation") from exc
 
     tree = TreeNode.read(str(tree_newick_path))
-    tip_names = set(tree.subset_nonempty_tips().names)
+    tip_names = {tip.name for tip in tree.tips()}
     otu_set = set(otu_ids)
     missing_from_tree = otu_set - tip_names
     extra_in_tree = tip_names - otu_set
@@ -304,7 +304,10 @@ def compute_mpd_from_counts(
     overlap_counts = np.array([counts[otu_ids.index(oid)] for oid in overlap])
     tree_pruned = tree.shear(overlap)
     result = alpha_diversity(
-        "mpd", overlap_counts.reshape(1, -1), overlap, tree=tree_pruned
+        "faith_pd",
+        overlap_counts.reshape(1, -1),
+        taxa=overlap,
+        tree=tree_pruned,
     )
     return float(result[0])
 
