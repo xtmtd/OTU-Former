@@ -240,10 +240,13 @@ def _plot_partition_panel(
     leaf_order,
     tip_y_positions,
     bar_width=0.75,
+    tip_text_x=0.98,
+    tip_text_ha="right",
 ):
     import numpy as np
     import seaborn as sns
     from matplotlib.patches import Rectangle
+    from matplotlib import transforms
 
     n_samples = len(ordered_ids)
     y_positions = [tip_y_positions[name] for name in ordered_ids]
@@ -251,9 +254,19 @@ def _plot_partition_panel(
     top_label_y = min(y_positions) - 0.7 * abs(y_step)
 
     ax_names.axis("off")
+    ax_names.set_xlim(0, 1)
+    tip_transform = transforms.blended_transform_factory(
+        ax_names.transAxes, ax_names.transData
+    )
     for tip in ordered_ids:
         ax_names.text(
-            0.98, tip_y_positions[tip], tip, ha="right", va="center", fontsize=9
+            tip_text_x,
+            tip_y_positions[tip],
+            tip,
+            ha=tip_text_ha,
+            va="center",
+            fontsize=9,
+            transform=tip_transform,
         )
 
     n_parts = len(partitions)
@@ -310,6 +323,90 @@ def _plot_partition_panel(
         )
 
 
+def _plot_corrected_cluster_panel(
+    ax_corr,
+    ordered_ids,
+    tip_y_positions,
+    corrected_labels,
+    bar_width=0.08,
+):
+    import seaborn as sns
+    from matplotlib.patches import Rectangle
+
+    if len(ordered_ids) == 0:
+        ax_corr.axis("off")
+        return
+
+    y_positions = [tip_y_positions[name] for name in ordered_ids]
+    y_step = (y_positions[1] - y_positions[0]) if len(y_positions) > 1 else 10.0
+    abs_step = abs(y_step)
+
+    cluster_sequence = [corrected_labels.get(name, "") for name in ordered_ids]
+    unique_clusters = list(dict.fromkeys(cluster_sequence))
+    palette = sns.color_palette("tab20", max(20, len(unique_clusters)))
+    color_map = {
+        cid: palette[i % len(palette)] for i, cid in enumerate(unique_clusters)
+    }
+
+    ax_corr.set_xlim(0.0, 1.0)
+    ax_corr.set_xticks([])
+    ax_corr.set_yticks([])
+    for spine in ax_corr.spines.values():
+        spine.set_visible(False)
+
+    bar_w = max(0.02, float(bar_width))
+    bar_x = 0.0
+    label_x = min(0.98, bar_x + bar_w + 0.03)
+
+    run_start = 0
+    for idx in range(1, len(ordered_ids) + 1):
+        is_end = idx == len(ordered_ids)
+        current_cid = corrected_labels.get(ordered_ids[run_start], "")
+        next_cid = corrected_labels.get(ordered_ids[idx], "") if not is_end else None
+        if not is_end and next_cid == current_cid:
+            continue
+
+        first_id = ordered_ids[run_start]
+        last_id = ordered_ids[idx - 1]
+        y0 = tip_y_positions[first_id] - abs_step / 2.0
+        height = abs_step * (idx - run_start)
+        rect = Rectangle(
+            (bar_x, y0),
+            bar_w,
+            height,
+            facecolor=color_map.get(current_cid, (0.8, 0.8, 0.8)),
+            edgecolor="white",
+            linewidth=0.3,
+        )
+        ax_corr.add_patch(rect)
+
+        label_y = 0.5 * (tip_y_positions[first_id] + tip_y_positions[last_id])
+        ax_corr.text(
+            label_x,
+            label_y,
+            current_cid,
+            ha="left",
+            va="center",
+            fontsize=8,
+        )
+        ax_corr.text(
+            bar_x + bar_w / 2.0,
+            label_y,
+            str(idx - run_start),
+            ha="center",
+            va="center",
+            fontsize=8,
+            color="white" if (idx - run_start) > 1 else "black",
+        )
+
+        if not is_end:
+            y_sep = tip_y_positions[ordered_ids[idx]] - abs_step / 2.0
+            ax_corr.plot(
+                [bar_x, bar_x + bar_w], [y_sep, y_sep], color="white", linewidth=0.8
+            )
+        run_start = idx
+
+
 def _plot_upgma_partition_tree_panel(
     z,
     ids: list[str],
@@ -317,6 +414,9 @@ def _plot_upgma_partition_tree_panel(
     out_path: Path,
     support_dict=None,
     bootstrap_cutoff=50.0,
+    corrected_labels=None,
+    corrected_bar_width=0.08,
+    figure_width: float | None = None,
 ):
     import matplotlib.pyplot as plt
     from matplotlib import gridspec
@@ -324,14 +424,65 @@ def _plot_upgma_partition_tree_panel(
     import numpy as np
 
     n_samples = len(ids)
-    fig = plt.figure(figsize=(14, max(6, 0.25 * n_samples)))
+    max_tip_chars = max((len(str(v)) for v in ids), default=8)
+    max_corr_chars = max(
+        (len(str(v)) for v in (corrected_labels.values() if corrected_labels else [])),
+        default=6,
+    )
 
     n_parts = len(partitions) if partitions else 1
     base_partition_width = max(1.2, n_parts * 0.75 * 0.35)
     partition_width = base_partition_width * 0.8
-    width_ratios = [1.4, partition_width, 2.8]
-    gs = gridspec.GridSpec(1, 3, width_ratios=width_ratios, wspace=0.05)
-    ax_tree = fig.add_subplot(gs[0, 2])
+
+    tip_text_x = 1.0
+    tip_fontsize = 9
+    corr_fontsize = 8
+    base_fig_width = float(figure_width) if figure_width else 14.0
+    fig_height = max(6, 0.25 * n_samples)
+
+    def _measure_text_widths_in(texts, font_sizes):
+        fig = plt.figure(figsize=(2, 2))
+        artists = [
+            fig.text(0.0, 0.0, text or "", fontsize=size, alpha=0.0)
+            for text, size in zip(texts, font_sizes)
+        ]
+        fig.canvas.draw()
+        renderer = fig.canvas.get_renderer()
+        widths = [
+            artist.get_window_extent(renderer=renderer).width / fig.dpi
+            for artist in artists
+        ]
+        plt.close(fig)
+        return widths
+
+    if corrected_labels:
+        max_tip = max((str(v) for v in ids), default="")
+        max_corr = max((str(v) for v in corrected_labels.values()), default="")
+        tip_w_in, tip_char_in, corr_w_in, _ = _measure_text_widths_in(
+            [max_tip, "M", max_corr, "M"],
+            [tip_fontsize, tip_fontsize, corr_fontsize, corr_fontsize],
+        )
+
+        gap_in = 1.5 * tip_char_in
+        names_width_in = max(1.4, (tip_w_in + gap_in) / max(tip_text_x, 0.9))
+
+        bar_w = max(0.02, float(corrected_bar_width))
+        bar_x = 0.0
+        label_x = min(0.98, bar_x + bar_w + 0.03)
+        corr_width_in = max(0.55, (corr_w_in + 0.08) / max(0.2, (1.0 - label_x)))
+
+        width_ratios = [names_width_in, corr_width_in, partition_width, 2.8]
+        avg_axis = sum(width_ratios) / len(width_ratios)
+        wspace = max(0.0, min(0.1, gap_in / max(avg_axis, 1e-6)))
+        fig_width = max(base_fig_width, sum(width_ratios))
+        fig = plt.figure(figsize=(fig_width, fig_height))
+        gs = gridspec.GridSpec(1, 4, width_ratios=width_ratios, wspace=wspace)
+        ax_tree = fig.add_subplot(gs[0, 3])
+    else:
+        fig = plt.figure(figsize=(base_fig_width, fig_height))
+        width_ratios = [1.4, partition_width, 2.8]
+        gs = gridspec.GridSpec(1, 3, width_ratios=width_ratios, wspace=0.05)
+        ax_tree = fig.add_subplot(gs[0, 2])
 
     dendro = hierarchy.dendrogram(
         z,
@@ -353,25 +504,51 @@ def _plot_upgma_partition_tree_panel(
     y_lookup = {leaf_order[i]: y_positions[i] for i in range(len(leaf_order))}
     tip_y_positions = {ids[idx]: y_lookup[idx] for idx in leaf_order}
 
-    ax_names = fig.add_subplot(gs[0, 0], sharey=ax_tree)
-    ax_parts = fig.add_subplot(gs[0, 1], sharey=ax_tree)
+    if corrected_labels:
+        ax_names = fig.add_subplot(gs[0, 0], sharey=ax_tree)
+        ax_corr = fig.add_subplot(gs[0, 1], sharey=ax_tree)
+        ax_parts = fig.add_subplot(gs[0, 2], sharey=ax_tree)
+    else:
+        ax_names = fig.add_subplot(gs[0, 0], sharey=ax_tree)
+        ax_corr = None
+        ax_parts = fig.add_subplot(gs[0, 1], sharey=ax_tree)
     if partitions:
         _plot_partition_panel(
-            ax_names, ax_parts, ordered_ids, partitions, leaf_order, tip_y_positions
+            ax_names,
+            ax_parts,
+            ordered_ids,
+            partitions,
+            leaf_order,
+            tip_y_positions,
+            tip_text_x=tip_text_x,
+            tip_text_ha="right",
         )
     else:
         ax_names.axis("off")
         ax_parts.axis("off")
 
+    if corrected_labels and ax_corr is not None:
+        _plot_corrected_cluster_panel(
+            ax_corr,
+            ordered_ids,
+            tip_y_positions,
+            corrected_labels,
+            bar_width=corrected_bar_width,
+        )
+
     ymin = y_positions[-1] + y_step
     ymax = y_positions[0] - y_step
-    for ax in (ax_names, ax_parts, ax_tree):
+    axes = [ax_names, ax_parts, ax_tree]
+    if ax_corr is not None:
+        axes.insert(1, ax_corr)
+    for ax in axes:
         ax.set_ylim(ymin, ymax)
 
     ax_tree.set_xlabel("Distance")
     ax_tree.set_yticks([])
     for spine in ax_tree.spines.values():
         spine.set_visible(False)
+    ax_tree.spines["bottom"].set_visible(True)
 
     if support_dict:
         clade_heights = _compute_clade_heights(z, ids)

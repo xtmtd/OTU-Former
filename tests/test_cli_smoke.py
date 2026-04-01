@@ -57,7 +57,17 @@ def test_subcommand_help(cmd):
             ],
         ),
         ("cluster", ["--embeddings", "--distance", "--custom-cutoffs"]),
-        ("annotate", ["--assignments", "--corrections", "--out-dir"]),
+        (
+            "annotate",
+            [
+                "--raw-assignments",
+                "--corrections",
+                "--embeddings",
+                "--support-display-cutoff",
+                "--annotate-bar-width",
+                "--out-dir",
+            ],
+        ),
         ("diversity", ["--assignments", "--min-abundance", "--phylo"]),
         ("cam", ["--checkpoint", "--images-dir", "--cam-method"]),
         ("export", ["--checkpoint", "--imgsz", "--opset"]),
@@ -772,27 +782,71 @@ def test_cluster_euclidean_uses_l2_normalized_embeddings(tmp_path):
 
 
 def test_annotate_command(tmp_path):
-    assignments = pd.DataFrame({"id": ["a", "b"], "cluster": ["OTU_1", "OTU_1"]})
-    corrections = pd.DataFrame({"id": ["b"], "corrected_cluster": ["OTU_2"]})
-    assign_path = tmp_path / "assignments.csv"
-    corr_path = tmp_path / "corrections.csv"
+    runs_dir = tmp_path / "runs"
+    cluster_dir = runs_dir / "cluster"
+    tables_dir = cluster_dir / "UPGMA" / "partitions" / "tables"
+    logs_dir = cluster_dir / "logs"
+    extract_dir = runs_dir / "extract"
+    tables_dir.mkdir(parents=True, exist_ok=True)
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    extract_dir.mkdir(parents=True, exist_ok=True)
+
+    assignments = pd.DataFrame(
+        {
+            "id": ["a", "b", "c"],
+            "cluster": ["OTU_1", "OTU_1", "OTU_2"],
+            "sample": ["S1", "S1", "S2"],
+        }
+    )
+    assign_path = tables_dir / "partition_0.2_assignments.csv"
     assignments.to_csv(assign_path, index=False)
+    assignments.to_csv(tables_dir / "partition_0.25_assignments.csv", index=False)
+
+    emb = pd.DataFrame(
+        {
+            "id": ["a", "b", "c"],
+            "dim_0": [0.1, 0.2, 0.8],
+            "dim_1": [0.2, 0.1, 0.9],
+        }
+    )
+    emb.to_csv(extract_dir / "embeddings.csv", index=False)
+
+    cluster_log = "\n".join(
+        [
+            "[2026-04-01 00:00:00] Parameters:",
+            "[2026-04-01 00:00:00] {",
+            '[2026-04-01 00:00:00]   "distance": "cosine",',
+            '[2026-04-01 00:00:00]   "embeddings": "runs/extract/embeddings.csv",',
+            '[2026-04-01 00:00:00]   "pca_whitening": false,',
+            '[2026-04-01 00:00:00]   "pca_components": 256,',
+            '[2026-04-01 00:00:00]   "local_scaling": false,',
+            '[2026-04-01 00:00:00]   "local_k": 0,',
+            '[2026-04-01 00:00:00]   "local_k_strategy": "adaptive"',
+            "[2026-04-01 00:00:00] }",
+        ]
+    )
+    (logs_dir / "cluster.log").write_text(cluster_log, encoding="utf-8")
+
+    corrections = pd.DataFrame({"id": ["b"], "cluster": ["OTU_2"]})
+    corr_path = tmp_path / "corrections.csv"
     corrections.to_csv(corr_path, index=False)
 
     result = runner.invoke(
         app,
         [
             "annotate",
-            "--assignments",
+            "--raw-assignments",
             str(assign_path),
             "--corrections",
             str(corr_path),
+            "--embeddings",
+            str(extract_dir / "embeddings.csv"),
             "--out-dir",
             str(tmp_path / "annotate_out"),
         ],
     )
     assert result.exit_code == 0
-    assert (tmp_path / "annotate_out" / "assignments_annotated.csv").exists()
+    assert (tmp_path / "annotate_out" / "partition_0.2_assignments.csv").exists()
     assert (tmp_path / "annotate_out" / "logs" / "annotate.log").exists()
 
 
