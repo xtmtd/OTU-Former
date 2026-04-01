@@ -280,54 +280,81 @@ def build_mpd_inputs(
 
 def compute_mpd_from_counts(
     otu_ids: list[str], counts: np.ndarray, tree_newick_path: Path
-) -> float:
+) -> dict[str, float]:
     import warnings
 
     try:
         from skbio import TreeNode
         from skbio.diversity import alpha_diversity
+        from skbio.diversity.alpha import phydiv
     except Exception as exc:
         raise ImportError("scikit-bio required for MPD computation") from exc
 
-    tree = TreeNode.read(str(tree_newick_path))
+    tree = TreeNode.read(str(tree_newick_path), convert_underscores=False)
     tip_names = {tip.name for tip in tree.tips()}
-    otu_set = set(otu_ids)
-    missing_from_tree = otu_set - tip_names
-    extra_in_tree = tip_names - otu_set
+    taxa_set = set(otu_ids)
+
+    missing_from_tree = taxa_set - tip_names
     if missing_from_tree:
-        warnings.warn(f"OTUs missing from tree: {missing_from_tree}; dropped for MPD.")
-    if extra_in_tree:
-        warnings.warn(
-            f"Extra tree tips not in OTU table: {extra_in_tree}; ignored for MPD."
-        )
+        warnings.warn(f"Taxa missing from tree: {missing_from_tree}; dropped for MPD.")
+
     overlap = [oid for oid in otu_ids if oid in tip_names]
     if not overlap:
-        return float("nan")
+        return {
+            "MPD": float("nan"),
+            "MPD_w": float("nan"),
+            "PD_richness_norm": float("nan"),
+        }
     overlap_counts = np.array([counts[otu_ids.index(oid)] for oid in overlap])
     tree_pruned = tree.shear(overlap)
-    result = alpha_diversity(
+
+    faith_pd = alpha_diversity(
         "faith_pd",
         overlap_counts.reshape(1, -1),
         taxa=overlap,
         tree=tree_pruned,
     )
-    return float(result[0])
+    mpd_w = phydiv(
+        overlap_counts,
+        taxa=overlap,
+        tree=tree_pruned,
+        rooted=True,
+        weight=True,
+        validate=False,
+    )
+    richness = len(overlap)
+    pd_richness_norm = float(faith_pd[0]) / richness if richness > 0 else float("nan")
+
+    return {
+        "MPD": float(faith_pd[0]),
+        "MPD_w": float(mpd_w),
+        "PD_richness_norm": pd_richness_norm,
+    }
 
 
-def compute_mpd(assignments: pd.DataFrame, tree_newick_path: Path) -> float:
+def compute_mpd(assignments: pd.DataFrame, tree_newick_path: Path) -> dict[str, float]:
     try:
         from skbio import TreeNode
         from skbio.diversity import alpha_diversity
+        from skbio.diversity.alpha import phydiv
     except Exception as exc:
         raise ImportError("scikit-bio required for MPD computation") from exc
 
-    cluster_counts = assignments["cluster"].value_counts()
-    otu_ids = list(cluster_counts.index)
-    counts_arr = np.array([cluster_counts.get(o, 0) for o in otu_ids], dtype=int)
+    if "id" in assignments.columns:
+        tip_ids = list(assignments["id"].value_counts().index)
+        counts_arr = np.array(assignments["id"].value_counts().values, dtype=int)
+    else:
+        cluster_counts = assignments["cluster"].value_counts()
+        tip_ids = list(cluster_counts.index)
+        counts_arr = np.array([cluster_counts.get(o, 0) for o in tip_ids], dtype=int)
     try:
-        return compute_mpd_from_counts(otu_ids, counts_arr, tree_newick_path)
+        return compute_mpd_from_counts(tip_ids, counts_arr, tree_newick_path)
     except Exception:
-        return float("nan")
+        return {
+            "MPD": float("nan"),
+            "MPD_w": float("nan"),
+            "PD_richness_norm": float("nan"),
+        }
 
 
 def diversity_table(
@@ -345,9 +372,12 @@ def diversity_table(
         metrics = compute_alpha_diversity(filtered)
         if tree_newick_path is not None:
             try:
-                metrics["MPD"] = compute_mpd(filtered, tree_newick_path)
+                phylo_metrics = compute_mpd(filtered, tree_newick_path)
+                metrics.update(phylo_metrics)
             except Exception:
                 metrics["MPD"] = float("nan")
+                metrics["MPD_w"] = float("nan")
+                metrics["PD_richness_norm"] = float("nan")
         records[col] = metrics
     df = pd.DataFrame(records)
     df.index.name = "index"

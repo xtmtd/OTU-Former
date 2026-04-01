@@ -28,8 +28,12 @@ app = typer.Typer(
         "  Simpson: probability two individuals differ (higher = more diverse).\n"
         "  Hill_q0/q1/q2: Hill numbers (richness/evenness/diversity at orders 0,1,2).\n"
         "  Pielou_J: evenness (Shannon / log(richness)).\n"
-        "  MPD: mean pairwise phylogenetic distance across OTUs "
-        "(--phylo + --tree required).\n\n"
+        "  Faith's PD (MPD): morphological phylogenetic diversity, computed as "
+        "the sum of branch lengths of the minimal spanning subtree via "
+        "scikit-bio alpha_diversity('faith_pd').\n"
+        "  MPD_w: abundance-weighted rooted PD (rPD_w), branches weighted by "
+        "relative abundance of descending taxa.\n"
+        "  PD_richness_norm: Faith's PD divided by species richness (PD per species).\n\n"
         "Note: --no-phylo has been removed; omit --phylo to disable MPD."
     )
 )
@@ -81,9 +85,17 @@ def diversity(
         "0,2,5", "--min-abundance", help="Comma-separated min abundance thresholds."
     ),
     phylo: bool = typer.Option(
-        False, "--phylo", help="Compute MPD from tree when provided."
+        False,
+        "--phylo",
+        help=(
+            "Compute phylogenetic diversity (Faith's PD) from the Newick tree. "
+            "Faith's PD sums the branch lengths of the minimal subtree spanning "
+            "all taxa present in the sample. Requires --tree."
+        ),
     ),
-    tree: Path | None = typer.Option(None, "--tree", help="Optional Newick tree path."),
+    tree: Path | None = typer.Option(
+        None, "--tree", help="Newick tree path (required when --phylo is set)."
+    ),
 ) -> None:
     if ctx.invoked_subcommand is not None:
         return

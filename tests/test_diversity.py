@@ -276,3 +276,131 @@ def test_mpd_tree_missing_otus_warns(tmp_path: Path):
     counts = [3, 1, 2]
     with pytest.warns(UserWarning, match="missing from tree"):
         compute_mpd_from_counts(otu_ids, counts, tree_path)
+
+
+def test_mpd_preserves_underscores_in_tip_names(tmp_path: Path):
+    """Tip names with underscores should NOT be converted to spaces."""
+    pytest.importorskip("skbio")
+    import warnings
+    from otuformer.delineation.diversity import compute_mpd_from_counts
+
+    tree_path = tmp_path / "test.nwk"
+    tree_path.write_text("((img_01:1.0,img_02:1.0):0.5,img_03:1.5);")
+    otu_ids = ["img_01", "img_02", "img_03"]
+    counts = [2, 3, 1]
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        result = compute_mpd_from_counts(otu_ids, counts, tree_path)
+        mpd_warnings = [
+            x
+            for x in w
+            if "missing from tree" in str(x.message)
+            or "Extra tree tips" in str(x.message)
+        ]
+        assert len(mpd_warnings) == 0
+    assert result["MPD"] > 0
+    assert result["MPD_w"] > 0
+    assert result["PD_richness_norm"] > 0
+
+
+def test_mpd_no_warning_when_names_match_exactly(tmp_path: Path):
+    """No warnings when all tip names match exactly."""
+    pytest.importorskip("skbio")
+    import warnings
+    from otuformer.delineation.diversity import compute_mpd_from_counts
+
+    tree_path = tmp_path / "test.nwk"
+    tree_path.write_text("((A:1.0,B:2.0):0.5,C:1.5);")
+    otu_ids = ["A", "B", "C"]
+    counts = [1, 2, 3]
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        result = compute_mpd_from_counts(otu_ids, counts, tree_path)
+        mpd_warnings = [
+            x
+            for x in w
+            if "missing from tree" in str(x.message)
+            or "Extra tree tips" in str(x.message)
+        ]
+        assert len(mpd_warnings) == 0
+    assert result["MPD"] > 0
+
+
+def test_mpd_uses_id_column_when_available(tmp_path: Path):
+    """compute_mpd should use 'id' column (tip names) not 'cluster' column."""
+    pytest.importorskip("skbio")
+    from otuformer.delineation.diversity import compute_mpd
+
+    tree_path = tmp_path / "test.nwk"
+    tree_path.write_text("((img_01:1.0,img_02:1.0):0.5,img_03:1.5);")
+    assignments = pd.DataFrame(
+        {
+            "id": ["img_01", "img_01", "img_02", "img_03"],
+            "cluster": ["OTU_A", "OTU_A", "OTU_B", "OTU_C"],
+        }
+    )
+    result = compute_mpd(assignments, tree_path)
+    assert not (result["MPD"] != result["MPD"])
+
+
+def test_mpd_returns_nan_when_no_overlap(tmp_path: Path):
+    """compute_mpd should return NaN when no tip names match."""
+    pytest.importorskip("skbio")
+    from otuformer.delineation.diversity import compute_mpd_from_counts
+
+    tree_path = tmp_path / "test.nwk"
+    tree_path.write_text("((X:1.0,Y:1.0):0.5,Z:1.5);")
+    otu_ids = ["A", "B", "C"]
+    counts = [1, 2, 3]
+    result = compute_mpd_from_counts(otu_ids, counts, tree_path)
+    assert result["MPD"] != result["MPD"]
+    assert result["MPD_w"] != result["MPD_w"]
+    assert result["PD_richness_norm"] != result["PD_richness_norm"]
+
+
+def test_mpd_returns_dict_with_all_metrics(tmp_path: Path):
+    """compute_mpd_from_counts should return dict with MPD, MPD_w, PD_richness_norm."""
+    pytest.importorskip("skbio")
+    from otuformer.delineation.diversity import compute_mpd_from_counts
+
+    tree_path = tmp_path / "test.nwk"
+    tree_path.write_text("((A:1.0,B:2.0):0.5,C:1.5);")
+    otu_ids = ["A", "B", "C"]
+    counts = [1, 2, 3]
+    result = compute_mpd_from_counts(otu_ids, counts, tree_path)
+    assert isinstance(result, dict)
+    assert set(result.keys()) == {"MPD", "MPD_w", "PD_richness_norm"}
+
+
+def test_pd_richness_norm_equals_mpd_div_richness(tmp_path: Path):
+    """PD_richness_norm should equal MPD / richness."""
+    pytest.importorskip("skbio")
+    from otuformer.delineation.diversity import compute_mpd_from_counts
+
+    tree_path = tmp_path / "test.nwk"
+    tree_path.write_text("((A:1.0,B:2.0):0.5,C:1.5);")
+    otu_ids = ["A", "B", "C"]
+    counts = [1, 2, 3]
+    result = compute_mpd_from_counts(otu_ids, counts, tree_path)
+    expected = result["MPD"] / 3
+    assert abs(result["PD_richness_norm"] - expected) < 1e-10
+
+
+def test_diversity_table_with_tree_returns_mpd(tmp_path: Path):
+    """diversity_table should include MPD, MPD_w, PD_richness_norm when tree is provided."""
+    pytest.importorskip("skbio")
+    from otuformer.delineation.diversity import diversity_table
+
+    tree_path = tmp_path / "test.nwk"
+    tree_path.write_text("((img_01:1.0,img_02:1.0):0.5,img_03:1.5);")
+    assignments = pd.DataFrame(
+        {
+            "id": ["img_01", "img_01", "img_02", "img_03"],
+            "cluster": ["OTU_A", "OTU_A", "OTU_B", "OTU_C"],
+        }
+    )
+    table = diversity_table(assignments, [0], tree_newick_path=tree_path)
+    col = table["min_abundance_0"]
+    assert "MPD" in col.index
+    assert "MPD_w" in col.index
+    assert "PD_richness_norm" in col.index
