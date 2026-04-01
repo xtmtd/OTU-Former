@@ -67,7 +67,21 @@ def load_model_from_checkpoint(
     out_dim = cfg.get("out_dim") or cfg.get("metric_embed_dim", 256)
     encoder = OTUFormerEncoder(model_name=resolved_name, out_dim=out_dim)
     encoder.load_state_dict(ckpt["model_state_dict"], strict=False)
-    model = encoder.backbone
+    backbone = encoder.backbone
+    backbone.eval().to(device)
+
+    class _CamWrapper(torch.nn.Module):
+        def __init__(self, backbone: torch.nn.Module):
+            super().__init__()
+            self.backbone = backbone
+
+        def forward(self, x):
+            features = self.backbone.forward_features(x)
+            if features.ndim == 3:
+                return features[:, 0, :]
+            return features
+
+    model = _CamWrapper(backbone)
     model.eval().to(device)
     return model
 
@@ -76,17 +90,29 @@ def get_module_by_name(model: torch.nn.Module, name: str) -> torch.nn.Module:
     module = model
     for attr in name.split("."):
         if attr.isdigit():
-            module = module[int(attr)]
-        elif isinstance(module, torch.nn.ModuleDict) and attr in module:
+            idx = int(attr)
+            try:
+                module = module[idx]
+            except Exception as exc:
+                raise AttributeError(
+                    f"Module '{module.__class__.__name__}' has no index '{attr}'"
+                ) from exc
+            continue
+        if isinstance(module, torch.nn.ModuleDict) and attr in module:
             module = module[attr]
-        else:
-            module = getattr(module, attr)
+            continue
+        if not hasattr(module, attr):
+            raise AttributeError(
+                f"Module '{module.__class__.__name__}' has no attribute '{attr}'"
+            )
+        module = getattr(module, attr)
     return module
 
 
 def find_last_conv_module(model: torch.nn.Module) -> torch.nn.Module:
+    backbone = getattr(model, "backbone", model)
     last_conv = None
-    for _, module in model.named_modules():
+    for _, module in backbone.named_modules():
         if isinstance(module, torch.nn.Conv2d):
             last_conv = module
     if last_conv is None:
@@ -97,8 +123,9 @@ def find_last_conv_module(model: torch.nn.Module) -> torch.nn.Module:
 
 
 def default_vit_target(model: torch.nn.Module) -> torch.nn.Module:
-    if hasattr(model, "blocks") and len(model.blocks) > 0:
-        block = model.blocks[-1]
+    backbone = getattr(model, "backbone", model)
+    if hasattr(backbone, "blocks") and len(backbone.blocks) > 0:
+        block = backbone.blocks[-1]
         for candidate in ["norm1", "ln1", "ln"]:
             if hasattr(block, candidate):
                 return getattr(block, candidate)
@@ -125,7 +152,8 @@ def vit_reshape_transform(tensor: torch.Tensor) -> torch.Tensor:
 
 
 def build_eval_transforms(model: torch.nn.Module) -> Tuple:
-    cfg = resolve_model_data_config(model)
+    backbone = getattr(model, "backbone", model)
+    cfg = resolve_model_data_config(backbone)
     crop_tuple = cfg.get("test_input_size", cfg.get("input_size"))
     crop_size = crop_tuple[1]
     crop_pct = cfg.get("test_crop_pct", cfg.get("crop_pct", 1.0))
@@ -163,15 +191,16 @@ def prepare_cam(
 ):
     if not _HAS_CAM:
         raise ImportError("pytorch-grad-cam is required for CAM generation")
-    target_layers = (
-        [get_module_by_name(model, target_layer_name)]
-        if target_layer_name
-        else (
+    if target_layer_name:
+        backbone = getattr(model, "backbone", model)
+        target_layers = [get_module_by_name(backbone, target_layer_name)]
+    else:
+        target_layers = (
             [find_last_conv_module(model)]
             if arch == "cnn"
             else [default_vit_target(model)]
         )
-    )
+
     reshape_transform = vit_reshape_transform if arch == "vit" else None
     cam_kwargs = {
         "model": model,
@@ -183,7 +212,7 @@ def prepare_cam(
     cam = CAM_METHODS[cam_name](**cam_kwargs)
     if isinstance(cam, BaseCAM):
         cam.batch_size = cam_batch_size
-    return cam
+    return cam, target_layers, reshape_transform
 
 
 def collect_image_rows(images_dir: Path, label_csv: Optional[Path]) -> pd.DataFrame:
@@ -223,45 +252,41 @@ def process_image(
     import cv2
 
     pil_img = Image.open(img_path).convert("RGB")
-    # Keep original PIL for side-by-side composite (matches ref/GradCam_heatmap.py)
     original_img = pil_img.copy()
-    rgb_display = np.array(display_transform(pil_img)).astype(np.float32) / 255.0
+    rgb_display = np.array(original_img).astype(np.float32) / 255.0
 
     input_tensor = preprocess(pil_img).unsqueeze(0).to(device)
-    with torch.no_grad():
-        out = model(input_tensor)
+    with torch.inference_mode():
+        logits = model(input_tensor)
+        if logits.ndim == 3:
+            logits = logits[:, 0, :]
+        pred_idx = int(torch.argmax(logits, dim=1).item())
+        probs = torch.softmax(logits, dim=1)
+        pred_score = float(probs[0, pred_idx].cpu().item())
 
-    target_class = out.argmax(dim=1).item() if out.ndim > 1 else None
-    targets = (
-        [ClassifierOutputTarget(target_class)] if target_class is not None else None
-    )
+    targets = [ClassifierOutputTarget(pred_idx)]
     grayscale_cam = cam_extractor(input_tensor=input_tensor, targets=targets)[0]
 
-    # Normalise CAM to [0, 1]
     cam_norm = grayscale_cam - grayscale_cam.min()
     if cam_norm.max() > 0:
         cam_norm = cam_norm / cam_norm.max()
     else:
         cam_norm = np.zeros_like(cam_norm)
 
-    # Resize CAM to original image size for overlay
     cam_on_full = cv2.resize(
         cam_norm,
         (original_img.width, original_img.height),
         interpolation=cv2.INTER_LINEAR,
     )
 
-    # Build overlay on full-resolution image
-    rgb_full = np.array(original_img).astype(np.float32) / 255.0
     overlay = show_cam_on_image(
-        rgb_full,
+        rgb_display,
         cam_on_full,
         use_rgb=True,
         image_weight=image_weight,
     )
     overlay_img = Image.fromarray((overlay * 255).astype(np.uint8))
 
-    # Side-by-side: original | overlay (matches ref/GradCam_heatmap.py)
     combined = Image.new("RGB", (original_img.width * 2, original_img.height))
     combined.paste(original_img, (0, 0))
     combined.paste(overlay_img, (original_img.width, 0))
@@ -270,14 +295,19 @@ def process_image(
     fig_path = fig_dir / f"{stem}_cam.{fig_format}"
     combined.save(fig_path)
 
+    cam_array_path = ""
     if save_npy and array_dir is not None:
-        np.save(array_dir / f"{stem}_cam.npy", cam_norm.astype(np.float32))
+        npy_path = array_dir / f"{stem}.npy"
+        np.save(npy_path, cam_norm.astype(np.float32))
+        cam_array_path = str(npy_path)
 
     return {
         "image": img_path.name,
         "label": label,
-        "pred_class": int(target_class) if target_class is not None else -1,
-        "cam_file": str(fig_path),
+        "pred_class": pred_idx,
+        "pred_prob": pred_score,
+        "figure_path": str(fig_path),
+        "cam_array_path": cam_array_path,
     }
 
 
@@ -305,9 +335,17 @@ def run_cam(
     preprocess, display_transform = build_eval_transforms(model)
 
     resolved_arch = arch or infer_architecture(model_name, model)
-    cam_extractor = prepare_cam(
+    cam_extractor, target_layers, reshape_transform = prepare_cam(
         model, resolved_arch, target_layer_name, cam_method, cam_batch_size
     )
+
+    logging.info("Architecture inferred as %s", resolved_arch)
+    logging.info(
+        "Using target layer(s): %s",
+        ", ".join([layer.__class__.__name__ for layer in target_layers]),
+    )
+    if reshape_transform:
+        logging.info("Enabled ViT reshape_transform for CAM.")
 
     fig_dir = out_dir / "figures"
     fig_dir.mkdir(parents=True, exist_ok=True)
@@ -316,20 +354,38 @@ def run_cam(
         array_dir.mkdir(parents=True, exist_ok=True)
 
     if dump_model_structure:
+        backbone = getattr(model, "backbone", model)
         lines = ["# Named modules for --target-layer-name", "# Format: <name>\t<class>"]
-        for name, module in model.named_modules():
+        for name, module in backbone.named_modules():
             lines.append(f"{name or '<root>'}\t{module.__class__.__name__}")
         (out_dir / "model_layers.txt").write_text(
             "\n".join(lines) + "\n", encoding="utf-8"
         )
+        logging.info("Model layer names written to %s", out_dir / "model_layers.txt")
 
     rows_df = collect_image_rows(images_dir, label_csv)
     if max_images is not None:
         rows_df = rows_df.head(max_images)
 
+    if label_csv is not None:
+        image_map: Dict[str, Path] = {}
+        for p in images_dir.rglob("*"):
+            if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS:
+                image_map[p.name] = p
+    else:
+        image_map = {}
+
     results = []
-    for _, row in rows_df.iterrows():
-        img_path = images_dir / row["image"]
+    for idx, row in rows_df.iterrows():
+        if max_images is not None and idx >= max_images:
+            break
+        if image_map and row["image"] in image_map:
+            img_path = image_map[row["image"]].resolve()
+        else:
+            img_path = (images_dir / row["image"]).resolve()
+        if not img_path.exists():
+            logging.error("Image not found: %s", img_path)
+            continue
         try:
             result = process_image(
                 img_path=img_path,
@@ -347,14 +403,7 @@ def run_cam(
             )
             results.append(result)
         except Exception as exc:
-            logging.warning("Failed to process %s: %s", img_path.name, exc)
-            results.append(
-                {
-                    "image": img_path.name,
-                    "label": str(row["label"]),
-                    "cam_file": "FAILED",
-                }
-            )
+            logging.exception("Failed on %s: %s", img_path, exc)
 
-    summary_df = pd.DataFrame(results)
-    write_csv(summary_df, out_dir / "cam_summary.csv")
+    if results:
+        pd.DataFrame(results).to_csv(out_dir / "cam_summary.csv", index=False)

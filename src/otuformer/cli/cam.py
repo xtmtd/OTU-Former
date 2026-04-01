@@ -1,8 +1,9 @@
-"""cam command stub with full options."""
+"""Generate CAM heatmaps for OTU-Former models."""
 
 from __future__ import annotations
 
 import json
+import logging
 import sys
 import traceback
 from pathlib import Path
@@ -10,7 +11,9 @@ from pathlib import Path
 import click
 import typer
 
-app = typer.Typer(help="Generate CAM heatmaps.")
+app = typer.Typer(
+    help="Generate CAM heatmaps for visualizing model attention on images.",
+)
 
 
 def _format_user_command(ctx: typer.Context, params: dict[str, object]) -> str:
@@ -32,42 +35,85 @@ def _format_user_command(ctx: typer.Context, params: dict[str, object]) -> str:
 @app.callback(invoke_without_command=True)
 def cam(
     ctx: typer.Context,
-    checkpoint: Path = typer.Option(..., "--checkpoint", help="Checkpoint file path."),
-    images_dir: Path = typer.Option(..., "--images-dir", help="Directory of images."),
+    checkpoint: Path = typer.Option(
+        ..., "--checkpoint", help="Path to the OTU-Former checkpoint (.ckpt or .pth)."
+    ),
+    images_dir: Path = typer.Option(
+        ...,
+        "--images-dir",
+        help="Directory containing images to generate CAM heatmaps for.",
+    ),
     label_csv: Path | None = typer.Option(
-        None, "--label-csv", help="Optional CSV with image,label columns."
+        None,
+        "--label-csv",
+        help="Optional CSV with 'image' and 'label' columns. If omitted, all images in --images-dir are used.",
     ),
     out_dir: Path = typer.Option(
-        Path("runs/cam"), "--out-dir", help="Output directory."
+        Path("runs/cam"),
+        "--out-dir",
+        help="Directory to write CAM visualizations and artifacts.",
     ),
-    cam_method: str = typer.Option("gradcam", "--cam-method", help="CAM method."),
-    arch: str | None = typer.Option(None, "--arch", help="Architecture hint."),
+    cam_method: str = typer.Option(
+        "gradcam",
+        "--cam-method",
+        click_type=click.Choice(
+            ["gradcam", "gradcampp", "layercam", "scorecam", "eigencam", "ablationcam"]
+        ),
+        show_choices=False,
+        help="CAM algorithm: gradcam, gradcampp, layercam, scorecam, eigencam, ablationcam",
+    ),
+    arch: str | None = typer.Option(
+        None,
+        "--arch",
+        click_type=click.Choice(["cnn", "vit"]),
+        help="Force architecture type (auto-detected from model name if not set).",
+    ),
     target_layer_name: str | None = typer.Option(
-        None, "--target-layer-name", help="Target layer path."
+        None,
+        "--target-layer-name",
+        help="Specific model layer for CAM (auto-selected when omitted).",
     ),
     image_weight: float = typer.Option(
-        0.5, "--image-weight", help="Overlay image weight."
+        0.5,
+        "--image-weight",
+        help="Blend weight of original image in CAM overlay (0-1).",
     ),
-    fig_format: str = typer.Option("png", "--fig-format", help="Figure format."),
+    fig_format: str = typer.Option(
+        "png",
+        "--fig-format",
+        click_type=click.Choice(["png", "jpg", "pdf"]),
+        help="Output format for CAM figures.",
+    ),
     save_npy: bool = typer.Option(
-        False, "--save-npy/--no-save-npy", help="Save raw CAM array as NPY."
+        False,
+        "--save-npy",
+        help="Save raw CAM heatmaps as NumPy arrays.",
     ),
     dump_model_structure: bool = typer.Option(
         False,
-        "--dump-model-structure/--no-dump-model-structure",
-        help="Dump model layers to file.",
+        "--dump-model-structure",
+        help="Write model layer names to out-dir/model_layers.txt for --target-layer-name reference.",
     ),
     max_images: int | None = typer.Option(
-        None, "--max-images", help="Maximum images to process."
+        None,
+        "--max-images",
+        help="Maximum number of images to process (None = all).",
     ),
     cam_batch_size: int = typer.Option(
-        32, "--cam-batch-size", help="Batch size used by CAM backend."
+        32,
+        "--cam-batch-size",
+        help="Batch size for CAM inference.",
     ),
     num_workers: int = typer.Option(
-        4, "--num-workers", help="Data loading workers (reserved)."
+        4,
+        "--num-workers",
+        help="Number of dataloader worker processes (reserved).",
     ),
     device: str = typer.Option(
-        "auto", "--device", help="Device: auto | cpu | cuda | mps."
+        "auto",
+        "--device",
+        click_type=click.Choice(["auto", "cpu", "cuda", "mps"]),
+        help="Compute device for CAM generation.",
     ),
 ) -> None:
     if ctx.invoked_subcommand is not None:
@@ -80,6 +126,13 @@ def cam(
     original_stderr = sys.stderr
     sys.stdout = tee
     sys.stderr = tee
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(message)s",
+        stream=tee,
+        force=True,
+    )
     try:
         params = {
             "checkpoint": str(checkpoint),
