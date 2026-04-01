@@ -2,7 +2,20 @@
 
 from __future__ import annotations
 
+import sys
+
 import typer
+
+
+def detect_removed_no_phylo(argv: list[str]) -> bool:
+    return "diversity" in argv and "--no-phylo" in argv
+
+
+if detect_removed_no_phylo(sys.argv[1:]):
+    import typer as _typer
+
+    _typer.echo("Error: --no-phylo is removed; use --phylo to enable MPD.")
+    raise _typer.Exit(code=2)
 
 from otuformer.cli import annotate as _annotate_mod
 from otuformer.cli import cam as _cam_mod

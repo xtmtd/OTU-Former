@@ -53,6 +53,25 @@ def parse_otu_table(raw: pd.DataFrame, has_header: bool) -> pd.DataFrame:
     return data
 
 
+def normalize_assignments(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize assignment column names: accept id|image, cluster, optional sample."""
+    cols = {c.strip().lower(): c for c in df.columns}
+    if "id" in cols and "image" in cols:
+        raise ValueError("Assignments cannot contain both id and image columns.")
+    if "id" in cols:
+        df = df.rename(columns={cols["id"]: "id"})
+    elif "image" in cols:
+        df = df.rename(columns={cols["image"]: "id"})
+    else:
+        raise ValueError("Assignments must include id or image column.")
+    if "cluster" not in cols:
+        raise ValueError("Assignments must include cluster column.")
+    df = df.rename(columns={cols["cluster"]: "cluster"})
+    if "sample" in cols:
+        df = df.rename(columns={cols["sample"]: "sample"})
+    return df
+
+
 def has_valid_samples(assignments: pd.DataFrame) -> bool:
     """Return True if 'sample' column exists and no value is NaN or empty after trimming."""
     if "sample" not in assignments.columns:

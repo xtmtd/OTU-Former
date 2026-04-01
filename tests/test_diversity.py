@@ -14,10 +14,12 @@ from otuformer.delineation.diversity import (
     diversity_table,
     filter_by_min_abundance,
     has_valid_samples,
+    normalize_assignments,
     parse_otu_table,
     sanitize_sample_name,
     split_assignments_by_sample,
 )
+from otuformer.cli.diversity import validate_input_sources
 
 
 def sample_assignments():
@@ -221,3 +223,44 @@ def test_diversity_table_no_mpd_when_tree_missing():
     df = pd.DataFrame({"id": ["a"], "cluster": ["OTU_1"]})
     table = diversity_table(df, [0], tree_newick_path=None)
     assert "MPD" not in table.index
+
+
+def test_normalize_assignments_rejects_id_and_image():
+    df = pd.DataFrame({"id": ["a"], "image": ["b"], "cluster": ["OTU"]})
+    with pytest.raises(ValueError):
+        normalize_assignments(df)
+
+
+def test_normalize_assignments_accepts_id():
+    df = pd.DataFrame({"id": ["a"], "cluster": ["OTU"], "sample": ["s1"]})
+    result = normalize_assignments(df)
+    assert "id" in result.columns
+    assert "cluster" in result.columns
+    assert "sample" in result.columns
+
+
+def test_normalize_assignments_accepts_image():
+    df = pd.DataFrame({"image": ["a"], "cluster": ["OTU"]})
+    result = normalize_assignments(df)
+    assert "id" in result.columns
+
+
+def test_normalize_assignments_missing_cluster_errors():
+    df = pd.DataFrame({"id": ["a"]})
+    with pytest.raises(ValueError):
+        normalize_assignments(df)
+
+
+def test_validate_input_sources_both_errors():
+    with pytest.raises(ValueError):
+        validate_input_sources(Path("a.csv"), Path("b.csv"))
+
+
+def test_validate_input_sources_neither_errors():
+    with pytest.raises(ValueError):
+        validate_input_sources(None, None)
+
+
+def test_validate_input_sources_ok():
+    validate_input_sources(Path("a.csv"), None)
+    validate_input_sources(None, Path("b.csv"))
