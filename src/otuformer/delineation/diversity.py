@@ -49,6 +49,8 @@ def parse_otu_table(raw: pd.DataFrame, has_header: bool) -> pd.DataFrame:
     data = raw.iloc[1:, :].copy()
     data.columns = ["sample"] + otu_ids
     data["sample"] = data["sample"].astype(str)
+    for otu in otu_ids:
+        data[otu] = pd.to_numeric(data[otu], errors="coerce").fillna(0).astype(int)
     data = data.set_index("sample")
     return data
 

@@ -77,7 +77,6 @@ def diversity(
     out_dir: Path = typer.Option(
         Path("runs/diversity"), "--out-dir", help="Output directory."
     ),
-    prefix: str = typer.Option("OTU", "--prefix", help="Prefix for reporting."),
     min_abundance: str = typer.Option(
         "0,2,5", "--min-abundance", help="Comma-separated min abundance thresholds."
     ),
@@ -115,7 +114,6 @@ def diversity(
             "otu_table_csv": str(otu_table_csv) if otu_table_csv else "",
             "otu_table_has_header": otu_table_has_header,
             "out_dir": str(out_dir),
-            "prefix": prefix,
             "min_abundance": min_abundance,
             "phylo": phylo,
             "tree": str(tree) if tree is not None else "",
@@ -164,7 +162,7 @@ def diversity(
                     "Warning: sample column missing or empty; per-sample outputs skipped."
                 )
         else:
-            otu_raw = read_csv(otu_table_csv, encoding="utf-8-sig")
+            otu_raw = read_csv(otu_table_csv, encoding="utf-8-sig", header=None)
             otu_table = parse_otu_table(otu_raw, has_header=otu_table_has_header)
             global_table, per_sample = build_diversity_tables_from_otu_table(
                 otu_table, min_values, tree_path
