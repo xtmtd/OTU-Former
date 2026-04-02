@@ -95,7 +95,7 @@ All parameters migrated from `ref/ibot20260115.py` `get_parser()`, mode=pretrain
 - `--batch-size` [default: 32], `--num-workers` [default: 4], `--cpus` [default: 12]
 - `--device` [default: mps, choices: cpu/cuda/mps], `--seed` [default: 42]
 
-**Outputs:** `best.pt`, `last.pt`, `metrics.pretrain.csv`, `instant_metrics.csv`, training curves PDF, log file.
+**Outputs:** `SSL_latest.pth` (and epoch checkpoints `SSL_epoch_*.pth`), `metrics.pretrain.csv`, `instant_metrics.csv`, training curves PDF, log file.
 
 ---
 
@@ -116,7 +116,7 @@ All parameters migrated from `ref/ibot20260115.py` `get_parser()`, mode=finetune
 - `--batch-size`, `--num-workers`, `--cpus`, `--device`, `--seed`
 - `--log-every-n-steps`, `--save-every-epochs`, `--keep-last-checkpoints`
 
-**Outputs:** `best.pt`, `last.pt`, `metrics.finetune.csv`, `instant_metrics.csv`, training curves PDF, log file.
+**Outputs:** `finetune_latest.pth` (and epoch checkpoints `finetune_epoch_*.pth`), `metrics.finetune.csv`, `instant_metrics.csv`, training curves PDF, log file.
 
 ---
 

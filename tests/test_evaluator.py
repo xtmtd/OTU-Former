@@ -44,7 +44,7 @@ def test_map_range():
 def test_clustering_metrics_keys():
     embs, labels = make_data()
     result = compute_clustering_metrics(embs, labels)
-    for key in ["NMI", "ARI", "AMI", "Silhouette", "Purity"]:
+    for key in ["NMI", "ARI", "AMI", "Silhouette_Score", "Purity"]:
         assert key in result
 
 

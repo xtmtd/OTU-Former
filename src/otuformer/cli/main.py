@@ -34,8 +34,8 @@ app = typer.Typer(
         "OTU-Former: image-based morphological OTU delineation toolkit.\n\n"
         "Quick start:\n\n"
         "  otuformer pretrain --train-data images.csv --input-images-dir ./images\n\n"
-        "  otuformer finetune --checkpoint runs/pretrain/best.pt --train-data labels.csv\n\n"
-        "  otuformer extract --checkpoint runs/finetune/best.pt --input-images-dir ./images\n\n"
+        "  otuformer finetune --checkpoint runs/pretrain/SSL_latest.pth --train-data labels.csv\n\n"
+        "  otuformer extract --checkpoint runs/finetune/finetune_latest.pth --input-images-dir ./images\n\n"
         "  otuformer cluster --embeddings embeddings.csv\n\n"
         "  otuformer doctor\n"
     ),

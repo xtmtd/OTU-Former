@@ -114,20 +114,13 @@ def test_pretrain_encoder_exposes_projector_output_and_patch_tokens():
     assert patch_tokens.ndim == 3
 
 
-def test_pretrain_periodic_evaluation_uses_projector_output(monkeypatch):
-    """Embedding extraction for eval must use the normalized projector output (cls_emb),
-    not raw CLS tokens or patch-token aggregates."""
+def test_pretrain_periodic_evaluation_uses_cls_token_features():
+    """Embedding extraction for eval uses CLS token features from backbone tokens."""
     import inspect
 
     src = inspect.getsource(trainer._compute_embeddings_from_csv)
-    # Should extract out[0] when output is a tuple (projector output)
-    # and not bypass projector by calling backbone.forward_features directly
-    assert "out[0]" in src or "emb = out[0]" in src, (
-        "eval extraction must take first element of tuple output (projector cls_emb)"
-    )
-    assert "forward_features" not in src, (
-        "eval extraction must not bypass the projector by calling backbone.forward_features"
-    )
+    assert "tokens = _extract_tokens(model, batch)" in src
+    assert "emb = tokens[:, 0]" in src
 
 
 def test_teacher_momentum_updates_after_optimizer_step():

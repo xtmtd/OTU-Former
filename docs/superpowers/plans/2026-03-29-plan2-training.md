@@ -758,7 +758,7 @@ Key steps inside (matching original):
 5. Set up AdamW optimizer on student
 6. Training loop: forward both global views through student and teacher, compute 3 losses, backward, clip grad, EMA update teacher, center update (0.9 EMA), log metrics
 7. Every `eval_every` epochs: compute comprehensive metrics (NMI, ARI, Recall@K, kNN), save checkpoint
-8. Save `best.pt` (best NMI on eval set if available, else last), `last.pt`
+8. Save `SSL_latest.pth` (plus rolling `SSL_epoch_*.pth` checkpoints)
 
 - [ ] **Step 4: Implement `run_finetune()`**
 
@@ -776,7 +776,7 @@ Key steps:
 4. Instantiate loss from `LOSS_REGISTRY[args.loss]`
 5. Training loop: forward, loss, backward, log
 6. Evaluate every N epochs: kNN, NMI, ARI, Intra/Inter-class distances
-7. Save `best.pt`, `last.pt`
+7. Save `finetune_latest.pth` (plus rolling `finetune_epoch_*.pth` checkpoints)
 
 - [ ] **Step 5: Commit**
 
@@ -825,7 +825,7 @@ def test_pretrain_runs_one_epoch(tmp_path):
         "--device", "cpu",
     ])
     assert result.exit_code == 0
-    assert (tmp_path / "out" / "last.pt").exists()
+    assert (tmp_path / "out" / "SSL_latest.pth").exists()
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -924,7 +924,7 @@ def test_finetune_runs_one_epoch(tmp_path):
         "--batch-size", "2",
         "--device", "cpu",
     ])
-    ckpt = tmp_path / "pretrain_out" / "last.pt"
+    ckpt = tmp_path / "pretrain_out" / "SSL_latest.pth"
     labels_csv = _make_tiny_finetune_data(tmp_path)
     result = runner.invoke(app, [
         "finetune",
@@ -938,7 +938,7 @@ def test_finetune_runs_one_epoch(tmp_path):
         "--device", "cpu",
     ])
     assert result.exit_code == 0
-    assert (tmp_path / "finetune_out" / "last.pt").exists()
+    assert (tmp_path / "finetune_out" / "finetune_latest.pth").exists()
 ```
 
 - [ ] **Step 5: Run smoke tests**

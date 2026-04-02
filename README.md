@@ -2,7 +2,7 @@
 
 [中文文档](README.cn.md) | **English**
 
-An image-based morphological OTU (Operational Taxonomic Unit) delineation toolkit. Provides a unified `otuformer` CLI with commands for self-supervised pretraining, ArcFace metric learning finetuning, embedding extraction, model evaluation, UPGMA hierarchical clustering, expert-corrected annotation, community diversity analysis, CAM visualization, and ONNX model export.
+An image-based morphological OTU (Operational Taxonomic Unit) delineation toolkit. Provides a unified `otuformer` CLI with commands for self-supervised pretraining, ArcFace metric learning finetuning, embedding extraction (including quality metrics/UMAP when labels are provided), UPGMA hierarchical clustering, expert-corrected annotation, community diversity analysis, CAM visualization, and ONNX model export.
 
 ## Overview
 
@@ -18,7 +18,6 @@ otuformer <command> [options]
 | `pretrain` | Self-supervised contrastive pretraining (DINO/iBOT style) |
 | `finetune` | ArcFace metric learning finetuning |
 | `extract` | Extract image embeddings (ONNX-accelerated) |
-| `evaluate` | Evaluate embedding quality (NMI, ARI, Recall@K, etc.) |
 | `cluster` | UPGMA hierarchical clustering into morphological OTUs |
 | `annotate` | Apply expert corrections to produce refined OTU annotations |
 | `diversity` | Compute community alpha diversity indices (Shannon, Simpson, Chao1, Faith's PD, etc.) |
@@ -97,10 +96,9 @@ Recommended workflow command order:
 2. `pretrain` — Self-supervised pretraining
 3. `finetune` — ArcFace finetuning
 4. `extract` — Extract embeddings
-5. `evaluate` — Evaluate embedding quality
-6. `cluster` — UPGMA clustering into OTUs
-7. `annotate` — Apply expert corrections
-8. `diversity` — Diversity analysis
+5. `cluster` — UPGMA clustering into OTUs
+6. `annotate` — Apply expert corrections
+7. `diversity` — Diversity analysis
 
 ### Doctor Command
 
@@ -321,50 +319,6 @@ otuformer extract \
 - `embeddings.csv` — Embedding vectors (`id`, `dim_0`, `dim_1`, ...)
 - `metrics.csv` — Quality metrics (when `--label-csv` is provided)
 - `umap.pdf` — UMAP visualization (when `--label-csv` is provided and not disabled)
-
----
-
-### Evaluate Command
-
-Evaluate embedding quality metrics.
-
-```bash
-otuformer evaluate \
-    --embeddings runs/extract/embeddings.csv \
-    --labels labels.csv \
-    --out-dir runs/evaluate
-
-# Custom k values and UMAP parameters
-otuformer evaluate \
-    --embeddings runs/extract/embeddings.csv \
-    --labels labels.csv \
-    --knn-k 1,3,5,10 \
-    --umap-metric euclidean \
-    --out-dir runs/evaluate
-```
-
-| Parameter | Description | Default |
-|-----------|-------------|---------|
-| `--embeddings` | Embeddings CSV | Required |
-| `--labels` | Labels CSV (with `id` and `label` columns) | Required |
-| `--out-dir` | Output directory | `runs/evaluate` |
-| `--umap-dims` | UMAP output dimensions | 2 |
-| `--umap-n-neighbors` | UMAP n_neighbors | 15 |
-| `--umap-min-dist` | UMAP min_dist | 0.1 |
-| `--umap-metric` | UMAP distance metric | `cosine` |
-| `--visualize-class-number` | Max classes in UMAP plot | 20 |
-| `--knn-k` | k values for kNN/Recall@K (comma-separated) | `1,5,10` |
-| `--metrics-sample-size` | Max samples for metrics | 10000 |
-
-**Output metrics** (saved to `metrics.json` / `metrics.csv`):
-- kNN Accuracy (k=1/5/10, etc.)
-- Recall@K (K=1/5/10, etc.)
-- mAP (Mean Average Precision)
-- Linear Probing Accuracy
-- NMI, ARI, AMI (clustering agreement metrics)
-- Silhouette Score
-- Metric learning diagnostics
-- `umap.pdf` — UMAP visualization
 
 ---
 
@@ -666,7 +620,6 @@ otuformer -v
 │   │   ├── pretrain.py       # otuformer pretrain
 │   │   ├── finetune.py       # otuformer finetune
 │   │   ├── extract.py        # otuformer extract
-│   │   ├── evaluate.py       # otuformer evaluate
 │   │   ├── cluster.py        # otuformer cluster
 │   │   ├── annotate.py       # otuformer annotate
 │   │   ├── diversity.py      # otuformer diversity

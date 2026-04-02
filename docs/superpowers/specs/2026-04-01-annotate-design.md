@@ -123,6 +123,7 @@ Approach:
 
 - Reuse existing UPGMA partition plotting logic/style.
 - Add a new left-side annotation panel for corrected cluster labels aligned one-to-one with leaf images/IDs.
+- Keep corrected-cluster color bars anchored to the left edge of the corrected panel (panel-local x=0), not next to tip labels.
 - Add thin colored separators between adjacent corrected clusters; neighboring clusters must have different colors.
 - Preserve the existing partitioning schemes visual bands and overall readability.
 

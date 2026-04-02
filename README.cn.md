@@ -2,7 +2,7 @@
 
 **中文** | [English](README.md)
 
-一个基于图像形态学的 OTU（操作分类单元）划分工具包。提供统一的 `otuformer` 命令行工具，支持自监督预训练、ArcFace 度量学习微调、嵌入向量提取、模型评估、UPGMA 层次聚类、专家校正标注、群落多样性分析、CAM 可视化以及 ONNX 模型导出等功能。
+一个基于图像形态学的 OTU（操作分类单元）划分工具包。提供统一的 `otuformer` 命令行工具，支持自监督预训练、ArcFace 度量学习微调、嵌入向量提取（提供标签时可直接输出质量指标/UMAP）、UPGMA 层次聚类、专家校正标注、群落多样性分析、CAM 可视化以及 ONNX 模型导出等功能。
 
 ## 概述
 
@@ -18,7 +18,6 @@ otuformer <command> [options]
 | `pretrain` | 自监督对比学习预训练（DINO/iBOT 风格） |
 | `finetune` | ArcFace 度量学习微调 |
 | `extract` | 提取图像嵌入向量（支持 ONNX 加速） |
-| `evaluate` | 评估嵌入质量（NMI、ARI、Recall@K 等） |
 | `cluster` | UPGMA 层次聚类划分形态学 OTU |
 | `annotate` | 应用专家校正，生成 refined OTU 标注 |
 | `diversity` | 计算群落 alpha 多样性指标（Shannon、Simpson、Chao1、Faith's PD 等） |
@@ -97,10 +96,9 @@ pip install -e .
 2. `pretrain` — 自监督预训练
 3. `finetune` — ArcFace 微调
 4. `extract` — 提取嵌入向量
-5. `evaluate` — 评估嵌入质量
-6. `cluster` — UPGMA 聚类为 OTU
-7. `annotate` — 应用专家校正
-8. `diversity` — 多样性分析
+5. `cluster` — UPGMA 聚类为 OTU
+6. `annotate` — 应用专家校正
+7. `diversity` — 多样性分析
 
 ### doctor 命令
 
@@ -321,50 +319,6 @@ otuformer extract \
 - `embeddings.csv` — 嵌入向量（`id`, `dim_0`, `dim_1`, ...）
 - `metrics.csv` — 质量指标（提供 `--label-csv` 时）
 - `umap.pdf` — UMAP 可视化（提供 `--label-csv` 且未禁用时）
-
----
-
-### evaluate 命令
-
-评估嵌入向量的质量指标。
-
-```bash
-otuformer evaluate \
-    --embeddings runs/extract/embeddings.csv \
-    --labels labels.csv \
-    --out-dir runs/evaluate
-
-# 自定义 k 值与 UMAP 参数
-otuformer evaluate \
-    --embeddings runs/extract/embeddings.csv \
-    --labels labels.csv \
-    --knn-k 1,3,5,10 \
-    --umap-metric euclidean \
-    --out-dir runs/evaluate
-```
-
-| 参数 | 描述 | 默认值 |
-|-----------|-------------|---------|
-| `--embeddings` | 嵌入向量 CSV | 必填 |
-| `--labels` | 标签 CSV（含 `id` 和 `label` 列） | 必填 |
-| `--out-dir` | 输出目录 | `runs/evaluate` |
-| `--umap-dims` | UMAP 输出维度 | 2 |
-| `--umap-n-neighbors` | UMAP 邻居数 | 15 |
-| `--umap-min-dist` | UMAP 最小距离 | 0.1 |
-| `--umap-metric` | UMAP 距离度量 | `cosine` |
-| `--visualize-class-number` | UMAP 最大显示类别数 | 20 |
-| `--knn-k` | kNN/Recall@K 的 k 值（逗号分隔） | `1,5,10` |
-| `--metrics-sample-size` | 指标最大样本数 | 10000 |
-
-**输出指标**（保存到 `metrics.json` / `metrics.csv`）：
-- kNN 准确率（k=1/5/10 等）
-- Recall@K（K=1/5/10 等）
-- mAP（平均精度均值）
-- 线性探测准确率
-- NMI、ARI、AMI（聚类一致性指标）
-- 轮廓系数
-- 度量学习诊断指标
-- `umap.pdf` — UMAP 可视化
 
 ---
 
@@ -666,7 +620,6 @@ otuformer -v
 │   │   ├── pretrain.py       # otuformer pretrain
 │   │   ├── finetune.py       # otuformer finetune
 │   │   ├── extract.py        # otuformer extract
-│   │   ├── evaluate.py       # otuformer evaluate
 │   │   ├── cluster.py        # otuformer cluster
 │   │   ├── annotate.py       # otuformer annotate
 │   │   ├── diversity.py      # otuformer diversity

@@ -1,4 +1,5 @@
 import sys
+import re
 from pathlib import Path
 
 import pandas as pd
@@ -18,7 +19,8 @@ def test_tee_logger_writes_to_file(tmp_path):
     print("hello world")
     sys.stdout = original_stdout
     logger.close()
-    assert log_file.read_text() == "hello world\n"
+    content = log_file.read_text()
+    assert re.match(r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] hello world\n$", content)
 
 
 def test_tee_logger_skips_progress_bars(tmp_path):

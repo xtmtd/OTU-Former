@@ -1098,6 +1098,10 @@ def cluster(
             prefix=prefix,
             id_to_sample=id_to_sample,
         )
+        for legacy_file in tables_dir.glob("partition_*_assignments.csv"):
+            shutil.copy2(legacy_file, out_dir / legacy_file.name)
+        for legacy_file in tables_dir.glob("partition_*_summary.csv"):
+            shutil.copy2(legacy_file, out_dir / legacy_file.name)
         support = {}
         if num_replicates > 0:
             if support_mode == "subsample" and subsample_ratio >= 1.0:

@@ -50,7 +50,7 @@ def test_corrected_cluster_panel_respects_custom_bar_width():
     assert widths == [0.12, 0.12]
 
 
-def test_corrected_cluster_panel_places_bars_close_to_tips():
+def test_corrected_cluster_panel_anchors_bars_at_left_edge():
     fig, ax = plt.subplots(figsize=(4, 6))
     ordered_ids = ["a", "b"]
     tip_y_positions = {"a": 5, "b": 15}
@@ -59,6 +59,6 @@ def test_corrected_cluster_panel_places_bars_close_to_tips():
     _plot_corrected_cluster_panel(ax, ordered_ids, tip_y_positions, corrected_labels)
 
     xs = [p.get_x() for p in ax.patches]
-    assert all(x >= 0.75 for x in xs)
+    assert all(x == 0.0 for x in xs)
 
     plt.close(fig)

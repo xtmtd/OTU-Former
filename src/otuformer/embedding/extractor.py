@@ -351,10 +351,13 @@ def _apply_patch_topk_pca(embeddings: np.ndarray, topk_patches: int) -> np.ndarr
     from sklearn.preprocessing import StandardScaler
 
     n_samples, dim = embeddings.shape
+    preferred_dim = {10: 256, 20: 512, 30: 1024}.get(topk_patches, 512)
     if n_samples < 3:
+        target_dim = min(preferred_dim, dim)
+        if 0 < target_dim < dim:
+            return embeddings[:, :target_dim]
         return embeddings
 
-    preferred_dim = {10: 256, 20: 512, 30: 1024}.get(topk_patches, 512)
     max_possible_dim = min(n_samples - 1, dim)
     target_dim = min(preferred_dim, max_possible_dim)
     if target_dim <= 0 or target_dim >= dim:

@@ -163,14 +163,14 @@ Planned alignment points:
 - Global distillation must follow `ref/ibot20260115.py:1751-1760`: if `disable_cross_view_loss` is false, average SSL loss over the full Cartesian product of `student_global x teacher_global`; otherwise average only matching global-view pairs in zip order.
 - Local-to-global distillation must follow `ref/ibot20260115.py:1767-1773`: for every local student crop, compute one student projector output and average SSL loss over the Cartesian product of `local_student x teacher_global`.
 - Masked-token regression must follow `ref/ibot20260115.py:1441-1471` and `1762-1765`: for each `(student_tokens, teacher_tokens)` pair from the two global views, sample masked positions independently by sorting per-sample random values and selecting the first `max(1, int(mask_ratio * N))` token indices; gather those positions from both tensors; if `"eva" in model_name.lower()` use `F.mse_loss(student_masked, teacher_masked)`, otherwise L2-normalize both and use `mean(2 - 2 * dot(student_masked, teacher_masked))`.
-- Periodic evaluation during pretraining must use the same representation choice as the reference pretrain path: the normalized projector output returned by the SSL model for each image, not raw CLS features, patch-token aggregates, or any finetune-specific head output.
+- Periodic evaluation during pretraining must use raw CLS token features from backbone tokens (the current training/eval contract), not projector outputs or patch-token aggregates.
 
 The design intent is to preserve the current module boundary while making the numerical path behave like the reference.
 
 Decision on file changes:
 
 - `trainer.py` is expected to carry almost all behavioral changes.
-- `trainer.py` must be able to obtain from the encoder a stable two-value return contract for pretraining: `(normalized_projector_output, patch_tokens)`, where `normalized_projector_output` is the SSL projector output used for distillation and periodic evaluation, and `patch_tokens` are the patch embeddings used by masked-token regression. If the current encoder already guarantees that contract, keep the change in `trainer.py`; if not, tighten `model.py` so that this contract is explicit and shared by all pretrain call sites.
+- `trainer.py` must be able to obtain from the encoder a stable two-value return contract for pretraining: `(normalized_projector_output, patch_tokens)` for distillation, while periodic evaluation continues to consume CLS token features (`tokens[:, 0]`) from `_extract_tokens(...)`. If the current encoder already guarantees the pretrain tuple contract, keep the change in `trainer.py`; if not, tighten `model.py` so that this contract is explicit and shared by all pretrain call sites.
 - `cli/pretrain.py` should only change if an already-supported reference behavior cannot be expressed with current CLI arguments. No new user-facing options are planned in this pass.
 
 ### B. Evaluation-path alignment in `evaluator.py`
@@ -265,7 +265,7 @@ Comparison procedure:
    - momentum schedule is applied after `optimizer.step()`
    - center update occurs after teacher global outputs are concatenated for the current iteration
    - global/local loss averaging follows the Cartesian-product rules above
-   - periodic evaluation extracts projector outputs, not raw CLS tokens
+   - periodic evaluation extracts raw CLS tokens (`tokens[:, 0]`), not projector outputs
 7. Separate training-path alignment from evaluator-only changes during verification:
    - first inspect code changes to confirm whether metric computation formulas changed
    - if metric formulas changed, record that explicitly in the verification summary

@@ -3,6 +3,7 @@ import pandas as pd
 from PIL import Image
 import torch
 import os
+import logging
 from typer.testing import CliRunner
 
 from otuformer.cli.main import app
@@ -274,7 +275,7 @@ def test_finetune_runs_one_epoch(tmp_path):
         ],
     )
     assert result.exit_code == 0
-    assert (tmp_path / "finetune_out" / "last.pt").exists()
+    assert (tmp_path / "finetune_out" / "finetune_latest.pth").exists()
 
 
 def _make_ckpt(tmp_path, out_dim=64):
@@ -908,6 +909,50 @@ def test_cam_command(tmp_path):
     assert result.exit_code == 0
     assert (tmp_path / "cam_out" / "cam_summary.csv").exists()
     assert (tmp_path / "cam_out" / "logs" / "cam.log").exists()
+
+
+def test_cam_command_does_not_leave_closed_logging_stream(monkeypatch, tmp_path):
+    from otuformer.utils.logging import TeeLogger
+
+    def fake_run_cam(**kwargs):
+        out_dir = kwargs["out_dir"]
+        out_dir.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame([{"image": "x", "status": "ok"}]).to_csv(
+            out_dir / "cam_summary.csv", index=False
+        )
+
+    monkeypatch.setattr("otuformer.vision.cam.run_cam", fake_run_cam)
+
+    ckpt = _make_ckpt(tmp_path)
+    img_dir = tmp_path / "images"
+    img_dir.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", (224, 224)).save(img_dir / "test.jpg")
+
+    result = runner.invoke(
+        app,
+        [
+            "cam",
+            "--checkpoint",
+            str(ckpt),
+            "--images-dir",
+            str(img_dir),
+            "--out-dir",
+            str(tmp_path / "cam_out_cleanup"),
+            "--cam-method",
+            "eigencam",
+            "--max-images",
+            "1",
+            "--cam-batch-size",
+            "1",
+            "--device",
+            "cpu",
+        ],
+    )
+    assert result.exit_code == 0
+
+    for handler in logging.getLogger().handlers:
+        stream = getattr(handler, "stream", None)
+        assert not isinstance(stream, TeeLogger)
 
 
 def test_pretrain_default_model_name_and_device_auto(tmp_path, monkeypatch):

@@ -284,6 +284,7 @@ Requirements:
 
 - keep partition bands style aligned with cluster output
 - add left corrected-cluster annotation column aligned by leaf order
+- keep corrected-cluster bars left-anchored within the corrected panel (x=0 baseline)
 - add thin color separators between adjacent corrected clusters, with different neighbor colors
 - output filename exactly `UPGMA_tree_partitions_annotated.pdf`
 

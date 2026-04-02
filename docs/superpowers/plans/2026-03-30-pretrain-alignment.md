@@ -350,25 +350,25 @@ git commit -m "refactor: clarify pretrain encoder contract"
 - Modify: `src/otuformer/training/trainer.py`
 - Test: `tests/training/test_pretrain_alignment.py`
 
-- [ ] **Step 1: Write a failing test for evaluation representation selection**
+- [ ] **Step 1: Write a failing test for evaluation CLS-token selection**
 
 ```python
-def test_pretrain_periodic_evaluation_uses_projector_output(monkeypatch):
+def test_pretrain_periodic_evaluation_uses_cls_token_features(monkeypatch):
     captured = {}
     def fake_extract(*args, **kwargs):
         captured["source"] = kwargs.get("source")
         return np.zeros((2, 4))
     monkeypatch.setattr(trainer, "_extract_eval_embeddings", fake_extract)
     _ = _compute_and_log_all_metrics(...)
-    assert captured["source"] == "projector_output"
+    assert captured["source"] == "cls_token"
 ```
 
 - [ ] **Step 2: Run the targeted test to confirm failure**
 
-Run: `pytest tests/training/test_pretrain_alignment.py -k "evaluation_uses_projector_output" -v`
+Run: `pytest tests/training/test_pretrain_alignment.py -k "evaluation_uses_cls_token_features" -v`
 Expected: FAIL.
 
-- [ ] **Step 3: Update `trainer.py` to use projector outputs for periodic SSL evaluation**
+- [ ] **Step 3: Update `trainer.py` to keep CLS-token periodic SSL evaluation**
 
 Implementation notes:
 
@@ -377,14 +377,14 @@ Implementation notes:
 
 - [ ] **Step 4: Run the targeted test again**
 
-Run: `pytest tests/training/test_pretrain_alignment.py -k "evaluation_uses_projector_output" -v`
+Run: `pytest tests/training/test_pretrain_alignment.py -k "evaluation_uses_cls_token_features" -v`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add src/otuformer/training/trainer.py tests/training/test_pretrain_alignment.py
-git commit -m "fix: use projector outputs for pretrain evaluation"
+git commit -m "test: lock pretrain periodic evaluation to cls-token features"
 ```
 
 ## Task 9: Verify Evaluator Metric Mapping Against The Reference Semantics

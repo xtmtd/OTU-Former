@@ -187,6 +187,13 @@ def cam(
         traceback.print_exc(file=tee)
         raise
     finally:
+        root_logger = logging.getLogger()
+        for handler in list(root_logger.handlers):
+            root_logger.removeHandler(handler)
+            try:
+                handler.close()
+            except Exception:
+                pass
         sys.stdout = tee.terminal
         sys.stderr = original_stderr
         tee.close()
