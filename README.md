@@ -423,6 +423,7 @@ otuformer annotate \
 | `--figure-width` | Annotated UPGMA PDF width in inches | Auto |
 | `--annotate-bar-width` | Relative width of corrected OTU color bars | 0.08 |
 | `--show-annotation-bar` | Show corrected OTU annotation bars in annotated UPGMA PDF | No |
+| `--show-partitioning-bars` | Show partitioning bars in annotated UPGMA PDF | No |
 | `--out-dir` | Output directory | `runs/annotate` |
 
 **Output**:

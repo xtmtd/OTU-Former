@@ -423,6 +423,7 @@ otuformer annotate \
 | `--figure-width` | 标注 UPGMA PDF 宽度（英寸） | 自动 |
 | `--annotate-bar-width` | 校正 OTU 颜色条相对宽度 | 0.08 |
 | `--show-annotation-bar` | 在标注 UPGMA PDF 中显示校正 OTU 条 | 否 |
+| `--show-partitioning-bars` | 在标注 UPGMA PDF 中显示分区条带 | 否 |
 | `--out-dir` | 输出目录 | `runs/annotate` |
 
 **输出**：
