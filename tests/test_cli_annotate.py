@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pandas as pd
+import otuformer.delineation.annotate as annotate_mod
 from typer.testing import CliRunner
 
 from otuformer.cli.main import app
@@ -180,3 +181,50 @@ def test_annotate_without_embeddings_skips_intra_summary(tmp_path):
     assert result.exit_code == 0
     assert not (out_dir / "pairwise_distance_summary_intra-class.csv").exists()
     assert not (out_dir / "UPGMA_tree_partitions_annotated.pdf").exists()
+
+
+def test_annotate_partitioning_bar_flag_defaults_off_and_can_enable(
+    tmp_path, monkeypatch
+):
+    raw, corr, out_dir, emb_path = _write_cluster_like_layout(tmp_path)
+    calls: list[bool] = []
+
+    def _fake_render(*, out_path, show_partitioning_bars, **kwargs):
+        calls.append(bool(show_partitioning_bars))
+        out_path.write_bytes(b"%PDF-1.4\n")
+
+    monkeypatch.setattr(annotate_mod, "render_annotated_partitions_pdf", _fake_render)
+
+    default_run = runner.invoke(
+        app,
+        [
+            "annotate",
+            "--raw-assignments",
+            str(raw),
+            "--corrections",
+            str(corr),
+            "--embeddings",
+            str(emb_path),
+            "--out-dir",
+            str(out_dir / "default"),
+        ],
+    )
+    assert default_run.exit_code == 0
+
+    enabled_run = runner.invoke(
+        app,
+        [
+            "annotate",
+            "--raw-assignments",
+            str(raw),
+            "--corrections",
+            str(corr),
+            "--embeddings",
+            str(emb_path),
+            "--show-partitioning-bars",
+            "--out-dir",
+            str(out_dir / "enabled"),
+        ],
+    )
+    assert enabled_run.exit_code == 0
+    assert calls == [False, True]

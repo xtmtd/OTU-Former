@@ -387,6 +387,7 @@ def render_annotated_partitions_pdf(
     support_dict: dict[frozenset, float] | None,
     bootstrap_cutoff: float,
     corrected_bar_width: float,
+    show_partitioning_bars: bool,
     figure_width: float | None,
     out_path: Path,
 ) -> None:
@@ -401,6 +402,7 @@ def render_annotated_partitions_pdf(
         bootstrap_cutoff=bootstrap_cutoff,
         corrected_labels=corrected_labels,
         corrected_bar_width=corrected_bar_width,
+        show_partitioning_bars=show_partitioning_bars,
         figure_width=figure_width,
     )
 

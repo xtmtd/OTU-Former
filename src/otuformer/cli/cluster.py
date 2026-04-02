@@ -426,10 +426,12 @@ def _plot_upgma_partition_tree_panel(
     bootstrap_cutoff=50.0,
     corrected_labels=None,
     corrected_bar_width=0.08,
+    show_partitioning_bars=True,
     figure_width: float | None = None,
 ):
     import matplotlib.pyplot as plt
     from matplotlib import gridspec
+    from matplotlib import transforms
     from scipy.cluster import hierarchy
     import numpy as np
 
@@ -440,9 +442,9 @@ def _plot_upgma_partition_tree_panel(
         default=6,
     )
 
-    n_parts = len(partitions) if partitions else 1
-    base_partition_width = max(1.2, n_parts * 0.75 * 0.35)
-    partition_width = base_partition_width * 0.8
+    show_parts = bool(show_partitioning_bars and partitions)
+    n_parts = len(partitions) if show_parts else 0
+    partition_width = max(0.96, n_parts * 0.21) if show_parts else 0.0
 
     tip_text_x = 1.0
     tip_fontsize = 9
@@ -481,18 +483,30 @@ def _plot_upgma_partition_tree_panel(
         label_x = min(0.98, bar_x + bar_w + 0.03)
         corr_width_in = max(0.55, (corr_w_in + 0.08) / max(0.2, (1.0 - label_x)))
 
-        width_ratios = [names_width_in, corr_width_in, partition_width, 2.8]
+        if show_parts:
+            width_ratios = [names_width_in, corr_width_in, partition_width, 2.8]
+        else:
+            width_ratios = [names_width_in, corr_width_in, 2.8]
         avg_axis = sum(width_ratios) / len(width_ratios)
         wspace = max(0.0, min(0.1, gap_in / max(avg_axis, 1e-6)))
         fig_width = max(base_fig_width, sum(width_ratios))
         fig = plt.figure(figsize=(fig_width, fig_height))
-        gs = gridspec.GridSpec(1, 4, width_ratios=width_ratios, wspace=wspace)
-        ax_tree = fig.add_subplot(gs[0, 3])
+        gs = gridspec.GridSpec(
+            1, len(width_ratios), width_ratios=width_ratios, wspace=wspace
+        )
+        ax_tree = fig.add_subplot(gs[0, len(width_ratios) - 1])
     else:
         fig = plt.figure(figsize=(base_fig_width, fig_height))
-        width_ratios = [1.4, partition_width, 2.8]
-        gs = gridspec.GridSpec(1, 3, width_ratios=width_ratios, wspace=0.05)
-        ax_tree = fig.add_subplot(gs[0, 2])
+        if show_parts:
+            width_ratios = [1.4, partition_width, 2.8]
+            wspace = 0.05
+        else:
+            width_ratios = [1.4, 2.8]
+            wspace = 0.02
+        gs = gridspec.GridSpec(
+            1, len(width_ratios), width_ratios=width_ratios, wspace=wspace
+        )
+        ax_tree = fig.add_subplot(gs[0, len(width_ratios) - 1])
 
     dendro = hierarchy.dendrogram(
         z,
@@ -514,15 +528,33 @@ def _plot_upgma_partition_tree_panel(
     y_lookup = {leaf_order[i]: y_positions[i] for i in range(len(leaf_order))}
     tip_y_positions = {ids[idx]: y_lookup[idx] for idx in leaf_order}
 
+    def _plot_tip_names_only(ax_names_local) -> None:
+        ax_names_local.axis("off")
+        ax_names_local.set_xlim(0, 1)
+        tip_transform = transforms.blended_transform_factory(
+            ax_names_local.transAxes, ax_names_local.transData
+        )
+        for tip in ordered_ids:
+            ax_names_local.text(
+                tip_text_x,
+                tip_y_positions[tip],
+                tip,
+                ha="right",
+                va="center",
+                fontsize=tip_fontsize,
+                transform=tip_transform,
+            )
+
     if corrected_labels:
         ax_names = fig.add_subplot(gs[0, 0], sharey=ax_tree)
         ax_corr = fig.add_subplot(gs[0, 1], sharey=ax_tree)
-        ax_parts = fig.add_subplot(gs[0, 2], sharey=ax_tree)
+        ax_parts = fig.add_subplot(gs[0, 2], sharey=ax_tree) if show_parts else None
     else:
         ax_names = fig.add_subplot(gs[0, 0], sharey=ax_tree)
         ax_corr = None
-        ax_parts = fig.add_subplot(gs[0, 1], sharey=ax_tree)
-    if partitions:
+        ax_parts = fig.add_subplot(gs[0, 1], sharey=ax_tree) if show_parts else None
+
+    if show_parts and ax_parts is not None and partitions:
         _plot_partition_panel(
             ax_names,
             ax_parts,
@@ -533,9 +565,11 @@ def _plot_upgma_partition_tree_panel(
             tip_text_x=tip_text_x,
             tip_text_ha="right",
         )
-    else:
+    elif show_parts and ax_parts is not None:
         ax_names.axis("off")
         ax_parts.axis("off")
+    else:
+        _plot_tip_names_only(ax_names)
 
     if corrected_labels and ax_corr is not None:
         _plot_corrected_cluster_panel(
@@ -548,7 +582,9 @@ def _plot_upgma_partition_tree_panel(
 
     ymin = y_positions[-1] + y_step
     ymax = y_positions[0] - y_step
-    axes = [ax_names, ax_parts, ax_tree]
+    axes = [ax_names, ax_tree]
+    if ax_parts is not None:
+        axes.insert(1, ax_parts)
     if ax_corr is not None:
         axes.insert(1, ax_corr)
     for ax in axes:

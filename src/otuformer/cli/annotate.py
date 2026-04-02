@@ -90,6 +90,11 @@ def annotate(
         "--show-annotation-bar",
         help="Show corrected OTU annotation bars in annotated UPGMA PDF.",
     ),
+    show_partitioning_bars: bool = typer.Option(
+        False,
+        "--show-partitioning-bars",
+        help="Show partitioning bars in annotated UPGMA PDF.",
+    ),
     out_dir: Path = typer.Option(
         Path("runs/annotate"), "--out-dir", help="Output directory."
     ),
@@ -131,6 +136,7 @@ def annotate(
             "figure_width": figure_width,
             "annotate_bar_width": annotate_bar_width,
             "show_annotation_bar": show_annotation_bar,
+            "show_partitioning_bars": show_partitioning_bars,
             "out_dir": str(out_dir),
         }
         print(f"Command: {_format_user_command(ctx, params)}")
@@ -236,6 +242,7 @@ def annotate(
                 support_dict=support_dict,
                 bootstrap_cutoff=support_display_cutoff,
                 corrected_bar_width=annotate_bar_width,
+                show_partitioning_bars=show_partitioning_bars,
                 figure_width=figure_width,
                 out_path=out_pdf,
             )
