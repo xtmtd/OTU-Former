@@ -674,3 +674,5 @@ otuformer -v
   url = {https://github.com/xtmtd/OTU-Former}
 }
 ```
+
+预印本可查看：https://doi.org/10.64898/2026.04.28.721370

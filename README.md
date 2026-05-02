@@ -674,3 +674,5 @@ If you use OTU-Former in your research, please cite:
   url = {https://github.com/xtmtd/OTU-Former}
 }
 ```
+
+A preprint is available at: https://doi.org/10.64898/2026.04.28.721370
