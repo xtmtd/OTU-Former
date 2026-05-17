@@ -111,6 +111,34 @@ def diversity(
         "--tree",
         help="Legacy: Newick tree path for Faith's PD (used when --embeddings is absent).",
     ),
+    save_nj_tree: bool = typer.Option(
+        False,
+        "--save-nj-tree",
+        help="Save the OTU-centroid NJ Newick to <out-dir>/NJ_OTU.nwk.",
+    ),
+    nj_bootstrap: int = typer.Option(
+        0,
+        "--nj-bootstrap",
+        help=(
+            "Number of bootstrap replicates for the NJ tree (0 = disabled). "
+            "Writes annotated consensus Newick to <out-dir>/NJ_OTU_bootstrap.nwk."
+        ),
+    ),
+    nj_bootstrap_mode: str = typer.Option(
+        "subsample",
+        "--nj-bootstrap-mode",
+        help="Bootstrap mode: 'subsample' (default) or 'bootstrap'.",
+    ),
+    nj_subsample_ratio: float = typer.Option(
+        0.8,
+        "--nj-subsample-ratio",
+        help="Fraction of embedding dims per bootstrap replicate (subsample mode).",
+    ),
+    cpus: int = typer.Option(
+        1,
+        "--cpus",
+        help="Parallel workers for NJ bootstrap.",
+    ),
 ) -> None:
     if ctx.invoked_subcommand is not None:
         return
@@ -145,6 +173,11 @@ def diversity(
             "phylo": phylo,
             "embeddings": str(embeddings) if embeddings is not None else "",
             "tree": str(tree) if tree is not None else "",
+            "save_nj_tree": save_nj_tree,
+            "nj_bootstrap": nj_bootstrap,
+            "nj_bootstrap_mode": nj_bootstrap_mode,
+            "nj_subsample_ratio": nj_subsample_ratio,
+            "cpus": cpus,
         }
         print(f"Command: {_format_user_command(ctx, params)}")
         print("Parameters:")
@@ -169,6 +202,10 @@ def diversity(
         if tree is not None and not phylo:
             typer.echo("Warning: --tree provided without --phylo; tree ignored.")
 
+        # NJ tree / bootstrap output paths (global only)
+        nj_tree_out = (out_dir / "NJ_OTU.nwk") if (save_nj_tree and embeddings_df is not None) else None
+        nj_boot_out = (out_dir / "NJ_OTU_bootstrap.nwk") if (nj_bootstrap > 0 and embeddings_df is not None) else None
+
         if assignments is not None:
             assignments_df = normalize_assignments(
                 read_csv(assignments, encoding="utf-8-sig")
@@ -177,12 +214,22 @@ def diversity(
                 assignments_df, min_values,
                 embeddings=embeddings_df,
                 tree_newick_path=tree_path,
+                nj_tree_path=nj_tree_out,
+                nj_bootstrap_replicates=nj_bootstrap,
+                nj_bootstrap_path=nj_boot_out,
+                nj_bootstrap_support_mode=nj_bootstrap_mode,
+                nj_bootstrap_subsample_ratio=nj_subsample_ratio,
+                nj_jobs=cpus,
             )
             out_csv = out_dir / "diversity_indices.csv"
             table.reset_index().rename(columns={"index": "metric"}).to_csv(
                 out_csv, index=False
             )
             typer.echo(f"Diversity table: {out_csv}")
+            if nj_tree_out is not None and nj_tree_out.exists():
+                typer.echo(f"NJ tree: {nj_tree_out}")
+            if nj_boot_out is not None and nj_boot_out.exists():
+                typer.echo(f"NJ bootstrap tree: {nj_boot_out}")
 
             if has_valid_samples(assignments_df):
                 per_sample_dir = out_dir / "per-sample"
@@ -194,6 +241,7 @@ def diversity(
                         subset, min_values,
                         embeddings=embeddings_df,
                         tree_newick_path=tree_path,
+                        # no tree output for per-sample tables
                     )
                     sub_table.reset_index().rename(columns={"index": "metric"}).to_csv(
                         paths[sample], index=False

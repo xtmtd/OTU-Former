@@ -51,6 +51,12 @@ def compute_otu_centroids(
 def compute_pd(
     assignments: pd.DataFrame,
     embeddings: pd.DataFrame,
+    nj_tree_path: Optional[Path] = None,
+    nj_bootstrap_replicates: int = 0,
+    nj_bootstrap_path: Optional[Path] = None,
+    nj_bootstrap_support_mode: str = "subsample",
+    nj_bootstrap_subsample_ratio: float = 0.8,
+    nj_jobs: int = 1,
 ) -> dict[str, float]:
     """Compute Faith's PD and related metrics using an OTU-centroid NJ tree.
 
@@ -63,6 +69,18 @@ def compute_pd(
         DataFrame with columns ``id`` and ``cluster``.
     embeddings:
         DataFrame with column ``id`` plus embedding dimension columns.
+    nj_tree_path:
+        If given, write the unrooted NJ Newick to this path.
+    nj_bootstrap_replicates:
+        Number of bootstrap replicates.  0 (default) skips bootstrap.
+    nj_bootstrap_path:
+        If given, write the majority-rule consensus bootstrap Newick here.
+    nj_bootstrap_support_mode:
+        ``"subsample"`` (default) or ``"bootstrap"``.
+    nj_bootstrap_subsample_ratio:
+        Fraction of embedding dimensions used per replicate (subsample mode).
+    nj_jobs:
+        Parallel workers for bootstrap replicates.
 
     Returns
     -------
@@ -81,7 +99,7 @@ def compute_pd(
         return _nan
 
     try:
-        from otuformer.delineation.tree import build_nj_tree
+        from otuformer.delineation.tree import build_nj_tree, compute_nj_bootstrap_support
         from otuformer.delineation.distance import compute_cosine_distances
 
         centroids, otu_ids = compute_otu_centroids(assignments, embeddings)
@@ -91,6 +109,33 @@ def compute_pd(
 
         dist_matrix = compute_cosine_distances(centroids)
         tree = build_nj_tree(dist_matrix, otu_ids)
+
+        # Optionally write the unrooted NJ tree
+        if nj_tree_path is not None:
+            nj_tree_path.parent.mkdir(parents=True, exist_ok=True)
+            nj_tree_path.write_text(str(tree), encoding="utf-8")
+
+        # Optionally compute and write bootstrap consensus tree
+        if nj_bootstrap_replicates > 0 and nj_bootstrap_path is not None:
+            support = compute_nj_bootstrap_support(
+                centroids,
+                otu_ids,
+                support_mode=nj_bootstrap_support_mode,
+                n_replicates=nj_bootstrap_replicates,
+                subsample_ratio=nj_bootstrap_subsample_ratio,
+                n_jobs=nj_jobs,
+            )
+            # Annotate unrooted NJ tree nodes with support values, write Newick
+            tree_annotated = build_nj_tree(dist_matrix, otu_ids)
+            for node in tree_annotated.traverse():
+                if node.is_tip() or node.is_root():
+                    continue
+                clade = frozenset(t.name for t in node.tips())
+                pct = support.get(clade)
+                if pct is not None:
+                    node.name = f"{pct:.1f}"
+            nj_bootstrap_path.parent.mkdir(parents=True, exist_ok=True)
+            nj_bootstrap_path.write_text(str(tree_annotated), encoding="utf-8")
 
         counts_series = assignments["cluster"].value_counts()
         counts_arr = np.array(
@@ -466,6 +511,12 @@ def diversity_table(
     min_abundances: list[int],
     embeddings: Optional[pd.DataFrame] = None,
     tree_newick_path: Optional[Path] = None,
+    nj_tree_path: Optional[Path] = None,
+    nj_bootstrap_replicates: int = 0,
+    nj_bootstrap_path: Optional[Path] = None,
+    nj_bootstrap_support_mode: str = "subsample",
+    nj_bootstrap_subsample_ratio: float = 0.8,
+    nj_jobs: int = 1,
 ) -> pd.DataFrame:
     """Compute alpha diversity metrics across abundance thresholds.
 
@@ -482,8 +533,23 @@ def diversity_table(
     tree_newick_path:
         Deprecated legacy path to a pre-built UPGMA Newick file.  Ignored
         when ``embeddings`` is provided.
+    nj_tree_path:
+        If given, write the unrooted NJ Newick to this path (global only,
+        not per-threshold).
+    nj_bootstrap_replicates:
+        Bootstrap replicates for the NJ tree.  0 disables bootstrap.
+    nj_bootstrap_path:
+        If given, write the annotated bootstrap consensus Newick here.
+    nj_bootstrap_support_mode:
+        ``"subsample"`` or ``"bootstrap"``.
+    nj_bootstrap_subsample_ratio:
+        Fraction of dimensions per bootstrap replicate.
+    nj_jobs:
+        Parallel workers for bootstrap.
     """
     records: dict[str, dict[str, float]] = {}
+    # NJ tree/bootstrap written once (from min_abundances[0] threshold)
+    _nj_written = False
     for min_ab in min_abundances:
         filtered = filter_by_min_abundance(assignments, min_ab)
         col = f"min_abundance_{min_ab}"
@@ -493,7 +559,19 @@ def diversity_table(
         metrics = compute_alpha_diversity(filtered)
         if embeddings is not None:
             try:
-                metrics.update(compute_pd(filtered, embeddings))
+                # Write tree/bootstrap only on first threshold to avoid redundancy
+                tree_out = nj_tree_path if not _nj_written else None
+                boot_out = nj_bootstrap_path if not _nj_written else None
+                metrics.update(compute_pd(
+                    filtered, embeddings,
+                    nj_tree_path=tree_out,
+                    nj_bootstrap_replicates=nj_bootstrap_replicates,
+                    nj_bootstrap_path=boot_out,
+                    nj_bootstrap_support_mode=nj_bootstrap_support_mode,
+                    nj_bootstrap_subsample_ratio=nj_bootstrap_subsample_ratio,
+                    nj_jobs=nj_jobs,
+                ))
+                _nj_written = True
             except Exception:
                 metrics["MPD"] = float("nan")
                 metrics["MPD_w"] = float("nan")
