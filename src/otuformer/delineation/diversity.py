@@ -464,8 +464,25 @@ def compute_mpd(assignments: pd.DataFrame, tree_newick_path: Path) -> dict[str, 
 def diversity_table(
     assignments: pd.DataFrame,
     min_abundances: list[int],
+    embeddings: Optional[pd.DataFrame] = None,
     tree_newick_path: Optional[Path] = None,
 ) -> pd.DataFrame:
+    """Compute alpha diversity metrics across abundance thresholds.
+
+    Parameters
+    ----------
+    assignments:
+        DataFrame with columns ``id``, ``cluster``, ``sample``.
+    min_abundances:
+        List of minimum-abundance thresholds; one result column per value.
+    embeddings:
+        When provided, an OTU-centroid NJ tree is built internally and
+        Faith's PD metrics (``MPD``, ``MPD_w``, ``PD_richness_norm``) are
+        added.  Takes precedence over ``tree_newick_path``.
+    tree_newick_path:
+        Deprecated legacy path to a pre-built UPGMA Newick file.  Ignored
+        when ``embeddings`` is provided.
+    """
     records: dict[str, dict[str, float]] = {}
     for min_ab in min_abundances:
         filtered = filter_by_min_abundance(assignments, min_ab)
@@ -474,10 +491,16 @@ def diversity_table(
             records[col] = {}
             continue
         metrics = compute_alpha_diversity(filtered)
-        if tree_newick_path is not None:
+        if embeddings is not None:
             try:
-                phylo_metrics = compute_mpd(filtered, tree_newick_path)
-                metrics.update(phylo_metrics)
+                metrics.update(compute_pd(filtered, embeddings))
+            except Exception:
+                metrics["MPD"] = float("nan")
+                metrics["MPD_w"] = float("nan")
+                metrics["PD_richness_norm"] = float("nan")
+        elif tree_newick_path is not None:
+            try:
+                metrics.update(compute_mpd(filtered, tree_newick_path))
             except Exception:
                 metrics["MPD"] = float("nan")
                 metrics["MPD_w"] = float("nan")
