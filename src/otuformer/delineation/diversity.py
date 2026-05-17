@@ -57,6 +57,7 @@ def compute_pd(
     nj_bootstrap_support_mode: str = "subsample",
     nj_bootstrap_subsample_ratio: float = 0.8,
     nj_jobs: int = 1,
+    nj_centroids_path: Optional[Path] = None,
 ) -> dict[str, float]:
     """Compute Faith's PD and related metrics using an OTU-centroid NJ tree.
 
@@ -81,6 +82,9 @@ def compute_pd(
         Fraction of embedding dimensions used per replicate (subsample mode).
     nj_jobs:
         Parallel workers for bootstrap replicates.
+    nj_centroids_path:
+        If given, write OTU centroid embeddings as CSV to this path.
+        Columns: ``cluster``, ``dim_0``, ``dim_1``, …
 
     Returns
     -------
@@ -106,6 +110,15 @@ def compute_pd(
 
         if len(otu_ids) < 3:
             return _nan
+
+        # Optionally write centroid embeddings
+        if nj_centroids_path is not None:
+            meta_cols = {"id", "sample"}
+            dim_cols = [c for c in embeddings.columns if c not in meta_cols]
+            centroid_df = pd.DataFrame(centroids, columns=dim_cols)
+            centroid_df.insert(0, "cluster", otu_ids)
+            nj_centroids_path.parent.mkdir(parents=True, exist_ok=True)
+            centroid_df.to_csv(nj_centroids_path, index=False)
 
         dist_matrix = compute_cosine_distances(centroids)
         tree = build_nj_tree(dist_matrix, otu_ids)
@@ -517,6 +530,7 @@ def diversity_table(
     nj_bootstrap_support_mode: str = "subsample",
     nj_bootstrap_subsample_ratio: float = 0.8,
     nj_jobs: int = 1,
+    nj_centroids_path: Optional[Path] = None,
 ) -> pd.DataFrame:
     """Compute alpha diversity metrics across abundance thresholds.
 
@@ -546,6 +560,8 @@ def diversity_table(
         Fraction of dimensions per bootstrap replicate.
     nj_jobs:
         Parallel workers for bootstrap.
+    nj_centroids_path:
+        If given, write OTU centroid embeddings CSV here (global only).
     """
     records: dict[str, dict[str, float]] = {}
     # NJ tree/bootstrap written once (from min_abundances[0] threshold)
@@ -562,6 +578,7 @@ def diversity_table(
                 # Write tree/bootstrap only on first threshold to avoid redundancy
                 tree_out = nj_tree_path if not _nj_written else None
                 boot_out = nj_bootstrap_path if not _nj_written else None
+                centroids_out = nj_centroids_path if not _nj_written else None
                 metrics.update(compute_pd(
                     filtered, embeddings,
                     nj_tree_path=tree_out,
@@ -570,6 +587,7 @@ def diversity_table(
                     nj_bootstrap_support_mode=nj_bootstrap_support_mode,
                     nj_bootstrap_subsample_ratio=nj_bootstrap_subsample_ratio,
                     nj_jobs=nj_jobs,
+                    nj_centroids_path=centroids_out,
                 ))
                 _nj_written = True
             except Exception:

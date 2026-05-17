@@ -139,6 +139,11 @@ def diversity(
         "--cpus",
         help="Parallel workers for NJ bootstrap.",
     ),
+    save_nj_centroids: bool = typer.Option(
+        False,
+        "--save-nj-centroids",
+        help="Save OTU centroid embeddings to <out-dir>/NJ_OTU_centroids.csv.",
+    ),
 ) -> None:
     if ctx.invoked_subcommand is not None:
         return
@@ -202,9 +207,10 @@ def diversity(
         if tree is not None and not phylo:
             typer.echo("Warning: --tree provided without --phylo; tree ignored.")
 
-        # NJ tree / bootstrap output paths (global only)
+        # NJ tree / bootstrap / centroids output paths (global only)
         nj_tree_out = (out_dir / "NJ_OTU.nwk") if (save_nj_tree and embeddings_df is not None) else None
         nj_boot_out = (out_dir / "NJ_OTU_bootstrap.nwk") if (nj_bootstrap > 0 and embeddings_df is not None) else None
+        nj_centroids_out = (out_dir / "NJ_OTU_centroids.csv") if (save_nj_centroids and embeddings_df is not None) else None
 
         if assignments is not None:
             assignments_df = normalize_assignments(
@@ -220,6 +226,7 @@ def diversity(
                 nj_bootstrap_support_mode=nj_bootstrap_mode,
                 nj_bootstrap_subsample_ratio=nj_subsample_ratio,
                 nj_jobs=cpus,
+                nj_centroids_path=nj_centroids_out,
             )
             out_csv = out_dir / "diversity_indices.csv"
             table.reset_index().rename(columns={"index": "metric"}).to_csv(
@@ -230,6 +237,8 @@ def diversity(
                 typer.echo(f"NJ tree: {nj_tree_out}")
             if nj_boot_out is not None and nj_boot_out.exists():
                 typer.echo(f"NJ bootstrap tree: {nj_boot_out}")
+            if nj_centroids_out is not None and nj_centroids_out.exists():
+                typer.echo(f"NJ centroids: {nj_centroids_out}")
 
             if has_valid_samples(assignments_df):
                 per_sample_dir = out_dir / "per-sample"
