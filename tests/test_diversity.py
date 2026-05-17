@@ -454,3 +454,62 @@ def test_compute_otu_centroids_missing_ids_ignored():
     centroids, otu_ids = compute_otu_centroids(assignments, embeddings)
     assert centroids.shape == (1, 2)
     assert otu_ids == ["OTU_1"]
+
+
+# ---------------------------------------------------------------------------
+# NJ-centroid PD tests
+# ---------------------------------------------------------------------------
+
+def _make_assignments_and_embeddings(n_otus: int = 4, members_per_otu: int = 3, n_dims: int = 8, seed: int = 0):
+    """Helper: synthetic assignments + embeddings with n_otus distinct clusters."""
+    rng = np.random.default_rng(seed)
+    rows_a, rows_e = [], []
+    idx = 0
+    for otu_i in range(n_otus):
+        center = rng.standard_normal(n_dims)
+        for _ in range(members_per_otu):
+            iid = f"img_{idx:04d}"
+            emb = center + rng.standard_normal(n_dims) * 0.05
+            rows_a.append({"id": iid, "cluster": f"OTU_{otu_i + 1}"})
+            row_e = {"id": iid}
+            row_e.update({f"dim_{d}": float(emb[d]) for d in range(n_dims)})
+            rows_e.append(row_e)
+            idx += 1
+    return pd.DataFrame(rows_a), pd.DataFrame(rows_e)
+
+
+def test_compute_pd_returns_three_keys():
+    pytest.importorskip("skbio")
+    from otuformer.delineation.diversity import compute_pd
+    assignments, embeddings = _make_assignments_and_embeddings()
+    result = compute_pd(assignments, embeddings)
+    assert set(result.keys()) == {"MPD", "MPD_w", "PD_richness_norm"}
+
+
+def test_compute_pd_values_are_finite():
+    pytest.importorskip("skbio")
+    from otuformer.delineation.diversity import compute_pd
+    assignments, embeddings = _make_assignments_and_embeddings()
+    result = compute_pd(assignments, embeddings)
+    for k, v in result.items():
+        assert np.isfinite(v), f"{k} = {v} is not finite"
+
+
+def test_compute_pd_single_otu_returns_nan():
+    pytest.importorskip("skbio")
+    from otuformer.delineation.diversity import compute_pd
+    assignments = pd.DataFrame({"id": ["i1", "i2"], "cluster": ["OTU_1", "OTU_1"]})
+    embeddings = pd.DataFrame({"id": ["i1", "i2"], "dim_0": [1.0, 1.0], "dim_1": [0.0, 0.0]})
+    result = compute_pd(assignments, embeddings)
+    for v in result.values():
+        assert np.isnan(v)
+
+
+def test_compute_pd_richness_norm_relation():
+    pytest.importorskip("skbio")
+    from otuformer.delineation.diversity import compute_pd
+    assignments, embeddings = _make_assignments_and_embeddings(n_otus=5)
+    result = compute_pd(assignments, embeddings)
+    n_otus = assignments["cluster"].nunique()
+    expected_norm = result["MPD"] / n_otus
+    assert abs(result["PD_richness_norm"] - expected_norm) < 1e-9

@@ -48,6 +48,73 @@ def compute_otu_centroids(
     return centroids, otu_ids
 
 
+def compute_pd(
+    assignments: pd.DataFrame,
+    embeddings: pd.DataFrame,
+) -> dict[str, float]:
+    """Compute Faith's PD and related metrics using an OTU-centroid NJ tree.
+
+    Builds one NJ tree per call from OTU centroid cosine distances.
+    Requires ≥ 3 OTUs; returns all-NaN dict otherwise.
+
+    Parameters
+    ----------
+    assignments:
+        DataFrame with columns ``id`` and ``cluster``.
+    embeddings:
+        DataFrame with column ``id`` plus embedding dimension columns.
+
+    Returns
+    -------
+    dict with keys ``"MPD"`` (Faith's PD), ``"MPD_w"`` (abundance-weighted
+    unrooted PD), ``"PD_richness_norm"`` (Faith PD / OTU richness).
+    """
+    _nan: dict[str, float] = {
+        "MPD": float("nan"),
+        "MPD_w": float("nan"),
+        "PD_richness_norm": float("nan"),
+    }
+
+    try:
+        from skbio.diversity.alpha import phydiv
+    except ImportError:
+        return _nan
+
+    try:
+        from otuformer.delineation.tree import build_nj_tree
+        from otuformer.delineation.distance import compute_cosine_distances
+
+        centroids, otu_ids = compute_otu_centroids(assignments, embeddings)
+
+        if len(otu_ids) < 3:
+            return _nan
+
+        dist_matrix = compute_cosine_distances(centroids)
+        tree = build_nj_tree(dist_matrix, otu_ids)
+
+        counts_series = assignments["cluster"].value_counts()
+        counts_arr = np.array(
+            [counts_series.get(otu, 0) for otu in otu_ids], dtype=int
+        )
+        richness = len(otu_ids)
+
+        # Faith's PD requires a rooted tree; midpoint-root the NJ tree
+        tree_rooted = tree.root_at_midpoint()
+        faith_pd = float(phydiv(counts_arr, otu_ids, tree_rooted, rooted=True, weight=False))
+
+        # Abundance-weighted PD on the unrooted tree
+        mpd_w = float(phydiv(counts_arr, otu_ids, tree, rooted=False, weight=True))
+
+        return {
+            "MPD": faith_pd,
+            "MPD_w": mpd_w,
+            "PD_richness_norm": faith_pd / richness,
+        }
+
+    except Exception:
+        return _nan
+
+
 def _is_number(value: object) -> bool:
     try:
         float(str(value).strip())
