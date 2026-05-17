@@ -35,7 +35,7 @@ otuformer <command> [options]
 - **PCA Whitening & Local Scaling**: Optional PCA whitening and Mutual-Proximity-style local scaling for improved clustering
 - **Bootstrap Support Estimation**: Subsample/bootstrap modes for branch support estimation
 - **Expert-Corrected Annotation**: Accept manual correction CSVs to produce refined OTU assignments with intra-class distance summaries
-- **Community Diversity Analysis**: Richness, Chao1, ACE, Shannon, Simpson, Hill numbers (q0/q1/q2), Pielou evenness, Faith's PD (MPD), weighted PD (MPD_w), and other alpha diversity metrics
+- **Community Diversity Analysis**: Richness, Chao1, ACE, Shannon, Simpson, Hill numbers (q0/q1/q2), Pielou evenness, Faith's PD (MPD), weighted PD (MPD_w), and other alpha diversity metrics; phylogenetic diversity is computed from an OTU-centroid neighbor-joining tree when embeddings are provided
 - **Model Interpretability**: Six CAM algorithms — Grad-CAM, Grad-CAM++, LayerCAM, Score-CAM, Eigen-CAM, Ablation-CAM
 - **ONNX Export & Acceleration**: Export to ONNX format for 2-5x faster CPU inference
 - **UMAP Visualization**: Embedding space dimensionality reduction for intuitive morphological distribution
@@ -438,7 +438,7 @@ otuformer annotate \
 
 ### Diversity Command
 
-Compute community alpha diversity indices. Supports two input modes: partition assignment CSV or OTU table CSV.
+Compute community alpha diversity indices. Supports two input modes: partition assignment CSV or OTU table CSV. For Faith's PD, the recommended path is to provide `--embeddings`, which builds an OTU-centroid neighbor-joining (NJ) tree internally. The older `--tree` input remains available as a legacy fallback.
 
 ```bash
 # From partition assignments
@@ -446,7 +446,16 @@ otuformer diversity \
     --assignments runs/cluster/UPGMA/partitions/tables/partition_0.30_assignments.csv \
     --out-dir runs/diversity
 
-# With Faith's PD (requires Newick tree)
+# With Faith's PD from OTU-centroid NJ (recommended)
+otuformer diversity \
+    --assignments runs/cluster/UPGMA/partitions/tables/partition_0.30_assignments.csv \
+    --phylo \
+    --embeddings runs/extract/embeddings.csv \
+    --save-nj-tree \
+    --nj-bootstrap 100 \
+    --out-dir runs/diversity
+
+# Legacy Faith's PD path from an existing Newick tree
 otuformer diversity \
     --assignments runs/cluster/UPGMA/partitions/tables/partition_0.30_assignments.csv \
     --phylo \
@@ -466,8 +475,12 @@ otuformer diversity \
 | `--otu-table-has-header` | Force first row as header (required if OTU IDs are numeric) | No |
 | `--out-dir` | Output directory | `runs/diversity` |
 | `--min-abundance` | Minimum abundance thresholds (comma-separated) | `0,2,5` |
-| `--phylo` | Compute Faith's PD (MPD); requires `--tree` | No |
-| `--tree` | Newick tree path (required when `--phylo` is set) | None |
+| `--phylo` | Enable Faith's PD / PD-related metrics | No |
+| `--embeddings` | Embeddings CSV; recommended for PD because OTU-centroid NJ is built internally | None |
+| `--tree` | Legacy Newick tree path used only when `--embeddings` is absent | None |
+| `--save-nj-tree` | Save the inferred OTU-centroid NJ tree to `NJ_OTU.nwk` | No |
+| `--nj-bootstrap` | Bootstrap replicates for NJ support; writes `NJ_OTU_bootstrap.nwk` | `0` |
+| `--save-nj-centroids` | Save OTU centroid embeddings to `NJ_OTU_centroids.csv` | No |
 
 **Output metrics** (saved to `diversity_indices.csv`, global and per-sample):
 - **Richness**: Number of unique OTUs
@@ -477,13 +490,16 @@ otuformer diversity \
 - **Simpson**: Probability two individuals differ (higher = more diverse)
 - **Hill q0/q1/q2**: Hill numbers (richness/evenness/diversity at orders 0,1,2)
 - **Pielou_J**: Evenness (Shannon / log(richness))
-- **Faith's PD (MPD)**: Morphological phylogenetic diversity (via scikit-bio)
+- **Faith's PD (MPD)**: Morphological phylogenetic diversity computed from the OTU-centroid NJ tree (or legacy `--tree` input)
 - **MPD_w**: Abundance-weighted rooted PD (rPD_w)
 - **PD_richness_norm**: Faith's PD / species richness
 
 **Output**:
 - `diversity_indices.csv` — Global diversity indices
 - `per-sample/` — Per-sample diversity files (when valid sample column exists)
+- `NJ_OTU.nwk` — OTU-centroid NJ tree (with `--embeddings --save-nj-tree`)
+- `NJ_OTU_bootstrap.nwk` — NJ tree with bootstrap support labels (with `--nj-bootstrap > 0`)
+- `NJ_OTU_centroids.csv` — OTU centroid embeddings (with `--save-nj-centroids`)
 
 ---
 

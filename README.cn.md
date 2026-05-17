@@ -35,7 +35,7 @@ otuformer <command> [options]
 - **PCA 白化与局部缩放**：可选的 PCA 白化与 Mutual-Proximity 风格局部缩放，提升聚类质量
 - **Bootstrap 支持率估计**：支持 subsample/bootstrap 模式估计分支支持率
 - **专家校正标注**：接受人工校正 CSV，生成 refined OTU 分配与类内距离摘要
-- **群落多样性分析**：Richness、Chao1、ACE、Shannon、Simpson、Hill 数（q0/q1/q2）、Pielou 均匀度、Faith's PD（MPD）、加权 PD（MPD_w）等 alpha 多样性指标
+- **群落多样性分析**：Richness、Chao1、ACE、Shannon、Simpson、Hill 数（q0/q1/q2）、Pielou 均匀度、Faith's PD（MPD）、加权 PD（MPD_w）等 alpha 多样性指标；当提供嵌入向量时，PD 基于 OTU 质心 NJ 树计算
 - **模型可解释性**：支持 Grad-CAM、Grad-CAM++、LayerCAM、Score-CAM、Eigen-CAM、Ablation-CAM 六种算法
 - **ONNX 导出加速**：导出为 ONNX 格式，CPU 推理提速 2-5 倍
 - **UMAP 可视化**：嵌入空间降维可视化，直观展示形态学分布
@@ -438,7 +438,7 @@ otuformer annotate \
 
 ### diversity 命令
 
-计算群落 alpha 多样性指标。支持两种输入模式：分区分配 CSV 或 OTU 表 CSV。
+计算群落 alpha 多样性指标。支持两种输入模式：分区分配 CSV 或 OTU 表 CSV。若要计算 Faith's PD，推荐提供 `--embeddings`，程序会在内部基于 OTU 质心构建 neighbor-joining（NJ）树。旧的 `--tree` 方式仍保留为兼容回退路径。
 
 ```bash
 # 从分区分配计算
@@ -446,7 +446,16 @@ otuformer diversity \
     --assignments runs/cluster/UPGMA/partitions/tables/partition_0.30_assignments.csv \
     --out-dir runs/diversity
 
-# 启用 Faith's PD（需要 Newick 树）
+# 启用 Faith's PD（推荐：内部构建 OTU 质心 NJ 树）
+otuformer diversity \
+    --assignments runs/cluster/UPGMA/partitions/tables/partition_0.30_assignments.csv \
+    --phylo \
+    --embeddings runs/extract/embeddings.csv \
+    --save-nj-tree \
+    --nj-bootstrap 100 \
+    --out-dir runs/diversity
+
+# 旧方式：基于现有 Newick 树计算 Faith's PD
 otuformer diversity \
     --assignments runs/cluster/UPGMA/partitions/tables/partition_0.30_assignments.csv \
     --phylo \
@@ -466,8 +475,12 @@ otuformer diversity \
 | `--otu-table-has-header` | 强制将 OTU 表首行作为列头（OTU ID 为数值时必需） | 否 |
 | `--out-dir` | 输出目录 | `runs/diversity` |
 | `--min-abundance` | 最小丰度阈值（逗号分隔） | `0,2,5` |
-| `--phylo` | 计算 Faith's PD（MPD），需要 `--tree` | 否 |
-| `--tree` | Newick 树路径（`--phylo` 时必需） | 无 |
+| `--phylo` | 启用 Faith's PD / PD 相关指标 | 否 |
+| `--embeddings` | 嵌入向量 CSV；PD 推荐使用，会在内部构建 OTU 质心 NJ 树 | 无 |
+| `--tree` | 旧版 Newick 树路径，仅在未提供 `--embeddings` 时使用 | 无 |
+| `--save-nj-tree` | 保存推断得到的 OTU 质心 NJ 树到 `NJ_OTU.nwk` | 否 |
+| `--nj-bootstrap` | NJ 支持率 bootstrap 次数；输出 `NJ_OTU_bootstrap.nwk` | `0` |
+| `--save-nj-centroids` | 保存 OTU 质心嵌入到 `NJ_OTU_centroids.csv` | 否 |
 
 **输出指标**（保存到 `diversity_indices.csv`，含全局与 per-sample）：
 - **Richness**：OTU 数量
@@ -477,13 +490,16 @@ otuformer diversity \
 - **Simpson**：两个个体不同的概率（越高 = 越多样）
 - **Hill q0/q1/q2**：Hill 数（丰富度/均匀度/多样性）
 - **Pielou_J**：均匀度（Shannon / log(richness)）
-- **Faith's PD (MPD)**：形态系统发育多样性（通过 scikit-bio 计算）
+- **Faith's PD (MPD)**：形态系统发育多样性，默认基于 OTU 质心 NJ 树计算（或使用旧 `--tree` 输入）
 - **MPD_w**：丰度加权根 PD（rPD_w）
 - **PD_richness_norm**：Faith's PD / 物种丰富度
 
 **输出**：
 - `diversity_indices.csv` — 全局多样性指标
 - `per-sample/` — 各样本多样性指标（当存在有效 sample 列时）
+- `NJ_OTU.nwk` — OTU 质心 NJ 树（使用 `--embeddings --save-nj-tree` 时）
+- `NJ_OTU_bootstrap.nwk` — 带 bootstrap 支持率标签的 NJ 树（`--nj-bootstrap > 0` 时）
+- `NJ_OTU_centroids.csv` — OTU 质心嵌入（使用 `--save-nj-centroids` 时）
 
 ---
 
