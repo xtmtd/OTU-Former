@@ -92,13 +92,24 @@ def diversity(
         False,
         "--phylo",
         help=(
-            "Compute phylogenetic diversity (Faith's PD) from the Newick tree. "
-            "Faith's PD sums the branch lengths of the minimal subtree spanning "
-            "all taxa present in the sample. Requires --tree."
+            "Compute phylogenetic diversity (Faith's PD). "
+            "Provide --embeddings (recommended, NJ tree built from OTU centroids) "
+            "or --tree (legacy UPGMA Newick)."
+        ),
+    ),
+    embeddings: Path | None = typer.Option(
+        None,
+        "--embeddings",
+        help=(
+            "embeddings.csv from the extract step. When provided with --phylo, "
+            "an OTU-centroid NJ tree is built automatically for Faith's PD. "
+            "Recommended over --tree."
         ),
     ),
     tree: Path | None = typer.Option(
-        None, "--tree", help="Newick tree path (required when --phylo is set)."
+        None,
+        "--tree",
+        help="Legacy: Newick tree path for Faith's PD (used when --embeddings is absent).",
     ),
 ) -> None:
     if ctx.invoked_subcommand is not None:
@@ -132,6 +143,7 @@ def diversity(
             "out_dir": str(out_dir),
             "min_abundance": min_abundance,
             "phylo": phylo,
+            "embeddings": str(embeddings) if embeddings is not None else "",
             "tree": str(tree) if tree is not None else "",
         }
         print(f"Command: {_format_user_command(ctx, params)}")
@@ -140,10 +152,20 @@ def diversity(
         print("-" * 80)
 
         min_values = [int(x.strip()) for x in min_abundance.split(",") if x.strip()]
-        tree_path = tree if phylo else None
 
-        if phylo and tree is None:
-            typer.echo("Warning: --phylo set but no --tree provided; MPD skipped.")
+        # Resolve phylo inputs
+        embeddings_df = None
+        tree_path = None
+        if phylo:
+            if embeddings is not None:
+                import pandas as pd
+                embeddings_df = pd.read_csv(embeddings)
+            elif tree is not None:
+                tree_path = tree
+            else:
+                typer.echo("Warning: --phylo set but neither --embeddings nor --tree provided; MPD skipped.")
+        if embeddings is not None and not phylo:
+            typer.echo("Warning: --embeddings provided without --phylo; embeddings ignored.")
         if tree is not None and not phylo:
             typer.echo("Warning: --tree provided without --phylo; tree ignored.")
 
@@ -152,7 +174,9 @@ def diversity(
                 read_csv(assignments, encoding="utf-8-sig")
             )
             table = diversity_table(
-                assignments_df, min_values, tree_newick_path=tree_path
+                assignments_df, min_values,
+                embeddings=embeddings_df,
+                tree_newick_path=tree_path,
             )
             out_csv = out_dir / "diversity_indices.csv"
             table.reset_index().rename(columns={"index": "metric"}).to_csv(
@@ -167,7 +191,9 @@ def diversity(
                 paths = build_per_sample_paths(list(parts.keys()), per_sample_dir)
                 for sample, subset in parts.items():
                     sub_table = diversity_table(
-                        subset, min_values, tree_newick_path=tree_path
+                        subset, min_values,
+                        embeddings=embeddings_df,
+                        tree_newick_path=tree_path,
                     )
                     sub_table.reset_index().rename(columns={"index": "metric"}).to_csv(
                         paths[sample], index=False
