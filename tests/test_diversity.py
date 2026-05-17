@@ -1,3 +1,4 @@
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -404,3 +405,52 @@ def test_diversity_table_with_tree_returns_mpd(tmp_path: Path):
     assert "MPD" in col.index
     assert "MPD_w" in col.index
     assert "PD_richness_norm" in col.index
+
+
+def test_compute_otu_centroids_shape():
+    from otuformer.delineation.diversity import compute_otu_centroids
+    assignments = pd.DataFrame({
+        "id":      ["i1", "i2", "i3", "i4"],
+        "cluster": ["OTU_1", "OTU_1", "OTU_2", "OTU_2"],
+    })
+    embeddings = pd.DataFrame({
+        "id":    ["i1", "i2", "i3", "i4"],
+        "dim_0": [1.0, 3.0, 0.0, 0.0],
+        "dim_1": [0.0, 0.0, 1.0, 3.0],
+    })
+    centroids, otu_ids = compute_otu_centroids(assignments, embeddings)
+    assert centroids.shape == (2, 2)
+    assert set(otu_ids) == {"OTU_1", "OTU_2"}
+
+
+def test_compute_otu_centroids_l2_normalised():
+    from otuformer.delineation.diversity import compute_otu_centroids
+    assignments = pd.DataFrame({
+        "id":      ["i1", "i2"],
+        "cluster": ["OTU_A", "OTU_B"],
+    })
+    embeddings = pd.DataFrame({
+        "id":    ["i1", "i2"],
+        "dim_0": [3.0, 0.0],
+        "dim_1": [4.0, 5.0],
+    })
+    centroids, _ = compute_otu_centroids(assignments, embeddings)
+    norms = np.linalg.norm(centroids, axis=1)
+    np.testing.assert_allclose(norms, [1.0, 1.0], atol=1e-6)
+
+
+def test_compute_otu_centroids_missing_ids_ignored():
+    """Individuals in assignments but absent from embeddings are silently dropped."""
+    from otuformer.delineation.diversity import compute_otu_centroids
+    assignments = pd.DataFrame({
+        "id":      ["i1", "i2", "MISSING"],
+        "cluster": ["OTU_1", "OTU_1", "OTU_1"],
+    })
+    embeddings = pd.DataFrame({
+        "id":    ["i1", "i2"],
+        "dim_0": [1.0, 1.0],
+        "dim_1": [0.0, 0.0],
+    })
+    centroids, otu_ids = compute_otu_centroids(assignments, embeddings)
+    assert centroids.shape == (1, 2)
+    assert otu_ids == ["OTU_1"]

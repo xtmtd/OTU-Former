@@ -11,6 +11,43 @@ import numpy as np
 import pandas as pd
 
 
+def compute_otu_centroids(
+    assignments: pd.DataFrame,
+    embeddings: pd.DataFrame,
+) -> tuple[np.ndarray, list[str]]:
+    """Compute L2-normalised centroid embedding for each OTU.
+
+    Parameters
+    ----------
+    assignments:
+        DataFrame with columns ``id`` and ``cluster``.
+    embeddings:
+        DataFrame with column ``id`` and one column per embedding dimension
+        (named ``dim_0``, ``dim_1``, … or any non-id, non-sample column).
+
+    Returns
+    -------
+    centroids : np.ndarray, shape (n_otus, n_dims)
+        Row-wise L2-normalised centroid embeddings, one row per OTU.
+    otu_ids : list[str]
+        OTU labels in the same row order as ``centroids``.
+    """
+    meta_cols = {"id", "sample"}
+    dim_cols = [c for c in embeddings.columns if c not in meta_cols]
+
+    merged = assignments[["id", "cluster"]].merge(
+        embeddings[["id"] + dim_cols], on="id", how="inner"
+    )
+    grouped = merged.groupby("cluster", sort=True)[dim_cols].mean()
+    otu_ids: list[str] = list(grouped.index)
+    raw = grouped.values.astype(np.float64)
+
+    norms = np.linalg.norm(raw, axis=1, keepdims=True)
+    norms = np.where(norms < 1e-12, 1.0, norms)
+    centroids = raw / norms
+    return centroids, otu_ids
+
+
 def _is_number(value: object) -> bool:
     try:
         float(str(value).strip())
