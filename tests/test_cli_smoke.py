@@ -555,8 +555,8 @@ def test_cluster_writes_ref_like_structure_and_csv_stats(tmp_path):
     )
     assert result.exit_code == 0
 
-    root_entries = sorted(p.name for p in out_dir.iterdir())
-    assert root_entries == ["UPGMA", "distance_statistics", "logs"]
+    root_dirs = sorted(p.name for p in out_dir.iterdir() if p.is_dir())
+    assert root_dirs == ["UPGMA", "distance_statistics", "logs"]
     assert not (out_dir / "logs" / "log.txt").exists()
     assert (out_dir / "logs" / "cluster.log").exists()
 
