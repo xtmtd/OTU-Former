@@ -294,14 +294,16 @@ def build_diversity_tables_from_otu_table(
     global_assignments = pd.DataFrame(
         {"cluster": global_counts.index.repeat(global_counts.values.astype(int))}
     )
-    global_table = diversity_table(global_assignments, min_values, tree_newick_path)
+    global_table = diversity_table(
+        global_assignments, min_values, tree_newick_path=tree_newick_path
+    )
     per_sample = {}
     for sample, row in otu_table.iterrows():
         assignments = pd.DataFrame(
             {"cluster": row.index.repeat(row.values.astype(int))}
         )
         per_sample[str(sample)] = diversity_table(
-            assignments, min_values, tree_newick_path
+            assignments, min_values, tree_newick_path=tree_newick_path
         )
     return global_table, per_sample
 

@@ -212,6 +212,21 @@ def test_build_diversity_tables_from_otu_table_thresholds():
     )
 
 
+def test_build_diversity_tables_from_otu_table_tree_path_uses_legacy_kwarg(tmp_path: Path):
+    pytest.importorskip("skbio")
+    otu = pd.DataFrame({"OTU_A": [2, 0], "OTU_B": [1, 3], "OTU_C": [1, 1]}, index=["s1", "s2"])
+    tree_path = tmp_path / "legacy_tree.nwk"
+    tree_path.write_text("((OTU_A:1.0,OTU_B:1.0):0.5,OTU_C:1.5);", encoding="utf-8")
+
+    global_table, per_sample = build_diversity_tables_from_otu_table(
+        otu, [0], tree_newick_path=tree_path
+    )
+
+    assert np.isfinite(global_table.loc["MPD", "min_abundance_0"])
+    assert np.isfinite(global_table.loc["MPD_w", "min_abundance_0"])
+    assert all(np.isfinite(table.loc["MPD", "min_abundance_0"]) for table in per_sample.values())
+
+
 def test_build_mpd_inputs_aligns_otu_ids():
     otu_ids = ["OTU_1", "OTU_2"]
     counts = [3, 1]

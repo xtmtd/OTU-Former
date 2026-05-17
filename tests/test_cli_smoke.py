@@ -877,6 +877,54 @@ def test_diversity_command(tmp_path):
     assert (tmp_path / "diversity_out" / "logs" / "diversity.log").exists()
 
 
+def test_diversity_log_command_uses_flag_style_for_bools(tmp_path):
+    assignments = pd.DataFrame(
+        {
+            "id": ["img1", "img2", "img3", "img4"],
+            "cluster": ["OTU_1", "OTU_1", "OTU_2", "OTU_3"],
+        }
+    )
+    embeddings = pd.DataFrame(
+        {
+            "id": ["img1", "img2", "img3", "img4"],
+            "dim_0": [1.0, 0.9, 0.0, 0.0],
+            "dim_1": [0.0, 0.1, 1.0, 0.9],
+        }
+    )
+    assign_path = tmp_path / "assignments.csv"
+    emb_path = tmp_path / "embeddings.csv"
+    out_dir = tmp_path / "diversity_out_flags"
+    assignments.to_csv(assign_path, index=False)
+    embeddings.to_csv(emb_path, index=False)
+
+    result = runner.invoke(
+        app,
+        [
+            "diversity",
+            "--assignments",
+            str(assign_path),
+            "--out-dir",
+            str(out_dir),
+            "--min-abundance",
+            "0",
+            "--phylo",
+            "--embeddings",
+            str(emb_path),
+            "--save-nj-tree",
+        ],
+    )
+
+    assert result.exit_code == 0
+    log_text = (out_dir / "logs" / "diversity.log").read_text(encoding="utf-8")
+    command_line = next(
+        (line for line in log_text.splitlines() if "Command:" in line), ""
+    )
+    assert "--phylo" in command_line
+    assert "--save-nj-tree" in command_line
+    assert "--phylo true" not in command_line
+    assert "--save-nj-tree true" not in command_line
+
+
 def test_cam_command(tmp_path):
     pytest.importorskip("pytorch_grad_cam")
     pytest.importorskip("cv2")

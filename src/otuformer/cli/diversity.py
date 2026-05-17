@@ -58,7 +58,8 @@ def _format_user_command(ctx: typer.Context, params: dict[str, object]) -> str:
             continue
         option = f"--{key.replace('_', '-')}"
         if isinstance(value, bool):
-            parts.extend([option, str(value).lower()])
+            if value:
+                parts.append(option)
             continue
         if value in (None, ""):
             continue
