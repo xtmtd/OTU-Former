@@ -1,6 +1,25 @@
+import pytest
 import torch
 
 from otuformer.training.model import ArcFaceHead, OTUFormerEncoder
+
+
+def test_encoder_does_not_silently_fall_back_to_random_weights(monkeypatch):
+    import otuformer.training.model as model_module
+
+    calls = []
+
+    def fail_pretrained(_model_name, **kwargs):
+        calls.append(kwargs)
+        raise OSError("corrupt pretrained-weight cache")
+
+    monkeypatch.setattr(model_module.timm, "create_model", fail_pretrained)
+
+    with pytest.raises(RuntimeError, match="pretrained backbone weights"):
+        OTUFormerEncoder(model_name="vit_tiny_patch16_224")
+
+    assert calls
+    assert all(kwargs["pretrained"] for kwargs in calls)
 
 
 def test_encoder_output_shape():

@@ -63,15 +63,11 @@ class OTUFormerEncoder(nn.Module):
                     self.backbone.head = nn.Identity()
                 if hasattr(self.backbone, "fc_norm"):
                     self.backbone.fc_norm = nn.Identity()
-            except Exception:
-                self.backbone = timm.create_model(
-                    model_name,
-                    img_size=img_size,
-                    num_classes=0,
-                    global_pool="",
-                    pretrained=False,
-                    dynamic_img_size=True,
-                )
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Could not load pretrained backbone weights for '{model_name}'. "
+                    "Repair or remove the corrupted timm/Hugging Face cache, then retry."
+                ) from exc
         hidden_dim = self.backbone.num_features
         proj_hidden_dim = 2048
         self.projector = ProjectionHead(hidden_dim, proj_hidden_dim, out_dim)
