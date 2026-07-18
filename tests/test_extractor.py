@@ -10,6 +10,7 @@ from otuformer.embedding.extractor import (
     detect_batch_mode,
     extract_embeddings,
     _iter_trainable_params,
+    _load_model,
 )
 
 
@@ -32,6 +33,27 @@ def make_images(directory: Path, n: int = 3) -> None:
         Image.new("RGB", (224, 224), color=(i * 80, 0, 0)).save(
             directory / f"img_{i}.jpg"
         )
+
+
+def test_extractor_checkpoint_loader_disables_pretrained_weights(monkeypatch, tmp_path):
+    import otuformer.embedding.extractor as extractor_module
+
+    seen = {}
+
+    class FakeEncoder(torch.nn.Module):
+        def __init__(self, **kwargs):
+            super().__init__()
+            seen.update(kwargs)
+
+        def load_state_dict(self, *_args, **_kwargs):
+            return None
+
+    monkeypatch.setattr(extractor_module, "load_checkpoint", lambda _path: {"model_state_dict": {}})
+    monkeypatch.setattr(extractor_module, "OTUFormerEncoder", FakeEncoder)
+
+    _load_model(tmp_path / "model.pth", "vit_tiny_patch16_224", torch.device("cpu"))
+
+    assert seen["pretrained"] is False
 
 
 def test_extract_single_dir(tmp_path: Path):

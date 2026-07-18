@@ -124,13 +124,17 @@ def cam(
         click_type=click.Choice(["auto", "cpu", "cuda", "mps"]),
         help="Compute device for CAM generation.",
     ),
+    overwrite: bool = typer.Option(
+        False, "--overwrite", help="Clear an existing non-empty output directory."
+    ),
 ) -> None:
     if ctx.invoked_subcommand is not None:
         return
 
     from otuformer.utils.logging import TeeLogger
+    from otuformer.utils.io import prepare_output_dir
 
-    out_dir.mkdir(parents=True, exist_ok=True)
+    prepare_output_dir(out_dir, overwrite=overwrite)
     tee = TeeLogger(out_dir / "logs" / "cam.log")
     original_stderr = sys.stderr
     sys.stdout = tee
@@ -148,6 +152,7 @@ def cam(
             "images_dir": str(images_dir),
             "label_csv": str(label_csv) if label_csv is not None else "",
             "out_dir": str(out_dir),
+            "overwrite": overwrite,
             "cam_method": cam_method,
             "arch": arch or "",
             "target_layer_name": target_layer_name or "",

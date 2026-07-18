@@ -23,6 +23,7 @@ otuformer <command> [options]
 | `diversity` | 计算群落 alpha 多样性指标（Shannon、Simpson、Chao1、Faith's PD 等） |
 | `cam` | 生成 GradCAM 等热力图 |
 | `export` | 导出模型为 ONNX 格式 |
+| `update` | 检查并安装最新已发布版本 |
 
 ## 功能特性
 
@@ -115,11 +116,45 @@ otuformer doctor
 **输出**：
 - 终端打印诊断报告
 
+### update 命令
+
+```bash
+otuformer update
+otuformer update --check
+otuformer update --yes
+```
+
+从已发布的 Git tag 检查更新，并在确认后安装最新版本。
+
+### 输出安全
+
+默认情况下，命令拒绝使用非空的 `--out-dir`。请显式使用 `--overwrite`
+清空该目录。训练时的 `--resume` 会保留并追加已有输出目录；`--resume`
+与 `--overwrite` 不能同时使用。
+
+### Hugging Face 权重
+
+新的 pretrain 和 finetune 会使用公开 timm 权重初始化。首次下载权重或本地
+缓存缺失时，出现未认证 Hugging Face 请求的 warning 属于正常现象；`HF_TOKEN`
+可选，仅用于提高限额。CAM、extract 和 export 会加载指定的本地 checkpoint，
+不需要访问 Hugging Face。
+
 ---
 
 ### pretrain 命令
 
 基于 DINO/iBOT 风格的教师-学生 ViT 对比学习进行自监督预训练，无需标注数据。
+
+如需加入新图像继续预训练，请创建同时包含旧图和新图的 CSV，保持相同的
+`--out-dir`，使用最新 checkpoint 的 `--resume`，并增加 `--max-epochs`：
+
+```bash
+otuformer pretrain --train-data images_union.csv --input-images-dir ./images \
+    --out-dir runs/pretrain --resume runs/pretrain/SSL_latest.pth --max-epochs 100
+```
+
+扩展训练可以使用更大的合并数据集；原计划的中断恢复则需要保持原来的
+DataLoader 长度。只用新增图像训练虽然可行，但可能遗忘已有数据。
 
 ```bash
 # 基本用法
@@ -195,6 +230,19 @@ otuformer pretrain \
 ### finetune 命令
 
 利用标注数据进行 ArcFace 度量学习微调。
+
+如需为已有类别加入新图像，请使用同时包含旧图和新图标注的 CSV，保持相同的
+`--out-dir`，从最新微调 checkpoint 使用 `--resume`，并增加
+`--finetune-epochs`：
+
+```bash
+otuformer finetune --train-data labels_union.csv --input-images-dir ./images \
+    --out-dir runs/finetune --resume runs/finetune/finetune_latest.pth \
+    --finetune-epochs 50
+```
+
+恢复时 CSV 必须保留完全相同的标签集合。增加新类别时，应使用
+`--checkpoint` 新建微调，而不能使用 `--resume`。
 
 ```bash
 # 基本用法

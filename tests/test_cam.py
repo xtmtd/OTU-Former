@@ -9,6 +9,32 @@ from otuformer.vision.cam import (
 )
 
 
+def test_cam_checkpoint_loader_disables_pretrained_weights(monkeypatch, tmp_path):
+    import otuformer.vision.cam as cam_module
+
+    seen = {}
+
+    class FakeBackbone(torch.nn.Module):
+        def forward_features(self, x):
+            return x
+
+    class FakeEncoder(torch.nn.Module):
+        def __init__(self, **kwargs):
+            super().__init__()
+            seen.update(kwargs)
+            self.backbone = FakeBackbone()
+
+        def load_state_dict(self, *_args, **_kwargs):
+            return None
+
+    monkeypatch.setattr(cam_module, "load_checkpoint", lambda _path: {"model_state_dict": {}})
+    monkeypatch.setattr(cam_module, "OTUFormerEncoder", FakeEncoder)
+
+    cam_module.load_model_from_checkpoint(tmp_path / "model.pth", "vit_tiny_patch16_224", torch.device("cpu"))
+
+    assert seen["pretrained"] is False
+
+
 def make_tiny_vit():
     import timm
 

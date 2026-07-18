@@ -52,13 +52,6 @@ def finetune(
             "Used as initialization when --resume is not set."
         ),
     ),
-    resume: str = typer.Option(
-        "",
-        "--resume",
-        help=(
-            "Fine-tune checkpoint path to resume from (restores model/optimizer state)."
-        ),
-    ),
     train_data: Path = typer.Option(
         ..., "--train-data", help="CSV with 'image' and 'label' columns."
     ),
@@ -159,13 +152,26 @@ def finetune(
             "to reduce runtime overhead."
         ),
     ),
+    resume: str = typer.Option(
+        "",
+        "--resume",
+        help="Fine-tune checkpoint path to resume from (restores model/optimizer state).",
+    ),
+    overwrite: bool = typer.Option(
+        False, "--overwrite", help="Clear an existing non-empty output directory."
+    ),
 ) -> None:
     if ctx.invoked_subcommand is not None:
         return
 
     from otuformer.utils.logging import TeeLogger
+    from otuformer.utils.io import prepare_output_dir
 
-    out_dir.mkdir(parents=True, exist_ok=True)
+    if resume and overwrite:
+        raise typer.BadParameter("--resume and --overwrite cannot be used together.")
+    if resume and not Path(resume).is_file():
+        raise typer.BadParameter(f"Resume checkpoint not found: {resume}")
+    prepare_output_dir(out_dir, overwrite=overwrite, allow_existing=bool(resume))
     tee = TeeLogger(
         out_dir / "logs" / "finetune.log",
         append=bool(resume),
@@ -180,6 +186,7 @@ def finetune(
             train_data=str(train_data),
             input_images_dir=str(input_images_dir),
             out_dir=str(out_dir),
+            overwrite=overwrite,
             model_name=model_name,
             metric_embed_dim=metric_embed_dim,
             finetune_epochs=finetune_epochs,

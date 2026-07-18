@@ -119,8 +119,15 @@ def test_examples_epidorcus_e2e_low_memory(tmp_path: Path):
     )
     assert res.exit_code == 0
 
-    assignments = cluster_out / "partition_0.5_assignments.csv"
+    assignments = (
+        cluster_out
+        / "UPGMA"
+        / "partitions"
+        / "tables"
+        / "partition_0.5_assignments.csv"
+    )
     assert assignments.exists()
+    assert not (cluster_out / "partition_0.5_assignments.csv").exists()
 
     diversity_out = tmp_path / "diversity_out"
     res = runner.invoke(

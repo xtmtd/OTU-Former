@@ -28,6 +28,7 @@ from otuformer.cli import export as _export_mod
 from otuformer.cli import extract as _extract_mod
 from otuformer.cli import finetune as _finetune_mod
 from otuformer.cli import pretrain as _pretrain_mod
+from otuformer.cli import update as _update_mod
 
 app = typer.Typer(
     help=(
@@ -73,3 +74,4 @@ app.add_typer(_annotate_mod.app, name="annotate")
 app.add_typer(_diversity_mod.app, name="diversity")
 app.add_typer(_cam_mod.app, name="cam")
 app.add_typer(_export_mod.app, name="export")
+app.add_typer(_update_mod.app, name="update")

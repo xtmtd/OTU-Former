@@ -49,13 +49,17 @@ def export(
         help="Input image size for ONNX export. Auto-inferred from backbone if not provided.",
     ),
     opset: int = typer.Option(18, "--opset", help="ONNX opset version."),
+    overwrite: bool = typer.Option(
+        False, "--overwrite", help="Clear an existing non-empty output directory."
+    ),
 ) -> None:
     if ctx.invoked_subcommand is not None:
         return
 
     from otuformer.vision.export import export_to_onnx
+    from otuformer.utils.io import prepare_output_dir
 
-    out_dir.mkdir(parents=True, exist_ok=True)
+    prepare_output_dir(out_dir, overwrite=overwrite)
     from otuformer.utils.logging import TeeLogger
 
     tee = TeeLogger(out_dir / "logs" / "export.log")
@@ -66,6 +70,7 @@ def export(
         params = {
             "checkpoint": str(checkpoint),
             "out_dir": str(out_dir),
+            "overwrite": overwrite,
             "imgsz": imgsz,
             "opset": opset,
         }

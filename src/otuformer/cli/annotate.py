@@ -98,6 +98,9 @@ def annotate(
     out_dir: Path = typer.Option(
         Path("runs/annotate"), "--out-dir", help="Output directory."
     ),
+    overwrite: bool = typer.Option(
+        False, "--overwrite", help="Clear an existing non-empty output directory."
+    ),
 ) -> None:
     if ctx.invoked_subcommand is not None:
         return
@@ -118,9 +121,9 @@ def annotate(
         validate_raw_assignments,
     )
     from otuformer.delineation.tree import build_upgma
-    from otuformer.utils.io import read_csv, write_csv, write_json
+    from otuformer.utils.io import prepare_output_dir, read_csv, write_csv, write_json
 
-    out_dir.mkdir(parents=True, exist_ok=True)
+    prepare_output_dir(out_dir, overwrite=overwrite)
     from otuformer.utils.logging import TeeLogger
 
     tee = TeeLogger(out_dir / "logs" / "annotate.log")
@@ -138,6 +141,7 @@ def annotate(
             "show_annotation_bar": show_annotation_bar,
             "show_partitioning_bars": show_partitioning_bars,
             "out_dir": str(out_dir),
+            "overwrite": overwrite,
         }
         print(f"Command: {_format_user_command(ctx, params)}")
         print("Parameters:")

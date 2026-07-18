@@ -65,7 +65,9 @@ def load_model_from_checkpoint(
     cfg = ckpt.get("config", {})
     resolved_name = cfg.get("model_name", model_name)
     out_dim = cfg.get("out_dim") or cfg.get("metric_embed_dim", 256)
-    encoder = OTUFormerEncoder(model_name=resolved_name, out_dim=out_dim)
+    encoder = OTUFormerEncoder(
+        model_name=resolved_name, out_dim=out_dim, pretrained=False
+    )
     encoder.load_state_dict(ckpt["model_state_dict"], strict=False)
     backbone = encoder.backbone
     backbone.eval().to(device)

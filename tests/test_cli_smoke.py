@@ -4,6 +4,7 @@ from PIL import Image
 import torch
 import os
 import logging
+from pathlib import Path
 from typer.testing import CliRunner
 
 from otuformer.cli.main import app
@@ -15,6 +16,29 @@ def test_help():
     result = runner.invoke(app, ["--help"])
     assert result.exit_code == 0
     assert "otu-former" in result.output.lower() or "otuformer" in result.output.lower()
+
+
+@pytest.mark.parametrize(
+    "command,options",
+    [
+        ("pretrain", ["--resume", "--overwrite"]),
+        ("finetune", ["--resume", "--overwrite"]),
+        ("extract", ["--overwrite"]),
+        ("cluster", ["--overwrite"]),
+        ("annotate", ["--overwrite"]),
+        ("diversity", ["--overwrite"]),
+        ("cam", ["--overwrite"]),
+        ("export", ["--overwrite"]),
+    ],
+)
+def test_help_lists_safety_options_after_out_dir(command, options):
+    result = runner.invoke(app, [command, "--help"])
+
+    assert result.exit_code == 0
+    positions = [result.output.rfind(option) for option in options]
+    assert all(position >= 0 for position in positions)
+    assert positions == sorted(positions)
+    assert positions[-1] > result.output.rfind("--out-dir")
 
 
 def test_doctor():
@@ -208,6 +232,78 @@ def test_pretrain_runs_one_epoch_without_train_data(tmp_path):
     assert result.exit_code == 0
     assert not (tmp_path / "pretrain_out_no_csv" / "last.pt").exists()
     assert (tmp_path / "pretrain_out_no_csv" / "SSL_latest.pth").exists()
+
+
+@pytest.mark.parametrize("command", ["pretrain", "finetune"])
+def test_training_rejects_resume_with_overwrite(tmp_path, command):
+    args = [
+        command,
+        "--resume",
+        str(tmp_path / "missing.pth"),
+        "--overwrite",
+        "--out-dir",
+        str(tmp_path / "out"),
+        "--input-images-dir",
+        str(tmp_path),
+        "--train-data",
+        str(tmp_path / "data.csv"),
+    ]
+    result = runner.invoke(app, args)
+
+    assert result.exit_code != 0
+    assert "cannot be used together" in result.output
+
+
+def test_pretrain_resume_allows_existing_output_and_appends_log(tmp_path, monkeypatch):
+    checkpoint = tmp_path / "resume.pth"
+    torch.save({}, checkpoint)
+    out_dir = tmp_path / "pretrain_out"
+    log_path = out_dir / "logs" / "pretrain.log"
+    log_path.parent.mkdir(parents=True)
+    log_path.write_text("old run\n", encoding="utf-8")
+    monkeypatch.setattr("otuformer.training.trainer.run_pretrain", lambda _args: None)
+
+    result = runner.invoke(
+        app,
+        [
+            "pretrain", "--resume", str(checkpoint), "--train-data", str(tmp_path / "data.csv"),
+            "--input-images-dir", str(tmp_path), "--out-dir", str(out_dir),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert log_path.read_text(encoding="utf-8").startswith("old run\n")
+
+
+def test_finetune_checkpoint_initialization_requires_empty_or_overwrite(tmp_path, monkeypatch):
+    checkpoint = tmp_path / "pretrained.pth"
+    torch.save({}, checkpoint)
+    out_dir = tmp_path / "finetune_out"
+    out_dir.mkdir()
+    stale = out_dir / "stale.txt"
+    stale.write_text("stale", encoding="utf-8")
+    monkeypatch.setattr("otuformer.training.trainer.run_finetune", lambda _args: None)
+    args = [
+        "finetune", "--checkpoint", str(checkpoint), "--train-data", str(tmp_path / "labels.csv"),
+        "--input-images-dir", str(tmp_path), "--out-dir", str(out_dir),
+    ]
+
+    rejected = runner.invoke(app, args)
+    assert rejected.exit_code != 0
+    assert stale.exists()
+
+    overwritten = runner.invoke(app, [*args, "--overwrite"])
+    assert overwritten.exit_code == 0
+    assert not stale.exists()
+
+
+def test_readmes_document_update_and_continued_training():
+    for path in ["README.md", "README.cn.md"]:
+        text = Path(path).read_text(encoding="utf-8")
+        assert "otuformer update" in text
+        assert "--overwrite" in text
+        assert "--resume" in text
+        assert "HF_TOKEN" in text
 
 
 def test_finetune_runs_one_epoch(tmp_path):
@@ -651,7 +747,7 @@ def test_cluster_old_bootstrap_flag_is_rejected(tmp_path):
     assert result.exit_code != 0
 
 
-def test_cluster_cleans_old_outputs_before_writing(tmp_path):
+def test_cluster_rejects_old_outputs_without_overwrite(tmp_path):
     emb_path, labels_path = _make_embeddings_and_labels(tmp_path)
     out_dir = tmp_path / "cluster_out_cleanup"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -670,6 +766,33 @@ def test_cluster_cleans_old_outputs_before_writing(tmp_path):
             str(labels_path),
             "--custom-cutoffs",
             "0.5",
+        ],
+    )
+    assert result.exit_code != 0
+    assert "--overwrite" in str(result.exception)
+    assert stale.exists()
+
+
+def test_cluster_overwrite_cleans_old_outputs_before_writing(tmp_path):
+    emb_path, labels_path = _make_embeddings_and_labels(tmp_path)
+    out_dir = tmp_path / "cluster_out_cleanup"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stale = out_dir / "old_should_disappear.txt"
+    stale.write_text("stale", encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        [
+            "cluster",
+            "--embeddings",
+            str(emb_path),
+            "--out-dir",
+            str(out_dir),
+            "--label-csv",
+            str(labels_path),
+            "--custom-cutoffs",
+            "0.5",
+            "--overwrite",
         ],
     )
     assert result.exit_code == 0

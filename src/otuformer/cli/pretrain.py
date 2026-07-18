@@ -124,14 +124,6 @@ def pretrain(
             "Default keeps full cross-view matching between global crops."
         ),
     ),
-    resume: str = typer.Option(
-        "",
-        "--resume",
-        help=(
-            "Checkpoint path for resuming interrupted pretraining "
-            "(restores model/optimizer/scheduler state)."
-        ),
-    ),
     log_every_n_steps: int = typer.Option(
         50, "--log-every-n-steps", help="Log metrics every N iterations."
     ),
@@ -193,13 +185,26 @@ def pretrain(
         "auto", "--device", help="Device: auto | cpu | cuda | mps."
     ),
     seed: int = typer.Option(42, "--seed", help="Random seed."),
+    resume: str = typer.Option(
+        "",
+        "--resume",
+        help="Checkpoint path for resuming interrupted pretraining.",
+    ),
+    overwrite: bool = typer.Option(
+        False, "--overwrite", help="Clear an existing non-empty output directory."
+    ),
 ) -> None:
     if ctx.invoked_subcommand is not None:
         return
 
     from otuformer.utils.logging import TeeLogger
+    from otuformer.utils.io import prepare_output_dir
 
-    out_dir.mkdir(parents=True, exist_ok=True)
+    if resume and overwrite:
+        raise typer.BadParameter("--resume and --overwrite cannot be used together.")
+    if resume and not Path(resume).is_file():
+        raise typer.BadParameter(f"Resume checkpoint not found: {resume}")
+    prepare_output_dir(out_dir, overwrite=overwrite, allow_existing=bool(resume))
     tee = TeeLogger(
         out_dir / "logs" / "pretrain.log",
         append=bool(resume),
@@ -212,6 +217,7 @@ def pretrain(
             train_data=str(train_data) if train_data is not None else "",
             input_images_dir=str(input_images_dir),
             out_dir=str(out_dir),
+            overwrite=overwrite,
             model_name=model_name,
             out_dim=out_dim,
             max_epochs=max_epochs,

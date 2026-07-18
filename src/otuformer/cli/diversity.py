@@ -145,6 +145,9 @@ def diversity(
         "--save-nj-centroids",
         help="Save OTU centroid embeddings to <out-dir>/NJ_OTU_centroids.csv.",
     ),
+    overwrite: bool = typer.Option(
+        False, "--overwrite", help="Clear an existing non-empty output directory."
+    ),
 ) -> None:
     if ctx.invoked_subcommand is not None:
         return
@@ -158,9 +161,9 @@ def diversity(
         parse_otu_table,
         split_assignments_by_sample,
     )
-    from otuformer.utils.io import read_csv
+    from otuformer.utils.io import prepare_output_dir, read_csv
 
-    out_dir.mkdir(parents=True, exist_ok=True)
+    prepare_output_dir(out_dir, overwrite=overwrite)
     from otuformer.utils.logging import TeeLogger
 
     tee = TeeLogger(out_dir / "logs" / "diversity.log")
@@ -175,6 +178,7 @@ def diversity(
             "otu_table_csv": str(otu_table_csv) if otu_table_csv else "",
             "otu_table_has_header": otu_table_has_header,
             "out_dir": str(out_dir),
+            "overwrite": overwrite,
             "min_abundance": min_abundance,
             "phylo": phylo,
             "embeddings": str(embeddings) if embeddings is not None else "",

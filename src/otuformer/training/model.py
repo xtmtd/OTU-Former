@@ -38,6 +38,7 @@ class OTUFormerEncoder(nn.Module):
         out_dim: int = 256,
         return_patch_tokens: bool = False,
         img_size: int = 224,
+        pretrained: bool = True,
     ) -> None:
         super().__init__()
         self.return_patch_tokens = return_patch_tokens
@@ -48,7 +49,7 @@ class OTUFormerEncoder(nn.Module):
                 img_size=img_size,
                 num_classes=0,
                 global_pool="",
-                pretrained=True,
+                pretrained=pretrained,
                 dynamic_img_size=True,
             )
         except Exception:
@@ -56,7 +57,7 @@ class OTUFormerEncoder(nn.Module):
                 self.backbone = timm.create_model(
                     model_name,
                     img_size=img_size,
-                    pretrained=True,
+                    pretrained=pretrained,
                     dynamic_img_size=True,
                 )
                 if hasattr(self.backbone, "head"):

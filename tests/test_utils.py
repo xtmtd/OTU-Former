@@ -7,7 +7,13 @@ import pytest
 import torch
 
 from otuformer.utils.checkpoint import load_checkpoint, save_checkpoint
-from otuformer.utils.io import read_csv, read_json, write_csv, write_json
+from otuformer.utils.io import (
+    prepare_output_dir,
+    read_csv,
+    read_json,
+    write_csv,
+    write_json,
+)
 from otuformer.utils.logging import TeeLogger
 
 
@@ -66,3 +72,30 @@ def test_checkpoint_roundtrip(tmp_path):
 def test_load_checkpoint_missing_file():
     with pytest.raises(FileNotFoundError):
         load_checkpoint(Path("/nonexistent/path.pt"))
+
+
+def test_prepare_output_dir_rejects_existing_content(tmp_path):
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    (out_dir / ".DS_Store").write_text("metadata", encoding="utf-8")
+
+    with pytest.raises(FileExistsError, match="--overwrite"):
+        prepare_output_dir(out_dir)
+
+
+def test_prepare_output_dir_overwrite_removes_existing_content(tmp_path):
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    (out_dir / "stale.txt").write_text("stale", encoding="utf-8")
+
+    assert prepare_output_dir(out_dir, overwrite=True) == out_dir
+    assert out_dir.exists()
+    assert list(out_dir.iterdir()) == []
+
+
+def test_prepare_output_dir_allows_existing_resume_directory(tmp_path):
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    (out_dir / "SSL_latest.pth").write_text("checkpoint", encoding="utf-8")
+
+    assert prepare_output_dir(out_dir, allow_existing=True) == out_dir

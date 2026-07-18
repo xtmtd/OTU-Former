@@ -23,6 +23,7 @@ otuformer <command> [options]
 | `diversity` | Compute community alpha diversity indices (Shannon, Simpson, Chao1, Faith's PD, etc.) |
 | `cam` | Generate GradCAM and other heatmaps |
 | `export` | Export model to ONNX format |
+| `update` | Check for and install the latest published version |
 
 ## Features
 
@@ -115,11 +116,48 @@ The report includes:
 **Output**:
 - Diagnostic report printed to terminal
 
+### Update Command
+
+```bash
+otuformer update
+otuformer update --check
+otuformer update --yes
+```
+
+Checks published Git tags and installs the latest release only after confirmation.
+
+### Output Safety
+
+Commands refuse a non-empty `--out-dir` by default. Pass `--overwrite` to clear
+it deliberately. Training `--resume` runs keep and append to their existing
+output directory; `--resume` and `--overwrite` cannot be combined.
+
+### Hugging Face Weights
+
+New pretrain and finetune runs initialize from public timm weights. An
+unauthenticated Hugging Face warning is expected when those weights are first
+downloaded or absent from the local cache; `HF_TOKEN` is optional and only raises
+rate limits. CAM, extract, and export load their supplied local checkpoint and
+do not require Hugging Face access.
+
 ---
 
 ### Pretrain Command
 
 Self-supervised contrastive pretraining using DINO/iBOT-style teacher-student ViT, no labels required.
+
+To continue pretraining after adding images, create a CSV containing both old and
+new images, keep the same `--out-dir`, pass the latest checkpoint to `--resume`,
+and increase `--max-epochs`:
+
+```bash
+otuformer pretrain --train-data images_union.csv --input-images-dir ./images \
+    --out-dir runs/pretrain --resume runs/pretrain/SSL_latest.pth --max-epochs 100
+```
+
+An extended run may use a larger union dataset. A same-plan resume requires the
+original DataLoader length. Training on only newly added images is possible but
+can forget previously learned data.
 
 ```bash
 # Basic usage
@@ -195,6 +233,19 @@ otuformer pretrain \
 ### Finetune Command
 
 ArcFace metric learning finetuning with labelled data.
+
+To add images to known classes, train with a CSV containing the union of old and
+new labeled images, keep the same `--out-dir`, resume from the latest fine-tune
+checkpoint, and increase `--finetune-epochs`:
+
+```bash
+otuformer finetune --train-data labels_union.csv --input-images-dir ./images \
+    --out-dir runs/finetune --resume runs/finetune/finetune_latest.pth \
+    --finetune-epochs 50
+```
+
+The resumed CSV must retain exactly the same label set. New classes require a
+new fine-tune initialized with `--checkpoint` rather than `--resume`.
 
 ```bash
 # Basic usage

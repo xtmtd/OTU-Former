@@ -6,6 +6,31 @@ import torch
 from otuformer.vision.export import export_to_onnx, load_exported_onnx
 
 
+def test_export_checkpoint_loader_disables_pretrained_weights(monkeypatch, tmp_path: Path):
+    import otuformer.vision.export as export_module
+
+    seen = {}
+
+    class FakeEncoder(torch.nn.Module):
+        def __init__(self, **kwargs):
+            super().__init__()
+            seen.update(kwargs)
+
+        def load_state_dict(self, *_args, **_kwargs):
+            return None
+
+        def eval(self):
+            return self
+
+    monkeypatch.setattr(export_module, "load_checkpoint", lambda _path: {"model_state_dict": {}})
+    monkeypatch.setattr(export_module, "OTUFormerEncoder", FakeEncoder)
+    monkeypatch.setattr(export_module.torch.onnx, "export", lambda *_args, **_kwargs: None)
+
+    export_to_onnx(tmp_path / "model.pth", tmp_path / "encoder.onnx", imgsz=224)
+
+    assert seen["pretrained"] is False
+
+
 def make_checkpoint(tmp_path: Path, out_dim: int = 64) -> Path:
     from otuformer.training.model import OTUFormerEncoder
 

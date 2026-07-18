@@ -108,6 +108,87 @@ def _cosine_scheduler(
     return schedule
 
 
+def _build_pretrain_schedules(
+    args: argparse.Namespace,
+    schedule_state: dict[str, Any] | None,
+    *,
+    steps_per_epoch: int,
+    global_step: int,
+    completed_epochs: int,
+    original_max_epochs: int | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
+    """Build schedules without restarting LR after a resumed pretrain run."""
+    final_lr = float(args.lr) * 0.01
+    if schedule_state is None:
+        if completed_epochs > 0 and original_max_epochs != args.max_epochs:
+            raise ValueError(
+                "Cannot resume a legacy checkpoint without schedule metadata."
+            )
+        total_steps = max(1, args.max_epochs * steps_per_epoch)
+        warmup_steps = int(max(0, args.warmup_epochs) * steps_per_epoch)
+        metadata = {
+            "original_max_epochs": args.max_epochs,
+            "total_steps": total_steps,
+            "steps_per_epoch": steps_per_epoch,
+            "warmup_steps": warmup_steps,
+            "last_lr": float(args.lr),
+            "final_lr": final_lr,
+        }
+        lr = _cosine_scheduler(
+            args.lr, final_lr, args.max_epochs, steps_per_epoch,
+            warmup_epochs=args.warmup_epochs, start_warmup_value=args.lr * 0.1,
+        )
+        momentum = _cosine_scheduler(
+            args.teacher_momentum, args.teacher_momentum_end,
+            args.max_epochs, steps_per_epoch,
+        )
+        teacher_temp = _build_teacher_temp_schedule(
+            total_steps, args.teacher_temp_start, args.teacher_temp_end
+        )
+    else:
+        original_epochs = int(schedule_state["original_max_epochs"])
+        original_steps = int(schedule_state["total_steps"])
+        original_spe = int(schedule_state["steps_per_epoch"])
+        if args.max_epochs <= completed_epochs:
+            raise ValueError("--max-epochs must exceed the completed checkpoint epoch.")
+        if args.max_epochs < original_epochs:
+            raise ValueError("Cannot decrease the original pretrain epoch plan.")
+        if args.max_epochs == original_epochs:
+            if steps_per_epoch != original_spe:
+                raise ValueError("same-plan resume requires the original DataLoader length.")
+            lr = _cosine_scheduler(
+                args.lr, float(schedule_state["final_lr"]), original_epochs,
+                original_spe, warmup_epochs=float(schedule_state["warmup_steps"]) / original_spe,
+                start_warmup_value=args.lr * 0.1,
+            )
+            momentum = _cosine_scheduler(
+                args.teacher_momentum, args.teacher_momentum_end, original_epochs, original_spe
+            )
+            teacher_temp = _build_teacher_temp_schedule(
+                original_steps, args.teacher_temp_start, args.teacher_temp_end
+            )
+            metadata = dict(schedule_state)
+        else:
+            extension_steps = (args.max_epochs - completed_epochs) * steps_per_epoch
+            extension_lr = _cosine_scheduler(
+                float(schedule_state["last_lr"]), float(schedule_state["final_lr"]),
+                1, extension_steps,
+            )
+            lr = np.concatenate([np.full(global_step, float(schedule_state["last_lr"])), extension_lr])
+            momentum = np.full(len(lr), args.teacher_momentum_end, dtype=np.float32)
+            teacher_temp = np.full(len(lr), args.teacher_temp_end, dtype=np.float32)
+            metadata = {
+                **schedule_state,
+                "steps_per_epoch": steps_per_epoch,
+                "total_steps": len(lr),
+                "last_lr": float(schedule_state["last_lr"]),
+            }
+    if global_step >= len(lr):
+        raise ValueError("Checkpoint iteration exceeds the available pretrain schedule.")
+    student_temp = np.full(len(lr), float(args.student_temp), dtype=np.float32)
+    return lr, momentum, student_temp, teacher_temp, metadata
+
+
 def _compute_global_loss(
     student_global: list[torch.Tensor],
     teacher_global: list[torch.Tensor],
@@ -908,64 +989,51 @@ def run_pretrain(args: argparse.Namespace) -> None:
 
     start_epoch = 0
     global_step = 0
+    resume_ckpt: dict[str, Any] | None = None
     if getattr(args, "resume", ""):
         resume_path = Path(args.resume)
-        if resume_path.exists():
-            ckpt = torch.load(resume_path, map_location="cpu", weights_only=False)
-            if "student" in ckpt:
-                student.load_state_dict(ckpt["student"], strict=False)
-            elif "model_state_dict" in ckpt:
-                student.load_state_dict(ckpt["model_state_dict"], strict=False)
-            if "teacher" in ckpt:
-                teacher.load_state_dict(ckpt["teacher"], strict=False)
-            if "optimizer" in ckpt:
-                optimizer.load_state_dict(ckpt["optimizer"])
-            if "center" in ckpt:
-                teacher.center.copy_(ckpt["center"].to(device))
-            start_epoch = int(ckpt.get("epoch", -1)) + 1
-            global_step = int(ckpt.get("iteration", start_epoch * max(1, len(loader))))
-            print(
-                f"[Info] Resume from {resume_path} at epoch {start_epoch}, iteration {global_step}"
+        resume_ckpt = torch.load(resume_path, map_location="cpu", weights_only=False)
+        if "student" in resume_ckpt:
+            student.load_state_dict(resume_ckpt["student"], strict=False)
+        elif "model_state_dict" in resume_ckpt:
+            student.load_state_dict(resume_ckpt["model_state_dict"], strict=False)
+        if "teacher" in resume_ckpt:
+            teacher.load_state_dict(resume_ckpt["teacher"], strict=False)
+        if "optimizer" in resume_ckpt:
+            optimizer.load_state_dict(resume_ckpt["optimizer"])
+        if "center" in resume_ckpt:
+            teacher.center.copy_(resume_ckpt["center"].to(device))
+        start_epoch = int(resume_ckpt.get("epoch", -1)) + 1
+        global_step = int(resume_ckpt.get("iteration", start_epoch * max(1, len(loader))))
+        legacy_max_epochs = resume_ckpt.get("args", {}).get("max_epochs")
+        if (
+            resume_ckpt.get("schedule") is None
+            and legacy_max_epochs is not None
+            and args.max_epochs != int(legacy_max_epochs)
+        ):
+            raise ValueError(
+                "Cannot extend a legacy checkpoint without schedule metadata."
             )
+        print(
+            f"[Info] Resume from {resume_path} at epoch {start_epoch}, iteration {global_step}"
+        )
 
     niter_per_epoch = max(1, len(loader))
-    total_steps = max(1, args.max_epochs * niter_per_epoch)
-    warmup_epochs = float(max(0, args.warmup_epochs))
-    warmup_iters = int(warmup_epochs * niter_per_epoch)
-    if getattr(args, "resume", "") and global_step >= warmup_iters:
-        warmup_epochs = 0.0
-        print(
-            f"[Info] Already past warmup phase (iter {global_step} >= {warmup_iters}), setting warmup_epochs=0"
-        )
-    elif getattr(args, "resume", "") and global_step > 0:
-        remaining_warmup_iters = max(0, warmup_iters - global_step)
-        warmup_epochs = remaining_warmup_iters / max(1, niter_per_epoch)
-        print(
-            f"[Info] Resuming during warmup phase, adjusting warmup to {warmup_epochs:.2f} epochs"
-        )
-
-    lr_schedule = _cosine_scheduler(
-        base_value=args.lr,
-        final_value=args.lr * 0.01,
-        epochs=args.max_epochs,
-        niter_per_ep=niter_per_epoch,
-        warmup_epochs=warmup_epochs,
-        start_warmup_value=args.lr * 0.1,
+    lr_schedule, momentum_schedule, temp_student_schedule, teacher_temp_schedule, schedule_state = _build_pretrain_schedules(
+        args,
+        resume_ckpt.get("schedule") if resume_ckpt is not None else None,
+        steps_per_epoch=niter_per_epoch,
+        global_step=global_step,
+        completed_epochs=start_epoch,
+        original_max_epochs=(
+            int(resume_ckpt["args"]["max_epochs"])
+            if resume_ckpt is not None
+            and isinstance(resume_ckpt.get("args"), dict)
+            and "max_epochs" in resume_ckpt["args"]
+            else None
+        ),
     )
-    momentum_schedule = _cosine_scheduler(
-        base_value=args.teacher_momentum,
-        final_value=args.teacher_momentum_end,
-        epochs=args.max_epochs,
-        niter_per_ep=niter_per_epoch,
-    )
-    temp_student_schedule = np.ones(total_steps, dtype=np.float32) * float(
-        args.student_temp
-    )
-    teacher_temp_schedule = _build_teacher_temp_schedule(
-        total_iters=total_steps,
-        teacher_temp_start=args.teacher_temp_start,
-        teacher_temp_end=args.teacher_temp_end,
-    )
+    total_steps = len(lr_schedule)
 
     cosine_sim = 0.0
     eval_image_size = (
@@ -999,7 +1067,7 @@ def run_pretrain(args: argparse.Namespace) -> None:
             global_views = views[:2]
             local_views = views[2:]
 
-            iter_idx = min(global_step, total_steps - 1)
+            iter_idx = global_step
             for group in optimizer.param_groups:
                 group["lr"] = float(lr_schedule[iter_idx])
 
@@ -1125,6 +1193,10 @@ def run_pretrain(args: argparse.Namespace) -> None:
                     "model_name": args.model_name,
                     "out_dim": args.out_dim,
                 },
+                "schedule": {
+                    **schedule_state,
+                    "last_lr": float(optimizer.param_groups[0]["lr"]),
+                },
             }
             ckpt_path = out_dir / f"SSL_epoch_{epoch + 1:04d}.pth"
             save_checkpoint(ckpt, ckpt_path)
@@ -1167,6 +1239,19 @@ def _freeze_backbone_blocks(model: OTUFormerEncoder, freeze_ratio: float) -> Non
         requires_grad = i >= n_freeze
         for p in block.parameters():
             p.requires_grad = requires_grad
+
+
+def _validate_finetune_resume(
+    checkpoint: dict[str, Any], current_class_labels: list[str], finetune_epochs: int
+) -> None:
+    completed_epochs = int(checkpoint.get("epoch", -1)) + 1
+    if finetune_epochs <= completed_epochs:
+        raise ValueError("--finetune-epochs must exceed the completed checkpoint epoch.")
+    saved_labels = checkpoint.get("class_labels")
+    if saved_labels is not None and list(saved_labels) != current_class_labels:
+        raise ValueError("Cannot resume: training class labels differ from checkpoint.")
+    if saved_labels is None:
+        print("[Warning] Resume checkpoint lacks class labels; validating class count only.")
 
 
 def run_finetune(args: argparse.Namespace) -> None:
@@ -1213,6 +1298,15 @@ def run_finetune(args: argparse.Namespace) -> None:
 
     start_epoch = 0
     if resume_path is not None:
+        class_labels = sorted(str(label) for label in ds.class_to_idx)
+        _validate_finetune_resume(ckpt, class_labels, args.finetune_epochs)
+        saved_loss = ckpt.get("loss_state_dict")
+        if saved_loss is not None:
+            saved_classes = saved_loss["head.weight"].shape[0]
+            if saved_classes != n_classes:
+                raise ValueError(
+                    "Cannot resume: checkpoint class count differs from training data."
+                )
         if "optimizer" in ckpt:
             optimizer.load_state_dict(ckpt["optimizer"])
         if "loss_state_dict" in ckpt:
@@ -1315,6 +1409,7 @@ def run_finetune(args: argparse.Namespace) -> None:
                     "metric_embed_dim": out_dim,
                     "out_dim": out_dim,
                 },
+                "class_labels": sorted(str(label) for label in ds.class_to_idx),
             }
             save_path = out_dir / f"finetune_epoch_{epoch + 1:04d}.pth"
             save_checkpoint(ckpt_payload, save_path)

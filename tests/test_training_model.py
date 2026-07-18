@@ -22,6 +22,24 @@ def test_encoder_does_not_silently_fall_back_to_random_weights(monkeypatch):
     assert all(kwargs["pretrained"] for kwargs in calls)
 
 
+def test_encoder_forwards_pretrained_false_to_all_timm_branches(monkeypatch):
+    import otuformer.training.model as model_module
+
+    calls = []
+
+    def fail_create_model(_model_name, **kwargs):
+        calls.append(kwargs)
+        raise OSError("no local weights required")
+
+    monkeypatch.setattr(model_module.timm, "create_model", fail_create_model)
+
+    with pytest.raises(RuntimeError, match="Could not load pretrained backbone weights"):
+        OTUFormerEncoder(model_name="vit_tiny_patch16_224", pretrained=False)
+
+    assert calls
+    assert all(kwargs["pretrained"] is False for kwargs in calls)
+
+
 def test_encoder_output_shape():
     model = OTUFormerEncoder(model_name="vit_tiny_patch16_224", out_dim=128)
     x = torch.randn(2, 3, 224, 224)

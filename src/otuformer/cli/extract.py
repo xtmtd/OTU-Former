@@ -149,14 +149,17 @@ def extract(
         ),
     ),
     seed: int = typer.Option(42, "--seed", help="Random seed."),
+    overwrite: bool = typer.Option(
+        False, "--overwrite", help="Clear an existing non-empty output directory."
+    ),
 ) -> None:
     if ctx.invoked_subcommand is not None:
         return
 
     from otuformer.embedding.extractor import extract_embeddings
-    from otuformer.utils.io import write_csv
+    from otuformer.utils.io import prepare_output_dir, write_csv
 
-    out_dir.mkdir(parents=True, exist_ok=True)
+    prepare_output_dir(out_dir, overwrite=overwrite)
 
     from otuformer.utils.logging import TeeLogger
 
@@ -169,6 +172,7 @@ def extract(
             checkpoint=str(checkpoint) if checkpoint is not None else "",
             input_images_dir=str(input_images_dir),
             out_dir=str(out_dir),
+            overwrite=overwrite,
             model_name=model_name,
             extract_size=extract_size,
             use_projector_output=use_projector_output,

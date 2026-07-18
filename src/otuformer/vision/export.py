@@ -41,7 +41,7 @@ def export_to_onnx(
     model_name = cfg.get("model_name", "vit_tiny_patch16_224")
     out_dim = cfg.get("out_dim") or cfg.get("metric_embed_dim", 256)
 
-    model = OTUFormerEncoder(model_name=model_name, out_dim=out_dim)
+    model = OTUFormerEncoder(model_name=model_name, out_dim=out_dim, pretrained=False)
     model.load_state_dict(ckpt["model_state_dict"], strict=False)
     model.eval()
 

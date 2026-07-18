@@ -1,7 +1,97 @@
 import pytest
 import torch
+import argparse
 
 from otuformer.training import trainer
+
+
+def _schedule_args(max_epochs=5):
+    return argparse.Namespace(
+        max_epochs=max_epochs,
+        lr=0.001,
+        warmup_epochs=1,
+        teacher_momentum=0.995,
+        teacher_momentum_end=0.999,
+        student_temp=0.1,
+        teacher_temp_start=0.04,
+        teacher_temp_end=0.07,
+    )
+
+
+def test_pretrain_extension_starts_at_saved_lr_and_never_increases():
+    saved = {
+        "original_max_epochs": 2,
+        "total_steps": 8,
+        "steps_per_epoch": 4,
+        "warmup_steps": 4,
+        "last_lr": 0.0002,
+        "final_lr": 0.00001,
+    }
+    lr, momentum, _, teacher_temp, metadata = trainer._build_pretrain_schedules(
+        _schedule_args(), saved, steps_per_epoch=6, global_step=8, completed_epochs=2
+    )
+
+    extension = lr[8:]
+    assert extension[0] == pytest.approx(0.0002)
+    assert all(left >= right for left, right in zip(extension, extension[1:]))
+    assert momentum[8] == pytest.approx(0.999)
+    assert teacher_temp[8] == pytest.approx(0.07)
+    assert metadata["steps_per_epoch"] == 6
+
+
+def test_same_plan_pretrain_resume_rejects_changed_loader_length():
+    saved = {
+        "original_max_epochs": 2,
+        "total_steps": 8,
+        "steps_per_epoch": 4,
+        "warmup_steps": 4,
+        "last_lr": 0.0002,
+        "final_lr": 0.00001,
+    }
+
+    with pytest.raises(ValueError, match="same-plan resume"):
+        trainer._build_pretrain_schedules(
+            _schedule_args(2), saved, steps_per_epoch=5, global_step=4, completed_epochs=1
+        )
+
+
+def test_finetune_resume_rejects_different_class_mapping():
+    with pytest.raises(ValueError, match="class labels differ"):
+        trainer._validate_finetune_resume(
+            {"epoch": 0, "class_labels": ["a", "b"]}, ["a", "c"], 2
+        )
+
+
+def test_legacy_pretrain_same_plan_resume_is_allowed():
+    lr, *_ = trainer._build_pretrain_schedules(
+        _schedule_args(5),
+        None,
+        steps_per_epoch=4,
+        global_step=8,
+        completed_epochs=2,
+        original_max_epochs=5,
+    )
+
+    assert len(lr) == 20
+
+
+def test_legacy_pretrain_resume_rejects_missing_schedule_metadata():
+    with pytest.raises(ValueError, match="legacy checkpoint"):
+        trainer._build_pretrain_schedules(
+            _schedule_args(6),
+            None,
+            steps_per_epoch=4,
+            global_step=8,
+            completed_epochs=2,
+            original_max_epochs=5,
+        )
+
+
+def test_finetune_resume_rejects_completed_epoch_target():
+    with pytest.raises(ValueError, match="finetune-epochs must exceed"):
+        trainer._validate_finetune_resume(
+            {"epoch": 2, "class_labels": ["a", "b"]}, ["a", "b"], 3
+        )
 
 
 def test_teacher_temp_schedule_uses_70_percent_warmup():

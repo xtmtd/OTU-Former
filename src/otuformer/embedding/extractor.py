@@ -416,7 +416,9 @@ def _load_model(
     cfg = ckpt.get("config", {})
     out_dim = cfg.get("out_dim") or cfg.get("metric_embed_dim", 256)
     resolved_model = cfg.get("model_name", model_name)
-    model = OTUFormerEncoder(model_name=resolved_model, out_dim=out_dim)
+    model = OTUFormerEncoder(
+        model_name=resolved_model, out_dim=out_dim, pretrained=False
+    )
 
     if use_student:
         state_dict = ckpt.get("student") or ckpt.get("model_state_dict")

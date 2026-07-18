@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import shutil
 import sys
 import traceback
 from pathlib import Path
@@ -812,7 +811,7 @@ def cluster(
     out_dir: Path = typer.Option(
         Path("runs/cluster"),
         "--out-dir",
-        help="Output directory. Existing contents are cleared before each run.",
+        help="Output directory.",
     ),
     distance: str = typer.Option(
         "cosine",
@@ -899,6 +898,9 @@ def cluster(
     ),
     cpus: int = typer.Option(8, "--cpus", help="CPU threads."),
     random_state: int = typer.Option(42, "--random-state", help="Random seed."),
+    overwrite: bool = typer.Option(
+        False, "--overwrite", help="Clear an existing non-empty output directory."
+    ),
 ) -> None:
     if ctx.invoked_subcommand is not None:
         return
@@ -925,6 +927,7 @@ def cluster(
         upgma_to_newick,
     )
     from otuformer.utils.io import read_csv
+    from otuformer.utils.io import prepare_output_dir
     from otuformer.utils.logging import TeeLogger
 
     pca_whitening_enabled = _parse_bool_option("pca-whitening", pca_whitening)
@@ -934,9 +937,7 @@ def cluster(
     )
     save_distances_enabled = _parse_bool_option("save-distances", save_distances)
 
-    if out_dir.exists():
-        shutil.rmtree(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    prepare_output_dir(out_dir, overwrite=overwrite)
     tee = TeeLogger(out_dir / "logs" / "cluster.log")
     original_stderr = sys.stderr
     sys.stdout = tee
@@ -945,6 +946,7 @@ def cluster(
         params = {
             "embeddings": str(embeddings),
             "out_dir": str(out_dir),
+            "overwrite": overwrite,
             "distance": distance,
             "prefix": prefix,
             "pca_whitening": pca_whitening_enabled,
@@ -1134,10 +1136,6 @@ def cluster(
             prefix=prefix,
             id_to_sample=id_to_sample,
         )
-        for legacy_file in tables_dir.glob("partition_*_assignments.csv"):
-            shutil.copy2(legacy_file, out_dir / legacy_file.name)
-        for legacy_file in tables_dir.glob("partition_*_summary.csv"):
-            shutil.copy2(legacy_file, out_dir / legacy_file.name)
         support = {}
         if num_replicates > 0:
             if support_mode == "subsample" and subsample_ratio >= 1.0:
