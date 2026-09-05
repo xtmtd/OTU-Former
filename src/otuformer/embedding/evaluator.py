@@ -10,7 +10,10 @@ import numpy as np
 
 def _safe_cv_splits(labels: np.ndarray, max_cv: int = 5) -> int:
     n_classes = len(np.unique(labels))
-    return max(1, min(max_cv, n_classes))
+    if n_classes == 0:
+        return 1
+    min_class_count = int(np.min(np.unique(labels, return_counts=True)[1]))
+    return max(1, min(max_cv, n_classes, min_class_count))
 
 
 def compute_knn_accuracy(
@@ -27,13 +30,18 @@ def compute_knn_accuracy(
     cv = _safe_cv_splits(labels)
     if cv < 2:
         return {f"kNN_Acc_k{k}": 0.0 for k in k_values}
+    max_train_size = len(labels) - int(np.ceil(len(labels) / cv))
     for k in k_values:
+        key = f"kNN_Acc_k{k}"
+        if k < 1 or k > max_train_size:
+            result[key] = 0.0
+            continue
         knn = KNeighborsClassifier(n_neighbors=k, metric="cosine")
         try:
             scores = cross_val_score(knn, x, labels, cv=cv)
-            result[f"kNN_Acc_k{k}"] = float(scores.mean())
+            result[key] = float(np.nanmean(scores))
         except Exception:
-            result[f"kNN_Acc_k{k}"] = 0.0
+            result[key] = 0.0
     return result
 
 
@@ -93,11 +101,15 @@ def compute_clustering_metrics(
     unique_labels, label_codes = np.unique(labels, return_inverse=True)
     n_clusters = len(unique_labels)
     x = normalize(embeddings, norm="l2")
-    km = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-    pred = km.fit_predict(x)
+    if np.unique(x, axis=0).shape[0] < n_clusters:
+        pred = np.zeros(len(x), dtype=int)
+    else:
+        km = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+        pred = km.fit_predict(x)
 
     purity = sum(
-        np.bincount(label_codes[pred == c]).max() for c in range(n_clusters)
+        np.bincount(label_codes[pred == c], minlength=n_clusters).max()
+        for c in range(n_clusters)
     ) / len(label_codes)
     if len(x) < 2 or len(np.unique(label_codes)) < 2:
         sil = 0.0
@@ -183,13 +195,13 @@ def run_umap(
     import umap.umap_ as umap
     from sklearn.preprocessing import normalize
 
-    if labels is not None and len(labels) < 2:
+    if len(embeddings) < 3 or (labels is not None and len(labels) < 2):
         return
 
     x = normalize(embeddings, norm="l2")
     reducer = umap.UMAP(
         n_components=n_components,
-        n_neighbors=n_neighbors,
+        n_neighbors=min(max(2, n_neighbors), len(x) - 1),
         min_dist=min_dist,
         metric=metric,
         random_state=42,

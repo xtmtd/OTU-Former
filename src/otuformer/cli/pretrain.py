@@ -137,8 +137,8 @@ def pretrain(
         None,
         "--visualize-data",
         help=(
-            "CSV with 'image' and optional 'label' for periodic embedding metrics/UMAP. "
-            "If omitted, --train-data is reused when available."
+            "CSV with an 'image' column and optional 'label' for periodic embedding metrics/UMAP. "
+            "Without labels, only UMAP is generated. If omitted, --train-data is reused when available."
         ),
     ),
     extract_size: int = typer.Option(
@@ -152,7 +152,7 @@ def pretrain(
     metrics_sample_size: int = typer.Option(
         10000,
         "--metrics-sample-size",
-        help="Max samples for expensive periodic metrics (<=0 means no cap).",
+        help="Max samples for periodic metrics and UMAP (<=0 means no cap).",
     ),
     umap_n_neighbors: int = typer.Option(
         15, "--umap-n-neighbors", help="UMAP n_neighbors."

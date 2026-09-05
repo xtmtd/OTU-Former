@@ -148,6 +148,50 @@ def test_extract_attention_pool_requires_training_csv_without_finetuned_pool(
         )
 
 
+def test_extract_attention_pool_rejects_image_only_training_csv(tmp_path: Path):
+    ckpt = make_checkpoint(tmp_path)
+    img_dir = tmp_path / "images"
+    make_images(img_dir, n=2)
+    csv_path = tmp_path / "images.csv"
+    pd.DataFrame({"image": ["img_0.jpg", "img_1.jpg"]}).to_csv(
+        csv_path, index=False
+    )
+
+    with pytest.raises(ValueError, match="image.*label"):
+        extract_embeddings(
+            checkpoint_path=ckpt,
+            images_dir=img_dir,
+            device="cpu",
+            batch_size=2,
+            token_mode="attention-pool",
+            attention_train_csv=csv_path,
+        )
+
+
+def test_extract_attention_pool_validates_csv_before_start_message(
+    tmp_path: Path, capsys
+):
+    ckpt = make_checkpoint(tmp_path)
+    img_dir = tmp_path / "images"
+    make_images(img_dir, n=2)
+    csv_path = tmp_path / "images.csv"
+    pd.DataFrame({"image": ["img_0.jpg", "img_1.jpg"]}).to_csv(
+        csv_path, index=False
+    )
+
+    with pytest.raises(ValueError, match="image.*label"):
+        extract_embeddings(
+            checkpoint_path=ckpt,
+            images_dir=img_dir,
+            device="cpu",
+            batch_size=2,
+            token_mode="attention-pool",
+            attention_train_csv=csv_path,
+        )
+
+    assert "Starting query finetuning" not in capsys.readouterr().out
+
+
 def test_extract_csv_preserves_csv_order(tmp_path: Path):
     ckpt = make_checkpoint(tmp_path)
     img_dir = tmp_path / "images"

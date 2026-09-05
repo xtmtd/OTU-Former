@@ -816,7 +816,7 @@ def _maybe_subsample_for_metrics(
     max_samples: int,
     seed: int,
 ) -> tuple[np.ndarray, np.ndarray | None]:
-    if len(embeddings) <= max_samples:
+    if max_samples <= 0 or len(embeddings) <= max_samples:
         return embeddings, labels
     rng = np.random.default_rng(seed)
     idx = rng.choice(len(embeddings), size=max_samples, replace=False)
@@ -844,7 +844,11 @@ def _compute_all_metrics(
         "Silhouette_Score": "",
         "Purity": "",
     }
-    if labels is None or len(embeddings) == 0:
+    if (
+        labels is None
+        or len(embeddings) == 0
+        or len(np.unique(labels)) < 2
+    ):
         return fields
 
     try:
@@ -894,7 +898,7 @@ def _compute_and_log_all_metrics(
             feats_eval, labels_eval = _maybe_subsample_for_metrics(
                 feats,
                 labels,
-                max_samples=max(1, args.metrics_sample_size),
+                max_samples=args.metrics_sample_size,
                 seed=args.seed,
             )
             metrics = _compute_all_metrics(
@@ -902,14 +906,21 @@ def _compute_and_log_all_metrics(
             )
             metrics_logger.log(epoch + 1, "train", metrics)
             print(f"[Metrics] Epoch {epoch + 1}:")
+            if labels_eval is None:
+                print("  [Info] Skipping supervised embedding metrics: no labels provided.")
+            elif len(np.unique(labels_eval)) < 2:
+                print(
+                    "  [Info] Skipping supervised embedding metrics: "
+                    "fewer than two label classes after sampling."
+                )
             for k, v in metrics.items():
                 if v != "":
                     print(f"  {k}: {float(v):.4f}")
-            if labels is not None and len(feats) >= 10:
+            if len(feats_eval) >= 10:
                 out_path = logs_dir / f"umap.train.epoch_{epoch + 1:04d}.pdf"
                 run_umap(
-                    feats,
-                    labels,
+                    feats_eval,
+                    labels_eval,
                     out_path,
                     n_components=2,
                     n_neighbors=args.umap_n_neighbors,
@@ -919,6 +930,8 @@ def _compute_and_log_all_metrics(
                     title=f"UMAP Train - Epoch {epoch + 1}",
                 )
                 print(f"[Info] Saved UMAP plot to {out_path}")
+            else:
+                print("[Info] Skipping UMAP: fewer than 10 samples after sampling.")
         except Exception as exc:
             print(
                 f"[Warning] Failed to compute embedding metrics at epoch {epoch + 1}: {exc}"

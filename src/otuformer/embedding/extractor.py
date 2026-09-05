@@ -855,6 +855,11 @@ def extract_embeddings(
                 raise ValueError(
                     "attention-pool requires training a query vector. Please provide --label-csv for training data."
                 )
+            columns = set(pd.read_csv(attention_train_csv, nrows=0).columns)
+            if "image" not in columns or "label" not in columns:
+                raise ValueError(
+                    "attention-pool query training requires --label-csv with 'image' and 'label' columns"
+                )
             print(
                 f"[Info] No finetuned attention pooling checkpoint found: {save_ckpt_path}. "
                 f"Starting query finetuning for {attention_pooling_epochs} epochs..."

@@ -1,6 +1,8 @@
+import argparse
+
+import numpy as np
 import pytest
 import torch
-import argparse
 
 from otuformer.training import trainer
 
@@ -211,6 +213,221 @@ def test_pretrain_periodic_evaluation_uses_cls_token_features():
     src = inspect.getsource(trainer._compute_embeddings_from_csv)
     assert "tokens = _extract_tokens(model, batch)" in src
     assert "emb = tokens[:, 0]" in src
+
+
+def test_unlabeled_periodic_evaluation_still_generates_umap(
+    tmp_path, monkeypatch, capsys
+):
+    calls = []
+
+    class MetricsLogger:
+        def log(self, *args, **kwargs):
+            calls.append((args, kwargs))
+
+    monkeypatch.setattr(
+        trainer,
+        "_compute_embeddings_from_csv",
+        lambda **kwargs: (np.zeros((10, 4), dtype=np.float32), None),
+    )
+    monkeypatch.setattr(
+        trainer,
+        "run_umap",
+        lambda embeddings, labels, out_path, **kwargs: calls.append(
+            (embeddings, labels, out_path)
+        ),
+    )
+    args = argparse.Namespace(
+        visualize_data="images.csv",
+        train_data="",
+        input_images_dir="images",
+        batch_size=2,
+        num_workers=0,
+        metrics_sample_size=100,
+        seed=42,
+        umap_n_neighbors=15,
+        umap_min_dist=0.1,
+        umap_metric="cosine",
+        visualize_class_number=20,
+    )
+
+    trainer._compute_and_log_all_metrics(
+        args=args,
+        model=object(),
+        device=torch.device("cpu"),
+        epoch=0,
+        logs_dir=tmp_path,
+        metrics_logger=MetricsLogger(),
+        eval_image_size=224,
+    )
+
+    assert len(calls) == 2
+    assert calls[1][0].shape[0] == 10
+    assert calls[1][1] is None
+    assert "no labels provided" in capsys.readouterr().out
+
+
+def test_zero_metrics_sample_size_does_not_subsample():
+    embeddings = np.arange(20, dtype=np.float32).reshape(10, 2)
+
+    sampled, labels = trainer._maybe_subsample_for_metrics(
+        embeddings, None, max_samples=0, seed=42
+    )
+
+    assert sampled is embeddings
+    assert labels is None
+
+
+def test_single_class_periodic_evaluation_skips_supervised_metrics():
+    fields = trainer._compute_all_metrics(
+        np.zeros((4, 3), dtype=np.float32),
+        np.array(["one"] * 4),
+        compute_linear_probe=True,
+    )
+
+    assert all(value == "" for value in fields.values())
+
+
+def test_unlabeled_periodic_evaluation_skips_small_sampled_umap(
+    tmp_path, monkeypatch, capsys
+):
+    calls = []
+
+    class MetricsLogger:
+        def log(self, *args, **kwargs):
+            pass
+
+    monkeypatch.setattr(
+        trainer,
+        "_compute_embeddings_from_csv",
+        lambda **kwargs: (np.zeros((20, 4), dtype=np.float32), None),
+    )
+    monkeypatch.setattr(
+        trainer,
+        "run_umap",
+        lambda *args, **kwargs: calls.append(args),
+    )
+    args = argparse.Namespace(
+        visualize_data="images.csv",
+        train_data="",
+        input_images_dir="images",
+        batch_size=2,
+        num_workers=0,
+        metrics_sample_size=5,
+        seed=42,
+        umap_n_neighbors=15,
+        umap_min_dist=0.1,
+        umap_metric="cosine",
+        visualize_class_number=20,
+    )
+
+    trainer._compute_and_log_all_metrics(
+        args=args,
+        model=object(),
+        device=torch.device("cpu"),
+        epoch=0,
+        logs_dir=tmp_path,
+        metrics_logger=MetricsLogger(),
+        eval_image_size=224,
+    )
+
+    assert not calls
+    assert "Skipping UMAP" in capsys.readouterr().out
+
+
+def test_unlabeled_periodic_evaluation_uses_sampled_umap_features(
+    tmp_path, monkeypatch
+):
+    calls = []
+
+    class MetricsLogger:
+        def log(self, *args, **kwargs):
+            pass
+
+    monkeypatch.setattr(
+        trainer,
+        "_compute_embeddings_from_csv",
+        lambda **kwargs: (np.zeros((20, 4), dtype=np.float32), None),
+    )
+    monkeypatch.setattr(
+        trainer,
+        "run_umap",
+        lambda embeddings, labels, out_path, **kwargs: calls.append(embeddings),
+    )
+    args = argparse.Namespace(
+        visualize_data="images.csv",
+        train_data="",
+        input_images_dir="images",
+        batch_size=2,
+        num_workers=0,
+        metrics_sample_size=10,
+        seed=42,
+        umap_n_neighbors=15,
+        umap_min_dist=0.1,
+        umap_metric="cosine",
+        visualize_class_number=20,
+    )
+
+    trainer._compute_and_log_all_metrics(
+        args=args,
+        model=object(),
+        device=torch.device("cpu"),
+        epoch=0,
+        logs_dir=tmp_path,
+        metrics_logger=MetricsLogger(),
+        eval_image_size=224,
+    )
+
+    assert calls[0].shape[0] == 10
+
+
+def test_sampled_single_class_evaluation_reports_skipped_metrics(
+    tmp_path, monkeypatch, capsys
+):
+    class MetricsLogger:
+        def log(self, *args, **kwargs):
+            pass
+
+    monkeypatch.setattr(
+        trainer,
+        "_compute_embeddings_from_csv",
+        lambda **kwargs: (
+            np.zeros((10, 4), dtype=np.float32),
+            np.array(["one"] * 10),
+        ),
+    )
+    monkeypatch.setattr(
+        trainer,
+        "_maybe_subsample_for_metrics",
+        lambda embeddings, labels, max_samples, seed: (
+            embeddings[:5],
+            np.array(["one"] * 5),
+        ),
+    )
+    args = argparse.Namespace(
+        visualize_data="images.csv",
+        train_data="",
+        input_images_dir="images",
+        batch_size=2,
+        num_workers=0,
+        metrics_sample_size=5,
+        seed=42,
+        umap_n_neighbors=15,
+        umap_min_dist=0.1,
+        umap_metric="cosine",
+        visualize_class_number=20,
+    )
+
+    trainer._compute_and_log_all_metrics(
+        args=args,
+        model=object(),
+        device=torch.device("cpu"),
+        epoch=0,
+        logs_dir=tmp_path,
+        metrics_logger=MetricsLogger(),
+        eval_image_size=224,
+    )
+
+    assert "fewer than two label classes after sampling" in capsys.readouterr().out
 
 
 def test_teacher_momentum_updates_after_optimizer_step():

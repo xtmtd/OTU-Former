@@ -131,7 +131,9 @@ def test_extract_help_lists_attention_pooling_type_choices():
 
 def _make_tiny_pretrain_data(tmp_path):
     for i in range(4):
-        Image.new("RGB", (224, 224)).save(tmp_path / f"img_{i}.jpg")
+        Image.new("RGB", (224, 224), color=(i * 60, 20, 10)).save(
+            tmp_path / f"img_{i}.jpg"
+        )
     df = pd.DataFrame({"image": [f"img_{i}.jpg" for i in range(4)]})
     csv_path = tmp_path / "images.csv"
     df.to_csv(csv_path, index=False)
@@ -140,7 +142,9 @@ def _make_tiny_pretrain_data(tmp_path):
 
 def _make_tiny_finetune_data(tmp_path):
     for i in range(4):
-        Image.new("RGB", (224, 224)).save(tmp_path / f"img_{i}.jpg")
+        Image.new("RGB", (224, 224), color=(i * 60, 20, 10)).save(
+            tmp_path / f"img_{i}.jpg"
+        )
     df = pd.DataFrame(
         {
             "image": [f"img_{i}.jpg" for i in range(4)],
@@ -416,6 +420,155 @@ def test_extract_command(tmp_path):
     )
     assert result.exit_code == 0
     assert (tmp_path / "extract_out" / "embeddings.csv").exists()
+
+
+def test_extract_image_only_csv_generates_umap_without_metrics(tmp_path, monkeypatch):
+    ckpt = _make_ckpt(tmp_path)
+    img_dir = tmp_path / "images"
+    img_dir.mkdir(parents=True, exist_ok=True)
+    for i in range(10):
+        Image.new("RGB", (224, 224), color=(i * 10, 0, 0)).save(
+            img_dir / f"img_{i}.jpg"
+        )
+    csv_path = tmp_path / "images.csv"
+    pd.DataFrame({"image": [f"img_{i}.jpg" for i in range(10)]}).to_csv(
+        csv_path, index=False
+    )
+
+    def fake_umap(embeddings, labels, out_path, **kwargs):
+        assert len(embeddings) == 10
+        assert labels is None
+        out_path.write_text("umap")
+
+    monkeypatch.setattr("otuformer.embedding.evaluator.run_umap", fake_umap)
+    result = runner.invoke(
+        app,
+        [
+            "extract",
+            "--checkpoint",
+            str(ckpt),
+            "--input-images-dir",
+            str(img_dir),
+            "--label-csv",
+            str(csv_path),
+            "--out-dir",
+            str(tmp_path / "extract_image_only"),
+            "--extract-size",
+            "224",
+            "--batch-size",
+            "10",
+            "--num-workers",
+            "0",
+            "--device",
+            "cpu",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert (tmp_path / "extract_image_only" / "umap.pdf").exists()
+    assert not (tmp_path / "extract_image_only" / "metrics.csv").exists()
+
+
+def test_extract_small_visualization_sample_reports_skipped_umap(
+    tmp_path, monkeypatch
+):
+    ckpt = _make_ckpt(tmp_path)
+    img_dir = tmp_path / "images"
+    img_dir.mkdir(parents=True, exist_ok=True)
+    for i in range(10):
+        Image.new("RGB", (224, 224), color=(i * 20, 20, 10)).save(
+            img_dir / f"img_{i}.jpg"
+        )
+    csv_path = tmp_path / "images.csv"
+    pd.DataFrame({"image": [f"img_{i}.jpg" for i in range(10)]}).to_csv(
+        csv_path, index=False
+    )
+
+    monkeypatch.setattr(
+        "otuformer.embedding.evaluator.run_umap",
+        lambda *args, **kwargs: pytest.fail("UMAP should be skipped"),
+    )
+    result = runner.invoke(
+        app,
+        [
+            "extract",
+            "--checkpoint",
+            str(ckpt),
+            "--input-images-dir",
+            str(img_dir),
+            "--label-csv",
+            str(csv_path),
+            "--out-dir",
+            str(tmp_path / "extract_small_sample"),
+            "--metrics-sample-size",
+            "5",
+            "--extract-size",
+            "224",
+            "--batch-size",
+            "10",
+            "--num-workers",
+            "0",
+            "--device",
+            "cpu",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Skipping UMAP: fewer than 10 samples after sampling" in result.output
+    assert not (tmp_path / "extract_small_sample" / "umap.pdf").exists()
+
+
+def test_extract_single_class_csv_skips_metrics_but_generates_umap(
+    tmp_path, monkeypatch
+):
+    ckpt = _make_ckpt(tmp_path)
+    img_dir = tmp_path / "images"
+    img_dir.mkdir(parents=True, exist_ok=True)
+    for i in range(10):
+        Image.new("RGB", (224, 224), color=(i * 20, 20, 10)).save(
+            img_dir / f"img_{i}.jpg"
+        )
+    csv_path = tmp_path / "single_class.csv"
+    pd.DataFrame(
+        {
+            "image": [f"img_{i}.jpg" for i in range(10)],
+            "label": ["one"] * 10,
+        }
+    ).to_csv(csv_path, index=False)
+
+    def fake_umap(embeddings, labels, out_path, **kwargs):
+        assert len(embeddings) == 10
+        assert set(labels) == {"one"}
+        out_path.write_text("umap")
+
+    monkeypatch.setattr("otuformer.embedding.evaluator.run_umap", fake_umap)
+    result = runner.invoke(
+        app,
+        [
+            "extract",
+            "--checkpoint",
+            str(ckpt),
+            "--input-images-dir",
+            str(img_dir),
+            "--label-csv",
+            str(csv_path),
+            "--out-dir",
+            str(tmp_path / "extract_single_class"),
+            "--extract-size",
+            "224",
+            "--batch-size",
+            "10",
+            "--num-workers",
+            "0",
+            "--device",
+            "cpu",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "fewer than two classes" in result.output
+    assert (tmp_path / "extract_single_class" / "umap.pdf").exists()
+    assert not (tmp_path / "extract_single_class" / "metrics.csv").exists()
 
 
 def test_export_command(tmp_path):
@@ -1213,7 +1366,9 @@ def test_pretrain_save_every_epochs_and_console_progress(tmp_path):
 def test_pretrain_embedding_metrics_and_umap_toggle(tmp_path):
     records = []
     for i in range(10):
-        Image.new("RGB", (224, 224)).save(tmp_path / f"img_{i}.jpg")
+        Image.new("RGB", (224, 224), color=(i * 20, 30, 10)).save(
+            tmp_path / f"img_{i}.jpg"
+        )
         records.append({"image": f"img_{i}.jpg", "label": f"class_{i % 2}"})
     labeled_csv = tmp_path / "labeled.csv"
     pd.DataFrame(records).to_csv(labeled_csv, index=False)

@@ -105,13 +105,16 @@ def extract(
         None,
         "--label-csv",
         help=(
-            "CSV with 'image' and 'label' columns for evaluating embedding quality "
-            "and generating UMAP. In attention-pool mode this CSV is also used to "
-            "train query pooling if cached pooling weights are missing."
+            "CSV with an 'image' column and optional 'label' for selecting images, "
+            "evaluating embedding quality, and generating UMAP. Without labels, only "
+            "UMAP is generated. In attention-pool mode this CSV must include labels "
+            "when cached pooling weights are missing."
         ),
     ),
     metrics_sample_size: int = typer.Option(
-        10000, "--metrics-sample-size", help="Max samples for metrics evaluation."
+        10000,
+        "--metrics-sample-size",
+        help="Max samples for metrics and UMAP evaluation (<=0 means no cap).",
     ),
     # UMAP options (mirrors pretrain/finetune)
     umap_n_neighbors: int = typer.Option(
@@ -253,38 +256,36 @@ def extract(
             )
 
             label_df = pd.read_csv(label_csv)
-            if "image" not in label_df.columns or "label" not in label_df.columns:
-                print(
-                    "[Warning] label-csv must have 'image' and 'label' columns; skipping metrics."
-                )
-            else:
-                # Align labels to embedding rows by filename (id column)
-                emb_ids = df["id"].tolist()
-                emb_id_set = set(emb_ids)
-                label_df = label_df[label_df["image"].isin(emb_id_set)].copy()
-                label_indexed = label_df.set_index("image")
-                # Keep only rows whose id appears in label_csv, preserving emb order
-                valid_ids = [x for x in emb_ids if x in label_indexed.index]
-                emb_mask = df["id"].isin(set(valid_ids))
-                dim_cols = [c for c in df.columns if c.startswith("dim_")]
-                embeddings = df.loc[emb_mask, dim_cols].values
-                labels = label_indexed.loc[
-                    df.loc[emb_mask, "id"].tolist(), "label"
-                ].values
+            if "image" not in label_df.columns:
+                raise ValueError("--label-csv must contain an 'image' column")
 
-                # subsample
-                n = len(embeddings)
-                if metrics_sample_size > 0 and n > metrics_sample_size:
-                    rng = np.random.default_rng(seed)
-                    idx = np.sort(
-                        rng.choice(n, size=metrics_sample_size, replace=False)
-                    )
-                    embeddings = embeddings[idx]
+            # Align labels to embedding rows by filename (id column).
+            emb_ids = df["id"].tolist()
+            emb_id_set = set(emb_ids)
+            label_df = label_df[label_df["image"].isin(emb_id_set)].copy()
+            label_indexed = label_df.set_index("image")
+            valid_ids = [x for x in emb_ids if x in label_indexed.index]
+            emb_mask = df["id"].isin(set(valid_ids))
+            dim_cols = [c for c in df.columns if c.startswith("dim_")]
+            embeddings = df.loc[emb_mask, dim_cols].values
+            labels = (
+                label_indexed.loc[df.loc[emb_mask, "id"].tolist(), "label"].values
+                if "label" in label_df.columns
+                else None
+            )
+
+            n = len(embeddings)
+            if metrics_sample_size > 0 and n > metrics_sample_size:
+                rng = np.random.default_rng(seed)
+                idx = np.sort(rng.choice(n, size=metrics_sample_size, replace=False))
+                embeddings = embeddings[idx]
+                if labels is not None:
                     labels = labels[idx]
-                    print(
-                        f"[Info] Metrics subsample: {len(idx)}/{n} samples (seed={seed})"
-                    )
+                print(
+                    f"[Info] Visualization subsample: {len(idx)}/{n} samples (seed={seed})"
+                )
 
+            if labels is not None and len(np.unique(labels)) >= 2:
                 print(f"[Metrics] Computing metrics on {len(embeddings)} samples ...")
                 metrics: dict[str, object] = {}
 
@@ -292,30 +293,25 @@ def extract(
                     metrics.update(compute_recall_at_k(embeddings, labels))
                 except Exception as e:
                     print(f"[Warning] Recall@K failed: {e}")
-
                 try:
                     metrics.update(compute_knn_accuracy(embeddings, labels))
                 except Exception as e:
                     print(f"[Warning] kNN accuracy failed: {e}")
-
                 try:
                     metrics["Linear_Probing_Acc"] = compute_linear_probing(
                         embeddings, labels
                     )
                 except Exception as e:
                     print(f"[Warning] Linear probing failed: {e}")
-
                 try:
                     metrics["mAP"] = compute_map(embeddings, labels)
                 except Exception as e:
                     print(f"[Warning] mAP failed: {e}")
-
                 try:
                     metrics.update(compute_clustering_metrics(embeddings, labels))
                 except Exception as e:
                     print(f"[Warning] Clustering metrics failed: {e}")
 
-                # Save metrics as CSV
                 metrics_path = out_dir / "metrics.csv"
                 metrics_rows = [{"metric": k, "value": v} for k, v in metrics.items()]
                 pd.DataFrame(metrics_rows).to_csv(metrics_path, index=False)
@@ -326,24 +322,29 @@ def extract(
                             print(f"  {k}: {float(v):.4f}")
                         except (TypeError, ValueError):
                             print(f"  {k}: {v}")
+            elif labels is not None:
+                print("[Info] Skipping supervised metrics: label-csv contains fewer than two classes.")
 
-                # UMAP
-                if not disable_umap and len(embeddings) >= 10:
-                    umap_path = out_dir / "umap.pdf"
-                    print(f"[UMAP] Generating UMAP projection -> {umap_path}")
-                    try:
-                        run_umap(
-                            embeddings,
-                            labels,
-                            umap_path,
-                            n_neighbors=umap_n_neighbors,
-                            min_dist=umap_min_dist,
-                            metric=umap_metric,
-                            max_classes=visualize_class_number,
-                        )
-                        print(f"[UMAP] Saved to: {umap_path}")
-                    except Exception as e:
-                        print(f"[Warning] UMAP failed: {e}")
+            if disable_umap:
+                pass
+            elif len(embeddings) >= 10:
+                umap_path = out_dir / "umap.pdf"
+                print(f"[UMAP] Generating UMAP projection -> {umap_path}")
+                try:
+                    run_umap(
+                        embeddings,
+                        labels,
+                        umap_path,
+                        n_neighbors=umap_n_neighbors,
+                        min_dist=umap_min_dist,
+                        metric=umap_metric,
+                        max_classes=visualize_class_number,
+                    )
+                    print(f"[UMAP] Saved to: {umap_path}")
+                except Exception as e:
+                    print(f"[Warning] UMAP failed: {e}")
+            else:
+                print("[Info] Skipping UMAP: fewer than 10 samples after sampling.")
 
     except Exception:
         traceback.print_exc(file=tee)

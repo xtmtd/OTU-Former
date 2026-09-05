@@ -368,7 +368,8 @@ def test_mpd_returns_nan_when_no_overlap(tmp_path: Path):
     tree_path.write_text("((X:1.0,Y:1.0):0.5,Z:1.5);")
     otu_ids = ["A", "B", "C"]
     counts = [1, 2, 3]
-    result = compute_mpd_from_counts(otu_ids, counts, tree_path)
+    with pytest.warns(UserWarning, match="Taxa missing from tree"):
+        result = compute_mpd_from_counts(otu_ids, counts, tree_path)
     assert result["MPD"] != result["MPD"]
     assert result["MPD_w"] != result["MPD_w"]
     assert result["PD_richness_norm"] != result["PD_richness_norm"]

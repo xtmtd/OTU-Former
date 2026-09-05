@@ -94,8 +94,9 @@ All parameters migrated from `ref/ibot20260115.py` `get_parser()`, mode=pretrain
 - `--log-every-n-steps` [default: 50], `--save-every-epochs` [default: 10], `--keep-last-checkpoints` [default: 10]
 - `--batch-size` [default: 32], `--num-workers` [default: 4], `--cpus` [default: 12]
 - `--device` [default: mps, choices: cpu/cuda/mps], `--seed` [default: 42]
+- `--visualize-data` : CSV with `image` and optional `label` columns for periodic evaluation; without labels, only UMAP is generated
 
-**Outputs:** `SSL_latest.pth` (and epoch checkpoints `SSL_epoch_*.pth`), `metrics.pretrain.csv`, `instant_metrics.csv`, training curves PDF, log file.
+**Outputs:** `SSL_latest.pth` (and epoch checkpoints `SSL_epoch_*.pth`), `metrics.pretrain.csv`, `instant_metrics.csv`, training curves PDF, log file. When labels are absent or contain fewer than two classes, supervised metric fields remain empty while the epoch row is retained; an image-only visualization CSV still produces UMAP. `--metrics-sample-size` limits both supervised metric and UMAP inputs when positive.
 
 ---
 
@@ -115,8 +116,9 @@ All parameters migrated from `ref/ibot20260115.py` `get_parser()`, mode=finetune
 - `--loss` : loss function [default: arcface] — registry supports future additions (ProxyAnchor planned)
 - `--batch-size`, `--num-workers`, `--cpus`, `--device`, `--seed`
 - `--log-every-n-steps`, `--save-every-epochs`, `--keep-last-checkpoints`
+- `--visualize-data` : CSV with `image` and optional `label` columns for periodic evaluation; without labels, only UMAP is generated
 
-**Outputs:** `finetune_latest.pth` (and epoch checkpoints `finetune_epoch_*.pth`), `metrics.finetune.csv`, `instant_metrics.csv`, training curves PDF, log file.
+**Outputs:** `finetune_latest.pth` (and epoch checkpoints `finetune_epoch_*.pth`), `metrics.finetune.csv`, `instant_metrics.csv`, training curves PDF, log file. When labels are absent or contain fewer than two classes, supervised metric fields remain empty while the epoch row is retained; an image-only visualization CSV still produces UMAP. `--metrics-sample-size` limits both supervised metric and UMAP inputs when positive.
 
 ---
 
@@ -135,13 +137,14 @@ Parameters migrated from `ref/ibot20260115.py` `get_parser()`, mode=extract. Ful
 - `--topk-patches` : for patch-topk mode, choices: 10/20/30 [default: 20]
 - `--attention-pooling-type` : `lightweight` | `multihead` | `gated` [default: lightweight]
 - `--attention-pooling-epochs` [default: 20]
-- `--metrics-sample-size` [default: 10000]
+- `--label-csv` : CSV with required `image` and optional `label`; labels enable quality metrics, while image-only input enables unlabeled UMAP. Attention-pool query training still requires `label`.
+- `--metrics-sample-size` [default: 10000; limits metric/UMAP inputs when positive, no cap when <=0]
 - `--batch-size`, `--num-workers`, `--device`, `--seed`
 - `--prefix` : OTU name prefix applied to cluster IDs downstream [default: OTU]
 
 **Batch mode:** When `--input-images-dir` contains subdirectories, each subdirectory is treated as an independent sample set. All embeddings are extracted and merged into a single CSV with a `sample` column recording the source subdirectory. This ensures consistent OTU naming across datasets when feeding into `cluster`.
 
-**Outputs:** `embeddings.csv` (columns: `id`, `sample` (batch only), then embedding dimensions)
+**Outputs:** `embeddings.csv` (columns: `id`, `sample` (batch only), then embedding dimensions), optional `umap.pdf`, and `metrics.csv` only when at least two label classes are available. Positive `--metrics-sample-size` limits both metric and UMAP inputs; values <=0 disable the cap.
 
 ---
 

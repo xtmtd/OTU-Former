@@ -205,9 +205,9 @@ otuformer pretrain \
 | `--log-every-n-steps` | 每 N 步记录指标 | 50 |
 | `--save-every-epochs` | 每 N 轮保存检查点 | 10 |
 | `--keep-last-checkpoints` | 保留最近 N 个检查点 | 10 |
-| `--visualize-data` | 用于周期指标/UMAP 的 CSV；省略则复用 `--train-data` | 无 |
+| `--visualize-data` | 含 `image` 列及可选 `label` 列的 CSV；无 label 时仅生成 UMAP；省略则复用 `--train-data` | 无 |
 | `--extract-size` | 嵌入提取图像尺寸（<=0 自动） | 0 |
-| `--metrics-sample-size` | 周期指标最大样本数 | 10000 |
+| `--metrics-sample-size` | 指标与 UMAP 最大样本数（<=0 不设上限） | 10000 |
 | `--umap-n-neighbors` | UMAP 邻居数 | 15 |
 | `--umap-min-dist` | UMAP 最小距离 | 0.1 |
 | `--umap-metric` | UMAP 距离度量 | `cosine` |
@@ -293,9 +293,9 @@ otuformer finetune \
 | `--log-every-n-steps` | 每 N 步记录指标 | 50 |
 | `--save-every-epochs` | 每 N 轮保存检查点 | 10 |
 | `--keep-last-checkpoints` | 保留最近 N 个检查点 | 10 |
-| `--visualize-data` | 用于周期指标/UMAP 的 CSV；省略则复用 `--train-data` | 无 |
+| `--visualize-data` | 含 `image` 列及可选 `label` 列的 CSV；无 label 时仅生成 UMAP；省略则复用 `--train-data` | 无 |
 | `--extract-size` | 嵌入提取图像尺寸（<=0 自动） | 0 |
-| `--metrics-sample-size` | 周期指标最大样本数 | 10000 |
+| `--metrics-sample-size` | 指标与 UMAP 最大样本数（<=0 不设上限） | 10000 |
 | `--umap-n-neighbors` | UMAP 邻居数 | 15 |
 | `--umap-min-dist` | UMAP 最小距离 | 0.1 |
 | `--umap-metric` | UMAP 距离度量 | `cosine` |
@@ -350,8 +350,8 @@ otuformer extract \
 | `--topk-patches` | patch-topk 模式的 top-K 值 | 20 |
 | `--attention-pooling-type` | `lightweight`/`multihead`/`gated` | `lightweight` |
 | `--attention-pooling-epochs` | attention-pool 查询微调轮数 | 20 |
-| `--label-csv` | 用于评估嵌入质量与生成 UMAP 的标签 CSV | 无 |
-| `--metrics-sample-size` | 指标评估最大样本数 | 10000 |
+| `--label-csv` | 含 `image` 列及可选 `label` 列的 CSV；仅 image 时生成 UMAP，不计算监督指标 | 无 |
+| `--metrics-sample-size` | 指标与 UMAP 最大样本数（<=0 不设上限） | 10000 |
 | `--umap-n-neighbors` | UMAP 邻居数 | 15 |
 | `--umap-min-dist` | UMAP 最小距离 | 0.1 |
 | `--umap-metric` | UMAP 距离度量 | `cosine` |
@@ -365,8 +365,8 @@ otuformer extract \
 
 **输出**：
 - `embeddings.csv` — 嵌入向量（`id`, `dim_0`, `dim_1`, ...）
-- `metrics.csv` — 质量指标（提供 `--label-csv` 时）
-- `umap.pdf` — UMAP 可视化（提供 `--label-csv` 且未禁用时）
+- `metrics.csv` — 质量指标（`--label-csv` 至少包含两个类别时）
+- `umap.pdf` — UMAP 可视化（提供 `--label-csv`、未禁用且抽样后至少有 10 个样本时）
 
 ---
 

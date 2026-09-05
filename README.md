@@ -146,6 +146,8 @@ do not require Hugging Face access.
 
 Self-supervised contrastive pretraining using DINO/iBOT-style teacher-student ViT, no labels required.
 
+When `--visualize-data` has no `label` column, periodic supervised metrics are skipped and UMAP is still generated from the visualization embeddings.
+
 To continue pretraining after adding images, create a CSV containing both old and
 new images, keep the same `--out-dir`, pass the latest checkpoint to `--resume`,
 and increase `--max-epochs`:
@@ -208,9 +210,9 @@ otuformer pretrain \
 | `--log-every-n-steps` | Log metrics every N steps | 50 |
 | `--save-every-epochs` | Save checkpoint every N epochs | 10 |
 | `--keep-last-checkpoints` | Keep only last N checkpoints | 10 |
-| `--visualize-data` | CSV for periodic embedding metrics/UMAP; if omitted, `--train-data` is reused | None |
+| `--visualize-data` | CSV with `image` and optional `label`; without labels, only UMAP is generated; if omitted, `--train-data` is reused | None |
 | `--extract-size` | Image size for embedding extraction (<=0 means auto) | 0 |
-| `--metrics-sample-size` | Max samples for periodic metrics | 10000 |
+| `--metrics-sample-size` | Max samples for periodic metrics and UMAP; <=0 means no cap | 10000 |
 | `--umap-n-neighbors` | UMAP n_neighbors | 15 |
 | `--umap-min-dist` | UMAP min_dist | 0.1 |
 | `--umap-metric` | UMAP distance metric | `cosine` |
@@ -233,6 +235,8 @@ otuformer pretrain \
 ### Finetune Command
 
 ArcFace metric learning finetuning with labelled data.
+
+A separate image-only `--visualize-data` CSV may be used for UMAP; supervised metrics require at least two label classes.
 
 To add images to known classes, train with a CSV containing the union of old and
 new labeled images, keep the same `--out-dir`, resume from the latest fine-tune
@@ -296,9 +300,9 @@ otuformer finetune \
 | `--log-every-n-steps` | Log metrics every N steps | 50 |
 | `--save-every-epochs` | Save checkpoint every N epochs | 10 |
 | `--keep-last-checkpoints` | Keep only last N checkpoints | 10 |
-| `--visualize-data` | CSV for periodic embedding metrics/UMAP; if omitted, `--train-data` is reused | None |
+| `--visualize-data` | CSV with `image` and optional `label`; without labels, only UMAP is generated; if omitted, `--train-data` is reused | None |
 | `--extract-size` | Image size for embedding extraction (<=0 means auto) | 0 |
-| `--metrics-sample-size` | Max samples for periodic metrics | 10000 |
+| `--metrics-sample-size` | Max samples for periodic metrics and UMAP; <=0 means no cap | 10000 |
 | `--umap-n-neighbors` | UMAP n_neighbors | 15 |
 | `--umap-min-dist` | UMAP min_dist | 0.1 |
 | `--umap-metric` | UMAP distance metric | `cosine` |
@@ -316,6 +320,8 @@ otuformer finetune \
 ### Extract Command
 
 Extract embeddings from images. Supports ONNX model for accelerated CPU inference.
+
+`--label-csv` requires an `image` column and accepts an optional `label` column. Image-only input generates UMAP without supervised metrics; attention-pool query training still requires labels.
 
 ```bash
 # Using PyTorch checkpoint (CLS token mode)
@@ -353,8 +359,8 @@ otuformer extract \
 | `--topk-patches` | Top-K patch tokens for patch-topk mode | 20 |
 | `--attention-pooling-type` | `lightweight`/`multihead`/`gated` | `lightweight` |
 | `--attention-pooling-epochs` | Epochs to finetune attention query | 20 |
-| `--label-csv` | Label CSV for embedding quality evaluation and UMAP generation | None |
-| `--metrics-sample-size` | Max samples for metrics evaluation | 10000 |
+| `--label-csv` | CSV with `image` and optional `label`; image-only input generates UMAP without supervised metrics; attention-pool training still needs `label` | None |
+| `--metrics-sample-size` | Max samples for metrics and UMAP evaluation; <=0 means no cap | 10000 |
 | `--umap-n-neighbors` | UMAP n_neighbors | 15 |
 | `--umap-min-dist` | UMAP min_dist | 0.1 |
 | `--umap-metric` | UMAP distance metric | `cosine` |
