@@ -89,8 +89,12 @@ def load_model_from_checkpoint(
         state_dict = ckpt["model_state_dict"]
     elif "model" in ckpt:
         state_dict = ckpt["model"]
+    elif "teacher" in ckpt:
+        state_dict = ckpt["teacher"]
     else:
-        raise KeyError("Checkpoint must contain 'model_state_dict' or legacy 'model'.")
+        raise KeyError(
+            "Checkpoint must contain 'model_state_dict', legacy 'model', or SSL 'teacher'."
+        )
     encoder.load_state_dict(state_dict, strict=False)
     backbone = encoder.backbone
     backbone.eval().to(device)

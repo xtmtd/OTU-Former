@@ -43,6 +43,39 @@ def test_cam_checkpoint_loader_accepts_legacy_arcface_model_key(monkeypatch, tmp
     assert seen["state_dict"] is legacy_weights
 
 
+def test_cam_checkpoint_loader_prefers_legacy_ssl_teacher_key(monkeypatch, tmp_path):
+    import otuformer.vision.cam as cam_module
+
+    seen = {}
+
+    class FakeBackbone(torch.nn.Module):
+        def forward_features(self, x):
+            return x
+
+    class FakeEncoder(torch.nn.Module):
+        def __init__(self, **_kwargs):
+            super().__init__()
+            self.backbone = FakeBackbone()
+
+        def load_state_dict(self, state_dict, **_kwargs):
+            seen["state_dict"] = state_dict
+
+    teacher_weights = {"backbone.cls_token": torch.ones(1, 1, 1)}
+    student_weights = {"backbone.cls_token": torch.zeros(1, 1, 1)}
+    monkeypatch.setattr(
+        cam_module,
+        "load_checkpoint",
+        lambda _path: {"teacher": teacher_weights, "student": student_weights},
+    )
+    monkeypatch.setattr(cam_module, "OTUFormerEncoder", FakeEncoder)
+
+    cam_module.load_model_from_checkpoint(
+        tmp_path / "SSL_epoch_0020.pth", "vit_tiny_patch16_224", torch.device("cpu")
+    )
+
+    assert seen["state_dict"] is teacher_weights
+
+
 def test_cam_checkpoint_loader_disables_pretrained_weights(monkeypatch, tmp_path):
     import otuformer.vision.cam as cam_module
 
