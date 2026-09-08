@@ -12,6 +12,8 @@ from pathlib import Path
 import click
 import typer
 
+from otuformer.cli import SIZE_EXAMPLES, _parse_size
+
 app = typer.Typer(
     help=(
         "ArcFace metric learning fine-tuning.\n\n"
@@ -117,12 +119,13 @@ def finetune(
             "Without labels, only UMAP is generated. If omitted, --train-data is reused."
         ),
     ),
-    extract_size: int = typer.Option(
-        0,
+    extract_size: str = typer.Option(
+        "auto",
         "--extract-size",
         help=(
             "Image size for periodic metrics/UMAP embedding extraction. "
-            "<=0 means auto from backbone input size."
+            "'auto' uses the model's img_size. "
+            f"{SIZE_EXAMPLES}"
         ),
     ),
     metrics_sample_size: int = typer.Option(
@@ -202,7 +205,7 @@ def finetune(
             save_every_epochs=save_every_epochs,
             keep_last_checkpoints=keep_last_checkpoints,
             visualize_data=str(visualize_data) if visualize_data is not None else "",
-            extract_size=extract_size,
+            extract_size=_parse_size(extract_size, stage="--extract-size"),
             metrics_sample_size=metrics_sample_size,
             umap_n_neighbors=umap_n_neighbors,
             umap_min_dist=umap_min_dist,

@@ -16,13 +16,18 @@ from tqdm import tqdm
 
 from otuformer.training.dataset import (
     _build_recursive_index,
-    _make_eval_transform,
     _resolve_image_path,
     _supports_recursive_lookup,
+    build_eval_transform,
 )
 from otuformer.training.model import OTUFormerEncoder
 from otuformer.utils.checkpoint import load_checkpoint
 from otuformer.utils.device import resolve_device
+from otuformer.utils.size import (
+    resolve_onnx_input_size,
+    resolve_training_image_size,
+    validate_input_size,
+)
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 ATTENTION_POOLING_TYPES = {"lightweight", "multihead", "gated"}
@@ -31,14 +36,19 @@ ATTENTION_POOLING_TYPES = {"lightweight", "multihead", "gated"}
 class ImageFolderDataset(Dataset):
     """Load all images from a directory."""
 
-    def __init__(self, images_dir: Path, extract_size: int = 224) -> None:
+    def __init__(
+        self,
+        images_dir: Path,
+        extract_size: int = 224,
+        eval_transform: str = "center-crop",
+    ) -> None:
         self.paths = sorted(
             p
             for p in images_dir.rglob("*")
             if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
         )
         # Use the same eval transform as pretrain/finetune: direct BICUBIC resize
-        self.transform = _make_eval_transform(extract_size)
+        self.transform = build_eval_transform(eval_transform, extract_size)
 
     def __len__(self) -> int:
         return len(self.paths)
@@ -52,9 +62,13 @@ class LabelCSVImageDataset(Dataset):
     """Load images and labels from a label CSV for attention-query training."""
 
     def __init__(
-        self, images_dir: Path, label_csv: Path, extract_size: int = 224
+        self,
+        images_dir: Path,
+        label_csv: Path,
+        extract_size: int = 224,
+        eval_transform: str = "center-crop",
     ) -> None:
-        self.transform = _make_eval_transform(extract_size)
+        self.transform = build_eval_transform(eval_transform, extract_size)
         label_df = pd.read_csv(label_csv)
         if "image" not in label_df.columns or "label" not in label_df.columns:
             raise ValueError("--label-csv must contain 'image' and 'label' columns")
@@ -103,9 +117,13 @@ class CSVImageDataset(Dataset):
     """Load extraction images in CSV order, preserving image id strings."""
 
     def __init__(
-        self, images_dir: Path, csv_path: Path, extract_size: int = 224
+        self,
+        images_dir: Path,
+        csv_path: Path,
+        extract_size: int = 224,
+        eval_transform: str = "center-crop",
     ) -> None:
-        self.transform = _make_eval_transform(extract_size)
+        self.transform = build_eval_transform(eval_transform, extract_size)
         df = pd.read_csv(csv_path)
         if "image" not in df.columns:
             raise ValueError("CSV must contain an 'image' column")
@@ -259,9 +277,13 @@ def _finetune_attention_query(
     batch_size: int,
     num_workers: int,
     num_epochs: int,
+    eval_transform: str = "center-crop",
 ) -> None:
     dataset = LabelCSVImageDataset(
-        images_dir=images_dir, label_csv=label_csv, extract_size=extract_size
+        images_dir=images_dir,
+        label_csv=label_csv,
+        extract_size=extract_size,
+        eval_transform=eval_transform,
     )
     loader = DataLoader(
         dataset,
@@ -400,8 +422,12 @@ def _load_model(
     model_name: str,
     device: torch.device,
     use_student: bool = False,
-) -> OTUFormerEncoder:
-    """Load model from checkpoint.
+) -> tuple[OTUFormerEncoder, int]:
+    """Load model from checkpoint and return ``(model, checkpoint_size)``.
+
+    The encoder is constructed with ``img_size=checkpoint_size`` so the
+    positional embeddings load exactly; the transform may run at a different
+    ``requested_input_size`` via ``dynamic_img_size=True`` interpolation.
 
     For SSL pretrain checkpoints the teacher is the EMA-averaged model and
     produces better embeddings for downstream analysis (consistent with ref
@@ -416,9 +442,14 @@ def _load_model(
     cfg = ckpt.get("config", {})
     out_dim = cfg.get("out_dim") or cfg.get("metric_embed_dim", 256)
     resolved_model = cfg.get("model_name", model_name)
+    checkpoint_size = resolve_training_image_size(ckpt)
     model = OTUFormerEncoder(
-        model_name=resolved_model, out_dim=out_dim, pretrained=False
+        model_name=resolved_model,
+        out_dim=out_dim,
+        pretrained=False,
+        img_size=checkpoint_size,
     )
+    validate_input_size(checkpoint_size, model, resolved_model)
 
     if use_student:
         state_dict = ckpt.get("student") or ckpt.get("model_state_dict")
@@ -430,7 +461,7 @@ def _load_model(
     model.load_state_dict(state_dict, strict=False)
     model.eval().to(device)
     print(f"[Info] Loaded weights from checkpoint key: '{source}'")
-    return model
+    return model, checkpoint_size
 
 
 def _extract_one_dir(
@@ -444,10 +475,11 @@ def _extract_one_dir(
     token_mode: str = "cls",
     topk_patches: int = 20,
     apply_patch_topk_pca: bool = True,
+    eval_transform: str = "center-crop",
 ) -> pd.DataFrame:
     from otuformer.training.model import OTUFormerEncoder
 
-    ds = ImageFolderDataset(images_dir, extract_size)
+    ds = ImageFolderDataset(images_dir, extract_size, eval_transform=eval_transform)
     loader = DataLoader(
         ds, batch_size=batch_size, shuffle=False, num_workers=num_workers
     )
@@ -532,9 +564,13 @@ def _extract_one_csv(
     use_projector_output: bool = False,
     token_mode: str = "cls",
     topk_patches: int = 20,
+    eval_transform: str = "center-crop",
 ) -> pd.DataFrame:
     ds = CSVImageDataset(
-        images_dir=images_dir, csv_path=csv_path, extract_size=extract_size
+        images_dir=images_dir,
+        csv_path=csv_path,
+        extract_size=extract_size,
+        eval_transform=eval_transform,
     )
     loader = DataLoader(
         ds, batch_size=batch_size, shuffle=False, num_workers=num_workers
@@ -618,6 +654,7 @@ def _extract_with_onnx(
     batch_size: int,
     num_workers: int,
     extract_csv: Path | None,
+    eval_transform: str = "center-crop",
 ) -> pd.DataFrame:
     import onnxruntime as ort
 
@@ -633,6 +670,7 @@ def _extract_with_onnx(
             extract_size=extract_size,
             batch_size=batch_size,
             num_workers=num_workers,
+            eval_transform=eval_transform,
         )
 
     if detect_batch_mode(images_dir):
@@ -646,6 +684,7 @@ def _extract_with_onnx(
                 extract_size=extract_size,
                 batch_size=batch_size,
                 num_workers=num_workers,
+                eval_transform=eval_transform,
             )
             if len(df) == 0:
                 continue
@@ -662,6 +701,7 @@ def _extract_with_onnx(
         extract_size=extract_size,
         batch_size=batch_size,
         num_workers=num_workers,
+        eval_transform=eval_transform,
     )
 
 
@@ -672,8 +712,9 @@ def _extract_one_dir_onnx(
     extract_size: int,
     batch_size: int,
     num_workers: int,
+    eval_transform: str = "center-crop",
 ) -> pd.DataFrame:
-    ds = ImageFolderDataset(images_dir, extract_size)
+    ds = ImageFolderDataset(images_dir, extract_size, eval_transform=eval_transform)
     loader = DataLoader(
         ds, batch_size=batch_size, shuffle=False, num_workers=num_workers
     )
@@ -701,9 +742,13 @@ def _extract_one_csv_onnx(
     extract_size: int,
     batch_size: int,
     num_workers: int,
+    eval_transform: str = "center-crop",
 ) -> pd.DataFrame:
     ds = CSVImageDataset(
-        images_dir=images_dir, csv_path=csv_path, extract_size=extract_size
+        images_dir=images_dir,
+        csv_path=csv_path,
+        extract_size=extract_size,
+        eval_transform=eval_transform,
     )
     loader = DataLoader(
         ds, batch_size=batch_size, shuffle=False, num_workers=num_workers
@@ -739,7 +784,7 @@ def extract_embeddings(
     checkpoint_path: Path | None,
     images_dir: Path,
     model_name: str = "vit_tiny_patch16_224",
-    extract_size: int = 224,
+    extract_size: int | None = None,
     batch_size: int = 32,
     device: str = "auto",
     num_workers: int = 0,
@@ -754,6 +799,7 @@ def extract_embeddings(
     extract_csv: Path | None = None,
     attention_pooling_checkpoint_path: Path | None = None,
     onnx_path: Path | None = None,
+    eval_transform: str = "center-crop",
 ) -> pd.DataFrame:
     """Extract embeddings and return DataFrame.
 
@@ -789,20 +835,35 @@ def extract_embeddings(
                 f"ONNX inference only supports token-mode 'cls', got '{token_mode}'. "
                 "Use PyTorch checkpoint for patch-topk or attention-pool modes."
             )
+        onnx_size = resolve_onnx_input_size(Path(onnx_path))
+        if extract_size is not None and extract_size != onnx_size:
+            raise ValueError(
+                f"--extract-size {extract_size} does not match ONNX input size "
+                f"{onnx_size} (the ONNX graph governs the resolution)."
+            )
         return _extract_with_onnx(
             onnx_path=Path(onnx_path),
             images_dir=images_dir,
-            extract_size=extract_size,
+            extract_size=onnx_size,
             batch_size=batch_size,
             num_workers=num_workers,
             extract_csv=extract_csv,
+            eval_transform=eval_transform,
         )
 
     if checkpoint_path is None:
         raise ValueError("--checkpoint is required when --onnx-path is not provided.")
 
     dev = resolve_device(device)
-    model = _load_model(checkpoint_path, model_name, dev, use_student=use_student)
+    model, checkpoint_size = _load_model(
+        checkpoint_path, model_name, dev, use_student=use_student
+    )
+    requested_size = checkpoint_size if extract_size is None else extract_size
+    validate_input_size(
+        requested_size, model, getattr(model, "model_name", model_name)
+    )
+    if extract_size is None:
+        print(f"[Info] Auto extract size from checkpoint: {requested_size}")
     print(
         f"[Info] Extraction mode: token_mode={token_mode}, "
         f"use_projector_output={use_projector_output}, topk_patches={topk_patches}"
@@ -869,11 +930,12 @@ def extract_embeddings(
                 attention_pool=attention_pool,
                 images_dir=images_dir,
                 label_csv=attention_train_csv,
-                extract_size=extract_size,
+                extract_size=requested_size,
                 device=dev,
                 batch_size=batch_size,
                 num_workers=num_workers,
                 num_epochs=attention_pooling_epochs,
+                eval_transform=eval_transform,
             )
             save_ckpt_path.parent.mkdir(parents=True, exist_ok=True)
             torch.save(
@@ -902,13 +964,14 @@ def extract_embeddings(
             model=model,
             images_dir=images_dir,
             csv_path=extract_csv,
-            extract_size=extract_size,
+            extract_size=requested_size,
             batch_size=batch_size,
             device=dev,
             num_workers=num_workers,
             use_projector_output=use_projector_output,
             token_mode=token_mode,
             topk_patches=topk_patches,
+            eval_transform=eval_transform,
         )
         return out_df
 
@@ -919,7 +982,7 @@ def extract_embeddings(
             df = _extract_one_dir(
                 model,
                 sub,
-                extract_size,
+                requested_size,
                 batch_size,
                 dev,
                 num_workers,
@@ -927,6 +990,7 @@ def extract_embeddings(
                 token_mode=token_mode,
                 topk_patches=topk_patches,
                 apply_patch_topk_pca=False,
+                eval_transform=eval_transform,
             )
             if len(df) == 0:
                 continue
@@ -942,7 +1006,7 @@ def extract_embeddings(
     out_df = _extract_one_dir(
         model,
         images_dir,
-        extract_size,
+        requested_size,
         batch_size,
         dev,
         num_workers,
@@ -950,6 +1014,7 @@ def extract_embeddings(
         token_mode=token_mode,
         topk_patches=topk_patches,
         apply_patch_topk_pca=False,
+        eval_transform=eval_transform,
     )
     if token_mode == "patch-topk":
         print(f"[Info] Applying PCA reduction for Top-{topk_patches} patches...")

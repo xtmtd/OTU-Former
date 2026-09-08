@@ -12,6 +12,7 @@ from otuformer.embedding.extractor import (
     _iter_trainable_params,
     _load_model,
 )
+from otuformer.utils.size import resolve_onnx_input_size
 
 
 def make_checkpoint(tmp_path: Path, out_dim: int = 64) -> Path:
@@ -32,6 +33,190 @@ def make_images(directory: Path, n: int = 3) -> None:
     for i in range(n):
         Image.new("RGB", (224, 224), color=(i * 80, 0, 0)).save(
             directory / f"img_{i}.jpg"
+        )
+
+
+def make_legacy_checkpoint(
+    tmp_path: Path, out_dim: int = 64, global_crop_size: int = 32
+) -> Path:
+    from otuformer.training.model import OTUFormerEncoder
+
+    model = OTUFormerEncoder(
+        model_name="vit_tiny_patch16_224",
+        out_dim=out_dim,
+        pretrained=False,
+        img_size=global_crop_size,
+    )
+    ckpt = {
+        "model_state_dict": model.state_dict(),
+        "config": {"model_name": "vit_tiny_patch16_224", "out_dim": out_dim},
+        "args": {"global_crop_size": global_crop_size},
+    }
+    p = tmp_path / "legacy_ckpt.pt"
+    torch.save(ckpt, p)
+    return p
+
+
+def test_load_model_constructs_at_recorded_checkpoint_size(monkeypatch, tmp_path):
+    import otuformer.embedding.extractor as extractor_module
+
+    seen = {}
+
+    class FakeEncoder(torch.nn.Module):
+        def __init__(self, **kwargs):
+            super().__init__()
+            seen.update(kwargs)
+
+        def load_state_dict(self, *_args, **_kwargs):
+            return None
+
+    monkeypatch.setattr(
+        extractor_module,
+        "load_checkpoint",
+        lambda _path: {"model_state_dict": {}, "args": {"global_crop_size": 32}},
+    )
+    monkeypatch.setattr(extractor_module, "OTUFormerEncoder", FakeEncoder)
+
+    model, size = extractor_module._load_model(
+        tmp_path / "model.pth", "vit_tiny_patch16_224", torch.device("cpu")
+    )
+
+    assert seen["img_size"] == 32
+    assert size == 32
+
+
+def test_extract_pos_embed_matches_legacy_checkpoint_size(tmp_path):
+    ckpt = make_legacy_checkpoint(tmp_path, global_crop_size=32)
+    model, size = _load_model(ckpt, "vit_tiny_patch16_224", torch.device("cpu"))
+    assert size == 32
+    # (32 / 16) ** 2 + 1 CLS token = 5 tokens
+    assert model.backbone.pos_embed.shape[1] == 5
+
+
+def test_extract_224_checkpoint_at_384_uses_dynamic_interpolation(tmp_path):
+    ckpt = make_checkpoint(tmp_path)  # 224 checkpoint, no recorded size
+    img_dir = tmp_path / "images"
+    make_images(img_dir, n=2)
+
+    out = extract_embeddings(
+        checkpoint_path=ckpt,
+        images_dir=img_dir,
+        device="cpu",
+        batch_size=2,
+        extract_size=384,
+        token_mode="cls",
+    )
+    assert len(out) == 2
+
+
+def test_extract_auto_size_resolves_to_checkpoint_size(tmp_path):
+    ckpt = make_legacy_checkpoint(tmp_path, global_crop_size=32)
+    img_dir = tmp_path / "images"
+    make_images(img_dir, n=2)
+    out = extract_embeddings(
+        checkpoint_path=ckpt,
+        images_dir=img_dir,
+        device="cpu",
+        batch_size=2,
+        token_mode="cls",
+        extract_size=None,
+    )
+    assert len(out) == 2
+
+
+def test_extract_size_error_names_resolved_model_not_cli_arg(tmp_path):
+    """Size-validation errors must name the checkpoint-resolved model."""
+    ckpt = make_checkpoint(tmp_path)  # config model_name = vit_tiny_patch16_224
+    img_dir = tmp_path / "images"
+    make_images(img_dir, n=2)
+    with pytest.raises(ValueError, match="for vit_tiny_patch16_224"):
+        extract_embeddings(
+            checkpoint_path=ckpt,
+            images_dir=img_dir,
+            device="cpu",
+            batch_size=2,
+            model_name="some_unrelated_backbone",
+            extract_size=518,
+            token_mode="cls",
+        )
+
+
+def _make_onnx_graph_proto(dims):
+    import onnx
+    from onnx import TensorProto, helper
+
+    value_info = helper.make_tensor_value_info("input", TensorProto.FLOAT, dims)
+    node = helper.make_node("Identity", ["input"], ["out"])
+    graph = helper.make_graph(
+        [node], "g", [value_info], [helper.make_tensor_value_info("out", TensorProto.FLOAT, [1])]
+    )
+    return onnx.ModelProto(ir_version=8, graph=graph)
+
+
+def test_resolve_onnx_input_size_reads_static_square_nchw(monkeypatch, tmp_path):
+    import onnx
+
+    monkeypatch.setattr(
+        onnx, "load", lambda p: _make_onnx_graph_proto([1, 3, 224, 224])
+    )
+    assert resolve_onnx_input_size(tmp_path / "m.onnx") == 224
+
+    monkeypatch.setattr(
+        onnx, "load", lambda p: _make_onnx_graph_proto([1, 3, 224, 256])
+    )
+    with pytest.raises(ValueError, match="square"):
+        resolve_onnx_input_size(tmp_path / "m.onnx")
+
+    monkeypatch.setattr(
+        onnx, "load", lambda p: _make_onnx_graph_proto([1, 1, 224, 224])
+    )
+    with pytest.raises(ValueError, match="NCHW"):
+        resolve_onnx_input_size(tmp_path / "m.onnx")
+
+    monkeypatch.setattr(
+        onnx, "load", lambda p: _make_onnx_graph_proto([1, 3, "h", 224])
+    )
+    with pytest.raises(ValueError, match="static"):
+        resolve_onnx_input_size(tmp_path / "m.onnx")
+
+
+def test_extract_onnx_auto_size_reads_graph_and_explicit_must_match(tmp_path):
+    ckpt = make_checkpoint(tmp_path)
+    img_dir = tmp_path / "images"
+    make_images(img_dir, n=2)
+    onnx_path = make_onnx(tmp_path)  # exported at 224 (static input)
+
+    auto_out = extract_embeddings(
+        checkpoint_path=ckpt,
+        images_dir=img_dir,
+        device="cpu",
+        batch_size=2,
+        token_mode="cls",
+        onnx_path=onnx_path,
+        extract_size=None,
+    )
+    assert len(auto_out) == 2
+
+    match_out = extract_embeddings(
+        checkpoint_path=ckpt,
+        images_dir=img_dir,
+        device="cpu",
+        batch_size=2,
+        token_mode="cls",
+        onnx_path=onnx_path,
+        extract_size=224,
+    )
+    assert len(match_out) == 2
+
+    with pytest.raises(ValueError, match="does not match ONNX input size"):
+        extract_embeddings(
+            checkpoint_path=ckpt,
+            images_dir=img_dir,
+            device="cpu",
+            batch_size=2,
+            token_mode="cls",
+            onnx_path=onnx_path,
+            extract_size=384,
         )
 
 

@@ -11,12 +11,16 @@ import pandas as pd
 import torch
 import torchvision.transforms as transforms
 from PIL import Image
-from timm.data import resolve_model_data_config
-from torchvision.transforms.functional import InterpolationMode
 
+from otuformer.training.dataset import (
+    EVAL_TRANSFORMS,
+    build_eval_transform,
+    pad_to_square,
+)
 from otuformer.training.model import OTUFormerEncoder
 from otuformer.utils.checkpoint import load_checkpoint
 from otuformer.utils.device import resolve_device
+from otuformer.utils.size import resolve_training_image_size, validate_input_size
 
 try:
     from pytorch_grad_cam import (
@@ -60,14 +64,27 @@ def load_model_from_checkpoint(
     checkpoint_path: Path,
     model_name: str,
     device: torch.device,
-) -> torch.nn.Module:
+) -> tuple[torch.nn.Module, int, str]:
+    """Load the CAM model and return ``(model, checkpoint_size, resolved_name)``.
+
+    The encoder is constructed with ``img_size=checkpoint_size`` so the
+    positional embeddings load exactly; ``checkpoint_size`` is also the
+    resolution at which CAM and display transforms are built. The resolved
+    model name comes from checkpoint metadata so architecture inference is
+    not fooled by the CLI default model name.
+    """
     ckpt = load_checkpoint(checkpoint_path)
     cfg = ckpt.get("config", {})
     resolved_name = cfg.get("model_name", model_name)
     out_dim = cfg.get("out_dim") or cfg.get("metric_embed_dim", 256)
+    checkpoint_size = resolve_training_image_size(ckpt)
     encoder = OTUFormerEncoder(
-        model_name=resolved_name, out_dim=out_dim, pretrained=False
+        model_name=resolved_name,
+        out_dim=out_dim,
+        pretrained=False,
+        img_size=checkpoint_size,
     )
+    validate_input_size(checkpoint_size, encoder, resolved_name)
     encoder.load_state_dict(ckpt["model_state_dict"], strict=False)
     backbone = encoder.backbone
     backbone.eval().to(device)
@@ -85,7 +102,7 @@ def load_model_from_checkpoint(
 
     model = _CamWrapper(backbone)
     model.eval().to(device)
-    return model
+    return model, checkpoint_size, resolved_name
 
 
 def get_module_by_name(model: torch.nn.Module, name: str) -> torch.nn.Module:
@@ -153,35 +170,90 @@ def vit_reshape_transform(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.permute(0, 2, 1).reshape(batch, channels, spatial_dim, spatial_dim)
 
 
-def build_eval_transforms(model: torch.nn.Module) -> Tuple:
-    backbone = getattr(model, "backbone", model)
-    cfg = resolve_model_data_config(backbone)
-    crop_tuple = cfg.get("test_input_size", cfg.get("input_size"))
-    crop_size = crop_tuple[1]
-    crop_pct = cfg.get("test_crop_pct", cfg.get("crop_pct", 1.0))
-    resize_shorter = int(round(crop_size / crop_pct))
-    mean = cfg.get("mean")
-    std = cfg.get("std")
-    interpolation = getattr(
-        InterpolationMode,
-        cfg.get("interpolation", "bicubic").upper(),
-        InterpolationMode.BICUBIC,
+def build_display_transform(name: str, size: int) -> transforms.Compose:
+    """Return the display transform matching the named eval protocol.
+
+    The display transform mirrors the geometric (resize/pad/crop) part of the
+    preprocessing without the tensor/normalization steps.
+    """
+    if name == "center-crop":
+        return transforms.Compose(
+            [
+                transforms.Resize(size, interpolation=Image.BICUBIC),
+                transforms.CenterCrop(size),
+            ]
+        )
+    if name == "whole-specimen-pad":
+        return transforms.Compose(
+            [
+                transforms.Lambda(pad_to_square),
+                transforms.Resize((size, size), interpolation=Image.BICUBIC),
+            ]
+        )
+    raise ValueError(
+        f"Unknown eval transform '{name}'; choose from: {', '.join(EVAL_TRANSFORMS)}"
     )
-    preprocess = transforms.Compose(
-        [
-            transforms.Resize(resize_shorter, interpolation=interpolation),
-            transforms.CenterCrop(crop_size),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=mean, std=std),
-        ]
+
+
+def _dim_desaturate(rgb: np.ndarray, factor: float = 0.5) -> np.ndarray:
+    """Dim and desaturate an RGB image (H, W, 3) in [0, 1]."""
+    gray = np.dot(rgb[..., :3], [0.299, 0.587, 0.114])
+    return np.repeat(gray[..., None], 3, axis=2) * factor
+
+
+def map_cam_to_original(
+    cam_norm: np.ndarray,
+    original_size: tuple[int, int],
+    eval_transform: str,
+    model_size: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Map the model-resolution CAM back to original-image coordinates.
+
+    Returns ``(cam_on_full, fov_mask)`` where ``cam_on_full`` is a (H, W)
+    float map in [0, 1] at the original resolution and ``fov_mask`` is a bool
+    (H, W) marking pixels inside the model's field of view.
+
+    - ``center-crop``: the model's field of view is the center crop of the
+      resized image; the CAM is placed into that rectangle on a canvas sized
+      to the resized image, then the canvas is resized back to the original.
+    - ``whole-specimen-pad``: the whole specimen is in view (nothing is
+      cropped), so the CAM covers the full original and the mask is all-True.
+    """
+    import cv2
+
+    width, height = original_size
+    if eval_transform == "whole-specimen-pad":
+        side = max(width, height)
+        padded = cv2.resize(cam_norm, (side, side), interpolation=cv2.INTER_LINEAR)
+        if width >= height:
+            y0 = (side - height) // 2
+            region = padded[y0 : y0 + height, :]
+        else:
+            x0 = (side - width) // 2
+            region = padded[:, x0 : x0 + width]
+        cam_on_full = cv2.resize(
+            region, (width, height), interpolation=cv2.INTER_LINEAR
+        )
+        return cam_on_full, np.ones((height, width), dtype=bool)
+
+    # center-crop: replicate torchvision Resize(shorter side) then CenterCrop.
+    # torchvision truncates the long side with int(); CenterCrop offsets use
+    # int(round((long - size) / 2)).
+    if width >= height:
+        resized_w, resized_h = int(model_size * width / height), model_size
+    else:
+        resized_w, resized_h = model_size, int(model_size * height / width)
+    x0 = int(round((resized_w - model_size) / 2.0))
+    y0 = int(round((resized_h - model_size) / 2.0))
+    canvas = np.zeros((resized_h, resized_w), dtype=np.float32)
+    fov = np.zeros((resized_h, resized_w), dtype=bool)
+    canvas[y0 : y0 + model_size, x0 : x0 + model_size] = cam_norm
+    fov[y0 : y0 + model_size, x0 : x0 + model_size] = True
+    cam_on_full = cv2.resize(canvas, (width, height), interpolation=cv2.INTER_LINEAR)
+    fov_full = cv2.resize(
+        fov.astype(np.float32), (width, height), interpolation=cv2.INTER_NEAREST
     )
-    display_transform = transforms.Compose(
-        [
-            transforms.Resize(resize_shorter, interpolation=interpolation),
-            transforms.CenterCrop(crop_size),
-        ]
-    )
-    return preprocess, display_transform
+    return cam_on_full, fov_full > 0.5
 
 
 def prepare_cam(
@@ -250,6 +322,8 @@ def process_image(
     image_weight: float,
     fig_format: str,
     save_npy: bool,
+    eval_transform: str = "center-crop",
+    model_size: int = 224,
 ) -> Dict:
     import cv2
 
@@ -275,10 +349,8 @@ def process_image(
     else:
         cam_norm = np.zeros_like(cam_norm)
 
-    cam_on_full = cv2.resize(
-        cam_norm,
-        (original_img.width, original_img.height),
-        interpolation=cv2.INTER_LINEAR,
+    cam_on_full, fov_mask = map_cam_to_original(
+        cam_norm, original_img.size, eval_transform, model_size
     )
 
     overlay = show_cam_on_image(
@@ -287,6 +359,11 @@ def process_image(
         use_rgb=True,
         image_weight=image_weight,
     )
+    # show_cam_on_image returns uint8 in [0, 255]; rescale to [0, 1] so the
+    # dim/desaturate mix and the *255 uint8 conversion below do not overflow.
+    overlay = overlay.astype(np.float32) / 255.0
+    if not fov_mask.all():
+        overlay = np.where(fov_mask[..., None], overlay, _dim_desaturate(rgb_display))
     overlay_img = Image.fromarray((overlay * 255).astype(np.uint8))
 
     combined = Image.new("RGB", (original_img.width * 2, original_img.height))
@@ -329,14 +406,23 @@ def run_cam(
     max_images: Optional[int] = None,
     cam_batch_size: int = 1,
     device: str = "auto",
+    eval_transform: str = "center-crop",
 ) -> None:
     from otuformer.utils.io import write_csv
 
+    if eval_transform not in EVAL_TRANSFORMS:
+        raise ValueError(
+            f"Unknown eval transform '{eval_transform}'; "
+            f"choose from: {', '.join(EVAL_TRANSFORMS)}"
+        )
     dev = _resolve_device(device)
-    model = load_model_from_checkpoint(checkpoint, model_name, dev)
-    preprocess, display_transform = build_eval_transforms(model)
+    model, checkpoint_size, resolved_name = load_model_from_checkpoint(
+        checkpoint, model_name, dev
+    )
+    preprocess = build_eval_transform(eval_transform, checkpoint_size)
+    display_transform = build_display_transform(eval_transform, checkpoint_size)
 
-    resolved_arch = arch or infer_architecture(model_name, model)
+    resolved_arch = arch or infer_architecture(resolved_name, model)
     cam_extractor, target_layers, reshape_transform = prepare_cam(
         model, resolved_arch, target_layer_name, cam_method, cam_batch_size
     )
@@ -402,6 +488,8 @@ def run_cam(
                 image_weight=image_weight,
                 fig_format=fig_format,
                 save_npy=save_npy,
+                eval_transform=eval_transform,
+                model_size=checkpoint_size,
             )
             results.append(result)
         except Exception as exc:

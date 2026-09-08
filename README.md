@@ -194,8 +194,8 @@ otuformer pretrain \
 | `--lr` | Base learning rate | 5e-4 |
 | `--weight-decay` | AdamW weight decay | 0.05 |
 | `--warmup-epochs` | Warmup epochs | 3 |
-| `--global-crop-size` | Global crop resolution | 224 |
-| `--local-crop-size` | Local crop resolution | 96 |
+| `--global-crop-size` | Global crop resolution; `auto` uses the backbone's native input size (new run) or the checkpoint's recorded size (`--resume`). Common: 224, 384, 448 (518 = patch-14 models only) | auto |
+| `--local-crop-size` | Local crop resolution (must be divisible by the backbone patch size, e.g. 98 or 112 for patch-14 models) | 96 |
 | `--local-crops` | Number of local crops | 6 |
 | `--mask-ratio` | Masked token ratio | 0.5 |
 | `--lambda-local` | Local crop loss weight | 1.5 |
@@ -211,7 +211,7 @@ otuformer pretrain \
 | `--save-every-epochs` | Save checkpoint every N epochs | 10 |
 | `--keep-last-checkpoints` | Keep only last N checkpoints | 10 |
 | `--visualize-data` | CSV with `image` and optional `label`; without labels, only UMAP is generated; if omitted, `--train-data` is reused | None |
-| `--extract-size` | Image size for embedding extraction (<=0 means auto) | 0 |
+| `--extract-size` | Image size for embedding extraction; `auto` uses the model's img_size | auto |
 | `--metrics-sample-size` | Max samples for periodic metrics and UMAP; <=0 means no cap | 10000 |
 | `--umap-n-neighbors` | UMAP n_neighbors | 15 |
 | `--umap-min-dist` | UMAP min_dist | 0.1 |
@@ -301,7 +301,7 @@ otuformer finetune \
 | `--save-every-epochs` | Save checkpoint every N epochs | 10 |
 | `--keep-last-checkpoints` | Keep only last N checkpoints | 10 |
 | `--visualize-data` | CSV with `image` and optional `label`; without labels, only UMAP is generated; if omitted, `--train-data` is reused | None |
-| `--extract-size` | Image size for embedding extraction (<=0 means auto) | 0 |
+| `--extract-size` | Image size for embedding extraction; `auto` uses the model's img_size | auto |
 | `--metrics-sample-size` | Max samples for periodic metrics and UMAP; <=0 means no cap | 10000 |
 | `--umap-n-neighbors` | UMAP n_neighbors | 15 |
 | `--umap-min-dist` | UMAP min_dist | 0.1 |
@@ -352,7 +352,8 @@ otuformer extract \
 | `--input-images-dir` | Input image directory | Required |
 | `--out-dir` | Output directory | `runs/extract` |
 | `--model-name` | timm backbone name | `vit_tiny_patch16_224` |
-| `--extract-size` | Resize/crop size for extraction | 224 |
+| `--extract-size` | Resize/crop size for extraction; `auto` uses the checkpoint's recorded training size | auto |
+| `--eval-transform` | Evaluation preprocessing protocol: `center-crop` (default) or `whole-specimen-pad` (aspect-preserving square padding, reserved) | `center-crop` |
 | `--use-projector-output` | Use projector output instead of CLS token | No |
 | `--use-student` | Load student weights instead of teacher (EMA) | No |
 | `--token-mode` | `cls`/`patch-topk`/`attention-pool` | `cls` |
@@ -604,6 +605,7 @@ otuformer cam \
 | `--cam-batch-size` | Batch size for CAM inference | 32 |
 | `--num-workers` | Dataloader worker processes | 4 |
 | `--device` | `auto`/`cpu`/`cuda`/`mps` | `auto` |
+| `--eval-transform` | Evaluation preprocessing protocol: `center-crop` (heatmap confined to the model's field of view) or `whole-specimen-pad` (heatmap covers the whole specimen) | `center-crop` |
 
 **Output**:
 - `figures/` — CAM overlay images
@@ -635,7 +637,7 @@ otuformer export \
 |-----------|-------------|---------|
 | `--checkpoint` | Checkpoint path | Required |
 | `--out-dir` | Output directory | `runs/export` |
-| `--imgsz` | Input image size for ONNX export (auto-inferred from backbone if not provided) | Auto |
+| `--imgsz` | Input image size for ONNX export; `auto` uses the checkpoint's recorded training size | auto |
 | `--opset` | ONNX opset version | 18 |
 
 **Output**:

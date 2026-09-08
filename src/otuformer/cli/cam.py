@@ -113,6 +113,18 @@ def cam(
         "--cam-batch-size",
         help="Batch size for CAM inference.",
     ),
+    eval_transform: str = typer.Option(
+        "center-crop",
+        "--eval-transform",
+        click_type=click.Choice(["center-crop", "whole-specimen-pad"]),
+        show_choices=False,
+        help=(
+            "Evaluation preprocessing protocol: center-crop (Resize + CenterCrop; "
+            "heatmap confined to the model's field of view) or whole-specimen-pad "
+            "(aspect-preserving square padding; heatmap covers the whole specimen). "
+            "Default: center-crop."
+        ),
+    ),
     num_workers: int = typer.Option(
         4,
         "--num-workers",
@@ -164,6 +176,7 @@ def cam(
             "cam_batch_size": cam_batch_size,
             "num_workers": num_workers,
             "device": device,
+            "eval_transform": eval_transform,
         }
         print(f"Command: {_format_user_command(ctx, params)}")
         print("Parameters:")
@@ -187,6 +200,7 @@ def cam(
             max_images=max_images,
             cam_batch_size=max(1, min(cam_batch_size, 8)),
             device=device,
+            eval_transform=eval_transform,
         )
     except Exception:
         traceback.print_exc(file=tee)

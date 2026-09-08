@@ -30,9 +30,9 @@ from otuformer.training.dataset import (
     MetricDataset,
     MultiCropDataset,
     _build_recursive_index,
-    _make_eval_transform,
     _resolve_image_path,
     _supports_recursive_lookup,
+    center_crop_eval_transform,
 )
 from otuformer.training.loss import (
     ArcFaceLoss,
@@ -40,6 +40,12 @@ from otuformer.training.loss import (
 )
 from otuformer.training.model import OTUFormerEncoder
 from otuformer.utils.checkpoint import load_checkpoint, save_checkpoint
+from otuformer.utils.size import (
+    resolve_backbone_native_size,
+    resolve_training_image_size,
+    validate_input_size,
+    validate_model_name_size,
+)
 
 
 def _set_seed(seed: int) -> None:
@@ -713,22 +719,6 @@ def _extract_tokens(model: OTUFormerEncoder, images: torch.Tensor) -> torch.Tens
     return feats
 
 
-def _infer_backbone_image_size(model: OTUFormerEncoder, fallback: int = 224) -> int:
-    patch_embed = getattr(model.backbone, "patch_embed", None)
-    if patch_embed is not None:
-        img_size = getattr(patch_embed, "img_size", None)
-        if isinstance(img_size, (tuple, list)) and len(img_size) >= 1:
-            return int(img_size[0])
-        if isinstance(img_size, int):
-            return int(img_size)
-    default_cfg = getattr(model.backbone, "default_cfg", None)
-    if isinstance(default_cfg, dict):
-        input_size = default_cfg.get("input_size")
-        if isinstance(input_size, (tuple, list)) and len(input_size) >= 3:
-            return int(input_size[1])
-    return int(fallback)
-
-
 def _compute_grad_norm(model: nn.Module) -> float:
     total = 0.0
     for p in model.parameters():
@@ -785,7 +775,7 @@ def _compute_embeddings_from_csv(
     ]
     labels = df["label"].astype(str).to_numpy() if "label" in df.columns else None
 
-    tf = _make_eval_transform(image_size)
+    tf = center_crop_eval_transform(image_size)
     all_embs: list[np.ndarray] = []
     model.eval()
     _ = num_workers
@@ -946,10 +936,43 @@ def run_pretrain(args: argparse.Namespace) -> None:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Resolve the global crop size before dataset/model construction.
+    # ``args.global_crop_size`` is None (auto) or an explicit resolved int.
+    resume_ckpt: dict[str, Any] | None = None
+    start_epoch = 0
+    global_step = 0
+    if getattr(args, "resume", ""):
+        resume_path = Path(args.resume)
+        resume_ckpt = torch.load(resume_path, map_location="cpu", weights_only=False)
+        checkpoint_size = resolve_training_image_size(resume_ckpt)
+        if (
+            args.global_crop_size is not None
+            and args.global_crop_size != checkpoint_size
+        ):
+            raise ValueError(
+                "resume cannot change the input size: checkpoint records "
+                f"{checkpoint_size}, got --global-crop-size {args.global_crop_size}. "
+                "Start a new run for a different input size."
+            )
+        global_crop_size = checkpoint_size
+    else:
+        global_crop_size = (
+            args.global_crop_size
+            if args.global_crop_size is not None
+            else resolve_backbone_native_size(args.model_name)
+        )
+    args.global_crop_size = global_crop_size
+    validate_model_name_size(args.model_name, global_crop_size)
+    # local crops are processed by the same patch embed: when used, they must
+    # satisfy the same divisibility constraint (the default 96 is invalid for
+    # patch-14). With --local-crops 0 the local size is unused, so skip it.
+    if args.local_crops > 0:
+        validate_model_name_size(args.model_name, args.local_crop_size)
+
     ds = MultiCropDataset(
         csv_path=Path(args.train_data) if getattr(args, "train_data", "") else None,
         images_dir=Path(args.input_images_dir),
-        global_crop_size=args.global_crop_size,
+        global_crop_size=global_crop_size,
         local_crop_size=args.local_crop_size,
         local_crops=args.local_crops,
     )
@@ -966,7 +989,7 @@ def run_pretrain(args: argparse.Namespace) -> None:
         model_name=args.model_name,
         out_dim=args.out_dim,
         return_patch_tokens=True,
-        img_size=args.global_crop_size,
+        img_size=global_crop_size,
     ).to(device)
 
     rng_state = torch.get_rng_state()
@@ -976,7 +999,7 @@ def run_pretrain(args: argparse.Namespace) -> None:
         model_name=args.model_name,
         out_dim=args.out_dim,
         return_patch_tokens=True,
-        img_size=args.global_crop_size,
+        img_size=global_crop_size,
     ).to(device)
     torch.set_rng_state(rng_state)
     if cuda_rng_state is not None:
@@ -1000,12 +1023,7 @@ def run_pretrain(args: argparse.Namespace) -> None:
         else None
     )
 
-    start_epoch = 0
-    global_step = 0
-    resume_ckpt: dict[str, Any] | None = None
-    if getattr(args, "resume", ""):
-        resume_path = Path(args.resume)
-        resume_ckpt = torch.load(resume_path, map_location="cpu", weights_only=False)
+    if resume_ckpt is not None:
         if "student" in resume_ckpt:
             student.load_state_dict(resume_ckpt["student"], strict=False)
         elif "model_state_dict" in resume_ckpt:
@@ -1051,11 +1069,12 @@ def run_pretrain(args: argparse.Namespace) -> None:
     cosine_sim = 0.0
     eval_image_size = (
         int(args.extract_size)
-        if int(getattr(args, "extract_size", 0)) > 0
-        else _infer_backbone_image_size(teacher, fallback=args.global_crop_size)
+        if getattr(args, "extract_size", None) is not None
+        else global_crop_size
     )
-    if int(getattr(args, "extract_size", 0)) <= 0:
-        print(f"[Info] Auto eval crop size from backbone: {eval_image_size}")
+    validate_input_size(eval_image_size, teacher, args.model_name)
+    if args.extract_size is None:
+        print(f"[Info] Auto eval crop size from model img_size: {eval_image_size}")
 
     with torch.no_grad():
         sample_batch = next(iter(loader))
@@ -1205,6 +1224,7 @@ def run_pretrain(args: argparse.Namespace) -> None:
                 "config": {
                     "model_name": args.model_name,
                     "out_dim": args.out_dim,
+                    "image_size": global_crop_size,
                 },
                 "schedule": {
                     **schedule_state,
@@ -1286,8 +1306,14 @@ def run_finetune(args: argparse.Namespace) -> None:
     cfg = ckpt.get("config", {})
     model_name = cfg.get("model_name", args.model_name)
     out_dim = cfg.get("out_dim", args.metric_embed_dim)
+    finetune_image_size = resolve_training_image_size(ckpt)
 
-    model = OTUFormerEncoder(model_name=model_name, out_dim=out_dim).to(device)
+    model = OTUFormerEncoder(
+        model_name=model_name,
+        out_dim=out_dim,
+        img_size=finetune_image_size,
+    ).to(device)
+    validate_input_size(finetune_image_size, model, model_name)
     model.load_state_dict(ckpt["model_state_dict"], strict=False)
 
     _freeze_backbone_blocks(model, args.freeze_ratio)
@@ -1295,7 +1321,7 @@ def run_finetune(args: argparse.Namespace) -> None:
     ds = MetricDataset(
         csv_path=Path(args.train_data),
         images_dir=Path(args.input_images_dir),
-        image_size=224,
+        image_size=finetune_image_size,
     )
     loader = DataLoader(
         ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers
@@ -1344,11 +1370,12 @@ def run_finetune(args: argparse.Namespace) -> None:
 
     eval_image_size = (
         int(args.extract_size)
-        if int(getattr(args, "extract_size", 0)) > 0
-        else _infer_backbone_image_size(model, fallback=224)
+        if getattr(args, "extract_size", None) is not None
+        else finetune_image_size
     )
-    if int(getattr(args, "extract_size", 0)) <= 0:
-        print(f"[Info] Auto eval crop size from backbone: {eval_image_size}")
+    validate_input_size(eval_image_size, model, model_name)
+    if args.extract_size is None:
+        print(f"[Info] Auto eval crop size from model img_size: {eval_image_size}")
 
     # Global iteration counter (mirrors ref finetune_arcface `it` variable)
     global_step = int(ckpt.get("iteration", 0))
@@ -1421,6 +1448,7 @@ def run_finetune(args: argparse.Namespace) -> None:
                     "model_name": model_name,
                     "metric_embed_dim": out_dim,
                     "out_dim": out_dim,
+                    "image_size": finetune_image_size,
                 },
                 "class_labels": sorted(str(label) for label in ds.class_to_idx),
             }

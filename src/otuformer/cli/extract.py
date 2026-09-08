@@ -11,6 +11,8 @@ from pathlib import Path
 import click
 import typer
 
+from otuformer.cli import SIZE_EXAMPLES, _parse_size
+
 app = typer.Typer(
     help=(
         "Extract embeddings from images.\n\n"
@@ -59,8 +61,25 @@ def extract(
     model_name: str = typer.Option(
         "vit_tiny_patch16_224", "--model-name", help="timm backbone."
     ),
-    extract_size: int = typer.Option(
-        224, "--extract-size", help="Resize/crop size for extraction."
+    extract_size: str = typer.Option(
+        "auto",
+        "--extract-size",
+        help=(
+            "Resize/crop size for extraction. 'auto' uses the checkpoint's "
+            "recorded training size. "
+            f"{SIZE_EXAMPLES}"
+        ),
+    ),
+    eval_transform: str = typer.Option(
+        "center-crop",
+        "--eval-transform",
+        click_type=click.Choice(["center-crop", "whole-specimen-pad"]),
+        show_choices=False,
+        help=(
+            "Evaluation preprocessing protocol: center-crop (Resize + CenterCrop) "
+            "or whole-specimen-pad (aspect-preserving square padding). "
+            "Default: center-crop."
+        ),
     ),
     use_projector_output: bool = typer.Option(
         False,
@@ -178,6 +197,7 @@ def extract(
             overwrite=overwrite,
             model_name=model_name,
             extract_size=extract_size,
+            eval_transform=eval_transform,
             use_projector_output=use_projector_output,
             use_student=use_student,
             token_mode=token_mode,
@@ -222,7 +242,7 @@ def extract(
             checkpoint_path=checkpoint,
             images_dir=input_images_dir,
             model_name=model_name,
-            extract_size=extract_size,
+            extract_size=_parse_size(extract_size, stage="--extract-size"),
             batch_size=batch_size,
             device=device,
             num_workers=num_workers,
@@ -237,6 +257,7 @@ def extract(
             extract_csv=label_csv,
             attention_pooling_checkpoint_path=attention_pooling_checkpoint,
             onnx_path=onnx_path,
+            eval_transform=eval_transform,
         )
         out_path = out_dir / "embeddings.csv"
         write_csv(df, out_path)

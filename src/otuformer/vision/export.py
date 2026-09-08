@@ -12,22 +12,7 @@ import torch
 from otuformer.training.model import OTUFormerEncoder
 from otuformer.utils.checkpoint import load_checkpoint
 from otuformer.utils.io import write_json
-
-
-def _infer_backbone_image_size(model: OTUFormerEncoder, fallback: int = 224) -> int:
-    patch_embed = getattr(model.backbone, "patch_embed", None)
-    if patch_embed is not None:
-        img_size = getattr(patch_embed, "img_size", None)
-        if isinstance(img_size, (tuple, list)) and len(img_size) >= 1:
-            return int(img_size[0])
-        if isinstance(img_size, int):
-            return int(img_size)
-    default_cfg = getattr(model.backbone, "default_cfg", None)
-    if isinstance(default_cfg, dict):
-        input_size = default_cfg.get("input_size")
-        if isinstance(input_size, (tuple, list)) and len(input_size) >= 3:
-            return int(input_size[1])
-    return int(fallback)
+from otuformer.utils.size import resolve_training_image_size, validate_input_size
 
 
 def export_to_onnx(
@@ -40,13 +25,21 @@ def export_to_onnx(
     cfg = ckpt.get("config", {})
     model_name = cfg.get("model_name", "vit_tiny_patch16_224")
     out_dim = cfg.get("out_dim") or cfg.get("metric_embed_dim", 256)
+    checkpoint_size = resolve_training_image_size(ckpt)
 
-    model = OTUFormerEncoder(model_name=model_name, out_dim=out_dim, pretrained=False)
+    model = OTUFormerEncoder(
+        model_name=model_name,
+        out_dim=out_dim,
+        pretrained=False,
+        img_size=checkpoint_size,
+    )
+    validate_input_size(checkpoint_size, model, model_name)
     model.load_state_dict(ckpt["model_state_dict"], strict=False)
     model.eval()
 
     if imgsz is None:
-        imgsz = _infer_backbone_image_size(model, fallback=224)
+        imgsz = checkpoint_size
+    validate_input_size(imgsz, model, model_name)
 
     dummy_input = torch.randn(1, 3, imgsz, imgsz)
     out_path.parent.mkdir(parents=True, exist_ok=True)

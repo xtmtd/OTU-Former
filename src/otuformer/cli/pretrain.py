@@ -12,6 +12,8 @@ from pathlib import Path
 import click
 import typer
 
+from otuformer.cli import SIZE_EXAMPLES, _parse_size
+
 app = typer.Typer(
     help=(
         "SSL self-supervised pre-training (DINO/iBOT style).\n\n"
@@ -83,11 +85,22 @@ def pretrain(
         "--warmup-epochs",
         help="Warmup epochs before cosine LR decay.",
     ),
-    global_crop_size: int = typer.Option(
-        224, "--global-crop-size", help="Global crop resolution."
+    global_crop_size: str = typer.Option(
+        "auto",
+        "--global-crop-size",
+        help=(
+            "Global crop resolution. 'auto' resolves to the backbone's native "
+            "input size on a new run, or the checkpoint's recorded size on "
+            f"--resume. {SIZE_EXAMPLES}"
+        ),
     ),
     local_crop_size: int = typer.Option(
-        96, "--local-crop-size", help="Local crop resolution."
+        96,
+        "--local-crop-size",
+        help=(
+            "Local crop resolution. Must be divisible by the backbone patch "
+            "size (e.g. 98 or 112 for patch-14 models)."
+        ),
     ),
     local_crops: int = typer.Option(6, "--local-crops", help="Number of local crops."),
     mask_ratio: float = typer.Option(
@@ -141,12 +154,13 @@ def pretrain(
             "Without labels, only UMAP is generated. If omitted, --train-data is reused when available."
         ),
     ),
-    extract_size: int = typer.Option(
-        0,
+    extract_size: str = typer.Option(
+        "auto",
         "--extract-size",
         help=(
             "Image size for periodic metrics/UMAP embedding extraction. "
-            "<=0 means auto from backbone input size."
+            "'auto' uses the model's img_size. "
+            f"{SIZE_EXAMPLES}"
         ),
     ),
     metrics_sample_size: int = typer.Option(
@@ -224,7 +238,7 @@ def pretrain(
             lr=lr,
             weight_decay=weight_decay,
             warmup_epochs=warmup_epochs,
-            global_crop_size=global_crop_size,
+            global_crop_size=_parse_size(global_crop_size, stage="--global-crop-size"),
             local_crop_size=local_crop_size,
             local_crops=local_crops,
             mask_ratio=mask_ratio,
@@ -241,7 +255,7 @@ def pretrain(
             save_every_epochs=save_every_epochs,
             keep_last_checkpoints=keep_last_checkpoints,
             visualize_data=str(visualize_data) if visualize_data is not None else "",
-            extract_size=extract_size,
+            extract_size=_parse_size(extract_size, stage="--extract-size"),
             metrics_sample_size=metrics_sample_size,
             umap_n_neighbors=umap_n_neighbors,
             umap_min_dist=umap_min_dist,

@@ -1,10 +1,16 @@
 import argparse
 
 import numpy as np
+import pandas as pd
 import pytest
 import torch
+from PIL import Image
 
 from otuformer.training import trainer
+from otuformer.utils.size import (
+    resolve_training_image_size,
+    validate_input_size,
+)
 
 
 def _schedule_args(max_epochs=5):
@@ -441,3 +447,127 @@ def test_teacher_momentum_updates_after_optimizer_step():
     assert opt_pos != -1, "optimizer.step() not found in run_pretrain"
     assert ema_pos != -1, "update_teacher call not found in run_pretrain"
     assert opt_pos < ema_pos, "EMA update must occur after optimizer.step()"
+
+
+def test_resolve_training_image_size_precedence():
+    # 1. fine-tune augmentation_config.image_size
+    assert (
+        resolve_training_image_size(
+            {
+                "config": {
+                    "augmentation_config": {"image_size": 384},
+                    "image_size": 224,
+                },
+                "args": {"global_crop_size": 96},
+            }
+        )
+        == 384
+    )
+    # 2. pretrain augmentation_config.global_crop.size
+    assert (
+        resolve_training_image_size(
+            {
+                "config": {
+                    "augmentation_config": {"global_crop": {"size": 448}},
+                    "image_size": 224,
+                }
+            }
+        )
+        == 448
+    )
+    # 3. this plan's fine-tune config.image_size
+    assert resolve_training_image_size({"config": {"image_size": 352}}) == 352
+    # 4. legacy args.global_crop_size
+    assert resolve_training_image_size({"args": {"global_crop_size": 288}}) == 288
+    # 5. fallback 224
+    assert resolve_training_image_size({}) == 224
+    assert resolve_training_image_size(None) == 224
+    # invalid (bool / negative / non-integer) values are rejected (treated as absent)
+    assert resolve_training_image_size({"config": {"image_size": True}}) == 224
+    assert resolve_training_image_size({"config": {"image_size": -4}}) == 224
+    assert resolve_training_image_size({"config": {"image_size": "big"}}) == 224
+
+
+def test_validate_input_size_rejects_non_divisible_with_model_name():
+    import timm
+
+    model = timm.create_model("vit_tiny_patch16_224", pretrained=False)
+    with pytest.raises(
+        ValueError,
+        match="518 is not divisible by patch size 16 for vit_tiny_patch16_224; nearest valid: 512",
+    ):
+        validate_input_size(518, model, "vit_tiny_patch16_224")
+
+
+def test_validate_input_size_passes_cnn_backbone_without_patch_embed():
+    import timm
+
+    model = timm.create_model("convnextv2_femto", pretrained=False)
+    validate_input_size(224, model, "convnextv2_femto")  # no raise
+
+
+def test_finetune_resolves_and_persists_checkpoint_size(tmp_path):
+    from otuformer.training.model import OTUFormerEncoder
+
+    encoder = OTUFormerEncoder(
+        model_name="vit_tiny_patch16_224",
+        out_dim=16,
+        pretrained=False,
+        img_size=32,
+    )
+    ckpt = {
+        "model_state_dict": encoder.state_dict(),
+        "config": {"model_name": "vit_tiny_patch16_224", "out_dim": 16},
+        "args": {"global_crop_size": 32},
+    }
+    ckpt_path = tmp_path / "pretrain_32.pth"
+    torch.save(ckpt, ckpt_path)
+
+    img_dir = tmp_path / "images"
+    img_dir.mkdir()
+    for i in range(4):
+        Image.new("RGB", (64, 64), color=(i * 50, 0, 0)).save(img_dir / f"img_{i}.jpg")
+    df = pd.DataFrame(
+        {
+            "image": [f"img_{i}.jpg" for i in range(4)],
+            "label": ["classA", "classA", "classB", "classB"],
+        }
+    )
+    csv_path = tmp_path / "labels.csv"
+    df.to_csv(csv_path, index=False)
+
+    args = argparse.Namespace(
+        seed=42,
+        cpus=0,
+        device="cpu",
+        out_dir=str(tmp_path / "ft_out"),
+        checkpoint=str(ckpt_path),
+        resume="",
+        train_data=str(csv_path),
+        input_images_dir=str(img_dir),
+        model_name="vit_tiny_patch16_224",
+        metric_embed_dim=16,
+        finetune_epochs=1,
+        finetune_lr=1e-4,
+        freeze_ratio=0.7,
+        loss="arcface",
+        batch_size=2,
+        num_workers=0,
+        log_every_n_steps=50,
+        save_every_epochs=1,
+        keep_last_checkpoints=0,
+        compute_embedding_metrics=False,
+        extract_size=None,
+        visualize_data="",
+        metrics_sample_size=10000,
+    )
+    trainer.run_finetune(args)
+
+    saved = torch.load(
+        tmp_path / "ft_out" / "finetune_latest.pth",
+        map_location="cpu",
+        weights_only=False,
+    )
+    assert saved["config"]["image_size"] == 32
+    # and a finetune checkpoint resolves back to 32 (not 224)
+    assert resolve_training_image_size(saved) == 32

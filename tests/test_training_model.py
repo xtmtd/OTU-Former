@@ -40,6 +40,13 @@ def test_encoder_forwards_pretrained_false_to_all_timm_branches(monkeypatch):
     assert all(kwargs["pretrained"] is False for kwargs in calls)
 
 
+def test_encoder_rejects_cnn_style_backbone_with_clear_error():
+    """A CNN-style backbone (rejects the ViT-only kwargs) must produce an
+    honest error instead of blaming the timm/Hugging Face cache."""
+    with pytest.raises(RuntimeError, match="CNN-style model"):
+        OTUFormerEncoder(model_name="convnextv2_femto", out_dim=8, pretrained=False)
+
+
 def test_encoder_output_shape():
     model = OTUFormerEncoder(model_name="vit_tiny_patch16_224", out_dim=128)
     x = torch.randn(2, 3, 224, 224)

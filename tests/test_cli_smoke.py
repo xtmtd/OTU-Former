@@ -1304,7 +1304,7 @@ def test_pretrain_default_model_name_and_device_auto(tmp_path, monkeypatch):
     assert result.exit_code == 0
     assert seen["model_name"] == "vit_tiny_patch16_224"
     assert seen["device"] == "auto"
-    assert seen["extract_size"] == 0
+    assert seen["extract_size"] is None
 
 
 def test_pretrain_help_mentions_umap_metric_choices_and_extract_auto():
@@ -1529,3 +1529,407 @@ def test_pretrain_enables_mps_fallback_env_for_auto(tmp_path, monkeypatch):
 
     assert result.exit_code == 0
     assert seen["fallback"] == "1"
+
+
+# ---- Resolution & preprocessing consistency (2026-09-07 plan) ----
+
+
+@pytest.mark.parametrize("cmd", ["pretrain", "finetune", "extract", "export"])
+def test_size_options_document_auto_and_examples(cmd):
+    result = runner.invoke(app, [cmd, "--help"])
+    assert result.exit_code == 0
+    assert "auto" in result.output
+    for example in ["224", "384", "448"]:
+        assert example in result.output
+
+
+def test_size_options_qualify_518_as_patch14_example():
+    for cmd in ["pretrain", "finetune", "extract", "export"]:
+        result = runner.invoke(app, [cmd, "--help"])
+        assert result.exit_code == 0
+        if "518" in result.output:
+            assert "patch-14" in result.output
+
+
+def test_extract_size_auto_and_explicit_parse(tmp_path, monkeypatch):
+    seen = {}
+
+    def fake_extract(**kwargs):
+        seen["extract_size"] = kwargs["extract_size"]
+        return pd.DataFrame({"id": [], "dim_0": []})
+
+    monkeypatch.setattr("otuformer.embedding.extractor.extract_embeddings", fake_extract)
+
+    _make_tiny_pretrain_data(tmp_path)
+    for flag in ["auto", "224"]:
+        result = runner.invoke(
+            app,
+            [
+                "extract",
+                "--input-images-dir",
+                str(tmp_path),
+                "--out-dir",
+                str(tmp_path / f"out_{flag}"),
+                "--extract-size",
+                flag,
+            ],
+        )
+        assert result.exit_code == 0
+        expected = None if flag == "auto" else 224
+        assert seen["extract_size"] == expected
+
+
+@pytest.mark.parametrize("flag", ["0", "abc", "-8"])
+def test_extract_size_rejects_invalid_before_execution(tmp_path, flag):
+    result = runner.invoke(
+        app,
+        [
+            "extract",
+            "--input-images-dir",
+            str(tmp_path),
+            "--out-dir",
+            str(tmp_path / "out"),
+            "--extract-size",
+            flag,
+        ],
+    )
+    assert result.exit_code != 0
+    assert "positive integer" in result.output
+
+
+def test_global_crop_size_rejects_non_divisible_patch16(tmp_path):
+    csv_path = _make_tiny_pretrain_data(tmp_path)
+    result = runner.invoke(
+        app,
+        [
+            "pretrain",
+            "--train-data",
+            str(csv_path),
+            "--input-images-dir",
+            str(tmp_path),
+            "--out-dir",
+            str(tmp_path / "pretrain_out"),
+            "--global-crop-size",
+            "518",
+            "--max-epochs",
+            "1",
+            "--batch-size",
+            "2",
+            "--num-workers",
+            "0",
+            "--device",
+            "cpu",
+            "--disable-embedding-metrics",
+            "--disable-cross-view-loss",
+        ],
+    )
+    assert result.exit_code != 0
+    assert "518 is not divisible by patch size 16" in result.output
+    assert "vit_tiny_patch16_224" in result.output
+
+
+def test_pretrain_resume_rejects_changed_input_size(tmp_path):
+    ckpt = _make_ckpt(tmp_path)  # 224 checkpoint
+    result = runner.invoke(
+        app,
+        [
+            "pretrain",
+            "--resume",
+            str(ckpt),
+            "--input-images-dir",
+            str(tmp_path),
+            "--out-dir",
+            str(tmp_path / "pretrain_out"),
+            "--train-data",
+            str(tmp_path / "data.csv"),
+            "--global-crop-size",
+            "384",
+        ],
+    )
+    assert result.exit_code != 0
+    assert "resume cannot change the input size" in result.output
+
+
+def test_pretrain_resume_allows_equal_input_size(tmp_path, monkeypatch):
+    ckpt = _make_ckpt(tmp_path)  # 224 checkpoint
+    seen = {}
+
+    def fake_run_pretrain(args):
+        seen["global_crop_size"] = args.global_crop_size
+
+    monkeypatch.setattr("otuformer.training.trainer.run_pretrain", fake_run_pretrain)
+
+    result = runner.invoke(
+        app,
+        [
+            "pretrain",
+            "--resume",
+            str(ckpt),
+            "--input-images-dir",
+            str(tmp_path),
+            "--out-dir",
+            str(tmp_path / "pretrain_out"),
+            "--train-data",
+            str(tmp_path / "data.csv"),
+            "--global-crop-size",
+            "224",
+        ],
+    )
+    assert result.exit_code == 0
+    assert seen["global_crop_size"] == 224
+
+
+def test_pretrain_auto_global_crop_size_forwards_none(tmp_path, monkeypatch):
+    seen = {}
+
+    def fake_run_pretrain(args):
+        seen["global_crop_size"] = args.global_crop_size
+        seen["extract_size"] = args.extract_size
+
+    monkeypatch.setattr("otuformer.training.trainer.run_pretrain", fake_run_pretrain)
+
+    result = runner.invoke(
+        app,
+        [
+            "pretrain",
+            "--train-data",
+            str(tmp_path / "images.csv"),
+            "--input-images-dir",
+            str(tmp_path),
+            "--out-dir",
+            str(tmp_path / "pretrain_out"),
+        ],
+    )
+    assert result.exit_code == 0
+    assert seen["global_crop_size"] is None
+    assert seen["extract_size"] is None
+
+
+def test_export_imgsz_auto_and_explicit(tmp_path):
+    ckpt = _make_ckpt(tmp_path)
+    result = runner.invoke(
+        app,
+        [
+            "export",
+            "--checkpoint",
+            str(ckpt),
+            "--out-dir",
+            str(tmp_path / "export_auto"),
+            "--imgsz",
+            "auto",
+        ],
+    )
+    assert result.exit_code == 0
+    assert (tmp_path / "export_auto" / "encoder.onnx").exists()
+
+    result = runner.invoke(
+        app,
+        [
+            "export",
+            "--checkpoint",
+            str(ckpt),
+            "--out-dir",
+            str(tmp_path / "export_224"),
+            "--imgsz",
+            "224",
+        ],
+    )
+    assert result.exit_code == 0
+
+
+def test_extract_help_documents_eval_transform():
+    result = runner.invoke(app, ["extract", "--help"])
+    assert result.exit_code == 0
+    assert "eval-transform" in result.output
+    assert "center-crop" in result.output
+    assert "whole-specimen-pad" in result.output
+
+
+def test_cam_help_documents_eval_transform():
+    result = runner.invoke(app, ["cam", "--help"])
+    assert result.exit_code == 0
+    assert "eval-transform" in result.output
+    assert "center-crop" in result.output
+    assert "whole-specimen-pad" in result.output
+
+
+def test_extract_rejects_invalid_eval_transform(tmp_path):
+    result = runner.invoke(
+        app,
+        [
+            "extract",
+            "--input-images-dir",
+            str(tmp_path),
+            "--out-dir",
+            str(tmp_path / "out"),
+            "--eval-transform",
+            "bogus",
+        ],
+    )
+    assert result.exit_code != 0
+    assert "bogus" in result.output
+
+
+def test_cam_rejects_invalid_eval_transform(tmp_path):
+    ckpt = _make_ckpt(tmp_path)
+    result = runner.invoke(
+        app,
+        [
+            "cam",
+            "--checkpoint",
+            str(ckpt),
+            "--images-dir",
+            str(tmp_path),
+            "--out-dir",
+            str(tmp_path / "out"),
+            "--eval-transform",
+            "bogus",
+        ],
+    )
+    assert result.exit_code != 0
+    assert "bogus" in result.output
+
+
+def test_extract_forwards_eval_transform(monkeypatch, tmp_path):
+    seen = {}
+
+    def fake_extract(**kwargs):
+        seen["eval_transform"] = kwargs["eval_transform"]
+        return pd.DataFrame({"id": [], "dim_0": []})
+
+    monkeypatch.setattr("otuformer.embedding.extractor.extract_embeddings", fake_extract)
+
+    _make_tiny_pretrain_data(tmp_path)
+    result = runner.invoke(
+        app,
+        [
+            "extract",
+            "--input-images-dir",
+            str(tmp_path),
+            "--out-dir",
+            str(tmp_path / "out"),
+            "--eval-transform",
+            "whole-specimen-pad",
+        ],
+    )
+    assert result.exit_code == 0
+    assert seen["eval_transform"] == "whole-specimen-pad"
+
+
+def test_extract_default_eval_transform_is_center_crop(monkeypatch, tmp_path):
+    seen = {}
+
+    def fake_extract(**kwargs):
+        seen["eval_transform"] = kwargs["eval_transform"]
+        return pd.DataFrame({"id": [], "dim_0": []})
+
+    monkeypatch.setattr("otuformer.embedding.extractor.extract_embeddings", fake_extract)
+
+    _make_tiny_pretrain_data(tmp_path)
+    result = runner.invoke(
+        app,
+        [
+            "extract",
+            "--input-images-dir",
+            str(tmp_path),
+            "--out-dir",
+            str(tmp_path / "out"),
+        ],
+    )
+    assert result.exit_code == 0
+    assert seen["eval_transform"] == "center-crop"
+
+
+def test_cam_forwards_eval_transform(monkeypatch, tmp_path):
+    seen = {}
+
+    def fake_run_cam(**kwargs):
+        seen["eval_transform"] = kwargs["eval_transform"]
+        (kwargs["out_dir"] / "figures").mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setattr("otuformer.vision.cam.run_cam", fake_run_cam)
+
+    ckpt = _make_ckpt(tmp_path)
+    result = runner.invoke(
+        app,
+        [
+            "cam",
+            "--checkpoint",
+            str(ckpt),
+            "--images-dir",
+            str(tmp_path),
+            "--out-dir",
+            str(tmp_path / "out"),
+            "--eval-transform",
+            "whole-specimen-pad",
+        ],
+    )
+    assert result.exit_code == 0
+    assert seen["eval_transform"] == "whole-specimen-pad"
+
+
+def test_pretrain_local_crop_size_validated_against_patch(tmp_path):
+    csv_path = _make_tiny_pretrain_data(tmp_path)
+    result = runner.invoke(
+        app,
+        [
+            "pretrain",
+            "--train-data",
+            str(csv_path),
+            "--input-images-dir",
+            str(tmp_path),
+            "--out-dir",
+            str(tmp_path / "pretrain_out"),
+            "--local-crop-size",
+            "97",
+            "--max-epochs",
+            "1",
+            "--batch-size",
+            "2",
+            "--num-workers",
+            "0",
+            "--device",
+            "cpu",
+            "--disable-embedding-metrics",
+            "--disable-cross-view-loss",
+        ],
+    )
+    assert result.exit_code != 0
+    assert "97 is not divisible by patch size 16" in result.output
+    assert "vit_tiny_patch16_224" in result.output
+
+
+def test_pretrain_local_crops_zero_skips_local_size_validation(tmp_path):
+    """--local-crops 0 never uses local_crop_size, so an invalid local size
+    must not be rejected (mirrors the patch-14 + local_crops=0 config)."""
+    csv_path = _make_tiny_pretrain_data(tmp_path)
+    result = runner.invoke(
+        app,
+        [
+            "pretrain",
+            "--train-data",
+            str(csv_path),
+            "--input-images-dir",
+            str(tmp_path),
+            "--out-dir",
+            str(tmp_path / "pretrain_out"),
+            "--global-crop-size",
+            "224",
+            "--local-crop-size",
+            "97",  # invalid for patch-16, but unused when local_crops=0
+            "--local-crops",
+            "0",
+            "--max-epochs",
+            "1",
+            "--batch-size",
+            "2",
+            "--num-workers",
+            "0",
+            "--device",
+            "cpu",
+            "--disable-embedding-metrics",
+            "--disable-cross-view-loss",
+        ],
+    )
+    assert result.exit_code == 0
+    assert (tmp_path / "pretrain_out" / "SSL_latest.pth").exists()

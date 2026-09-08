@@ -1,9 +1,20 @@
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
+import pytest
 from PIL import Image
+from torchvision import transforms
 
-from otuformer.training.dataset import MetricDataset, MultiCropDataset
+from otuformer.training.dataset import (
+    EVAL_TRANSFORMS,
+    MetricDataset,
+    MultiCropDataset,
+    _estimate_background_color,
+    build_eval_transform,
+    center_crop_eval_transform,
+    whole_specimen_pad_transform,
+)
 
 
 def make_dummy_images(tmp_path: Path, n: int = 4) -> Path:
@@ -120,3 +131,70 @@ def test_multicrop_dataset_uses_all_images_when_csv_missing(tmp_path: Path):
         local_crops=2,
     )
     assert len(ds) == 2
+
+
+def test_center_crop_eval_transform_equals_old_composition():
+    tf = center_crop_eval_transform(64)
+    assert [type(t) for t in tf.transforms] == [
+        transforms.Resize,
+        transforms.CenterCrop,
+        transforms.ToTensor,
+        transforms.Normalize,
+    ]
+    assert tf.transforms[0].size == 64
+    assert tf.transforms[1].size == (64, 64)
+
+
+def test_whole_specimen_pad_transform_preserves_aspect_ratio():
+    img = Image.new("RGB", (8, 4))
+    for x in range(4):
+        for y in range(4):
+            img.putpixel((x, y), (0, 128, 0))
+    for x in range(4, 8):
+        for y in range(4):
+            img.putpixel((x, y), (0, 0, 255))
+
+    tf = whole_specimen_pad_transform(32)
+    out = tf(img)
+    assert out.shape == (3, 32, 32)
+    # green specimen half stays on the left, blue on the right: no distortion
+    assert out[1, :, 2].mean() > out[2, :, 2].mean()  # col 2 is green-dominant
+    assert out[2, :, 30].mean() > out[1, :, 30].mean()  # col 30 is blue-dominant
+
+
+def test_estimate_background_color_returns_edge_median():
+    img = Image.new("RGB", (6, 6), (255, 0, 0))
+    for x in range(1, 5):
+        for y in range(1, 5):
+            img.putpixel((x, y), (0, 255, 0))
+    assert _estimate_background_color(img) == (255, 0, 0)
+
+
+def test_estimate_background_color_fallback_on_failure():
+    assert _estimate_background_color(123) == (124, 116, 104)
+    assert _estimate_background_color(Image.new("RGB", (1, 1))) == (124, 116, 104)
+
+
+def test_build_eval_transform_maps_names_and_rejects_unknown():
+    assert set(EVAL_TRANSFORMS) == {"center-crop", "whole-specimen-pad"}
+
+    def spec(tf):
+        return [(type(t).__name__, getattr(t, "size", None)) for t in tf.transforms]
+
+    assert spec(build_eval_transform("center-crop", 64)) == spec(
+        center_crop_eval_transform(64)
+    )
+    assert spec(build_eval_transform("whole-specimen-pad", 64)) == spec(
+        whole_specimen_pad_transform(64)
+    )
+    with pytest.raises(ValueError, match="Unknown eval transform 'bogus'"):
+        build_eval_transform("bogus", 64)
+
+
+def test_pad_to_square_uses_edge_median_fill():
+    from otuformer.training.dataset import pad_to_square
+
+    img = Image.new("RGB", (6, 4), (10, 20, 30))
+    padded = pad_to_square(img)
+    assert padded.size == (6, 6)
+    assert padded.getpixel((0, 0)) == (10, 20, 30)

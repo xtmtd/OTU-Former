@@ -85,7 +85,7 @@ All parameters migrated from `ref/ibot20260115.py` `get_parser()`, mode=pretrain
 - `--out-dim` : SSL projector output dimension [default: 256]
 - `--max-epochs` [default: 50]
 - `--lr` [default: 5e-4], `--weight-decay` [default: 0.05], `--warmup-epochs` [default: 3]
-- `--global-crop-size` [default: 224], `--local-crop-size` [default: 96], `--local-crops` [default: 6]
+- `--global-crop-size` [default: auto; `auto` resolves to the backbone's native `default_cfg["input_size"]` on a new run or the checkpoint's recorded size on `--resume`; explicit values 224/384/448 are common, 518 is patch-14-only]; `--local-crop-size` [default: 96], `--local-crops` [default: 6]
 - `--mask-ratio` [default: 0.5], `--lambda-local` [default: 1.5], `--lambda-mask` [default: 1.0]
 - `--teacher-momentum` [default: 0.995], `--teacher-momentum-end` [default: 0.999]
 - `--student-temp` [default: 0.1], `--teacher-temp-start` [default: 0.04], `--teacher-temp-end` [default: 0.07]
@@ -131,7 +131,8 @@ Parameters migrated from `ref/ibot20260115.py` `get_parser()`, mode=extract. Ful
 - `--input-images-dir` : root image directory **or** parent directory containing subdirectories (batch mode, auto-detected)
 - `--out-dir`
 - `--model-name` : timm backbone (must match training) [default: vit_small_patch16_224]
-- `--extract-size` [default: 224]
+- `--extract-size` [default: auto; `auto` uses the checkpoint's recorded training size; explicit values (224/384/448, 518 = patch-14 models only) must be divisible by the backbone patch size]
+- `--eval-transform` : `center-crop` | `whole-specimen-pad` [default: center-crop; deterministic evaluation preprocessing protocol, applied to extraction and CAM]
 - `--use-projector-output` : use projector output instead of CLS token
 - `--token-mode` : `cls` | `patch-topk` | `attention-pool` [default: cls]
 - `--topk-patches` : for patch-topk mode, choices: 10/20/30 [default: 20]
@@ -272,6 +273,9 @@ Implementation mirrors `entomokit classify cam` (`/Users/zf/data/coding/entomoki
 - `--dump-model-structure` : write layer names to `model_layers.txt`
 - `--max-images` : limit number of images processed
 - `--cam-batch-size` [default: 32], `--num-workers` [default: 4], `--device`
+- `--eval-transform` : `center-crop` | `whole-specimen-pad` [default: center-crop; deterministic evaluation preprocessing protocol shared with extraction]
+
+Heatmaps are overlaid on the full original image via the correct inverse of the selected preprocessing: with `center-crop` the heatmap is confined to the model's field of view using a binary FOV mask (out-of-view pixels are dimmed directly, never routed through the heatmap colormap); with `whole-specimen-pad` the heatmap covers the whole specimen. The figure is a gradient-attribution heatmap of the raw CLS feature (its argmax treated as a pseudo-class), not a verified class-discriminative CAM; that semantic is tracked separately.
 
 **Outputs:** Per-image overlay images, `cam_summary.csv`, `model_layers.txt` (if `--dump-model-structure`).
 
@@ -282,7 +286,7 @@ Export encoder + projector to ONNX for deployment.
 
 - `--checkpoint` : pretrain or finetune checkpoint
 - `--out-dir`
-- `--imgsz` : input image size [default: 224]
+- `--imgsz` : input image size [default: auto; `auto` uses the checkpoint's recorded training size]
 - `--opset` : ONNX opset version [default: 17]
 
 **Note:** Always exports encoder + projector only. Output embedding dimension is read from the checkpoint metadata (set by `--out-dim` or `--metric-embed-dim` at training time) — not hardcoded.

@@ -189,8 +189,8 @@ otuformer pretrain \
 | `--lr` | 基础学习率 | 5e-4 |
 | `--weight-decay` | AdamW 权重衰减 | 0.05 |
 | `--warmup-epochs` | 预热轮数 | 3 |
-| `--global-crop-size` | 全局裁剪分辨率 | 224 |
-| `--local-crop-size` | 局部裁剪分辨率 | 96 |
+| `--global-crop-size` | 全局裁剪分辨率；`auto` 在新运行时使用骨干网络原生输入尺寸，`--resume` 时使用检查点记录尺寸（如 224、384、448，518 仅适用于 patch-14 模型） | auto |
+| `--local-crop-size` | 局部裁剪分辨率（必须能被骨干网络 patch size 整除，patch-14 模型如 98 或 112） | 96 |
 | `--local-crops` | 局部裁剪数量 | 6 |
 | `--mask-ratio` | 掩码 token 比例 | 0.5 |
 | `--lambda-local` | 局部裁剪损失权重 | 1.5 |
@@ -206,7 +206,7 @@ otuformer pretrain \
 | `--save-every-epochs` | 每 N 轮保存检查点 | 10 |
 | `--keep-last-checkpoints` | 保留最近 N 个检查点 | 10 |
 | `--visualize-data` | 含 `image` 列及可选 `label` 列的 CSV；无 label 时仅生成 UMAP；省略则复用 `--train-data` | 无 |
-| `--extract-size` | 嵌入提取图像尺寸（<=0 自动） | 0 |
+| `--extract-size` | 嵌入提取图像尺寸；`auto` 使用模型 img_size | auto |
 | `--metrics-sample-size` | 指标与 UMAP 最大样本数（<=0 不设上限） | 10000 |
 | `--umap-n-neighbors` | UMAP 邻居数 | 15 |
 | `--umap-min-dist` | UMAP 最小距离 | 0.1 |
@@ -294,7 +294,7 @@ otuformer finetune \
 | `--save-every-epochs` | 每 N 轮保存检查点 | 10 |
 | `--keep-last-checkpoints` | 保留最近 N 个检查点 | 10 |
 | `--visualize-data` | 含 `image` 列及可选 `label` 列的 CSV；无 label 时仅生成 UMAP；省略则复用 `--train-data` | 无 |
-| `--extract-size` | 嵌入提取图像尺寸（<=0 自动） | 0 |
+| `--extract-size` | 嵌入提取图像尺寸；`auto` 使用模型 img_size | auto |
 | `--metrics-sample-size` | 指标与 UMAP 最大样本数（<=0 不设上限） | 10000 |
 | `--umap-n-neighbors` | UMAP 邻居数 | 15 |
 | `--umap-min-dist` | UMAP 最小距离 | 0.1 |
@@ -343,7 +343,8 @@ otuformer extract \
 | `--input-images-dir` | 输入图像目录 | 必填 |
 | `--out-dir` | 输出目录 | `runs/extract` |
 | `--model-name` | timm 骨干网络名称 | `vit_tiny_patch16_224` |
-| `--extract-size` | 提取时图像缩放/裁剪尺寸 | 224 |
+| `--extract-size` | 提取时图像缩放/裁剪尺寸；`auto` 使用检查点记录的训练尺寸 | auto |
+| `--eval-transform` | 评估预处理协议：`center-crop`（默认）或 `whole-specimen-pad`（保持宽高比的方形填充，预留） | `center-crop` |
 | `--use-projector-output` | 使用投影器输出而非 CLS token | 否 |
 | `--use-student` | 加载学生权重而非教师（EMA） | 否 |
 | `--token-mode` | `cls`/`patch-topk`/`attention-pool` | `cls` |
@@ -595,6 +596,7 @@ otuformer cam \
 | `--cam-batch-size` | CAM 推理批量大小 | 32 |
 | `--num-workers` | DataLoader 工作进程数 | 4 |
 | `--device` | `auto`/`cpu`/`cuda`/`mps` | `auto` |
+| `--eval-transform` | 评估预处理协议：`center-crop`（热力图限定在模型视野内）或 `whole-specimen-pad`（热力图覆盖整个标本） | `center-crop` |
 
 **输出**：
 - `figures/` — CAM 叠加图像
@@ -626,7 +628,7 @@ otuformer export \
 |-----------|-------------|---------|
 | `--checkpoint` | 检查点路径 | 必填 |
 | `--out-dir` | 输出目录 | `runs/export` |
-| `--imgsz` | ONNX 导出输入图像尺寸（省略则自动从骨干推断） | 自动 |
+| `--imgsz` | ONNX 导出输入图像尺寸；`auto` 使用检查点记录的训练尺寸 | auto |
 | `--opset` | ONNX opset 版本 | 18 |
 
 **输出**：

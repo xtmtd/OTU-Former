@@ -4,13 +4,18 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import torch
 from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
 
-IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
+IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.webp', '.tif', '.tiff'}
+
+# 8-bit ImageNet mean, used as the background fill fallback when edge-median
+# estimation fails (e.g. degenerate or empty images).
+_BACKGROUND_FILL_FALLBACK = (124, 116, 104)
 
 
 def _supports_recursive_lookup(image_ref: str) -> bool:
@@ -124,7 +129,14 @@ def _make_local_transform(crop_size: int) -> transforms.Compose:
     )
 
 
-def _make_eval_transform(image_size: int) -> transforms.Compose:
+def center_crop_eval_transform(image_size: int) -> transforms.Compose:
+    """Deterministic center-crop evaluation protocol.
+
+    Resize the shorter side to ``image_size`` (bicubic), center-crop to a
+    square of ``image_size``, then tensorize and apply ImageNet normalization.
+    This is the shared deterministic preprocessing used by extraction, periodic
+    evaluation, fine-tuning ``none``, and CAM.
+    """
     return transforms.Compose(
         [
             transforms.Resize(image_size, interpolation=Image.BICUBIC),
@@ -133,6 +145,89 @@ def _make_eval_transform(image_size: int) -> transforms.Compose:
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ]
     )
+
+
+# Backward-compatible alias during the transition to the named protocol.
+_make_eval_transform = center_crop_eval_transform
+
+
+def _estimate_background_color(image: Image.Image) -> tuple[int, int, int]:
+    """Per-channel median of all four outer edges of the image.
+
+    Returns the documented fallback ``(124, 116, 104)`` on any conversion or
+    shape failure.
+    """
+    try:
+        arr = np.asarray(image.convert("RGB"))
+        if (
+            arr.ndim != 3
+            or arr.shape[2] != 3
+            or arr.shape[0] < 2
+            or arr.shape[1] < 2
+        ):
+            return _BACKGROUND_FILL_FALLBACK
+        edges = np.concatenate(
+            [arr[0, :, :], arr[-1, :, :], arr[:, 0, :], arr[:, -1, :]], axis=0
+        )
+        return tuple(int(v) for v in np.median(edges, axis=0))
+    except Exception:
+        return _BACKGROUND_FILL_FALLBACK
+
+
+def pad_to_square(image: Image.Image) -> Image.Image:
+    """Pad the image to a square canvas with the edge-median fill.
+
+    Preserves aspect ratio and introduces no distortion; the specimen is
+    centered on the square canvas.
+    """
+    width, height = image.size
+    if width == height:
+        return image
+    fill = _estimate_background_color(image)
+    side = max(width, height)
+    canvas = Image.new("RGB", (side, side), color=fill)
+    if width > height:
+        offset = (0, (side - height) // 2)
+    else:
+        offset = ((side - width) // 2, 0)
+    canvas.paste(image, offset)
+    return canvas
+
+
+def whole_specimen_pad_transform(image_size: int) -> transforms.Compose:
+    """Whole-specimen padding evaluation protocol (not the default).
+
+    Pads the source image to a square canvas with the edge-median background
+    fill (preserving aspect ratio, no distortion), resizes to a fixed square,
+    then tensorizes and normalizes. Reserved for later promotion once it wins
+    on downstream metrics.
+    """
+    return transforms.Compose(
+        [
+            transforms.Lambda(pad_to_square),
+            transforms.Resize(
+                (image_size, image_size), interpolation=Image.BICUBIC
+            ),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ]
+    )
+
+
+EVAL_TRANSFORMS = {
+    "center-crop": center_crop_eval_transform,
+    "whole-specimen-pad": whole_specimen_pad_transform,
+}
+
+
+def build_eval_transform(name: str, size: int) -> transforms.Compose:
+    """Return the named evaluation transform at the given resolution."""
+    builder = EVAL_TRANSFORMS.get(name)
+    if builder is None:
+        raise ValueError(
+            f"Unknown eval transform '{name}'; choose from: {', '.join(EVAL_TRANSFORMS)}"
+        )
+    return builder(size)
 
 
 class MultiCropDataset(Dataset):

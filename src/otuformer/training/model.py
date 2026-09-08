@@ -64,6 +64,15 @@ class OTUFormerEncoder(nn.Module):
                     self.backbone.head = nn.Identity()
                 if hasattr(self.backbone, "fc_norm"):
                     self.backbone.fc_norm = nn.Identity()
+            except TypeError as exc:
+                if "unexpected keyword argument" in str(exc):
+                    raise RuntimeError(
+                        f"Backbone '{model_name}' is not supported: it rejects the "
+                        "ViT-only options (img_size / dynamic_img_size), i.e. it is "
+                        "a CNN-style model. The OTU-Former pipeline is built around "
+                        "ViT patch tokens; CNN backbones are not supported."
+                    ) from exc
+                raise
             except Exception as exc:
                 raise RuntimeError(
                     f"Could not load pretrained backbone weights for '{model_name}'. "

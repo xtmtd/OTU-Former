@@ -10,6 +10,8 @@ from pathlib import Path
 import click
 import typer
 
+from otuformer.cli import SIZE_EXAMPLES, _parse_size
+
 app = typer.Typer(
     help=(
         "Export a PyTorch checkpoint to ONNX format.\n\n"
@@ -43,10 +45,14 @@ def export(
     out_dir: Path = typer.Option(
         Path("runs/export"), "--out-dir", help="Output directory."
     ),
-    imgsz: int | None = typer.Option(
-        None,
+    imgsz: str = typer.Option(
+        "auto",
         "--imgsz",
-        help="Input image size for ONNX export. Auto-inferred from backbone if not provided.",
+        help=(
+            "Input image size for ONNX export. 'auto' uses the checkpoint's "
+            "recorded training size. "
+            f"{SIZE_EXAMPLES}"
+        ),
     ),
     opset: int = typer.Option(18, "--opset", help="ONNX opset version."),
     overwrite: bool = typer.Option(
@@ -83,7 +89,7 @@ def export(
         report = export_to_onnx(
             checkpoint_path=checkpoint,
             out_path=onnx_path,
-            imgsz=imgsz,
+            imgsz=_parse_size(imgsz, stage="--imgsz"),
             opset=opset,
         )
         typer.echo(f"Export complete: {onnx_path}")
