@@ -85,7 +85,13 @@ def load_model_from_checkpoint(
         img_size=checkpoint_size,
     )
     validate_input_size(checkpoint_size, encoder, resolved_name)
-    encoder.load_state_dict(ckpt["model_state_dict"], strict=False)
+    if "model_state_dict" in ckpt:
+        state_dict = ckpt["model_state_dict"]
+    elif "model" in ckpt:
+        state_dict = ckpt["model"]
+    else:
+        raise KeyError("Checkpoint must contain 'model_state_dict' or legacy 'model'.")
+    encoder.load_state_dict(state_dict, strict=False)
     backbone = encoder.backbone
     backbone.eval().to(device)
 
