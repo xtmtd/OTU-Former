@@ -113,8 +113,8 @@ size 224 for both checkpoints.
   contract: rotation `[-180, 180]` degrees, bicubic, `expand=true`,
   edge-median-RGB fill; horizontal flip probability 0.5; vertical flip 0.0;
   global crop 224 at scale `[0.4, 1.0]`; 6 local crops of 96 at scale
-  `[0.05, 0.4]`; color jitter 0.8; grayscale 0.0; blur kernels 23 (global) and
-  7 (local).
+  `[0.05, 0.4]`; `ColorJitter p=0.8` (brightness 0.2, contrast 0.2, saturation
+  0.1, hue 0.02); grayscale 0.0; blur kernels 23 (global) and 7 (local).
 - **Baseline:** the checkpoint has no `augmentation_config` (legacy
   checkpoint); its saved `args` contain no augmentation fields. Its historical
   augmentation contract is not recoverable from the checkpoint.
@@ -131,10 +131,12 @@ Source: `runs/pretrain-global-barcode-50e/logs/instant_metrics.pretrain.csv`
 | Last available finite positive `feature_std` | `2.8874013423919678` at epoch 42, step 6. This is the last logged value, not a checkpoint-final value. |
 | Different-image similarities not all one | Yes. Candidate different-image median 0.6432 over 26,335 pairs, so embeddings did not collapse to a constant. |
 
-## Seven-metric baseline/candidate comparison
+## Seven-metric baseline/candidate comparison (train split)
 
-Final available rows (`epoch = 50`) from each run's `metrics.pretrain.csv`. All
-seven metrics were present for both runs; none is `unavailable`.
+Final available rows (`epoch = 50`) from each run's `metrics.pretrain.csv`; every
+row in both files has `split=train`, so these are training-split metrics, not
+held-out generalization performance. All seven metrics were present for both
+runs; none is `unavailable`.
 
 | Metric | Baseline (epoch 50) | Candidate (epoch 50) | Delta (candidate − baseline) |
 | --- | --- | --- | --- |
@@ -232,12 +234,19 @@ evidence.
 - Follow-up issue: investigate whether expanded-rotation scale variation
   (`expand=true`) trades rotation consistency for scale robustness, and whether
   a smaller or `expand=false` rotation would preserve more rotation
-  consistency without losing the other metric gains.
+  consistency without losing the other metric gains. See
+  [design §10.3 Extended implementation comparison](../specs/2026-09-07-otuformer-training-augmentation-design.md#103-extended-implementation-comparison).
 - Follow-up issue: run a seed-replicate comparison (at minimum 3 seeds) to
   separate augmentation effect from seed noise on the seven metrics and the
-  rotation summaries.
+  rotation summaries. See
+  [plan Task 6 Step 5](../plans/2026-09-07-otuformer-training-augmentation.md#task-6-run-an-extended-implementation-comparison-for-global-barcode).
+
+No external issue tracker is configured for this repository; the follow-up
+links above point to the design spec and plan sections that track these items.
 
 ## Artifacts not committed
 
-Generated checkpoints, full training logs, UMAP/curve PDFs, image data, and the
-validation JSON are intentionally excluded from git. `runs/` is gitignored.
+Generated checkpoints, full training logs, UMAP/curve PDFs, and the validation
+JSON are intentionally excluded from git. `runs/` is gitignored. No image data
+was added by this task; the example dataset under `examples/Epidorcus/images/`
+was already tracked in git before this comparison.
