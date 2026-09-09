@@ -22,8 +22,56 @@ app = typer.Typer(
         "Quick example:\n\n"
         "  otuformer finetune --checkpoint runs/pretrain/best.pt --train-data labels.csv --input-images-dir ./images\n"
         "  otuformer finetune --checkpoint runs/pretrain/SSL_latest.pth --train-data labels.csv --input-images-dir ./images --finetune-epochs 50\n"
+        "\nAugmentation contract:\n"
+        "\n"
+        "  --augmentation: none or conservative.\n"
+        "  default for a new run: none.\n"
+        "  conservative is experimental.\n"
+        "  --orientation-policy: invariant or sensitive.\n"
+        "  default for a new run: invariant.\n"
+        "\n"
+        "  Dorsal, ventral, and lateral images are distinct markers, as are\n"
+        "  anatomical-part views; arbitrary in-plane orientation is supported.\n"
+        "  conservative uses the selected policy. Orientation-policy=sensitive\n"
+        "  keeps every conservative view free of horizontal flip, with only -15 to\n"
+        "  15 degrees of rotation.\n"
+        "  orientation-policy is a no-op for augmentation=none; an omitted\n"
+        "  initialization inherits the pretraining checkpoint policy.\n"
+        "  Augmentation encourages but does not guarantee invariance.\n"
+        "  sensitive is the explicit, caller-selected path for direction-sensitive\n"
+        "  markers; it is not inferred from the image or taxon.\n"
+        "  Omitted values inherit on resume; conflicting explicit values fail, and\n"
+        "  parameter changes require a new run.\n"
     )
 )
+
+
+def _validate_augmentation(value: str | None, *, stage: str) -> None:
+    if value is None:
+        return
+    from otuformer.training.dataset import (
+        FINETUNE_AUGMENTATIONS,
+        PRETRAIN_AUGMENTATIONS,
+    )
+
+    allowed = PRETRAIN_AUGMENTATIONS if stage == "pretrain" else FINETUNE_AUGMENTATIONS
+    if value not in allowed:
+        choices = ", ".join(allowed)
+        raise typer.BadParameter(
+            f"Unknown {stage} augmentation profile '{value}'. Choose one of: {choices}."
+        )
+
+
+def _validate_orientation_policy(value: str | None) -> None:
+    if value is None:
+        return
+    from otuformer.training.dataset import ORIENTATION_POLICIES
+
+    if value not in ORIENTATION_POLICIES:
+        raise typer.BadParameter(
+            f"Unknown orientation policy '{value}'. Choose one of: "
+            f"{', '.join(ORIENTATION_POLICIES)}."
+        )
 
 
 def _format_user_command(ctx: typer.Context, params: dict[str, object]) -> str:
@@ -93,6 +141,25 @@ def finetune(
         "arcface",
         "--loss",
         help="Metric-learning loss name from LOSS_REGISTRY (default: arcface).",
+    ),
+    augmentation: str | None = typer.Option(
+        None,
+        "--augmentation",
+        help=(
+            "Augmentation profile: none or conservative. Default for a new "
+            "run: none. Omit to inherit the saved profile on --resume. See "
+            "'Augmentation contract' above."
+        ),
+    ),
+    orientation_policy: str | None = typer.Option(
+        None,
+        "--orientation-policy",
+        help=(
+            "Orientation policy: invariant or sensitive. Default for a new "
+            "run: invariant. Affects conservative; a no-op for none. Omit on "
+            "initialization to inherit the checkpoint policy. See "
+            "'Augmentation contract' above."
+        ),
     ),
     batch_size: int = typer.Option(32, "--batch-size", help="Batch size."),
     num_workers: int = typer.Option(4, "--num-workers", help="DataLoader workers."),
@@ -174,6 +241,8 @@ def finetune(
         raise typer.BadParameter("--resume and --overwrite cannot be used together.")
     if resume and not Path(resume).is_file():
         raise typer.BadParameter(f"Resume checkpoint not found: {resume}")
+    _validate_augmentation(augmentation, stage="finetune")
+    _validate_orientation_policy(orientation_policy)
     prepare_output_dir(out_dir, overwrite=overwrite, allow_existing=bool(resume))
     tee = TeeLogger(
         out_dir / "logs" / "finetune.log",
@@ -196,6 +265,8 @@ def finetune(
             finetune_lr=finetune_lr,
             freeze_ratio=freeze_ratio,
             loss=loss,
+            augmentation=augmentation,
+            orientation_policy=orientation_policy,
             batch_size=batch_size,
             num_workers=num_workers,
             cpus=cpus,

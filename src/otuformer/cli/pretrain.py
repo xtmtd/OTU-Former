@@ -23,8 +23,60 @@ app = typer.Typer(
         "Quick example:\n\n"
         "  otuformer pretrain --train-data images.csv --input-images-dir ./images\n"
         "  otuformer pretrain --input-images-dir ./images --model-name vit_small_patch16_224 --max-epochs 100\n"
+        "\nAugmentation contract:\n"
+        "\n"
+        "  --augmentation: global-barcode, color-robust, or legacy.\n"
+        "  default for a new run: global-barcode.\n"
+        "  --orientation-policy: invariant or sensitive.\n"
+        "  default for a new run: invariant.\n"
+        "\n"
+        "  Dorsal, ventral, and lateral images are distinct markers, as are\n"
+        "  anatomical-part views; arbitrary in-plane orientation is supported.\n"
+        "  color-robust can suppress diagnostic color, pattern, or metallic sheen.\n"
+        "  legacy reproduces 0.2.1 and records either policy without changing its\n"
+        "  historical transforms. An omitted policy can still be inherited by a new\n"
+        "  fine-tuning conservative run from that checkpoint.\n"
+        "  sensitive is the explicit, caller-selected path for direction-sensitive\n"
+        "  markers; it is not inferred from the image or taxon.\n"
+        "  Orientation-policy=sensitive keeps every new pretraining view and\n"
+        "  fine-tuning conservative view free of horizontal flip, with only -15 to\n"
+        "  15 degrees of rotation.\n"
+        "  All global and local pretraining views use the selected policy, so\n"
+        "  local-to-global training cannot silently reintroduce broad rotation or\n"
+        "  reflection.\n"
+        "  Augmentation encourages but does not guarantee invariance.\n"
+        "  Omitted values inherit on resume; conflicting explicit values fail, and\n"
+        "  parameter changes require a new run.\n"
     )
 )
+
+
+def _validate_augmentation(value: str | None, *, stage: str) -> None:
+    if value is None:
+        return
+    from otuformer.training.dataset import (
+        FINETUNE_AUGMENTATIONS,
+        PRETRAIN_AUGMENTATIONS,
+    )
+
+    allowed = PRETRAIN_AUGMENTATIONS if stage == "pretrain" else FINETUNE_AUGMENTATIONS
+    if value not in allowed:
+        choices = ", ".join(allowed)
+        raise typer.BadParameter(
+            f"Unknown {stage} augmentation profile '{value}'. Choose one of: {choices}."
+        )
+
+
+def _validate_orientation_policy(value: str | None) -> None:
+    if value is None:
+        return
+    from otuformer.training.dataset import ORIENTATION_POLICIES
+
+    if value not in ORIENTATION_POLICIES:
+        raise typer.BadParameter(
+            f"Unknown orientation policy '{value}'. Choose one of: "
+            f"{', '.join(ORIENTATION_POLICIES)}."
+        )
 
 
 def _format_user_command(ctx: typer.Context, params: dict[str, object]) -> str:
@@ -85,6 +137,24 @@ def pretrain(
         "--warmup-epochs",
         help="Warmup epochs before cosine LR decay.",
     ),
+    augmentation: str | None = typer.Option(
+        None,
+        "--augmentation",
+        help=(
+            "Augmentation profile: global-barcode, color-robust, or legacy. "
+            "Default for a new run: global-barcode. Omit to inherit the saved "
+            "profile on --resume. See 'Augmentation contract' above."
+        ),
+    ),
+    orientation_policy: str | None = typer.Option(
+        None,
+        "--orientation-policy",
+        help=(
+            "Orientation policy for every global and local view: invariant or "
+            "sensitive. Default for a new run: invariant. Omit to inherit the "
+            "saved policy on --resume. See 'Augmentation contract' above."
+        ),
+    ),
     global_crop_size: str = typer.Option(
         "auto",
         "--global-crop-size",
@@ -94,15 +164,23 @@ def pretrain(
             f"--resume. {SIZE_EXAMPLES}"
         ),
     ),
-    local_crop_size: int = typer.Option(
-        96,
+    local_crop_size: int | None = typer.Option(
+        None,
         "--local-crop-size",
         help=(
-            "Local crop resolution. Must be divisible by the backbone patch "
-            "size (e.g. 98 or 112 for patch-14 models)."
+            "Local crop resolution. Omit to use 96 for a new run or inherit "
+            "the checkpoint value on --resume. Must be divisible by the "
+            "backbone patch size (e.g. 98 or 112 for patch-14 models)."
         ),
     ),
-    local_crops: int = typer.Option(6, "--local-crops", help="Number of local crops."),
+    local_crops: int | None = typer.Option(
+        None,
+        "--local-crops",
+        help=(
+            "Number of local crops. Omit to use 6 for a new run or inherit "
+            "the checkpoint value on --resume."
+        ),
+    ),
     mask_ratio: float = typer.Option(
         0.5,
         "--mask-ratio",
@@ -218,6 +296,8 @@ def pretrain(
         raise typer.BadParameter("--resume and --overwrite cannot be used together.")
     if resume and not Path(resume).is_file():
         raise typer.BadParameter(f"Resume checkpoint not found: {resume}")
+    _validate_augmentation(augmentation, stage="pretrain")
+    _validate_orientation_policy(orientation_policy)
     prepare_output_dir(out_dir, overwrite=overwrite, allow_existing=bool(resume))
     tee = TeeLogger(
         out_dir / "logs" / "pretrain.log",
@@ -238,6 +318,8 @@ def pretrain(
             lr=lr,
             weight_decay=weight_decay,
             warmup_epochs=warmup_epochs,
+            augmentation=augmentation,
+            orientation_policy=orientation_policy,
             global_crop_size=_parse_size(global_crop_size, stage="--global-crop-size"),
             local_crop_size=local_crop_size,
             local_crops=local_crops,

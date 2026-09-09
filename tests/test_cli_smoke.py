@@ -1304,6 +1304,10 @@ def test_pretrain_default_model_name_and_device_auto(tmp_path, monkeypatch):
         seen["model_name"] = args.model_name
         seen["device"] = args.device
         seen["extract_size"] = args.extract_size
+        seen["augmentation"] = args.augmentation
+        seen["orientation_policy"] = args.orientation_policy
+        seen["local_crop_size"] = args.local_crop_size
+        seen["local_crops"] = args.local_crops
 
     monkeypatch.setattr("otuformer.training.trainer.run_pretrain", fake_run_pretrain)
 
@@ -1323,6 +1327,10 @@ def test_pretrain_default_model_name_and_device_auto(tmp_path, monkeypatch):
     assert seen["model_name"] == "vit_tiny_patch16_224"
     assert seen["device"] == "auto"
     assert seen["extract_size"] is None
+    assert seen["augmentation"] is None
+    assert seen["orientation_policy"] is None
+    assert seen["local_crop_size"] is None
+    assert seen["local_crops"] is None
 
 
 def test_pretrain_help_mentions_umap_metric_choices_and_extract_auto():
@@ -1951,3 +1959,384 @@ def test_pretrain_local_crops_zero_skips_local_size_validation(tmp_path):
     )
     assert result.exit_code == 0
     assert (tmp_path / "pretrain_out" / "SSL_latest.pth").exists()
+
+
+# ---- Training augmentation CLI contract (2026-09-07 plan) ----
+
+
+@pytest.mark.parametrize(
+    ("command", "profiles", "default"),
+    [
+        ("pretrain", ["global-barcode", "color-robust", "legacy"], "global-barcode"),
+        ("finetune", ["none", "conservative"], "none"),
+    ],
+)
+def test_training_help_documents_augmentation_contract(command, profiles, default):
+    result = runner.invoke(app, [command, "--help"])
+    assert result.exit_code == 0
+    output = result.output.lower()
+    assert "--augmentation" in output
+    assert "--orientation-policy" in output
+    assert "invariant" in output and "sensitive" in output
+    assert all(profile in output for profile in profiles)
+    assert f"default for a new run: {default}" in output
+    assert "default for a new run: invariant" in output
+    assert "dorsal" in output and "ventral" in output and "lateral" in output
+    assert "in-plane" in output
+    assert "does not guarantee" in output
+
+
+def test_pretrain_help_warns_about_color_robust_and_legacy():
+    output = runner.invoke(app, ["pretrain", "--help"]).output.lower()
+    assert "diagnostic" in output
+    assert "metallic" in output
+    assert "0.2.1" in output
+    assert "new run" in output
+
+
+def test_finetune_help_marks_conservative_experimental():
+    output = runner.invoke(app, ["finetune", "--help"]).output.lower()
+    assert "experimental" in output
+    assert "new run" in output
+
+
+def _write_augmented_pretrain_checkpoint(
+    tmp_path,
+    *,
+    local_crop_size,
+    local_crops,
+    profile="global-barcode",
+    policy="invariant",
+    image_size=224,
+):
+    from otuformer.training.dataset import build_pretrain_augmentation_config
+    from otuformer.training.model import OTUFormerEncoder
+
+    config = build_pretrain_augmentation_config(
+        profile,
+        image_size,
+        local_crop_size,
+        local_crops,
+        orientation_policy=policy,
+    )
+    encoder = OTUFormerEncoder(
+        model_name="vit_tiny_patch16_224",
+        out_dim=64,
+        pretrained=False,
+        img_size=image_size,
+    )
+    path = tmp_path / "augmented_resume.pth"
+    torch.save(
+        {
+            "model_state_dict": encoder.state_dict(),
+            "config": {
+                "model_name": "vit_tiny_patch16_224",
+                "out_dim": 64,
+                "augmentation_profile": profile,
+                "augmentation_config": config,
+            },
+            "args": {
+                "global_crop_size": image_size,
+                "local_crop_size": local_crop_size,
+                "local_crops": local_crops,
+            },
+        },
+        path,
+    )
+    return path
+
+
+def test_pretrain_augmentation_argument_forwarding_defaults_to_none(
+    tmp_path, monkeypatch
+):
+    seen = {}
+
+    def fake_run_pretrain(args):
+        seen["augmentation"] = args.augmentation
+        seen["orientation_policy"] = args.orientation_policy
+        seen["local_crop_size"] = args.local_crop_size
+        seen["local_crops"] = args.local_crops
+
+    monkeypatch.setattr("otuformer.training.trainer.run_pretrain", fake_run_pretrain)
+
+    result = runner.invoke(
+        app,
+        [
+            "pretrain",
+            "--train-data",
+            str(tmp_path / "images.csv"),
+            "--input-images-dir",
+            str(tmp_path),
+            "--out-dir",
+            str(tmp_path / "pretrain_out"),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert seen == {
+        "augmentation": None,
+        "orientation_policy": None,
+        "local_crop_size": None,
+        "local_crops": None,
+    }
+
+
+def test_pretrain_augmentation_argument_forwarding_explicit_values(
+    tmp_path, monkeypatch
+):
+    seen = {}
+
+    def fake_run_pretrain(args):
+        seen["augmentation"] = args.augmentation
+        seen["orientation_policy"] = args.orientation_policy
+        seen["local_crop_size"] = args.local_crop_size
+        seen["local_crops"] = args.local_crops
+
+    monkeypatch.setattr("otuformer.training.trainer.run_pretrain", fake_run_pretrain)
+
+    result = runner.invoke(
+        app,
+        [
+            "pretrain",
+            "--train-data",
+            str(tmp_path / "images.csv"),
+            "--input-images-dir",
+            str(tmp_path),
+            "--out-dir",
+            str(tmp_path / "pretrain_out"),
+            "--augmentation",
+            "legacy",
+            "--orientation-policy",
+            "sensitive",
+            "--local-crop-size",
+            "112",
+            "--local-crops",
+            "0",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert seen == {
+        "augmentation": "legacy",
+        "orientation_policy": "sensitive",
+        "local_crop_size": 112,
+        "local_crops": 0,
+    }
+
+
+def test_finetune_augmentation_argument_forwarding_defaults_to_none(
+    tmp_path, monkeypatch
+):
+    seen = {}
+
+    def fake_run_finetune(args):
+        seen["augmentation"] = args.augmentation
+        seen["orientation_policy"] = args.orientation_policy
+
+    monkeypatch.setattr("otuformer.training.trainer.run_finetune", fake_run_finetune)
+
+    result = runner.invoke(
+        app,
+        [
+            "finetune",
+            "--train-data",
+            str(tmp_path / "labels.csv"),
+            "--input-images-dir",
+            str(tmp_path),
+            "--out-dir",
+            str(tmp_path / "finetune_out"),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert seen == {"augmentation": None, "orientation_policy": None}
+
+
+def test_finetune_augmentation_argument_forwarding_explicit_values(
+    tmp_path, monkeypatch
+):
+    seen = {}
+
+    def fake_run_finetune(args):
+        seen["augmentation"] = args.augmentation
+        seen["orientation_policy"] = args.orientation_policy
+
+    monkeypatch.setattr("otuformer.training.trainer.run_finetune", fake_run_finetune)
+
+    result = runner.invoke(
+        app,
+        [
+            "finetune",
+            "--train-data",
+            str(tmp_path / "labels.csv"),
+            "--input-images-dir",
+            str(tmp_path),
+            "--out-dir",
+            str(tmp_path / "finetune_out"),
+            "--augmentation",
+            "conservative",
+            "--orientation-policy",
+            "sensitive",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert seen == {"augmentation": "conservative", "orientation_policy": "sensitive"}
+
+
+def test_finetune_initialization_inherits_policy_but_not_profile(
+    tmp_path, monkeypatch
+):
+    from otuformer.training import trainer
+
+    ckpt = _write_augmented_pretrain_checkpoint(
+        tmp_path,
+        local_crop_size=96,
+        local_crops=2,
+        profile="color-robust",
+        policy="sensitive",
+    )
+    seen = {}
+
+    def fake_run_finetune(args):
+        loaded = torch.load(ckpt, map_location="cpu", weights_only=False)
+        seen["augmentation"] = args.augmentation
+        seen["orientation_policy"] = args.orientation_policy
+        seen["profile"] = trainer._select_augmentation_profile(
+            args.augmentation, None, stage="finetune"
+        )
+        seen["policy"] = trainer._select_orientation_policy(
+            args.orientation_policy, loaded, stage="finetune", resume=False
+        )
+
+    monkeypatch.setattr("otuformer.training.trainer.run_finetune", fake_run_finetune)
+
+    result = runner.invoke(
+        app,
+        [
+            "finetune",
+            "--checkpoint",
+            str(ckpt),
+            "--train-data",
+            str(tmp_path / "labels.csv"),
+            "--input-images-dir",
+            str(tmp_path),
+            "--out-dir",
+            str(tmp_path / "finetune_out"),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert seen["augmentation"] is None
+    assert seen["orientation_policy"] is None
+    assert seen["profile"] == "none"
+    assert seen["policy"] == "sensitive"
+
+
+@pytest.mark.parametrize(
+    ("command", "flag", "value"),
+    [
+        ("pretrain", "--augmentation", "bogus"),
+        ("pretrain", "--orientation-policy", "bogus"),
+        ("finetune", "--augmentation", "bogus"),
+        ("finetune", "--orientation-policy", "bogus"),
+    ],
+)
+def test_training_augmentation_argument_rejects_invalid_before_training(
+    tmp_path, monkeypatch, command, flag, value
+):
+    called = []
+    monkeypatch.setattr(
+        "otuformer.training.trainer.run_pretrain", lambda _args: called.append("p")
+    )
+    monkeypatch.setattr(
+        "otuformer.training.trainer.run_finetune", lambda _args: called.append("f")
+    )
+    out_dir = tmp_path / "augmentation_out"
+
+    result = runner.invoke(
+        app,
+        [
+            command,
+            "--train-data",
+            str(tmp_path / "data.csv"),
+            "--input-images-dir",
+            str(tmp_path),
+            "--out-dir",
+            str(out_dir),
+            flag,
+            value,
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert value in result.output
+    assert called == []
+    assert not out_dir.exists()
+
+
+def test_pretrain_resume_inherits_saved_local_views_without_explicit_flags(
+    tmp_path, monkeypatch
+):
+    from otuformer.training import trainer
+
+    ckpt = _write_augmented_pretrain_checkpoint(
+        tmp_path, local_crop_size=112, local_crops=0
+    )
+    seen = {}
+
+    def fake_run_pretrain(args):
+        loaded = torch.load(ckpt, map_location="cpu", weights_only=False)
+        seen["local_crop_size"] = args.local_crop_size
+        seen["local_crops"] = args.local_crops
+        seen["resolved"] = trainer._resolve_pretrain_local_views(
+            args.local_crop_size, args.local_crops, loaded
+        )
+
+    monkeypatch.setattr("otuformer.training.trainer.run_pretrain", fake_run_pretrain)
+
+    result = runner.invoke(
+        app,
+        [
+            "pretrain",
+            "--resume",
+            str(ckpt),
+            "--train-data",
+            str(tmp_path / "data.csv"),
+            "--input-images-dir",
+            str(tmp_path),
+            "--out-dir",
+            str(tmp_path / "resume_out"),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert seen["local_crop_size"] is None
+    assert seen["local_crops"] is None
+    assert seen["resolved"] == (112, 0)
+
+
+def test_pretrain_resume_rejects_conflicting_local_views(tmp_path):
+    ckpt = _write_augmented_pretrain_checkpoint(
+        tmp_path, local_crop_size=112, local_crops=0
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "pretrain",
+            "--resume",
+            str(ckpt),
+            "--train-data",
+            str(tmp_path / "data.csv"),
+            "--input-images-dir",
+            str(tmp_path),
+            "--out-dir",
+            str(tmp_path / "resume_out"),
+            "--local-crops",
+            "6",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "Cannot resume" in result.output
