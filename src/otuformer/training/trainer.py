@@ -45,6 +45,7 @@ from otuformer.training.loss import (
 from otuformer.training.model import OTUFormerEncoder
 from otuformer.utils.checkpoint import load_checkpoint, save_checkpoint
 from otuformer.utils.size import (
+    _positive_int,
     resolve_backbone_native_size,
     resolve_training_image_size,
     validate_input_size,
@@ -943,13 +944,6 @@ def _validate_stage(stage: str) -> None:
         )
 
 
-def _valid_local_crop_size(value: Any) -> int | None:
-    """Return ``value`` as a positive non-boolean int, or ``None`` if invalid."""
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        return None
-    return int(value)
-
-
 def _valid_local_crops(value: Any) -> int | None:
     """Return ``value`` as a non-negative non-boolean int, or ``None`` if invalid."""
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -1053,7 +1047,7 @@ def _select_orientation_policy(
     metadata = _checkpoint_augmentation_metadata(checkpoint)
     if metadata is None:
         if checkpoint is None:
-            return requested_policy if requested_policy is not None else "invariant"
+            return requested_policy if requested_policy is not None else "sensitive"
         if stage == "pretrain" or resume:
             if requested_policy in (None, "invariant"):
                 return "invariant"
@@ -1062,8 +1056,8 @@ def _select_orientation_policy(
                 "saved orientation policy. Use invariant or start a new run."
             )
         # New fine-tuning run initialized from an old pretraining checkpoint:
-        # an explicit policy is honored, otherwise fall back to invariant.
-        return requested_policy if requested_policy is not None else "invariant"
+        # an explicit policy is honored, otherwise fall back to sensitive.
+        return requested_policy if requested_policy is not None else "sensitive"
     _, saved_config = metadata
     saved_policy = saved_config.get("orientation_policy")
     if not isinstance(saved_policy, str):
@@ -1095,7 +1089,7 @@ def _resolve_pretrain_local_views(
     ``args`` (old checkpoint), falling back to ``96``/``6`` only for missing or
     invalid old fields. Explicit values must match the resolved saved values.
     """
-    if requested_local_crop_size is not None and _valid_local_crop_size(
+    if requested_local_crop_size is not None and _positive_int(
         requested_local_crop_size
     ) is None:
         raise ValueError(
@@ -1126,7 +1120,7 @@ def _resolve_pretrain_local_views(
                 "malformed augmentation metadata: 'augmentation_config.local_crop' "
                 "must be a dict."
             )
-        saved_size = _valid_local_crop_size(local_crop.get("size"))
+        saved_size = _positive_int(local_crop.get("size"))
         saved_crops = _valid_local_crops(saved_config.get("local_crops"))
         if saved_size is None or saved_crops is None:
             raise ValueError(
@@ -1137,7 +1131,7 @@ def _resolve_pretrain_local_views(
         saved_args = checkpoint.get("args")
         if not isinstance(saved_args, dict):
             saved_args = {}
-        saved_size = _valid_local_crop_size(saved_args.get("local_crop_size")) or 96
+        saved_size = _positive_int(saved_args.get("local_crop_size")) or 96
         saved_crops = _valid_local_crops(saved_args.get("local_crops"))
         if saved_crops is None:
             saved_crops = 6
@@ -1177,13 +1171,6 @@ def _validate_augmentation_config(
         raise ValueError(
             "malformed augmentation metadata: current augmentation config must "
             "be a dict."
-        )
-    if (
-        current_config.get("profile") != profile
-        or current_config.get("orientation_policy") != policy
-    ):
-        raise ValueError(
-            "Augmentation configuration differs from the requested profile/policy."
         )
     metadata = _checkpoint_augmentation_metadata(checkpoint)
     if metadata is None:

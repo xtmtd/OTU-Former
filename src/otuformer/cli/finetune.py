@@ -12,7 +12,12 @@ from pathlib import Path
 import click
 import typer
 
-from otuformer.cli import SIZE_EXAMPLES, _parse_size
+from otuformer.cli import (
+    SIZE_EXAMPLES,
+    _parse_size,
+    _validate_augmentation,
+    _validate_orientation_policy,
+)
 
 app = typer.Typer(
     help=(
@@ -28,7 +33,7 @@ app = typer.Typer(
         "  default for a new run: none.\n"
         "  conservative is experimental.\n"
         "  --orientation-policy: invariant or sensitive.\n"
-        "  default for a new run: invariant.\n"
+        "  default for a new run: sensitive.\n"
         "\n"
         "  Dorsal, ventral, and lateral images are distinct markers, as are\n"
         "  anatomical-part views; arbitrary in-plane orientation is supported.\n"
@@ -44,34 +49,6 @@ app = typer.Typer(
         "  parameter changes require a new run.\n"
     )
 )
-
-
-def _validate_augmentation(value: str | None, *, stage: str) -> None:
-    if value is None:
-        return
-    from otuformer.training.dataset import (
-        FINETUNE_AUGMENTATIONS,
-        PRETRAIN_AUGMENTATIONS,
-    )
-
-    allowed = PRETRAIN_AUGMENTATIONS if stage == "pretrain" else FINETUNE_AUGMENTATIONS
-    if value not in allowed:
-        choices = ", ".join(allowed)
-        raise typer.BadParameter(
-            f"Unknown {stage} augmentation profile '{value}'. Choose one of: {choices}."
-        )
-
-
-def _validate_orientation_policy(value: str | None) -> None:
-    if value is None:
-        return
-    from otuformer.training.dataset import ORIENTATION_POLICIES
-
-    if value not in ORIENTATION_POLICIES:
-        raise typer.BadParameter(
-            f"Unknown orientation policy '{value}'. Choose one of: "
-            f"{', '.join(ORIENTATION_POLICIES)}."
-        )
 
 
 def _format_user_command(ctx: typer.Context, params: dict[str, object]) -> str:
@@ -156,7 +133,7 @@ def finetune(
         "--orientation-policy",
         help=(
             "Orientation policy: invariant or sensitive. Default for a new "
-            "run: invariant. Affects conservative; a no-op for none. Omit on "
+            "run: sensitive. Affects conservative; a no-op for none. Omit on "
             "initialization to inherit the checkpoint policy. See "
             "'Augmentation contract' above."
         ),

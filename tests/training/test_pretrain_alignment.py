@@ -578,7 +578,7 @@ def test_finetune_resolves_and_persists_checkpoint_size(tmp_path):
     assert saved["config"]["image_size"] == 32
     assert saved["config"]["augmentation_profile"] == "none"
     assert saved["config"]["augmentation_config"]["image_size"] == 32
-    assert saved["config"]["augmentation_config"]["orientation_policy"] == "invariant"
+    assert saved["config"]["augmentation_config"]["orientation_policy"] == "sensitive"
     assert "orientation_policy" not in saved["config"]
     # and a finetune checkpoint resolves back to 32 (not 224)
     assert resolve_training_image_size(saved) == 32
@@ -685,22 +685,27 @@ def test_new_run_uses_stage_defaults(stage, expected_profile):
     profile = trainer._select_augmentation_profile(None, None, stage=stage)
     policy = trainer._select_orientation_policy(None, None, stage=stage)
     config = _augmentation_config(stage, profile, policy)
-    assert (profile, policy) == (expected_profile, "invariant")
+    assert (profile, policy) == (expected_profile, "sensitive")
     assert trainer._validate_augmentation_config(
         profile, policy, config, None, stage=stage
     ) == config
 
 
 @pytest.mark.parametrize(
-    ("stage", "legacy_profile"),
-    [("pretrain", "legacy"), ("finetune", "none")],
+    ("stage", "legacy_profile", "expected_policy"),
+    [
+        ("pretrain", "legacy", "invariant"),
+        ("finetune", "none", "sensitive"),
+    ],
 )
-def test_old_checkpoint_maps_to_compatible_augmentation(stage, legacy_profile):
+def test_old_checkpoint_maps_to_compatible_augmentation(
+    stage, legacy_profile, expected_policy
+):
     checkpoint = {"config": {"model_name": "vit_tiny_patch16_224"}}
     profile = trainer._select_augmentation_profile(None, checkpoint, stage=stage)
     policy = trainer._select_orientation_policy(None, checkpoint, stage=stage)
     config = _augmentation_config(stage, profile, policy)
-    assert (profile, policy) == (legacy_profile, "invariant")
+    assert (profile, policy) == (legacy_profile, expected_policy)
     assert trainer._validate_augmentation_config(
         profile, policy, config, checkpoint, stage=stage
     ) == config
@@ -804,19 +809,27 @@ def test_resume_rejects_changed_expanded_configuration():
 def test_new_run_orientation_policy_defaults_and_override():
     assert (
         trainer._select_orientation_policy(None, None, stage="pretrain")
-        == "invariant"
+        == "sensitive"
     )
     assert (
         trainer._select_orientation_policy("sensitive", None, stage="pretrain")
         == "sensitive"
     )
     assert (
-        trainer._select_orientation_policy(None, None, stage="finetune")
+        trainer._select_orientation_policy("invariant", None, stage="pretrain")
         == "invariant"
+    )
+    assert (
+        trainer._select_orientation_policy(None, None, stage="finetune")
+        == "sensitive"
     )
     assert (
         trainer._select_orientation_policy("sensitive", None, stage="finetune")
         == "sensitive"
+    )
+    assert (
+        trainer._select_orientation_policy("invariant", None, stage="finetune")
+        == "invariant"
     )
 
 
@@ -905,7 +918,7 @@ def test_old_pretrain_checkpoint_finetune_initialization():
         trainer._select_orientation_policy(
             None, checkpoint, stage="finetune", resume=False
         )
-        == "invariant"
+        == "sensitive"
     )
     assert (
         trainer._select_orientation_policy(
@@ -1082,14 +1095,14 @@ def test_pretrain_passes_resolved_augmentation_to_dataset(
         trainer.run_pretrain(args)
 
     assert captured["augmentation_profile"] == "global-barcode"
-    assert captured["orientation_policy"] == "invariant"
+    assert captured["orientation_policy"] == "sensitive"
     assert captured["local_crop_size"] == 96
     assert captured["local_crops"] == 2
     out = capsys.readouterr().out
     assert "Augmentation profile: global-barcode" in out
     assert "Augmentation config:" in out
     assert '"profile": "global-barcode"' in out
-    assert '"orientation_policy": "invariant"' in out
+    assert '"orientation_policy": "sensitive"' in out
 
 
 def test_pretrain_passes_explicit_augmentation_to_dataset(tmp_path, monkeypatch):
@@ -1186,7 +1199,7 @@ def test_finetune_passes_resolved_training_size_to_model_and_dataset(
     assert captured_model["img_size"] == 32
     assert captured_dataset["image_size"] == 32
     assert captured_dataset["augmentation_profile"] == "none"
-    assert captured_dataset["orientation_policy"] == "invariant"
+    assert captured_dataset["orientation_policy"] == "sensitive"
     out = capsys.readouterr().out
     assert "Augmentation profile: none" in out
     assert '"image_size": 32' in out
@@ -1264,3 +1277,34 @@ def test_rotation_validation_script_accepts_shared_fixed_evaluation_size():
     assert shared == 224
     assert script.resolve_evaluation_size(candidate, 224) == 224
     assert script.require_matching_evaluation_sizes(shared, 224) == 224
+
+    for bad in (True, 224.0, 0, -4):
+        with pytest.raises(ValueError, match="positive integer"):
+            script.resolve_evaluation_size(baseline, bad)
+
+
+def test_different_image_sampling_cap_is_fixed_seed_deterministic():
+    script = _load_rotation_validation_script()
+    rng = np.random.default_rng(0)
+    embeddings = rng.normal(size=(600, 8))
+    assert 600 * 599 // 2 > script.DIFFERENT_IMAGE_MAX_PAIRS
+
+    first = script.different_image_similarity_summary(embeddings, seed=7)
+    second = script.different_image_similarity_summary(embeddings, seed=7)
+    third = script.different_image_similarity_summary(embeddings, seed=8)
+
+    assert first == second
+    assert 0 < first["pair_count"] <= script.DIFFERENT_IMAGE_MAX_PAIRS
+    assert first != third
+
+
+def test_orientation_policy_note_describes_policies_and_legacy_sensitive():
+    script = _load_rotation_validation_script()
+    assert "[-15, 15]" in script.orientation_policy_note("sensitive", "global-barcode")
+    assert "full rotation" in script.orientation_policy_note("invariant", "global-barcode")
+    assert "legacy checkpoint" in script.orientation_policy_note(None, None)
+
+    legacy_note = script.orientation_policy_note("sensitive", "legacy")
+    assert "legacy" in legacy_note
+    assert "historical" in legacy_note
+    assert "does not apply" in legacy_note

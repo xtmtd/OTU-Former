@@ -207,7 +207,7 @@ def test_pretrain_runs_one_epoch(tmp_path):
     )
     assert saved["config"]["augmentation_profile"] == "global-barcode"
     assert saved["config"]["augmentation_config"]["profile"] == "global-barcode"
-    assert saved["config"]["augmentation_config"]["orientation_policy"] == "invariant"
+    assert saved["config"]["augmentation_config"]["orientation_policy"] == "sensitive"
     assert "orientation_policy" not in saved["config"]
 
 
@@ -393,7 +393,7 @@ def test_finetune_runs_one_epoch(tmp_path):
     )
     assert saved["config"]["augmentation_profile"] == "none"
     assert saved["config"]["augmentation_config"]["profile"] == "none"
-    assert saved["config"]["augmentation_config"]["orientation_policy"] == "invariant"
+    assert saved["config"]["augmentation_config"]["orientation_policy"] == "sensitive"
     assert "orientation_policy" not in saved["config"]
 
 
@@ -2033,7 +2033,7 @@ def test_training_help_documents_augmentation_contract(command, profiles, defaul
     assert "invariant" in output and "sensitive" in output
     assert all(profile in output for profile in profiles)
     assert f"default for a new run: {default}" in output
-    assert "default for a new run: invariant" in output
+    assert "default for a new run: sensitive" in output
     assert "dorsal" in output and "ventral" in output and "lateral" in output
     assert "in-plane" in output
     assert "does not guarantee" in output
@@ -2175,6 +2175,54 @@ def test_pretrain_augmentation_argument_forwarding_explicit_values(
         "local_crop_size": 112,
         "local_crops": 0,
     }
+
+
+def test_format_user_command_omits_unset_augmentation_flags(tmp_path, monkeypatch):
+    monkeypatch.setattr("otuformer.training.trainer.run_pretrain", lambda _args: None)
+
+    def command_line(out_dir):
+        log_text = (out_dir / "logs" / "pretrain.log").read_text(encoding="utf-8")
+        return next(line for line in log_text.splitlines() if "Command:" in line)
+
+    default_out = tmp_path / "format_default"
+    default_result = runner.invoke(
+        app,
+        [
+            "pretrain",
+            "--train-data",
+            str(tmp_path / "images.csv"),
+            "--input-images-dir",
+            str(tmp_path),
+            "--out-dir",
+            str(default_out),
+        ],
+    )
+    assert default_result.exit_code == 0, default_result.output
+    default_line = command_line(default_out)
+    assert "--augmentation" not in default_line
+    assert "--orientation-policy" not in default_line
+
+    explicit_out = tmp_path / "format_explicit"
+    explicit_result = runner.invoke(
+        app,
+        [
+            "pretrain",
+            "--train-data",
+            str(tmp_path / "images.csv"),
+            "--input-images-dir",
+            str(tmp_path),
+            "--out-dir",
+            str(explicit_out),
+            "--augmentation",
+            "color-robust",
+            "--orientation-policy",
+            "invariant",
+        ],
+    )
+    assert explicit_result.exit_code == 0, explicit_result.output
+    explicit_line = command_line(explicit_out)
+    assert "--augmentation color-robust" in explicit_line
+    assert "--orientation-policy invariant" in explicit_line
 
 
 def test_finetune_augmentation_argument_forwarding_defaults_to_none(
@@ -2392,7 +2440,9 @@ def test_pretrain_resume_rejects_conflicting_local_views(tmp_path):
     )
 
     assert result.exit_code != 0
-    assert "Cannot resume" in result.output
+    assert isinstance(result.exception, ValueError)
+    assert "Cannot resume" in str(result.exception)
+    assert not (tmp_path / "resume_out" / "SSL_latest.pth").exists()
 
 
 class _DatasetCaptured(Exception):

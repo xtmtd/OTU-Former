@@ -49,6 +49,7 @@ from otuformer.training.dataset import (  # noqa: E402
     center_crop_eval_transform,
 )
 from otuformer.training.model import OTUFormerEncoder  # noqa: E402
+from otuformer.utils.checkpoint import load_checkpoint  # noqa: E402
 from otuformer.utils.device import resolve_device  # noqa: E402
 from otuformer.utils.size import resolve_training_image_size  # noqa: E402
 
@@ -148,7 +149,11 @@ def resolve_evaluation_size(
     evaluates at its own resolved training size.
     """
     if image_size_override is not None:
-        if isinstance(image_size_override, bool) or image_size_override <= 0:
+        if (
+            isinstance(image_size_override, bool)
+            or not isinstance(image_size_override, int)
+            or image_size_override <= 0
+        ):
             raise ValueError(
                 f"--image-size must be a positive integer, got {image_size_override!r}."
             )
@@ -178,9 +183,38 @@ def read_orientation_policy(checkpoint: dict) -> str | None:
     return policy if isinstance(policy, str) else None
 
 
-def orientation_policy_note(policy: str | None) -> str:
+def read_augmentation_profile(checkpoint: dict) -> str | None:
+    """Read the saved augmentation profile from ``config``, if any.
+
+    Prefers ``config.augmentation_profile`` and falls back to
+    ``config.augmentation_config.profile``.
+    """
+    config = checkpoint.get("config") or {}
+    if not isinstance(config, dict):
+        return None
+    profile = config.get("augmentation_profile")
+    if isinstance(profile, str):
+        return profile
+    augmentation = config.get("augmentation_config") or {}
+    if isinstance(augmentation, dict):
+        profile = augmentation.get("profile")
+        if isinstance(profile, str):
+            return profile
+    return None
+
+
+def orientation_policy_note(
+    policy: str | None, profile: str | None = None
+) -> str:
     """Describe how the saved policy bounds the reflection/rotation contract."""
     if policy == "sensitive":
+        if profile == "legacy":
+            return (
+                "Saved policy 'sensitive' on the 'legacy' profile: legacy keeps its "
+                "historical broad rotation and horizontal/vertical flips, so the "
+                "[-15, 15] no-flip contract does not apply. Reflection similarity "
+                "below is diagnostic only."
+            )
         return (
             "Saved policy 'sensitive': no horizontal flip and rotation limited to "
             "[-15, 15] degrees. Reflection similarity below is diagnostic only and "
@@ -198,7 +232,7 @@ def orientation_policy_note(policy: str | None) -> str:
 
 
 def _read_checkpoint(checkpoint_path: Path) -> dict:
-    checkpoint = torch.load(Path(checkpoint_path), map_location="cpu", weights_only=False)
+    checkpoint = load_checkpoint(Path(checkpoint_path), map_location="cpu")
     if not isinstance(checkpoint, dict):
         raise ValueError(f"Checkpoint {checkpoint_path} does not contain a dict.")
     return checkpoint
@@ -271,12 +305,22 @@ def _load_image_paths(csv_path: Path, images_dir: Path) -> list[Path]:
     ]
 
 
+def _estimate_edge_fills(image_paths: list[Path]) -> dict[str, list[int]]:
+    """Edge-median fill per resolved image path, for JSON traceability."""
+    fills: dict[str, list[int]] = {}
+    for path in image_paths:
+        with Image.open(path) as handle:
+            fills[str(path)] = list(_estimate_background_color(handle.convert("RGB")))
+    return fills
+
+
 def embed_validation_views(
     model: OTUFormerEncoder,
     transform,
     image_paths: list[Path],
     device: torch.device,
     *,
+    fills: dict[str, list[int]] | None = None,
     batch_size: int = DEFAULT_BATCH_SIZE,
 ) -> dict[str, np.ndarray]:
     """L2-normalized angle-0/90/180/270 and reflected CLS embeddings."""
@@ -287,7 +331,10 @@ def embed_validation_views(
         for path in chunk:
             with Image.open(path) as handle:
                 image = handle.convert("RGB")
-            fill = _estimate_background_color(image)
+            if fills is not None and str(path) in fills:
+                fill = tuple(fills[str(path)])
+            else:
+                fill = _estimate_background_color(image)
             # Angle 0 is the unrotated source image (rotate(0) is identity).
             prepared["rotation_0"].append(image)
             for angle in ROTATION_ANGLES:
@@ -325,22 +372,25 @@ def validate_checkpoint(
     image_paths: list[Path],
     evaluation_size: int,
     device: torch.device,
+    fills: dict[str, list[int]] | None = None,
     batch_size: int = DEFAULT_BATCH_SIZE,
 ) -> dict:
     """Compute the per-checkpoint rotation/reflection/different-image summary."""
     model, model_info = load_checkpoint_model(checkpoint, device)
     transform = center_crop_eval_transform(evaluation_size)
     embeddings = embed_validation_views(
-        model, transform, image_paths, device, batch_size=batch_size
+        model, transform, image_paths, device, fills=fills, batch_size=batch_size
     )
     baseline = embeddings["rotation_0"]
     policy = read_orientation_policy(checkpoint)
+    profile = read_augmentation_profile(checkpoint)
     return {
         "checkpoint": str(checkpoint_path),
         **model_info,
         "evaluation_image_size": int(evaluation_size),
+        "augmentation_profile": profile,
         "orientation_policy": policy,
-        "orientation_policy_note": orientation_policy_note(policy),
+        "orientation_policy_note": orientation_policy_note(policy, profile),
         "image_count": len(image_paths),
         "rotation": {
             str(angle): summarize_paired_similarities(
@@ -357,12 +407,15 @@ def validate_checkpoint(
 
 def run(args: argparse.Namespace) -> dict:
     device = resolve_device(args.device)
-    image_paths = _load_image_paths(args.images_csv, args.images_dir)
+    image_paths = list(
+        dict.fromkeys(_load_image_paths(args.images_csv, args.images_dir))
+    )
     if len(image_paths) < 2:
         raise ValueError(
             "At least two images are required for different-image similarities; "
             f"resolved {len(image_paths)} from {args.images_csv}."
         )
+    edge_median_fills = _estimate_edge_fills(image_paths)
 
     baseline_checkpoint = _read_checkpoint(args.baseline_checkpoint)
     candidate_checkpoint = _read_checkpoint(args.candidate_checkpoint)
@@ -376,6 +429,7 @@ def run(args: argparse.Namespace) -> dict:
         image_paths=image_paths,
         evaluation_size=effective_size,
         device=device,
+        fills=edge_median_fills,
     )
     print(f"Evaluated baseline checkpoint at size {effective_size}.", flush=True)
     candidate = validate_checkpoint(
@@ -384,6 +438,7 @@ def run(args: argparse.Namespace) -> dict:
         image_paths=image_paths,
         evaluation_size=effective_size,
         device=device,
+        fills=edge_median_fills,
     )
     print(f"Evaluated candidate checkpoint at size {effective_size}.", flush=True)
 
@@ -394,6 +449,7 @@ def run(args: argparse.Namespace) -> dict:
         "images_dir": str(args.images_dir),
         "image_count": len(image_paths),
         "effective_evaluation_image_size": int(effective_size),
+        "edge_median_fills": edge_median_fills,
         "baseline": baseline,
         "candidate": candidate,
     }

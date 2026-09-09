@@ -16,6 +16,7 @@ from otuformer.training.dataset import (
     PRETRAIN_AUGMENTATIONS,
     MetricDataset,
     MultiCropDataset,
+    _PretrainViewTransform,
     _estimate_background_color,
     build_eval_transform,
     build_finetune_augmentation_config,
@@ -214,9 +215,36 @@ def test_augmentation_profile_names_are_fixed():
     assert ORIENTATION_POLICIES == ("invariant", "sensitive")
 
 
+def test_builders_default_to_sensitive_orientation_policy():
+    assert (
+        build_pretrain_augmentation_config("global-barcode", 224, 96, 6)[
+            "orientation_policy"
+        ]
+        == "sensitive"
+    )
+    assert (
+        build_pretrain_augmentation_config("legacy", 224, 96, 6)[
+            "orientation_policy"
+        ]
+        == "sensitive"
+    )
+    assert (
+        build_finetune_augmentation_config("conservative", 224)["orientation_policy"]
+        == "sensitive"
+    )
+    assert (
+        build_finetune_augmentation_config("none", 224)["orientation_policy"]
+        == "sensitive"
+    )
+
+
 def test_pretrain_profile_configs_are_fully_expanded():
-    barcode = build_pretrain_augmentation_config("global-barcode", 224, 96, 6)
-    robust = build_pretrain_augmentation_config("color-robust", 224, 96, 6)
+    barcode = build_pretrain_augmentation_config(
+        "global-barcode", 224, 96, 6, orientation_policy="invariant"
+    )
+    robust = build_pretrain_augmentation_config(
+        "color-robust", 224, 96, 6, orientation_policy="invariant"
+    )
     sensitive = build_pretrain_augmentation_config(
         "global-barcode", 224, 96, 6, orientation_policy="sensitive"
     )
@@ -310,12 +338,16 @@ def test_expanded_augmentation_configs_are_json_serializable():
 
 
 def test_builders_return_fresh_configs():
-    first = build_pretrain_augmentation_config("global-barcode", 224, 96, 6)
+    first = build_pretrain_augmentation_config(
+        "global-barcode", 224, 96, 6, orientation_policy="invariant"
+    )
     first["global_crop"]["scale"].append(9.9)
     first["blur"]["probabilities"].append(9.9)
     first["rotation"]["degrees"].append(9.9)
     first["color_jitter"]["brightness"] = 9.9
-    second = build_pretrain_augmentation_config("global-barcode", 224, 96, 6)
+    second = build_pretrain_augmentation_config(
+        "global-barcode", 224, 96, 6, orientation_policy="invariant"
+    )
     assert second["global_crop"]["scale"] == [0.4, 1.0]
     assert second["blur"]["probabilities"] == [1.0, 0.1, 0.5]
     assert second["rotation"]["degrees"] == [-180.0, 180.0]
@@ -348,6 +380,19 @@ def test_local_crops_zero_skips_local_size_validation():
     config = build_pretrain_augmentation_config("global-barcode", 224, 2, 0)
     assert config["local_crops"] == 0
     assert config["local_crop"]["size"] == 2
+
+
+def test_multicrop_dataset_local_crops_zero_returns_two_views(tmp_path):
+    csv_path = make_dummy_images(tmp_path, n=1)
+    ds = MultiCropDataset(
+        csv_path=csv_path,
+        images_dir=tmp_path,
+        global_crop_size=32,
+        local_crop_size=2,  # small and unused when local_crops == 0
+        local_crops=0,
+    )
+    views = ds[0]
+    assert [tuple(view.shape) for view in views] == [(3, 32, 32), (3, 32, 32)]
 
 
 @pytest.mark.parametrize("profile", PRETRAIN_AUGMENTATIONS)
@@ -552,6 +597,62 @@ def test_build_finetune_conservative_sensitive_config():
     assert config["horizontal_flip_probability"] == 0.0
 
 
+def _asymmetric_half_image(size: int = 32) -> Image.Image:
+    image = Image.new("RGB", (size, size), (255, 0, 0))
+    for x in range(size // 2, size):
+        for y in range(size):
+            image.putpixel((x, y), (0, 0, 255))
+    return image
+
+
+def _controlled_view(profile: str, policy: str) -> _PretrainViewTransform:
+    """A policy-driven view transform with identity spatial geometry.
+
+    Cropping, rotation, and resize are disabled so the only source of output
+    variation is the profile's flip probabilities.
+    """
+    config = build_pretrain_augmentation_config(
+        profile, 32, 16, 0, orientation_policy=policy
+    )
+    return _PretrainViewTransform(
+        crop_size=32,
+        scale=(1.0, 1.0),
+        crop_ratio=(1.0, 1.0),
+        rotation_degrees=(0.0, 0.0),
+        rotation_expand=False,
+        rotation_fill=(0, 0, 0),
+        horizontal_flip_probability=config["horizontal_flip_probability"],
+        vertical_flip_probability=config["vertical_flip_probability"],
+        color_jitter={**config["color_jitter"], "probability": 0.0},
+        grayscale_probability=0.0,
+        blur_probability=0.0,
+        blur_kernel=1,
+        blur_sigma=tuple(config["blur"]["sigma"]),
+        post_rotation_resize=False,
+    )
+
+
+def test_sensitive_policy_never_horizontally_mirrors():
+    transform = _controlled_view("global-barcode", "sensitive")
+    assert transform.horizontal_flip_probability == 0.0
+    image = _asymmetric_half_image()
+    reference = transform(image, (0, 0, 0))
+    torch.manual_seed(1234)
+    for _ in range(25):
+        assert torch.allclose(transform(image, (0, 0, 0)), reference)
+
+
+def test_legacy_policy_keeps_historical_flips():
+    transform = _controlled_view("legacy", "sensitive")
+    assert transform.horizontal_flip_probability == 0.5
+    assert transform.vertical_flip_probability == 0.5
+    image = _asymmetric_half_image()
+    reference = transform(image, (0, 0, 0))
+    torch.manual_seed(0)
+    outputs = [transform(image, (0, 0, 0)) for _ in range(50)]
+    assert any(not torch.allclose(out, reference) for out in outputs)
+
+
 def test_finetune_none_skips_background_estimation(tmp_path, monkeypatch):
     csv_path = make_dummy_labeled_images(tmp_path, n=1)
     ds = MetricDataset(
@@ -682,6 +783,35 @@ def test_all_pretrain_views_share_one_background_estimate(tmp_path, monkeypatch)
     ]
     assert recorded == [(11, 22, 33)] * 4
     assert len(estimates) == 1
+
+
+def test_legacy_views_skip_background_estimation(tmp_path, monkeypatch):
+    csv_path = make_dummy_images(tmp_path, n=1)
+    ds = MultiCropDataset(
+        csv_path=csv_path,
+        images_dir=tmp_path,
+        global_crop_size=32,
+        local_crop_size=16,
+        local_crops=2,
+        augmentation_profile="legacy",
+    )
+    estimates = []
+
+    def fake_estimate(image):
+        estimates.append(image)
+        return (11, 22, 33)
+
+    monkeypatch.setattr(
+        "otuformer.training.dataset._estimate_background_color", fake_estimate
+    )
+    views = ds[0]
+    assert [tuple(view.shape) for view in views] == [
+        (3, 32, 32),
+        (3, 32, 32),
+        (3, 16, 16),
+        (3, 16, 16),
+    ]
+    assert estimates == []
 
 
 def test_pretrain_view_transform_uses_supplied_edge_fill(tmp_path):

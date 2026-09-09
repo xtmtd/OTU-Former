@@ -12,7 +12,12 @@ from pathlib import Path
 import click
 import typer
 
-from otuformer.cli import SIZE_EXAMPLES, _parse_size
+from otuformer.cli import (
+    SIZE_EXAMPLES,
+    _parse_size,
+    _validate_augmentation,
+    _validate_orientation_policy,
+)
 
 app = typer.Typer(
     help=(
@@ -28,7 +33,7 @@ app = typer.Typer(
         "  --augmentation: global-barcode, color-robust, or legacy.\n"
         "  default for a new run: global-barcode.\n"
         "  --orientation-policy: invariant or sensitive.\n"
-        "  default for a new run: invariant.\n"
+        "  default for a new run: sensitive.\n"
         "\n"
         "  Dorsal, ventral, and lateral images are distinct markers, as are\n"
         "  anatomical-part views; arbitrary in-plane orientation is supported.\n"
@@ -49,34 +54,6 @@ app = typer.Typer(
         "  parameter changes require a new run.\n"
     )
 )
-
-
-def _validate_augmentation(value: str | None, *, stage: str) -> None:
-    if value is None:
-        return
-    from otuformer.training.dataset import (
-        FINETUNE_AUGMENTATIONS,
-        PRETRAIN_AUGMENTATIONS,
-    )
-
-    allowed = PRETRAIN_AUGMENTATIONS if stage == "pretrain" else FINETUNE_AUGMENTATIONS
-    if value not in allowed:
-        choices = ", ".join(allowed)
-        raise typer.BadParameter(
-            f"Unknown {stage} augmentation profile '{value}'. Choose one of: {choices}."
-        )
-
-
-def _validate_orientation_policy(value: str | None) -> None:
-    if value is None:
-        return
-    from otuformer.training.dataset import ORIENTATION_POLICIES
-
-    if value not in ORIENTATION_POLICIES:
-        raise typer.BadParameter(
-            f"Unknown orientation policy '{value}'. Choose one of: "
-            f"{', '.join(ORIENTATION_POLICIES)}."
-        )
 
 
 def _format_user_command(ctx: typer.Context, params: dict[str, object]) -> str:
@@ -151,7 +128,7 @@ def pretrain(
         "--orientation-policy",
         help=(
             "Orientation policy for every global and local view: invariant or "
-            "sensitive. Default for a new run: invariant. Omit to inherit the "
+            "sensitive. Default for a new run: sensitive. Omit to inherit the "
             "saved policy on --resume. See 'Augmentation contract' above."
         ),
     ),

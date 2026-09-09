@@ -137,7 +137,7 @@ def build_pretrain_augmentation_config(
     global_crop_size: int,
     local_crop_size: int,
     local_crops: int,
-    orientation_policy: str = "invariant",
+    orientation_policy: str = "sensitive",
 ) -> dict[str, object]:
     """Return the fully expanded, JSON-serializable pretraining augmentation config."""
     if profile not in PRETRAIN_AUGMENTATIONS:
@@ -219,7 +219,7 @@ def build_pretrain_augmentation_config(
 def build_finetune_augmentation_config(
     profile: str,
     image_size: int,
-    orientation_policy: str = "invariant",
+    orientation_policy: str = "sensitive",
 ) -> dict[str, object]:
     """Return the fully expanded, JSON-serializable fine-tuning augmentation config.
 
@@ -366,6 +366,7 @@ class _PretrainViewTransform:
         *,
         crop_size: int,
         scale: tuple[float, float],
+        crop_ratio: tuple[float, float],
         rotation_degrees: tuple[float, float],
         rotation_expand: bool,
         rotation_fill: str | tuple[int, int, int] | list[int],
@@ -394,7 +395,10 @@ class _PretrainViewTransform:
         self._post_rotation_resize = bool(post_rotation_resize)
 
         self._crop = transforms.RandomResizedCrop(
-            self._crop_size, scale=self._scale, interpolation=Image.BICUBIC
+            self._crop_size,
+            scale=self._scale,
+            ratio=tuple(crop_ratio),
+            interpolation=Image.BICUBIC,
         )
         self._horizontal_flip = (
             transforms.RandomHorizontalFlip(p=self._horizontal_flip_probability)
@@ -519,6 +523,7 @@ def _build_pretrain_view_transform(
     return _PretrainViewTransform(
         crop_size=int(crop["size"]),
         scale=tuple(float(v) for v in crop["scale"]),
+        crop_ratio=tuple(float(v) for v in config["crop_ratio"]),
         rotation_degrees=tuple(float(v) for v in rotation["degrees"]),
         rotation_expand=bool(rotation["expand"]),
         rotation_fill=rotation["fill"],
@@ -565,6 +570,11 @@ class _ConservativeTransform:
         self._horizontal_flip_probability = float(
             config["horizontal_flip_probability"]
         )
+        safe_canvas = config["safe_canvas"]
+        self._safe_canvas_max_scale = float(safe_canvas["max_scale"])
+        self._safe_canvas_max_translation_fraction = float(
+            safe_canvas["max_translation_fraction"]
+        )
         self._translate = tuple(float(v) for v in config["translation"])
         self._scale = tuple(float(v) for v in config["scale"])
         color_jitter = config["color_jitter"]
@@ -602,7 +612,12 @@ class _ConservativeTransform:
     def __call__(
         self, image: Image.Image, fill: tuple[int, int, int]
     ) -> torch.Tensor:
-        canvas = _pad_to_safe_square(image, fill)
+        canvas = _pad_to_safe_square(
+            image,
+            fill,
+            max_scale=self._safe_canvas_max_scale,
+            max_translation_fraction=self._safe_canvas_max_translation_fraction,
+        )
         angle, translate, scale, shear = transforms.RandomAffine.get_params(
             degrees=list(self._rotation_degrees),
             translate=list(self._translate),
@@ -628,7 +643,7 @@ class _ConservativeTransform:
 
 
 def _validate_view_shape(
-    view: torch.Tensor, expected_size: int, view_name: str
+    view: object, expected_size: int, view_name: str
 ) -> None:
     """Reject a view whose tensor shape is not (3, expected, expected)."""
     shape = getattr(view, "shape", None)
@@ -653,7 +668,7 @@ def center_crop_eval_transform(image_size: int) -> transforms.Compose:
             transforms.Resize(image_size, interpolation=Image.BICUBIC),
             transforms.CenterCrop(image_size),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            transforms.Normalize(mean=_IMAGENET_MEAN, std=_IMAGENET_STD),
         ]
     )
 
@@ -720,7 +735,7 @@ def whole_specimen_pad_transform(image_size: int) -> transforms.Compose:
                 (image_size, image_size), interpolation=Image.BICUBIC
             ),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            transforms.Normalize(mean=_IMAGENET_MEAN, std=_IMAGENET_STD),
         ]
     )
 
@@ -752,7 +767,7 @@ class MultiCropDataset(Dataset):
         local_crop_size: int = 96,
         local_crops: int = 6,
         augmentation_profile: str = "global-barcode",
-        orientation_policy: str = "invariant",
+        orientation_policy: str = "sensitive",
     ) -> None:
         images_root = Path(images_dir)
         if csv_path is None:
@@ -799,6 +814,12 @@ class MultiCropDataset(Dataset):
         self.local_tf = _build_pretrain_view_transform(
             self.augmentation_config, "local", blur_probabilities[2]
         )
+        # Legacy profiles use a fixed fill, so the per-item edge-median estimate
+        # is skipped entirely when no view consumes it.
+        self._estimate_edge_fill = any(
+            view.uses_edge_fill
+            for view in (self.global_tf1, self.global_tf2, self.local_tf)
+        )
 
     def __len__(self) -> int:
         return len(self.image_paths)
@@ -818,7 +839,11 @@ class MultiCropDataset(Dataset):
     def __getitem__(self, idx: int) -> list[torch.Tensor]:
         with Image.open(self.image_paths[idx]) as im:
             img = im.convert("RGB")
-        fill = _estimate_background_color(img)
+        if self._estimate_edge_fill:
+            fill = _estimate_background_color(img)
+        else:
+            # Legacy transforms ignore the fill argument (fixed black fill).
+            fill = _BACKGROUND_FILL_FALLBACK
         views = [
             self._apply_view(
                 self.global_tf1, img, fill, self.global_crop_size, "global_tf1"
@@ -845,7 +870,7 @@ class MetricDataset(Dataset):
         images_dir: Path,
         image_size: int = 224,
         augmentation_profile: str = "none",
-        orientation_policy: str = "invariant",
+        orientation_policy: str = "sensitive",
     ) -> None:
         df = pd.read_csv(csv_path)
         images_root = Path(images_dir)
