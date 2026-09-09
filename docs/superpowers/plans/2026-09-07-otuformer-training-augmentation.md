@@ -381,7 +381,7 @@ Expected: all dataset tests pass, including existing recursive-path tests.
 - Consumes: `build_pretrain_augmentation_config()`, `build_finetune_augmentation_config()`, `MultiCropDataset(..., augmentation_profile=...)`, and `MetricDataset(..., augmentation_profile=...)` from Task 1.
 - Consumes: `ORIENTATION_POLICIES` and passes the selected `orientation_policy` to pretraining datasets/configuration.
 - Produces: `_select_augmentation_profile(requested_profile: str | None, checkpoint: dict[str, Any] | None, *, stage: str) -> str` and `_select_orientation_policy(requested_policy: str | None, checkpoint: dict[str, Any] | None, *, stage: str) -> str`.
-- Produces: `_validate_augmentation_config(profile: str, policy: str, current_config: dict[str, object], checkpoint: dict[str, Any] | None, *, stage: str) -> dict[str, object]`.
+- Produces: `_validate_augmentation_config(profile: str, current_config: dict[str, object], checkpoint: dict[str, Any] | None, *, stage: str) -> dict[str, object]`.
 - Produces: `_resolve_pretrain_local_views(requested_local_crop_size: int | None, requested_local_crops: int | None, checkpoint: dict[str, Any] | None) -> tuple[int, int]` for pretrain new-run defaults and resume continuity.
 - Uses the existing resolution-consistency size resolver and validation contract; no augmentation-specific image-size resolver is added.
 - Produces: `args.augmentation` and `args.orientation_policy` as the resolved effective values before dataset construction.
@@ -402,24 +402,29 @@ def test_new_run_uses_stage_defaults(stage, expected_profile):
     config = _augmentation_config(stage, profile, policy)
     assert (profile, policy) == (expected_profile, "sensitive")
     assert trainer._validate_augmentation_config(
-        profile, policy, config, None, stage=stage
+        profile, config, None, stage=stage
     ) == config
 
 
 @pytest.mark.parametrize(
-    ("stage", "legacy_profile"),
-    [("pretrain", "legacy"), ("finetune", "none")],
+    ("stage", "legacy_profile", "expected_policy"),
+    [
+        ("pretrain", "legacy", "invariant"),
+        ("finetune", "none", "sensitive"),
+    ],
 )
-def test_old_checkpoint_maps_to_compatible_augmentation(stage, legacy_profile):
+def test_old_checkpoint_maps_to_compatible_augmentation(
+    stage, legacy_profile, expected_policy
+):
     checkpoint = {"config": {"model_name": "vit_tiny_patch16_224"}}
     profile = trainer._select_augmentation_profile(
         None, checkpoint, stage=stage
     )
     policy = trainer._select_orientation_policy(None, checkpoint, stage=stage)
     config = _augmentation_config(stage, profile, policy)
-    assert (profile, policy) == (legacy_profile, "invariant")
+    assert (profile, policy) == (legacy_profile, expected_policy)
     assert trainer._validate_augmentation_config(
-        profile, policy, config, checkpoint, stage=stage
+        profile, config, checkpoint, stage=stage
     ) == config
 ```
 
@@ -428,7 +433,7 @@ Do not duplicate the existing size-precedence or validation matrix from resoluti
 Also assert:
 
 - omitted profile and orientation policy inherit a checkpoint's profile/policy/config when resuming; for new fine-tuning initialized from `--checkpoint`, omitted orientation policy inherits the pretraining checkpoint when present, while the augmentation profile remains independently defaulted to `none`;
-- when a pre-augmentation pretraining checkpoint is used with `--checkpoint`, omitted or explicit `--orientation-policy invariant` resolves to `invariant`; explicit `sensitive` is honored for the new fine-tuning run; explicit `--augmentation conservative` initializes successfully without inheriting the pretraining profile;
+- when a pre-augmentation pretraining checkpoint is used with `--checkpoint`, omitted orientation policy resolves to `sensitive` (the new-run default); explicit `--orientation-policy invariant` resolves to `invariant`; explicit `sensitive` is honored for the new fine-tuning run; explicit `--augmentation conservative` initializes successfully without inheriting the pretraining profile;
 - new runs with omitted orientation policy resolve to `sensitive`; explicit `sensitive` is preserved;
 - explicitly matching profile/policy/config succeeds;
 - explicit `sensitive` is accepted for a new `legacy` run and recorded, but cannot change its transform;
@@ -438,7 +443,7 @@ Also assert:
 - old pretrain plus explicit `--orientation-policy invariant` succeeds, while explicit `sensitive` fails on resume;
 - pretrain resume inherits saved local-crop size/count when their CLI options are omitted; explicit local-view values must match the saved expanded config for new checkpoints or the saved `args` for old checkpoints, otherwise fail with `Cannot resume`;
 - an old checkpoint missing or invalid local-view fields falls back to the historical `96` local crop size or `6` local crops respectively; `local_crop_size` accepts only non-boolean positive integers, while `local_crops` accepts non-boolean non-negative integers and a saved `local_crops=0` is inherited unchanged; explicit values conflicting with those resolved values fail;
-- old pretrain used with `--checkpoint` plus omitted policy resolves to `invariant`, explicit `sensitive` is honored for the new finetune run, and explicit `--augmentation conservative` initializes successfully;
+- old pretrain used with `--checkpoint` plus omitted policy resolves to `sensitive`, explicit `sensitive` is honored for the new finetune run, and explicit `--augmentation conservative` initializes successfully;
 - old finetune plus explicit `conservative` fails;
 - old finetune plus explicit `--orientation-policy invariant` succeeds, while explicit `sensitive` fails;
 - profile without config, config without profile, non-string profile, or non-dict expanded config raises `ValueError` containing `malformed augmentation metadata`;
@@ -488,7 +493,7 @@ if stage == "pretrain":
 else:
     current_config = builder(profile, ..., orientation_policy=policy)
 augmentation_config = _validate_augmentation_config(
-    profile, policy, current_config, checkpoint, stage=stage
+    profile, current_config, checkpoint, stage=stage
 )
 ```
 

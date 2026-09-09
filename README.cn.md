@@ -324,7 +324,7 @@ otuformer finetune \
 
 | Profile | 阶段 | 说明 |
 |---------|------|------|
-| `global-barcode` | pretrain（默认） | 方向无关的整标本条形码：温和的光度扰动；保留颜色（不做灰度化）。几何变换取决于所选方向策略。 |
+| `global-barcode` | pretrain（默认） | 整标本条形码配置；方向处理取决于所选方向策略。温和的光度扰动；保留颜色（不做灰度化）。 |
 | `color-robust` | pretrain | 几何与模糊设置与 `global-barcode` 相同，但颜色扰动更强并启用灰度化。**警告**：可能降低模型对诊断性体色、色斑或金属光泽的敏感度。 |
 | `legacy` | pretrain | 完全复现 OTU-Former 0.2.1 的数据增强，仅用于旧运行的续训与对比，不建议用于新运行。它会记录所选的任一方向策略，但不改变其历史变换。 |
 | `none` | finetune（默认） | 保持原有的确定性 `Resize -> CenterCrop -> ToTensor -> Normalize`。 |

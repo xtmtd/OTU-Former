@@ -153,7 +153,7 @@ This operation does not require a mask and does not assert that the estimated co
 
 ### 5.2 Pretraining rotation
 
-For `global-barcode` and `color-robust`, each global or local view follows this geometric order:
+For `global-barcode` and `color-robust` under `orientation-policy=invariant`, each global or local view follows this geometric order:
 
 ```text
 RandomResizedCrop
@@ -392,7 +392,7 @@ New pretrain and finetune checkpoints add JSON-serializable augmentation metadat
     "augmentation_profile": "global-barcode",
     "augmentation_config": {
         "profile": "global-barcode",
-        "orientation_policy": "invariant",
+        "orientation_policy": "sensitive",
         "global_crop": {"size": 224, "scale": [0.4, 1.0]},
         # Fully expanded settings used by this run, including
         # solarization_probability and the resolved crop/image sizes.
@@ -533,7 +533,7 @@ Run one additional `orientation-policy=sensitive` smoke per stage: `global-barco
 
 ### 10.3 Extended implementation comparison
 
-Run the existing Epidorcus example for 50 pretraining epochs with `global-barcode`, keeping other baseline training parameters unchanged. This is an implementation comparison and smoke-level health check, not evidence that the profile is biologically optimal across datasets.
+Run the existing Epidorcus example for 50 pretraining epochs with `global-barcode`, keeping other baseline training parameters unchanged. That comparison used the then-default `orientation-policy=invariant`; the current `sensitive` default was not evaluated by it. This is an implementation comparison and smoke-level health check, not evidence that the profile is biologically optimal across datasets.
 
 Training-health checks:
 

@@ -331,7 +331,7 @@ otuformer finetune \
 
 | Profile | Stage | Summary |
 |---------|-------|---------|
-| `global-barcode` | pretrain (default) | Orientation-insensitive whole-specimen barcode: modest photometric jitter; color is preserved (no grayscale). Geometry follows the selected orientation policy. |
+| `global-barcode` | pretrain (default) | Whole-specimen barcode profile; orientation handling follows the selected policy. Modest photometric jitter; color is preserved (no grayscale). |
 | `color-robust` | pretrain | Same geometry and blur as `global-barcode` with stronger color jitter and grayscale. **Warning:** it may reduce sensitivity to diagnostic body color, color patterns, or metallic sheen. |
 | `legacy` | pretrain | Reproduces OTU-Former 0.2.1 augmentation exactly for old-run continuation and comparison, not for new runs. It records either orientation policy without changing its historical transforms. |
 | `none` | finetune (default) | Unchanged deterministic `Resize -> CenterCrop -> ToTensor -> Normalize`. |
