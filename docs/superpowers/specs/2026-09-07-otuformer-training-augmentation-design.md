@@ -23,8 +23,8 @@ This review targets the code at `b4a4b3c` and its relevant ancestors `a583c74` a
   - `color-robust`
   - `legacy`
 - A high-level training orientation policy:
-  - `invariant` (default; existing broad rotation and horizontal reflection)
-  - `sensitive` (small rotation only, no horizontal reflection)
+  - `sensitive` (default; small rotation only, no horizontal reflection)
+  - `invariant` (opt-in; existing broad rotation and horizontal reflection)
 - Fine-tuning augmentation profiles:
   - `none` (default and current behavior)
   - `conservative` (experimental)
@@ -52,7 +52,7 @@ This review targets the code at `b4a4b3c` and its relevant ancestors `a583c74` a
 
 ### 3.1 Preserve marker identity
 
-Augmentation may model image acquisition variation only when that variation does not change the marker's biological meaning. The following are valid variations for the default global-barcode contract when the marker is treated as orientation-insensitive:
+Augmentation may model image acquisition variation only when that variation does not change the marker's biological meaning. The following are valid variations for the `global-barcode` contract under the opt-in `invariant` policy, when the marker is treated as orientation-insensitive:
 
 - arbitrary in-plane specimen orientation;
 - modest differences in position and scale;
@@ -169,7 +169,7 @@ Only one reflection transform is needed for the `invariant` policy. With arbitra
 
 For a direction-sensitive marker, use `orientation-policy=sensitive`. This policy changes the geometric direction operations for every global and local training view in `global-barcode` and `color-robust`, and for fine-tuning `conservative`: rotation becomes continuous `[-15 degrees, 15 degrees]` and horizontal reflection is disabled. Fine-tuning `none` has no stochastic geometric operations, so the policy has no transform effect there but remains part of the run's biological contract. The small rotation range models ordinary placement error without asserting that the marker is invariant to a change in anatomical direction. If the marker is sensitive to even small orientation changes, the caller should preserve the original orientation and not use this stochastic profile as a substitute for a canonicalization protocol. `sensitive` is not inferred automatically from the image or taxon.
 
-`orientation-policy` is a high-level policy, not a collection of low-level strength overrides. The default `invariant` policy preserves the existing broad rotation and reflection behavior. `legacy` remains a historical compatibility profile and is not rewritten by this option; it accepts either policy so checkpoint metadata remains uniform, but its old vertical and horizontal flips remain part of its exact compatibility contract. A policy recorded by `legacy` is still inherited under the ordinary fine-tuning initialization rule: for example, a new `conservative` run initialized from a `legacy` checkpoint that records `sensitive` uses the real narrow-rotation/no-flip `conservative` transform. Pretraining and fine-tuning profiles may differ because they serve different optimization objectives, but a fine-tuning run should use the pretraining checkpoint's policy by default when initialized from that checkpoint. An explicit fine-tuning policy may override it for a new run.
+`orientation-policy` is a high-level policy, not a collection of low-level strength overrides. The default `sensitive` policy applies narrow rotation with no horizontal reflection; the opt-in `invariant` policy preserves the existing broad rotation and reflection behavior. `legacy` remains a historical compatibility profile and is not rewritten by this option; it accepts either policy so checkpoint metadata remains uniform, but its old vertical and horizontal flips remain part of its exact compatibility contract. A policy recorded by `legacy` is still inherited under the ordinary fine-tuning initialization rule: for example, a new `conservative` run initialized from a `legacy` checkpoint that records `sensitive` uses the real narrow-rotation/no-flip `conservative` transform. Pretraining and fine-tuning profiles may differ because they serve different optimization objectives, but a fine-tuning run should use the pretraining checkpoint's policy by default when initialized from that checkpoint. An explicit fine-tuning policy may override it for a new run.
 
 Solarization remains disabled because intensity inversion has no defined biological interpretation for these specimen images and can introduce an artificial shortcut. Matching every transform in the generic DINO recipe is less important than preserving the marker's plausible imaging variation.
 
@@ -201,7 +201,7 @@ Center the unscaled source image on this square canvas using the edge-derived fi
 
 ### 6.1 Pretrain `global-barcode`
 
-`global-barcode` is the default for new pretraining runs. Its default `orientation-policy=invariant` preserves the broad geometric behavior below. With `orientation-policy=sensitive`, the rotation range and horizontal reflection entries change for both global and local views as described in Section 5.2; crop, color, grayscale, blur, and all other settings remain unchanged.
+`global-barcode` is the default for new pretraining runs. Its default `orientation-policy=sensitive` applies the narrow rotation/no-flip geometry for both global and local views as described in Section 5.2; crop, color, grayscale, blur, and all other settings remain unchanged. With the opt-in `orientation-policy=invariant`, the broad geometric behavior below applies. The `sensitive` default was selected because the 50-epoch `global-barcode` implementation comparison found no rotation-consistency gain from broad `invariant` rotation, and ±180° rotation is not a plausible routine augmentation; that comparison did not evaluate the `sensitive` default.
 
 Common geometric settings for both global views and all local views under `orientation-policy=invariant`:
 
@@ -344,7 +344,7 @@ otuformer pretrain --augmentation legacy
 
 Allowed values are exactly `global-barcode`, `color-robust`, and `legacy`. The effective default for a new run is `global-barcode`.
 
-Pretraining also accepts `--orientation-policy invariant|sensitive`, defaulting to `invariant`. `sensitive` applies to all global and local views in `global-barcode` and `color-robust` and means rotation `[-15°, 15°]` with no horizontal reflection. `legacy` accepts and records either policy but does not alter its historical flips. This option is for a caller who knows that marker direction or left/right asymmetry may be diagnostic; the software does not infer that property.
+Pretraining also accepts `--orientation-policy invariant|sensitive`, defaulting to `sensitive`. `sensitive` applies to all global and local views in `global-barcode` and `color-robust` and means rotation `[-15°, 15°]` with no horizontal reflection. `invariant` is the opt-in broad-rotation/reflection policy for markers where direction or left/right asymmetry is not diagnostic. `legacy` accepts and records either policy but does not alter its historical flips. Neither policy is inferred from the image or taxon; the caller selects it.
 
 ### 7.2 Finetune
 
@@ -353,7 +353,7 @@ otuformer finetune --augmentation none
 otuformer finetune --augmentation conservative
 ```
 
-Allowed values are exactly `none` and `conservative`. The effective default for a new run is `none`. Fine-tuning also accepts `--orientation-policy invariant|sensitive`. For a new run initialized from `--checkpoint`, an omitted policy inherits the pretraining checkpoint's saved policy; otherwise the default is `invariant`. An explicit policy is used for the new run. For `none`, the policy has no transform effect but remains part of the biological run metadata.
+Allowed values are exactly `none` and `conservative`. The effective default for a new run is `none`. Fine-tuning also accepts `--orientation-policy invariant|sensitive`. For a new run initialized from `--checkpoint`, an omitted policy inherits the pretraining checkpoint's saved policy; otherwise the default is `sensitive`. An explicit policy is used for the new run. For `none`, the policy has no transform effect but remains part of the biological run metadata.
 
 ### 7.3 Explicit versus implicit values
 
@@ -460,7 +460,7 @@ Starting a new fine-tuning run from a pretraining checkpoint via `--checkpoint` 
 
 - omitted `--augmentation`: use `none`;
 - explicit `--augmentation conservative`: use `conservative`;
-- omitted `--orientation-policy`: inherit the pretraining checkpoint's saved policy, including a policy recorded by `legacy`; if the old pretraining checkpoint has no augmentation metadata, fall back to `invariant`. The inherited policy has its normal transform effect if the selected fine-tuning profile is `conservative`;
+- omitted `--orientation-policy`: inherit the pretraining checkpoint's saved policy, including a policy recorded by `legacy`; if the old pretraining checkpoint has no augmentation metadata, fall back to `sensitive`. The inherited policy has its normal transform effect if the selected fine-tuning profile is `conservative`;
 - explicit `--orientation-policy`: use the requested policy, including `sensitive` for an old checkpoint when starting a new fine-tuning run;
 - do not inherit the pretraining profile.
 
@@ -510,7 +510,7 @@ CLI/checkpoint checks:
 - resume inherits metadata when the CLI option is omitted;
 - old pretrain checkpoints map to `legacy`/`invariant` for resume and inherit their saved local-view arguments; `local_crop_size` must be a positive integer, `local_crops` may be zero, explicit local-view conflicts fail, and only missing/invalid historical fields fall back to `96` local crop size and `6` local crops;
 - old finetune checkpoints map to `none`/`invariant` for resume;
-- old pretraining checkpoints used for new fine-tuning initialization fall back to `invariant` when policy is omitted, and explicit `conservative` initializes without inheriting the pretraining profile;
+- old pretraining checkpoints used for new fine-tuning initialization fall back to `sensitive` when policy is omitted, and explicit `conservative` initializes without inheriting the pretraining profile;
 - profile and expanded-config conflicts reject resume;
 - new fine-tuning from a pretraining checkpoint does not inherit the pretraining profile.
 
@@ -626,7 +626,7 @@ The former extraction/CAM preprocessing discrepancy has already been addressed b
 
 The implementation is acceptable when:
 
-- new pretraining defaults to `global-barcode` with `orientation-policy=invariant`;
+- new pretraining defaults to `global-barcode` with `orientation-policy=sensitive`;
 - new fine-tuning defaults to `none`; when initialized from a pretraining checkpoint, omitted `orientation-policy` inherits the checkpoint policy;
 - every profile and supported orientation policy behaves as specified and is fully documented;
 - pretraining and fine-tuning profiles may differ, while orientation-policy inheritance and explicit override behavior are unambiguous;

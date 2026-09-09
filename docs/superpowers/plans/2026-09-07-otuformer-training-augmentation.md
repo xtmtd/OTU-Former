@@ -17,7 +17,7 @@ This incremental plan starts from `b4a4b3c` and its relevant ancestors `a583c74`
 ## Global Constraints
 
 - New pretraining runs default to `global-barcode`; allowed profiles are exactly `global-barcode`, `color-robust`, and `legacy`.
-- New training runs default to `orientation-policy=invariant`; allowed policies are exactly `invariant` and `sensitive`. `sensitive` applies to every global/local view of `global-barcode` and `color-robust`, and to fine-tuning `conservative`, as rotation `[-15°, 15°]` with no horizontal flip. When fine-tuning is initialized from a pretraining checkpoint and the option is omitted, inherit that checkpoint's policy.
+- New training runs default to `orientation-policy=sensitive`; allowed policies are exactly `invariant` and `sensitive`. `sensitive` applies to every global/local view of `global-barcode` and `color-robust`, and to fine-tuning `conservative`, as rotation `[-15°, 15°]` with no horizontal flip. `invariant` is the opt-in broad-rotation/reflection policy. When fine-tuning is initialized from a pretraining checkpoint and the option is omitted, inherit that checkpoint's policy.
 - New fine-tuning runs default to `none`; allowed profiles are exactly `none` and `conservative`.
 - Keep global scale `(0.4, 1.0)`, local scale `(0.05, 0.4)`, torchvision ratio `(3/4, 4/3)`, two global views, and six local crops by default.
 - Keep `--global-crop-size`, `--local-crop-size`, and `--local-crops`; add only the high-level `--orientation-policy` option; do not add low-level augmentation-strength flags.
@@ -574,9 +574,9 @@ Expected: all tests pass.
 **Interfaces:**
 - Consumes: `PRETRAIN_AUGMENTATIONS` and `FINETUNE_AUGMENTATIONS` from Task 1 through a lazy callback/import so basic CLI startup does not eagerly import torch/torchvision.
 - Produces: pretrain `--augmentation [global-barcode|color-robust|legacy]`, internally `str | None`, new-run default described as `global-barcode`.
-- Produces: pretrain `--orientation-policy [invariant|sensitive]`, internally `str | None`, default `invariant` for new runs; it applies to every global and local view.
+- Produces: pretrain `--orientation-policy [invariant|sensitive]`, internally `str | None`, default `sensitive` for new runs; it applies to every global and local view.
 - Produces: finetune `--orientation-policy [invariant|sensitive]`, internally `str | None`; it affects `conservative` and is a no-op for `none`; omitted initialization inherits the pretraining checkpoint policy.
-- Help tests assert that `--orientation-policy`, both policy names, and the exact phrase `default for a new run: invariant` are present for both commands.
+- Help tests assert that `--orientation-policy`, both policy names, and the exact phrase `default for a new run: sensitive` are present for both commands.
 - Produces: finetune `--augmentation [none|conservative]`, internally `str | None`, new-run default described as `none`.
 - Produces: `args.augmentation` in the namespace, preserving `None` when omitted so Task 2 can distinguish omission from an explicit value.
 
@@ -601,7 +601,7 @@ def test_training_help_documents_augmentation_contract(command, profiles, defaul
     assert "invariant" in output and "sensitive" in output
     assert all(profile in output for profile in profiles)
     assert f"default for a new run: {default}" in output
-    assert "default for a new run: invariant" in output
+    assert "default for a new run: sensitive" in output
     assert "dorsal" in output and "ventral" in output and "lateral" in output
     assert "in-plane" in output
     assert "does not guarantee" in output
@@ -711,7 +711,7 @@ In the `pretrain` and `finetune` sections of `2026-03-29-otuformer-design.md`, a
 ```text
 pretrain: global-barcode (default), color-robust, legacy
 finetune: none (default), conservative
-orientation-policy: invariant (default for new runs), sensitive
+orientation-policy: sensitive (default for new runs), invariant
 ```
 
 State that omitted profile/policy values inherit on resume, old pretrain checkpoints map to `legacy`/`invariant`, old finetune checkpoints map to `none`/`invariant`, fine-tuning initialization inherits only the pretraining policy, and explicit mismatches fail. Link to `docs/superpowers/specs/2026-09-07-otuformer-training-augmentation-design.md` for transform-level details. Do not copy the full profile configuration into this broader design.
@@ -891,7 +891,7 @@ Expected: the positive log check finds the resolved profile/config, the inverted
 - Create: `scripts/validate_augmentation_rotation.py`
 - Test: `tests/training/test_pretrain_alignment.py`
 - Modify after implementation verification: `pyproject.toml`, `src/otuformer/__init__.py` (version `0.3.0` -> `0.4.0`)
-- Create after the run: `docs/superpowers/validation/2026-09-07-global-barcode-validation.md`
+- Create after the run: `docs/superpowers/specs/2026-09-07-global-barcode-validation.md`
 - Do not modify production extraction/evaluation code to support validation.
 
 **Interfaces:**
@@ -1021,7 +1021,7 @@ Expected acceptance condition: candidate 90-degree median same-image similarity 
 
 - [ ] **Step 6: Write the validation report**
 
-Create `docs/superpowers/validation/2026-09-07-global-barcode-validation.md` with:
+Create `docs/superpowers/specs/2026-09-07-global-barcode-validation.md` with:
 
 ```text
 Data identity and sample counts

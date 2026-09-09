@@ -6,6 +6,13 @@ checkpoint. It compares available implementation metrics and rotation/reflection
 consistency on one two-species dataset. It does not establish broad biological
 suitability of the new default.
 
+> **Default-policy note (added 2026-09-09).** The compared candidate run used
+> `global-barcode` with `orientation-policy=invariant`, which was the new-run
+> default at the time of the run. The current new-run default is
+> `orientation-policy=sensitive`, which was **not** compared here. The
+> `Technical implementation result: ISSUE` therefore concerns the `invariant`
+> run only.
+
 ## Data identity and sample counts
 
 | Item | Value |
@@ -235,7 +242,7 @@ evidence.
   (`expand=true`) trades rotation consistency for scale robustness, and whether
   a smaller or `expand=false` rotation would preserve more rotation
   consistency without losing the other metric gains. See
-  [design §10.3 Extended implementation comparison](../specs/2026-09-07-otuformer-training-augmentation-design.md#103-extended-implementation-comparison).
+  [design §10.3 Extended implementation comparison](2026-09-07-otuformer-training-augmentation-design.md#103-extended-implementation-comparison).
 - Follow-up issue: run a seed-replicate comparison (at minimum 3 seeds) to
   separate augmentation effect from seed noise on the seven metrics and the
   rotation summaries. See

@@ -194,7 +194,7 @@ otuformer pretrain \
 | `--local-crop-size` | 局部裁剪分辨率（必须能被骨干网络 patch size 整除，patch-14 模型如 98 或 112） | 96 |
 | `--local-crops` | 局部裁剪数量 | 6 |
 | `--augmentation` | 预训练数据增强配置：`global-barcode`（新运行默认）、`color-robust` 或 `legacy`；`--resume` 时省略则继承已保存配置 | `global-barcode` |
-| `--orientation-policy` | 所有全局与局部视图的方向策略（对 `legacy` 无变换效果）：`invariant`（宽角度旋转与翻转）或 `sensitive`（旋转 `[-15°, 15°]`，不做水平翻转）；`--resume` 时省略则继承已保存策略 | `invariant` |
+| `--orientation-policy` | 所有全局与局部视图的方向策略（对 `legacy` 无变换效果）：`sensitive`（新运行默认；旋转 `[-15°, 15°]`，不做水平翻转）或 `invariant`（可选加入的宽角度旋转与翻转）；`--resume` 时省略则继承已保存策略 | `sensitive` |
 | `--mask-ratio` | 掩码 token 比例 | 0.5 |
 | `--lambda-local` | 局部裁剪损失权重 | 1.5 |
 | `--lambda-mask` | 掩码 token 损失权重 | 1.0 |
@@ -292,7 +292,7 @@ otuformer finetune \
 | `--freeze-ratio` | 冻结骨干网络比例（0.0=不冻结，1.0=全冻结） | 0.7 |
 | `--loss` | 度量学习损失名称 | `arcface` |
 | `--augmentation` | 微调数据增强配置：`none`（新运行默认）或 `conservative`（实验性）；`--resume` 时省略则继承已保存配置 | `none` |
-| `--orientation-policy` | 方向策略：`invariant` 或 `sensitive`；仅影响 `conservative`。`--checkpoint` 初始化时省略则继承预训练 checkpoint 的策略；`--resume` 时省略则继承已保存策略 | `invariant` |
+| `--orientation-policy` | 方向策略：`sensitive`（新运行默认）或 `invariant`；仅影响 `conservative`。`--checkpoint` 初始化时省略则继承预训练 checkpoint 的策略；`--resume` 时省略则继承已保存策略 | `sensitive` |
 | `--batch-size` | 批量大小 | 32 |
 | `--num-workers` | DataLoader 工作线程数 | 4 |
 | `--cpus` | PyTorch/MKL CPU 线程数 | 12 |
@@ -320,11 +320,11 @@ otuformer finetune \
 
 ### 训练数据增强配置
 
-`pretrain` 支持 `--augmentation global-barcode|color-robust|legacy`（新运行默认 `global-barcode`）与 `--orientation-policy invariant|sensitive`（新运行默认 `invariant`）。`finetune` 支持 `--augmentation none|conservative`（新运行默认 `none`）以及相同的方向策略。
+`pretrain` 支持 `--augmentation global-barcode|color-robust|legacy`（新运行默认 `global-barcode`）与 `--orientation-policy invariant|sensitive`（新运行默认 `sensitive`）。`finetune` 支持 `--augmentation none|conservative`（新运行默认 `none`）以及相同的方向策略。
 
 | Profile | 阶段 | 说明 |
 |---------|------|------|
-| `global-barcode` | pretrain（默认） | 方向无关的整标本条形码：大范围平面内旋转、水平翻转与温和的光度扰动；保留颜色（不做灰度化）。 |
+| `global-barcode` | pretrain（默认） | 方向无关的整标本条形码：温和的光度扰动；保留颜色（不做灰度化）。几何变换取决于所选方向策略。 |
 | `color-robust` | pretrain | 几何与模糊设置与 `global-barcode` 相同，但颜色扰动更强并启用灰度化。**警告**：可能降低模型对诊断性体色、色斑或金属光泽的敏感度。 |
 | `legacy` | pretrain | 完全复现 OTU-Former 0.2.1 的数据增强，仅用于旧运行的续训与对比，不建议用于新运行。它会记录所选的任一方向策略，但不改变其历史变换。 |
 | `none` | finetune（默认） | 保持原有的确定性 `Resize -> CenterCrop -> ToTensor -> Normalize`。 |
@@ -332,11 +332,11 @@ otuformer finetune \
 
 **生物学约定。** 背面、腹面、侧面、整体以及解剖部位图像属于不同的标记，不得作为同一个标记的等价视图混用；支持任意平面内朝向。完整标记的要求针对源图像，而不是每一个随机 SSL 裁剪视图。全局与局部裁剪都是同一完整源标记的部分 SSL 观测，因此数据增强有助于提高嵌入一致性，但并不保证嵌入不变性。
 
-**方向策略。** `sensitive` 由调用者显式选择（程序不会自动推断），用于方向敏感标记：预训练的每个全局/局部视图以及微调 `conservative` 都使用 `[-15°, 15°]` 旋转且不做水平翻转。`invariant` 保留现有的宽角度旋转与翻转行为。`legacy` 接受任一策略，但保留其历史翻转。
+**方向策略。** `sensitive` 是新运行默认值，也是调用者显式选择的策略（程序不会自动推断），用于方向敏感标记：预训练的每个全局/局部视图以及微调 `conservative` 都使用 `[-15°, 15°]` 旋转且不做水平翻转。之所以采用该默认值，是因为 50 轮实现对比未发现宽角度 `invariant` 旋转带来旋转一致性提升，且 ±180° 旋转并不是合理的常规数据增强。`invariant` 是可选加入的宽角度旋转/翻转策略，用于方向不敏感标记，并保留现有行为。`legacy` 接受任一策略，但保留其历史翻转。
 
 **输入尺寸。** 两种微调配置都使用 checkpoint 记录的训练输入尺寸；对于未记录尺寸的旧 checkpoint，回退到 `224`。
 
-**续训与继承。** 省略 `--augmentation` 和 `--orientation-policy` 时，续训会继承已保存的值；显式冲突会报错，修改某个配置展开后的参数需要开启新运行。旧 pretrain checkpoint 映射为 `legacy`/`invariant`；旧 finetune checkpoint 映射为 `none`/`invariant`。通过 `--checkpoint` 开始新的微调属于初始化而非续训：它不会继承预训练的数据增强配置，省略策略时继承预训练 checkpoint 的策略（旧 checkpoint 回退为 `invariant`）。
+**续训与继承。** 省略 `--augmentation` 和 `--orientation-policy` 时，续训会继承已保存的值；显式冲突会报错，修改某个配置展开后的参数需要开启新运行。旧 pretrain checkpoint 映射为 `legacy`/`invariant`；旧 finetune checkpoint 映射为 `none`/`invariant`。通过 `--checkpoint` 开始新的微调属于初始化而非续训：它不会继承预训练的数据增强配置，省略策略时继承预训练 checkpoint 的策略（旧 checkpoint 回退为 `sensitive`）。
 
 checkpoint 元数据（`config.augmentation_profile`、`config.augmentation_config`）用于配置溯源，并不提供逐位确定性的复现。完整的变换级定义见 [`docs/superpowers/specs/2026-09-07-otuformer-training-augmentation-design.md`](docs/superpowers/specs/2026-09-07-otuformer-training-augmentation-design.md)。
 

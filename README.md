@@ -199,7 +199,7 @@ otuformer pretrain \
 | `--local-crop-size` | Local crop resolution (must be divisible by the backbone patch size, e.g. 98 or 112 for patch-14 models) | 96 |
 | `--local-crops` | Number of local crops | 6 |
 | `--augmentation` | Pretraining augmentation profile: `global-barcode` (new-run default), `color-robust`, or `legacy`; omit to inherit the saved profile on `--resume` | `global-barcode` |
-| `--orientation-policy` | Orientation policy for every global and local view (no transform effect for `legacy`): `invariant` (broad rotation and reflection) or `sensitive` (rotation `[-15°, 15°]`, no horizontal reflection); omit to inherit the saved policy on `--resume` | `invariant` |
+| `--orientation-policy` | Orientation policy for every global and local view (no transform effect for `legacy`): `sensitive` (new-run default; rotation `[-15°, 15°]`, no horizontal reflection) or `invariant` (opt-in broad rotation and reflection); omit to inherit the saved policy on `--resume` | `sensitive` |
 | `--mask-ratio` | Masked token ratio | 0.5 |
 | `--lambda-local` | Local crop loss weight | 1.5 |
 | `--lambda-mask` | Masked token loss weight | 1.0 |
@@ -299,7 +299,7 @@ otuformer finetune \
 | `--freeze-ratio` | Fraction of backbone blocks to freeze (0.0=none, 1.0=all) | 0.7 |
 | `--loss` | Metric-learning loss name | `arcface` |
 | `--augmentation` | Fine-tuning augmentation profile: `none` (new-run default) or `conservative` (experimental); omit to inherit the saved profile on `--resume` | `none` |
-| `--orientation-policy` | Orientation policy: `invariant` or `sensitive`; affects `conservative` only. Omit on `--checkpoint` initialization to inherit the pretraining checkpoint's saved policy; omit on `--resume` to inherit the saved policy | `invariant` |
+| `--orientation-policy` | Orientation policy: `sensitive` (new-run default) or `invariant`; affects `conservative` only. Omit on `--checkpoint` initialization to inherit the pretraining checkpoint's saved policy; omit on `--resume` to inherit the saved policy | `sensitive` |
 | `--batch-size` | Batch size | 32 |
 | `--num-workers` | DataLoader workers | 4 |
 | `--cpus` | PyTorch/MKL CPU threads | 12 |
@@ -327,11 +327,11 @@ otuformer finetune \
 
 ### Training Augmentation Profiles
 
-`pretrain` accepts `--augmentation global-barcode|color-robust|legacy` (new-run default `global-barcode`) and `--orientation-policy invariant|sensitive` (new-run default `invariant`). `finetune` accepts `--augmentation none|conservative` (new-run default `none`) and the same orientation policies.
+`pretrain` accepts `--augmentation global-barcode|color-robust|legacy` (new-run default `global-barcode`) and `--orientation-policy invariant|sensitive` (new-run default `sensitive`). `finetune` accepts `--augmentation none|conservative` (new-run default `none`) and the same orientation policies.
 
 | Profile | Stage | Summary |
 |---------|-------|---------|
-| `global-barcode` | pretrain (default) | Orientation-insensitive whole-specimen barcode: broad in-plane rotation, horizontal reflection, and modest photometric jitter; color is preserved (no grayscale). |
+| `global-barcode` | pretrain (default) | Orientation-insensitive whole-specimen barcode: modest photometric jitter; color is preserved (no grayscale). Geometry follows the selected orientation policy. |
 | `color-robust` | pretrain | Same geometry and blur as `global-barcode` with stronger color jitter and grayscale. **Warning:** it may reduce sensitivity to diagnostic body color, color patterns, or metallic sheen. |
 | `legacy` | pretrain | Reproduces OTU-Former 0.2.1 augmentation exactly for old-run continuation and comparison, not for new runs. It records either orientation policy without changing its historical transforms. |
 | `none` | finetune (default) | Unchanged deterministic `Resize -> CenterCrop -> ToTensor -> Normalize`. |
@@ -339,11 +339,11 @@ otuformer finetune \
 
 **Biological contract.** Dorsal, ventral, lateral, whole-body, and anatomical-part images are distinct markers and must not be mixed as interchangeable views of one marker; arbitrary in-plane orientation is supported. The complete-marker requirement applies to the source image, not to every stochastic SSL crop. Global and local crops are partial SSL observations of one complete source marker, so augmentation encourages but does not guarantee embedding invariance.
 
-**Orientation policy.** `sensitive` is an explicit caller choice (never inferred) for direction-sensitive markers: every global/local pretraining view and fine-tuning `conservative` uses rotation `[-15°, 15°]` and no horizontal reflection. `invariant` preserves the existing broad rotation and reflection behavior. `legacy` accepts either policy but keeps its historical flips.
+**Orientation policy.** `sensitive` is the new-run default and an explicit caller choice (never inferred) for direction-sensitive markers: every global/local pretraining view and fine-tuning `conservative` uses rotation `[-15°, 15°]` and no horizontal reflection. The default was chosen because the 50-epoch implementation comparison found no rotation-consistency gain from broad `invariant` rotation, and ±180° rotation is not a plausible routine augmentation. `invariant` is the opt-in broad-rotation/reflection policy for orientation-insensitive markers and preserves the existing behavior. `legacy` accepts either policy but keeps its historical flips.
 
 **Input size.** Both fine-tuning profiles use the checkpoint-recorded training input size, with a `224` fallback for old checkpoints that do not record one.
 
-**Resume and inheritance.** Omitted `--augmentation` and `--orientation-policy` inherit on resume; explicit conflicts fail, and changing a profile's expanded parameters requires a new run. Old pretrain checkpoints map to `legacy`/`invariant`; old finetune checkpoints map to `none`/`invariant`. Starting a new fine-tuning run from `--checkpoint` is initialization, not resume: it never inherits the pretraining augmentation profile, and an omitted policy inherits the pretraining checkpoint policy (fallback `invariant` for old checkpoints).
+**Resume and inheritance.** Omitted `--augmentation` and `--orientation-policy` inherit on resume; explicit conflicts fail, and changing a profile's expanded parameters requires a new run. Old pretrain checkpoints map to `legacy`/`invariant`; old finetune checkpoints map to `none`/`invariant`. Starting a new fine-tuning run from `--checkpoint` is initialization, not resume: it never inherits the pretraining augmentation profile, and an omitted policy inherits the pretraining checkpoint policy (fallback `sensitive` for old checkpoints).
 
 Checkpoint metadata (`config.augmentation_profile`, `config.augmentation_config`) provides configuration traceability, not bitwise deterministic replay. Full transform-level definitions are in [`docs/superpowers/specs/2026-09-07-otuformer-training-augmentation-design.md`](docs/superpowers/specs/2026-09-07-otuformer-training-augmentation-design.md).
 
