@@ -28,7 +28,9 @@ from otuformer.embedding.evaluator import (
     run_umap,
 )
 from otuformer.training.dataset import (
+    FINETUNE_AUGMENTATIONS,
     ORIENTATION_POLICIES,
+    PRETRAIN_AUGMENTATIONS,
     MetricDataset,
     MultiCropDataset,
     _build_recursive_index,
@@ -957,7 +959,10 @@ def _checkpoint_augmentation_metadata(
     """Return ``(profile, expanded_config)`` or ``None`` for absent/old metadata.
 
     A checkpoint is old only when both augmentation keys are absent from its
-    ``config`` dict. Any other malformed combination raises ``ValueError``.
+    ``config`` dict. Any other malformed combination raises ``ValueError``: the
+    top-level ``augmentation_profile`` must match the self-contained
+    ``augmentation_config['profile']``, and the saved orientation policy must be
+    a known policy.
     """
     if checkpoint is None:
         return None
@@ -982,6 +987,24 @@ def _checkpoint_augmentation_metadata(
     if not isinstance(config, dict):
         raise ValueError(
             "malformed augmentation metadata: 'augmentation_config' must be a dict."
+        )
+    nested_profile = config.get("profile")
+    if not isinstance(nested_profile, str):
+        raise ValueError(
+            "malformed augmentation metadata: 'augmentation_config.profile' must "
+            "be a string."
+        )
+    if nested_profile != profile:
+        raise ValueError(
+            "malformed augmentation metadata: 'augmentation_profile' "
+            f"({profile!r}) does not match 'augmentation_config.profile' "
+            f"({nested_profile!r})."
+        )
+    if config.get("orientation_policy") not in ORIENTATION_POLICIES:
+        raise ValueError(
+            "malformed augmentation metadata: "
+            "'augmentation_config.orientation_policy' must be one of: "
+            f"{', '.join(ORIENTATION_POLICIES)}."
         )
     return profile, config
 
@@ -1015,6 +1038,14 @@ def _select_augmentation_profile(
             "augmentation settings."
         )
     saved_profile, _ = metadata
+    allowed_profiles = (
+        PRETRAIN_AUGMENTATIONS if stage == "pretrain" else FINETUNE_AUGMENTATIONS
+    )
+    if saved_profile not in allowed_profiles:
+        raise ValueError(
+            f"Checkpoint augmentation profile '{saved_profile}' is not valid for "
+            f"{stage}; choose from: {', '.join(allowed_profiles)}."
+        )
     if requested_profile is None or requested_profile == saved_profile:
         return saved_profile
     raise ValueError(
@@ -1059,12 +1090,7 @@ def _select_orientation_policy(
         # an explicit policy is honored, otherwise fall back to sensitive.
         return requested_policy if requested_policy is not None else "sensitive"
     _, saved_config = metadata
-    saved_policy = saved_config.get("orientation_policy")
-    if not isinstance(saved_policy, str):
-        raise ValueError(
-            "malformed augmentation metadata: 'augmentation_config.orientation_policy' "
-            "must be a string."
-        )
+    saved_policy = saved_config["orientation_policy"]
     if stage == "pretrain" or resume:
         if requested_policy is None or requested_policy == saved_policy:
             return saved_policy

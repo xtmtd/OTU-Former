@@ -257,7 +257,7 @@ def build_finetune_augmentation_config(
         horizontal_flip_probability = 0.5
 
     return {
-        "profile": "conservative",
+        "profile": profile,
         "orientation_policy": orientation_policy,
         "image_size": int(image_size),
         "transform_order": list(_FINETUNE_CONSERVATIVE_TRANSFORM_ORDER),

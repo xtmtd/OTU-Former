@@ -963,6 +963,42 @@ def test_new_style_pretrain_checkpoint_finetune_initialization_inherits_policy_o
             }
         },
         {"config": {"augmentation_profile": "legacy", "augmentation_config": ["nope"]}},
+        # top-level profile disagrees with the self-contained nested profile
+        {
+            "config": {
+                "augmentation_profile": "legacy",
+                "augmentation_config": build_pretrain_augmentation_config(
+                    "global-barcode", 224, 96, 6
+                ),
+            }
+        },
+        # nested config omits its self-contained profile
+        {
+            "config": {
+                "augmentation_profile": "legacy",
+                "augmentation_config": {"orientation_policy": "invariant"},
+            }
+        },
+        # saved orientation policy is not a known policy
+        {
+            "config": {
+                "augmentation_profile": "legacy",
+                "augmentation_config": {
+                    "profile": "legacy",
+                    "orientation_policy": "bogus",
+                },
+            }
+        },
+        # saved orientation policy is missing / not a string
+        {
+            "config": {
+                "augmentation_profile": "legacy",
+                "augmentation_config": {
+                    "profile": "legacy",
+                    "orientation_policy": None,
+                },
+            }
+        },
     ],
 )
 def test_malformed_augmentation_metadata(checkpoint):
@@ -979,6 +1015,28 @@ def test_malformed_augmentation_metadata(checkpoint):
             checkpoint,
             stage="pretrain",
         )
+
+
+def test_saved_profile_must_match_stage():
+    pretrain_style = {
+        "config": {
+            "augmentation_profile": "global-barcode",
+            "augmentation_config": build_pretrain_augmentation_config(
+                "global-barcode", 224, 96, 6
+            ),
+        }
+    }
+    finetune_style = {
+        "config": {
+            "augmentation_profile": "none",
+            "augmentation_config": build_finetune_augmentation_config("none", 224),
+        }
+    }
+
+    with pytest.raises(ValueError, match="not valid for finetune"):
+        trainer._select_augmentation_profile(None, pretrain_style, stage="finetune")
+    with pytest.raises(ValueError, match="not valid for pretrain"):
+        trainer._select_augmentation_profile(None, finetune_style, stage="pretrain")
 
 
 @pytest.mark.parametrize("stage", ["other", "pretraining", ""])
