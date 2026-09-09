@@ -680,7 +680,7 @@ Do not duplicate transform strengths in Python help text. Help must concisely st
 - marker-view rule: dorsal/ventral/lateral/anatomical-part images are distinct markers, while arbitrary in-plane orientation is supported;
 - `color-robust` can suppress diagnostic color/pattern/metallic sheen;
 - `conservative` is experimental;
-- `orientation-policy=sensitive` is the explicit path for direction-sensitive markers: every new pretraining view and fine-tuning `conservative` view has no horizontal flip and only `[-15°, 15°]` rotation;
+- `orientation-policy=sensitive` is the caller-selected (never inferred) policy and the new-run default for direction-sensitive markers: every new pretraining view and fine-tuning `conservative` view has no horizontal flip and only `[-15°, 15°]` rotation;
 - `legacy` reproduces 0.2.1; it records either policy without changing its historical transforms, but an omitted policy can still be inherited by a new fine-tuning `conservative` run from that checkpoint;
 - omitted values inherit on resume, conflicts fail, and parameter changes require a new run;
 - augmentation encourages but does not guarantee invariance;

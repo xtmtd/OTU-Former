@@ -110,7 +110,7 @@ finetune: none (default), conservative
 orientation-policy: sensitive (default for new runs), invariant
 ```
 
-- `global-barcode` is the default orientation-insensitive whole-specimen barcode: modest photometric jitter; color is preserved (no grayscale). Its geometry follows the selected orientation policy (`sensitive` by default, `invariant` opt-in).
+- `global-barcode` is the default whole-specimen barcode profile: modest photometric jitter; color is preserved (no grayscale). Its geometry follows the selected orientation policy (`sensitive` by default, `invariant` opt-in).
 - `color-robust` uses the same geometry and blur as `global-barcode` with stronger color jitter and grayscale; it may reduce sensitivity to diagnostic body color, color patterns, or metallic sheen.
 - `legacy` reproduces OTU-Former 0.2.1 augmentation exactly for old-run continuation and comparison, not new runs; it records either orientation policy without changing its historical transforms.
 - `none` is the unchanged deterministic fine-tuning default: `Resize -> CenterCrop -> ToTensor -> Normalize`.

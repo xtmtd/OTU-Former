@@ -373,7 +373,7 @@ No new CLI flags are added for individual transform strengths. Existing crop siz
 - the requirement not to mix dorsal, ventral, lateral, and anatomical-part markers;
 - the color-information risk of `color-robust`;
 - the experimental status of finetune `conservative`;
-- that `sensitive` is an explicit caller-selected policy rather than automatic biological inference;
+- that `sensitive` is the caller-selected (never inferred) policy and the new-run default;
 - the purpose of `legacy`, including that it records either orientation policy without changing its historical transforms while that recorded policy can be inherited by a new fine-tuning `conservative` run;
 - resume inheritance and conflict behavior;
 - that changing a profile's expanded parameters constitutes a new training run rather than a resumable continuation;
