@@ -2039,6 +2039,50 @@ def test_training_help_documents_augmentation_contract(command, profiles, defaul
     assert "does not guarantee" in output
 
 
+def test_augmentation_completion_choices_match_dataset_constants():
+    from otuformer.cli import (
+        _FINETUNE_AUGMENTATION_CHOICES,
+        _ORIENTATION_POLICY_CHOICES,
+        _PRETRAIN_AUGMENTATION_CHOICES,
+    )
+    from otuformer.training.dataset import (
+        FINETUNE_AUGMENTATIONS,
+        ORIENTATION_POLICIES,
+        PRETRAIN_AUGMENTATIONS,
+    )
+
+    assert _PRETRAIN_AUGMENTATION_CHOICES == PRETRAIN_AUGMENTATIONS
+    assert _FINETUNE_AUGMENTATION_CHOICES == FINETUNE_AUGMENTATIONS
+    assert _ORIENTATION_POLICY_CHOICES == ORIENTATION_POLICIES
+
+
+def test_shell_completion_suggests_augmentation_values():
+    from click.shell_completion import ShellComplete
+    from typer.main import get_command
+
+    complete = ShellComplete(
+        get_command(app), {}, "otuformer", "_OTUFORMER_COMPLETE"
+    ).get_completions
+
+    def values(args):
+        return [item.value for item in complete(args, "")]
+
+    assert values(["pretrain", "--augmentation"]) == [
+        "global-barcode",
+        "color-robust",
+        "legacy",
+    ]
+    assert values(["finetune", "--augmentation"]) == ["none", "conservative"]
+    assert values(["pretrain", "--orientation-policy"]) == [
+        "invariant",
+        "sensitive",
+    ]
+    assert values(["finetune", "--orientation-policy"]) == [
+        "invariant",
+        "sensitive",
+    ]
+
+
 def test_pretrain_help_warns_about_color_robust_and_legacy():
     output = runner.invoke(app, ["pretrain", "--help"]).output.lower()
     assert "diagnostic" in output

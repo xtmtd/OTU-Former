@@ -17,6 +17,8 @@ from otuformer.cli import (
     _parse_size,
     _validate_augmentation,
     _validate_orientation_policy,
+    finetune_augmentation_choices,
+    orientation_policy_choices,
 )
 
 app = typer.Typer(
@@ -122,6 +124,7 @@ def finetune(
     augmentation: str | None = typer.Option(
         None,
         "--augmentation",
+        autocompletion=finetune_augmentation_choices,
         help=(
             "Augmentation profile: none or conservative. Default for a new "
             "run: none. Omit to inherit the saved profile on --resume. See "
@@ -131,6 +134,7 @@ def finetune(
     orientation_policy: str | None = typer.Option(
         None,
         "--orientation-policy",
+        autocompletion=orientation_policy_choices,
         help=(
             "Orientation policy: invariant or sensitive. Default for a new "
             "run: sensitive. Affects conservative; a no-op for none. Omit on "

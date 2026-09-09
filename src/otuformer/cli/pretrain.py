@@ -17,6 +17,8 @@ from otuformer.cli import (
     _parse_size,
     _validate_augmentation,
     _validate_orientation_policy,
+    orientation_policy_choices,
+    pretrain_augmentation_choices,
 )
 
 app = typer.Typer(
@@ -117,6 +119,7 @@ def pretrain(
     augmentation: str | None = typer.Option(
         None,
         "--augmentation",
+        autocompletion=pretrain_augmentation_choices,
         help=(
             "Augmentation profile: global-barcode, color-robust, or legacy. "
             "Default for a new run: global-barcode. Omit to inherit the saved "
@@ -126,6 +129,7 @@ def pretrain(
     orientation_policy: str | None = typer.Option(
         None,
         "--orientation-policy",
+        autocompletion=orientation_policy_choices,
         help=(
             "Orientation policy for every global and local view: invariant or "
             "sensitive. Default for a new run: sensitive. Omit to inherit the "

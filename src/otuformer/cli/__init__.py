@@ -6,6 +6,28 @@ import typer
 
 SIZE_EXAMPLES = "Common examples: 224, 384, 448 (e.g. 518 for patch-14 models)."
 
+# Shell-completion choices. These duplicate ``otuformer.training.dataset`` so
+# the CLI stays torch-free and Tab completion is instant; a test asserts they
+# stay in sync with the dataset constants.
+_PRETRAIN_AUGMENTATION_CHOICES = ("global-barcode", "color-robust", "legacy")
+_FINETUNE_AUGMENTATION_CHOICES = ("none", "conservative")
+_ORIENTATION_POLICY_CHOICES = ("invariant", "sensitive")
+
+
+def pretrain_augmentation_choices() -> list[str]:
+    """Shell-completion choices for ``pretrain --augmentation``."""
+    return list(_PRETRAIN_AUGMENTATION_CHOICES)
+
+
+def finetune_augmentation_choices() -> list[str]:
+    """Shell-completion choices for ``finetune --augmentation``."""
+    return list(_FINETUNE_AUGMENTATION_CHOICES)
+
+
+def orientation_policy_choices() -> list[str]:
+    """Shell-completion choices for ``--orientation-policy``."""
+    return list(_ORIENTATION_POLICY_CHOICES)
+
 
 def _parse_size(value: str, *, stage: str) -> int | None:
     """Parse ``auto`` or a positive integer size; ``None`` means auto."""
