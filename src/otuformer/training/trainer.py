@@ -1155,7 +1155,6 @@ def _resolve_pretrain_local_views(
 
 def _validate_augmentation_config(
     profile: str,
-    policy: str,
     current_config: dict[str, object],
     checkpoint: dict[str, Any] | None,
     *,
@@ -1247,7 +1246,7 @@ def run_pretrain(args: argparse.Namespace) -> None:
         orientation_policy=policy,
     )
     augmentation_config = _validate_augmentation_config(
-        profile, policy, augmentation_config, resume_ckpt, stage="pretrain"
+        profile, augmentation_config, resume_ckpt, stage="pretrain"
     )
     args.augmentation = profile
     args.orientation_policy = policy
@@ -1625,7 +1624,7 @@ def run_finetune(args: argparse.Namespace) -> None:
         profile, finetune_image_size, orientation_policy=policy
     )
     augmentation_config = _validate_augmentation_config(
-        profile, policy, augmentation_config, resume_ckpt, stage="finetune"
+        profile, augmentation_config, resume_ckpt, stage="finetune"
     )
     args.augmentation = profile
     args.orientation_policy = policy

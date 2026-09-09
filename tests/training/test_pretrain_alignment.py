@@ -687,7 +687,7 @@ def test_new_run_uses_stage_defaults(stage, expected_profile):
     config = _augmentation_config(stage, profile, policy)
     assert (profile, policy) == (expected_profile, "sensitive")
     assert trainer._validate_augmentation_config(
-        profile, policy, config, None, stage=stage
+        profile, config, None, stage=stage
     ) == config
 
 
@@ -707,7 +707,7 @@ def test_old_checkpoint_maps_to_compatible_augmentation(
     config = _augmentation_config(stage, profile, policy)
     assert (profile, policy) == (legacy_profile, expected_policy)
     assert trainer._validate_augmentation_config(
-        profile, policy, config, checkpoint, stage=stage
+        profile, config, checkpoint, stage=stage
     ) == config
 
 
@@ -721,7 +721,7 @@ def test_pretrain_resume_inherits_saved_augmentation():
     assert (profile, policy) == ("global-barcode", "invariant")
     assert (
         trainer._validate_augmentation_config(
-            profile, policy, config, checkpoint, stage="pretrain"
+            profile, config, checkpoint, stage="pretrain"
         )
         == config
     )
@@ -739,7 +739,7 @@ def test_pretrain_resume_accepts_explicit_matching_augmentation():
     assert (profile, policy) == ("color-robust", "sensitive")
     assert (
         trainer._validate_augmentation_config(
-            profile, policy, config, checkpoint, stage="pretrain"
+            profile, config, checkpoint, stage="pretrain"
         )
         == config
     )
@@ -771,7 +771,7 @@ def test_finetune_resume_inherits_and_matches_saved_augmentation():
     assert (profile, policy) == ("conservative", "sensitive")
     assert (
         trainer._validate_augmentation_config(
-            profile, policy, config, checkpoint, stage="finetune"
+            profile, config, checkpoint, stage="finetune"
         )
         == config
     )
@@ -796,13 +796,13 @@ def test_resume_rejects_changed_expanded_configuration():
     changed["color_jitter"]["brightness"] = 0.9
     with pytest.raises(ValueError, match="configuration differs"):
         trainer._validate_augmentation_config(
-            "global-barcode", "invariant", changed, checkpoint, stage="pretrain"
+            "global-barcode", changed, checkpoint, stage="pretrain"
         )
     changed_policy = json.loads(json.dumps(saved))
     changed_policy["orientation_policy"] = "sensitive"
     with pytest.raises(ValueError, match="configuration differs"):
         trainer._validate_augmentation_config(
-            "global-barcode", "sensitive", changed_policy, checkpoint, stage="pretrain"
+            "global-barcode", changed_policy, checkpoint, stage="pretrain"
         )
 
 
@@ -975,7 +975,6 @@ def test_malformed_augmentation_metadata(checkpoint):
     with pytest.raises(ValueError, match="malformed augmentation metadata"):
         trainer._validate_augmentation_config(
             "legacy",
-            "invariant",
             _augmentation_config("pretrain", "legacy", "invariant"),
             checkpoint,
             stage="pretrain",
@@ -991,7 +990,6 @@ def test_unsupported_stage_raises(stage):
     with pytest.raises(ValueError, match="Unsupported augmentation stage"):
         trainer._validate_augmentation_config(
             "none",
-            "invariant",
             _augmentation_config("finetune", "none", "invariant"),
             None,
             stage=stage,

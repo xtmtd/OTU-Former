@@ -48,11 +48,11 @@ The resolution-consistency implementation in this file is already complete. This
 - Produces: `PRETRAIN_AUGMENTATIONS: tuple[str, ...] = ("global-barcode", "color-robust", "legacy")`.
 - Produces: `FINETUNE_AUGMENTATIONS: tuple[str, ...] = ("none", "conservative")`.
 - Produces: `ORIENTATION_POLICIES: tuple[str, ...] = ("invariant", "sensitive")`.
-- Produces: `build_pretrain_augmentation_config(profile: str, global_crop_size: int, local_crop_size: int, local_crops: int, orientation_policy: str = "invariant") -> dict[str, object]`.
-- Produces: `build_finetune_augmentation_config(profile: str, image_size: int, orientation_policy: str = "invariant") -> dict[str, object]`; `image_size` is supplied by the existing resolution-consistency flow and recorded for auditability.
+- Produces: `build_pretrain_augmentation_config(profile: str, global_crop_size: int, local_crop_size: int, local_crops: int, orientation_policy: str = "sensitive") -> dict[str, object]`.
+- Produces: `build_finetune_augmentation_config(profile: str, image_size: int, orientation_policy: str = "sensitive") -> dict[str, object]`; `image_size` is supplied by the existing resolution-consistency flow and recorded for auditability.
 - Reuses: `_estimate_background_color(image: Image.Image) -> tuple[int, int, int]` already implemented by resolution consistency; no new helper is produced.
-- Changes: `MultiCropDataset(..., augmentation_profile: str = "global-barcode", orientation_policy: str = "invariant")` and exposes `augmentation_profile`, `orientation_policy`, plus `augmentation_config` attributes.
-- Changes: `MetricDataset(..., image_size: int, augmentation_profile: str = "none", orientation_policy: str = "invariant")` and exposes `augmentation_profile`, `orientation_policy`, plus `augmentation_config` attributes; both profiles honor the supplied `image_size`.
+- Changes: `MultiCropDataset(..., augmentation_profile: str = "global-barcode", orientation_policy: str = "sensitive")` and exposes `augmentation_profile`, `orientation_policy`, plus `augmentation_config` attributes.
+- Changes: `MetricDataset(..., image_size: int, augmentation_profile: str = "none", orientation_policy: str = "sensitive")` and exposes `augmentation_profile`, `orientation_policy`, plus `augmentation_config` attributes; both profiles honor the supplied `image_size`.
 - Consumes later: Task 2 imports both configuration builders and passes resolved profile/policy values to these datasets; Task 3 uses the allowed profile and orientation-policy values for CLI validation.
 
 - [ ] **Step 1: Add profile configuration tests**
@@ -80,8 +80,12 @@ def test_augmentation_profile_names_are_fixed():
 
 
 def test_pretrain_profile_configs_are_fully_expanded():
-    barcode = build_pretrain_augmentation_config("global-barcode", 224, 96, 6)
-    robust = build_pretrain_augmentation_config("color-robust", 224, 96, 6)
+    barcode = build_pretrain_augmentation_config(
+        "global-barcode", 224, 96, 6, orientation_policy="invariant"
+    )
+    robust = build_pretrain_augmentation_config(
+        "color-robust", 224, 96, 6, orientation_policy="invariant"
+    )
     sensitive = build_pretrain_augmentation_config(
         "global-barcode", 224, 96, 6, orientation_policy="sensitive"
     )
@@ -396,7 +400,7 @@ def test_new_run_uses_stage_defaults(stage, expected_profile):
     profile = trainer._select_augmentation_profile(None, None, stage=stage)
     policy = trainer._select_orientation_policy(None, None, stage=stage)
     config = _augmentation_config(stage, profile, policy)
-    assert (profile, policy) == (expected_profile, "invariant")
+    assert (profile, policy) == (expected_profile, "sensitive")
     assert trainer._validate_augmentation_config(
         profile, policy, config, None, stage=stage
     ) == config
@@ -425,7 +429,7 @@ Also assert:
 
 - omitted profile and orientation policy inherit a checkpoint's profile/policy/config when resuming; for new fine-tuning initialized from `--checkpoint`, omitted orientation policy inherits the pretraining checkpoint when present, while the augmentation profile remains independently defaulted to `none`;
 - when a pre-augmentation pretraining checkpoint is used with `--checkpoint`, omitted or explicit `--orientation-policy invariant` resolves to `invariant`; explicit `sensitive` is honored for the new fine-tuning run; explicit `--augmentation conservative` initializes successfully without inheriting the pretraining profile;
-- new runs with omitted orientation policy resolve to `invariant`; explicit `sensitive` is preserved;
+- new runs with omitted orientation policy resolve to `sensitive`; explicit `sensitive` is preserved;
 - explicitly matching profile/policy/config succeeds;
 - explicit `sensitive` is accepted for a new `legacy` run and recorded, but cannot change its transform;
 - an explicit different profile raises `ValueError` containing `Cannot resume` and `new run`;
@@ -455,8 +459,8 @@ Expected: failures because the augmentation profile/policy resolution and valida
 Add the augmentation selection, local-view resolution, and config-validation helpers near the existing resume helpers. Reuse the existing resolution-consistency size resolver rather than creating a local copy. The augmentation helpers' combined behavior must be:
 
 ```text
-new pretrain + omitted profile/policy -> global-barcode/invariant/current config
-new finetune + omitted profile/policy -> none/invariant/current config
+new pretrain + omitted profile/policy -> global-barcode/sensitive/current config
+new finetune + omitted profile/policy -> none/sensitive/current config
 old pretrain resume                  -> legacy/invariant/current legacy config
 old finetune resume                  -> none/invariant/current none config
 new finetune from --checkpoint        -> none/saved-pretrain-policy/current config

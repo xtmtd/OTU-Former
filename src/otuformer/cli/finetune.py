@@ -34,6 +34,7 @@ app = typer.Typer(
         "  conservative is experimental.\n"
         "  --orientation-policy: invariant or sensitive.\n"
         "  default for a new run: sensitive.\n"
+        "  invariant (opt-in): full rotation and horizontal reflection.\n"
         "\n"
         "  Dorsal, ventral, and lateral images are distinct markers, as are\n"
         "  anatomical-part views; arbitrary in-plane orientation is supported.\n"
@@ -43,8 +44,7 @@ app = typer.Typer(
         "  orientation-policy is a no-op for augmentation=none; an omitted\n"
         "  initialization inherits the pretraining checkpoint policy.\n"
         "  Augmentation encourages but does not guarantee invariance.\n"
-        "  sensitive is the explicit, caller-selected path for direction-sensitive\n"
-        "  markers; it is not inferred from the image or taxon.\n"
+        "  sensitive is not inferred automatically from the image or taxon.\n"
         "  Omitted values inherit on resume; conflicting explicit values fail, and\n"
         "  parameter changes require a new run.\n"
     )
