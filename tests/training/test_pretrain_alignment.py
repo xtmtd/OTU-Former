@@ -1,4 +1,5 @@
 import argparse
+import json
 
 import numpy as np
 import pandas as pd
@@ -7,6 +8,10 @@ import torch
 from PIL import Image
 
 from otuformer.training import trainer
+from otuformer.training.dataset import (
+    build_finetune_augmentation_config,
+    build_pretrain_augmentation_config,
+)
 from otuformer.utils.size import (
     resolve_training_image_size,
     validate_input_size,
@@ -569,5 +574,617 @@ def test_finetune_resolves_and_persists_checkpoint_size(tmp_path):
         weights_only=False,
     )
     assert saved["config"]["image_size"] == 32
+    assert saved["config"]["augmentation_profile"] == "none"
+    assert saved["config"]["augmentation_config"]["image_size"] == 32
+    assert saved["config"]["augmentation_config"]["orientation_policy"] == "invariant"
+    assert "orientation_policy" not in saved["config"]
     # and a finetune checkpoint resolves back to 32 (not 224)
     assert resolve_training_image_size(saved) == 32
+
+
+# --- Augmentation continuity ---------------------------------------------------------
+
+
+class _DatasetConstructionReached(Exception):
+    """Raised by fake datasets to stop a trainer before the DataLoader runs."""
+
+
+def _augmentation_config(
+    stage,
+    profile,
+    policy,
+    *,
+    global_crop_size=224,
+    local_crop_size=96,
+    local_crops=6,
+    image_size=224,
+):
+    if stage == "pretrain":
+        return build_pretrain_augmentation_config(
+            profile,
+            global_crop_size,
+            local_crop_size,
+            local_crops,
+            orientation_policy=policy,
+        )
+    return build_finetune_augmentation_config(
+        profile, image_size, orientation_policy=policy
+    )
+
+
+def _augmented_checkpoint(stage, profile, policy, **kwargs):
+    config = _augmentation_config(stage, profile, policy, **kwargs)
+    return {
+        "config": {
+            "model_name": "vit_tiny_patch16_224",
+            "augmentation_profile": profile,
+            "augmentation_config": config,
+        }
+    }
+
+
+def _write_pretrain_checkpoint(
+    path,
+    *,
+    image_size=32,
+    config_extra=None,
+    args_extra=None,
+    model_name="vit_tiny_patch16_224",
+    out_dim=16,
+):
+    from otuformer.training.model import OTUFormerEncoder
+
+    encoder = OTUFormerEncoder(
+        model_name=model_name,
+        out_dim=out_dim,
+        pretrained=False,
+        img_size=image_size,
+    )
+    config = {"model_name": model_name, "out_dim": out_dim}
+    if config_extra:
+        config.update(config_extra)
+    args = {"global_crop_size": image_size}
+    if args_extra:
+        args.update(args_extra)
+    torch.save(
+        {"model_state_dict": encoder.state_dict(), "config": config, "args": args},
+        path,
+    )
+    return path
+
+
+def _finetune_args(tmp_path, checkpoint_path, **overrides):
+    values = dict(
+        seed=42,
+        cpus=0,
+        device="cpu",
+        out_dir=str(tmp_path / "ft_out"),
+        checkpoint=str(checkpoint_path),
+        resume="",
+        train_data="labels.csv",
+        input_images_dir=str(tmp_path),
+        model_name="vit_tiny_patch16_224",
+        metric_embed_dim=16,
+        freeze_ratio=0.7,
+        extract_size=None,
+        compute_embedding_metrics=False,
+        augmentation=None,
+        orientation_policy=None,
+    )
+    values.update(overrides)
+    return argparse.Namespace(**values)
+
+
+@pytest.mark.parametrize(
+    ("stage", "expected_profile"),
+    [("pretrain", "global-barcode"), ("finetune", "none")],
+)
+def test_new_run_uses_stage_defaults(stage, expected_profile):
+    profile = trainer._select_augmentation_profile(None, None, stage=stage)
+    policy = trainer._select_orientation_policy(None, None, stage=stage)
+    config = _augmentation_config(stage, profile, policy)
+    assert (profile, policy) == (expected_profile, "invariant")
+    assert trainer._validate_augmentation_config(
+        profile, policy, config, None, stage=stage
+    ) == config
+
+
+@pytest.mark.parametrize(
+    ("stage", "legacy_profile"),
+    [("pretrain", "legacy"), ("finetune", "none")],
+)
+def test_old_checkpoint_maps_to_compatible_augmentation(stage, legacy_profile):
+    checkpoint = {"config": {"model_name": "vit_tiny_patch16_224"}}
+    profile = trainer._select_augmentation_profile(None, checkpoint, stage=stage)
+    policy = trainer._select_orientation_policy(None, checkpoint, stage=stage)
+    config = _augmentation_config(stage, profile, policy)
+    assert (profile, policy) == (legacy_profile, "invariant")
+    assert trainer._validate_augmentation_config(
+        profile, policy, config, checkpoint, stage=stage
+    ) == config
+
+
+def test_pretrain_resume_inherits_saved_augmentation():
+    checkpoint = _augmented_checkpoint("pretrain", "global-barcode", "invariant")
+    profile = trainer._select_augmentation_profile(None, checkpoint, stage="pretrain")
+    policy = trainer._select_orientation_policy(
+        None, checkpoint, stage="pretrain", resume=True
+    )
+    config = _augmentation_config("pretrain", profile, policy)
+    assert (profile, policy) == ("global-barcode", "invariant")
+    assert (
+        trainer._validate_augmentation_config(
+            profile, policy, config, checkpoint, stage="pretrain"
+        )
+        == config
+    )
+
+
+def test_pretrain_resume_accepts_explicit_matching_augmentation():
+    checkpoint = _augmented_checkpoint("pretrain", "color-robust", "sensitive")
+    profile = trainer._select_augmentation_profile(
+        "color-robust", checkpoint, stage="pretrain"
+    )
+    policy = trainer._select_orientation_policy(
+        "sensitive", checkpoint, stage="pretrain", resume=True
+    )
+    config = _augmentation_config("pretrain", profile, policy)
+    assert (profile, policy) == ("color-robust", "sensitive")
+    assert (
+        trainer._validate_augmentation_config(
+            profile, policy, config, checkpoint, stage="pretrain"
+        )
+        == config
+    )
+
+
+def test_pretrain_resume_rejects_different_profile_and_policy():
+    checkpoint = _augmented_checkpoint("pretrain", "global-barcode", "invariant")
+    with pytest.raises(ValueError, match="Cannot resume") as excinfo:
+        trainer._select_augmentation_profile(
+            "color-robust", checkpoint, stage="pretrain"
+        )
+    assert "new run" in str(excinfo.value)
+    with pytest.raises(ValueError, match="Cannot resume") as excinfo:
+        trainer._select_orientation_policy(
+            "sensitive", checkpoint, stage="pretrain", resume=True
+        )
+    assert "new run" in str(excinfo.value)
+
+
+def test_finetune_resume_inherits_and_matches_saved_augmentation():
+    checkpoint = _augmented_checkpoint(
+        "finetune", "conservative", "sensitive", image_size=224
+    )
+    profile = trainer._select_augmentation_profile(None, checkpoint, stage="finetune")
+    policy = trainer._select_orientation_policy(
+        None, checkpoint, stage="finetune", resume=True
+    )
+    config = _augmentation_config("finetune", profile, policy, image_size=224)
+    assert (profile, policy) == ("conservative", "sensitive")
+    assert (
+        trainer._validate_augmentation_config(
+            profile, policy, config, checkpoint, stage="finetune"
+        )
+        == config
+    )
+    assert (
+        trainer._select_augmentation_profile(
+            "conservative", checkpoint, stage="finetune"
+        )
+        == "conservative"
+    )
+    assert (
+        trainer._select_orientation_policy(
+            "sensitive", checkpoint, stage="finetune", resume=True
+        )
+        == "sensitive"
+    )
+
+
+def test_resume_rejects_changed_expanded_configuration():
+    checkpoint = _augmented_checkpoint("pretrain", "global-barcode", "invariant")
+    saved = checkpoint["config"]["augmentation_config"]
+    changed = json.loads(json.dumps(saved))
+    changed["color_jitter"]["brightness"] = 0.9
+    with pytest.raises(ValueError, match="configuration differs"):
+        trainer._validate_augmentation_config(
+            "global-barcode", "invariant", changed, checkpoint, stage="pretrain"
+        )
+    changed_policy = json.loads(json.dumps(saved))
+    changed_policy["orientation_policy"] = "sensitive"
+    with pytest.raises(ValueError, match="configuration differs"):
+        trainer._validate_augmentation_config(
+            "global-barcode", "sensitive", changed_policy, checkpoint, stage="pretrain"
+        )
+
+
+def test_new_run_orientation_policy_defaults_and_override():
+    assert (
+        trainer._select_orientation_policy(None, None, stage="pretrain")
+        == "invariant"
+    )
+    assert (
+        trainer._select_orientation_policy("sensitive", None, stage="pretrain")
+        == "sensitive"
+    )
+    assert (
+        trainer._select_orientation_policy(None, None, stage="finetune")
+        == "invariant"
+    )
+    assert (
+        trainer._select_orientation_policy("sensitive", None, stage="finetune")
+        == "sensitive"
+    )
+
+
+def test_new_legacy_run_records_explicit_sensitive_without_changing_transform():
+    profile = trainer._select_augmentation_profile("legacy", None, stage="pretrain")
+    policy = trainer._select_orientation_policy("sensitive", None, stage="pretrain")
+    config = _augmentation_config("pretrain", profile, policy)
+    assert (profile, policy) == ("legacy", "sensitive")
+    assert config["orientation_policy"] == "sensitive"
+    assert config["rotation"]["degrees"] == [-180.0, 180.0]
+    assert config["horizontal_flip_probability"] == 0.5
+
+
+def test_old_pretrain_resume_profile_and_policy_compatibility():
+    checkpoint = {"config": {"model_name": "vit_tiny_patch16_224"}}
+    assert (
+        trainer._select_augmentation_profile(None, checkpoint, stage="pretrain")
+        == "legacy"
+    )
+    assert (
+        trainer._select_augmentation_profile("legacy", checkpoint, stage="pretrain")
+        == "legacy"
+    )
+    with pytest.raises(ValueError, match="Cannot resume"):
+        trainer._select_augmentation_profile(
+            "global-barcode", checkpoint, stage="pretrain"
+        )
+    assert (
+        trainer._select_orientation_policy(
+            None, checkpoint, stage="pretrain", resume=True
+        )
+        == "invariant"
+    )
+    assert (
+        trainer._select_orientation_policy(
+            "invariant", checkpoint, stage="pretrain", resume=True
+        )
+        == "invariant"
+    )
+    with pytest.raises(ValueError, match="Cannot resume"):
+        trainer._select_orientation_policy(
+            "sensitive", checkpoint, stage="pretrain", resume=True
+        )
+
+
+def test_old_finetune_resume_compatibility():
+    checkpoint = {"config": {"model_name": "vit_tiny_patch16_224"}}
+    assert (
+        trainer._select_augmentation_profile(None, checkpoint, stage="finetune")
+        == "none"
+    )
+    assert (
+        trainer._select_augmentation_profile("none", checkpoint, stage="finetune")
+        == "none"
+    )
+    with pytest.raises(ValueError, match="Cannot resume"):
+        trainer._select_augmentation_profile(
+            "conservative", checkpoint, stage="finetune"
+        )
+    assert (
+        trainer._select_orientation_policy(
+            None, checkpoint, stage="finetune", resume=True
+        )
+        == "invariant"
+    )
+    assert (
+        trainer._select_orientation_policy(
+            "invariant", checkpoint, stage="finetune", resume=True
+        )
+        == "invariant"
+    )
+    with pytest.raises(ValueError, match="Cannot resume"):
+        trainer._select_orientation_policy(
+            "sensitive", checkpoint, stage="finetune", resume=True
+        )
+
+
+def test_old_pretrain_checkpoint_finetune_initialization():
+    checkpoint = {"config": {"model_name": "vit_tiny_patch16_224"}}
+    assert trainer._select_augmentation_profile(None, None, stage="finetune") == "none"
+    assert (
+        trainer._select_augmentation_profile("conservative", None, stage="finetune")
+        == "conservative"
+    )
+    assert (
+        trainer._select_orientation_policy(
+            None, checkpoint, stage="finetune", resume=False
+        )
+        == "invariant"
+    )
+    assert (
+        trainer._select_orientation_policy(
+            "invariant", checkpoint, stage="finetune", resume=False
+        )
+        == "invariant"
+    )
+    assert (
+        trainer._select_orientation_policy(
+            "sensitive", checkpoint, stage="finetune", resume=False
+        )
+        == "sensitive"
+    )
+
+
+def test_new_style_pretrain_checkpoint_finetune_initialization_inherits_policy_only():
+    checkpoint = _augmented_checkpoint("pretrain", "color-robust", "sensitive")
+    assert trainer._select_augmentation_profile(None, None, stage="finetune") == "none"
+    assert (
+        trainer._select_orientation_policy(
+            None, checkpoint, stage="finetune", resume=False
+        )
+        == "sensitive"
+    )
+    assert (
+        trainer._select_orientation_policy(
+            "invariant", checkpoint, stage="finetune", resume=False
+        )
+        == "invariant"
+    )
+
+
+@pytest.mark.parametrize(
+    "checkpoint",
+    [
+        {"config": {"augmentation_profile": "legacy"}},
+        {"config": {"augmentation_config": {"profile": "legacy"}}},
+        {
+            "config": {
+                "augmentation_profile": 7,
+                "augmentation_config": {"profile": "legacy"},
+            }
+        },
+        {"config": {"augmentation_profile": "legacy", "augmentation_config": ["nope"]}},
+    ],
+)
+def test_malformed_augmentation_metadata(checkpoint):
+    with pytest.raises(ValueError, match="malformed augmentation metadata"):
+        trainer._select_augmentation_profile(None, checkpoint, stage="pretrain")
+    with pytest.raises(ValueError, match="malformed augmentation metadata"):
+        trainer._select_orientation_policy(
+            None, checkpoint, stage="pretrain", resume=True
+        )
+    with pytest.raises(ValueError, match="malformed augmentation metadata"):
+        trainer._validate_augmentation_config(
+            "legacy",
+            "invariant",
+            _augmentation_config("pretrain", "legacy", "invariant"),
+            checkpoint,
+            stage="pretrain",
+        )
+
+
+@pytest.mark.parametrize("stage", ["other", "pretraining", ""])
+def test_unsupported_stage_raises(stage):
+    with pytest.raises(ValueError, match="Unsupported augmentation stage"):
+        trainer._select_augmentation_profile(None, None, stage=stage)
+    with pytest.raises(ValueError, match="Unsupported augmentation stage"):
+        trainer._select_orientation_policy(None, None, stage=stage)
+    with pytest.raises(ValueError, match="Unsupported augmentation stage"):
+        trainer._validate_augmentation_config(
+            "none",
+            "invariant",
+            _augmentation_config("finetune", "none", "invariant"),
+            None,
+            stage=stage,
+        )
+
+
+def test_pretrain_local_views_new_run_defaults_and_validation():
+    assert trainer._resolve_pretrain_local_views(None, None, None) == (96, 6)
+    assert trainer._resolve_pretrain_local_views(128, 4, None) == (128, 4)
+    assert trainer._resolve_pretrain_local_views(128, 0, None) == (128, 0)
+    for bad_size in (0, -1, True, 1.5, "96"):
+        with pytest.raises(ValueError):
+            trainer._resolve_pretrain_local_views(bad_size, None, None)
+    for bad_crops in (-1, False, 1.5, "6"):
+        with pytest.raises(ValueError):
+            trainer._resolve_pretrain_local_views(None, bad_crops, None)
+
+
+def test_pretrain_resume_inherits_saved_local_views():
+    checkpoint = _augmented_checkpoint(
+        "pretrain",
+        "global-barcode",
+        "invariant",
+        local_crop_size=128,
+        local_crops=4,
+    )
+    assert trainer._resolve_pretrain_local_views(None, None, checkpoint) == (128, 4)
+    assert trainer._resolve_pretrain_local_views(128, 4, checkpoint) == (128, 4)
+    with pytest.raises(ValueError, match="Cannot resume"):
+        trainer._resolve_pretrain_local_views(96, None, checkpoint)
+    with pytest.raises(ValueError, match="Cannot resume"):
+        trainer._resolve_pretrain_local_views(None, 6, checkpoint)
+
+
+def test_old_pretrain_local_views_inherit_and_fallback():
+    checkpoint = {
+        "config": {"model_name": "vit_tiny_patch16_224"},
+        "args": {"local_crop_size": 128, "local_crops": 0},
+    }
+    assert trainer._resolve_pretrain_local_views(None, None, checkpoint) == (128, 0)
+    assert trainer._resolve_pretrain_local_views(128, 0, checkpoint) == (128, 0)
+
+    missing = {"config": {"model_name": "vit_tiny_patch16_224"}, "args": {}}
+    assert trainer._resolve_pretrain_local_views(None, None, missing) == (96, 6)
+    with pytest.raises(ValueError, match="Cannot resume"):
+        trainer._resolve_pretrain_local_views(128, None, missing)
+
+    invalid = {
+        "config": {"model_name": "vit_tiny_patch16_224"},
+        "args": {"local_crop_size": 0, "local_crops": True},
+    }
+    assert trainer._resolve_pretrain_local_views(None, None, invalid) == (96, 6)
+    with pytest.raises(ValueError, match="Cannot resume"):
+        trainer._resolve_pretrain_local_views(None, 0, invalid)
+
+
+def test_augmentation_metadata_round_trips_training_size():
+    ft_config = build_finetune_augmentation_config("none", 384)
+    ft_checkpoint = {
+        "config": {"augmentation_profile": "none", "augmentation_config": ft_config}
+    }
+    assert resolve_training_image_size(ft_checkpoint) == 384
+    pt_config = build_pretrain_augmentation_config("global-barcode", 448, 96, 6)
+    pt_checkpoint = {
+        "config": {
+            "augmentation_profile": "global-barcode",
+            "augmentation_config": pt_config,
+        }
+    }
+    assert resolve_training_image_size(pt_checkpoint) == 448
+
+
+def test_pretrain_passes_resolved_augmentation_to_dataset(
+    tmp_path, monkeypatch, capsys
+):
+    captured = {}
+
+    def fake_dataset(**kwargs):
+        captured.update(kwargs)
+        raise _DatasetConstructionReached
+
+    monkeypatch.setattr(trainer, "MultiCropDataset", fake_dataset)
+    args = argparse.Namespace(
+        seed=42,
+        cpus=0,
+        device="cpu",
+        out_dir=str(tmp_path / "pretrain_out"),
+        model_name="vit_tiny_patch16_224",
+        out_dim=16,
+        global_crop_size=224,
+        local_crop_size=96,
+        local_crops=2,
+        resume="",
+        augmentation=None,
+        orientation_policy=None,
+        train_data="",
+        input_images_dir=str(tmp_path),
+    )
+
+    with pytest.raises(_DatasetConstructionReached):
+        trainer.run_pretrain(args)
+
+    assert captured["augmentation_profile"] == "global-barcode"
+    assert captured["orientation_policy"] == "invariant"
+    assert captured["local_crop_size"] == 96
+    assert captured["local_crops"] == 2
+    out = capsys.readouterr().out
+    assert "Augmentation profile: global-barcode" in out
+    assert "Augmentation config:" in out
+    assert '"profile": "global-barcode"' in out
+    assert '"orientation_policy": "invariant"' in out
+
+
+def test_pretrain_passes_explicit_augmentation_to_dataset(tmp_path, monkeypatch):
+    captured = {}
+
+    def fake_dataset(**kwargs):
+        captured.update(kwargs)
+        raise _DatasetConstructionReached
+
+    monkeypatch.setattr(trainer, "MultiCropDataset", fake_dataset)
+    args = argparse.Namespace(
+        seed=42,
+        cpus=0,
+        device="cpu",
+        out_dir=str(tmp_path / "pretrain_out"),
+        model_name="vit_tiny_patch16_224",
+        out_dim=16,
+        global_crop_size=224,
+        local_crop_size=96,
+        local_crops=0,
+        resume="",
+        augmentation="legacy",
+        orientation_policy="sensitive",
+        train_data="",
+        input_images_dir=str(tmp_path),
+    )
+
+    with pytest.raises(_DatasetConstructionReached):
+        trainer.run_pretrain(args)
+
+    assert captured["augmentation_profile"] == "legacy"
+    assert captured["orientation_policy"] == "sensitive"
+    assert captured["local_crops"] == 0
+
+
+def test_finetune_initialization_does_not_inherit_pretrain_augmentation(
+    tmp_path, monkeypatch, capsys
+):
+    pretrain_config = build_pretrain_augmentation_config(
+        "color-robust", 32, 96, 2, orientation_policy="sensitive"
+    )
+    checkpoint_path = _write_pretrain_checkpoint(
+        tmp_path / "pretrain.pth",
+        image_size=32,
+        config_extra={
+            "augmentation_profile": "color-robust",
+            "augmentation_config": pretrain_config,
+        },
+    )
+    captured = {}
+
+    def fake_dataset(**kwargs):
+        captured.update(kwargs)
+        raise _DatasetConstructionReached
+
+    monkeypatch.setattr(trainer, "MetricDataset", fake_dataset)
+    args = _finetune_args(tmp_path, checkpoint_path)
+
+    with pytest.raises(_DatasetConstructionReached):
+        trainer.run_finetune(args)
+
+    assert captured["augmentation_profile"] == "none"
+    assert captured["orientation_policy"] == "sensitive"
+    assert captured["image_size"] == 32
+    out = capsys.readouterr().out
+    assert "Augmentation profile: none" in out
+    assert '"orientation_policy": "sensitive"' in out
+
+
+def test_finetune_passes_resolved_training_size_to_model_and_dataset(
+    tmp_path, monkeypatch, capsys
+):
+    checkpoint_path = _write_pretrain_checkpoint(tmp_path / "legacy_pretrain.pth")
+    captured_model = {}
+    captured_dataset = {}
+
+    real_encoder = trainer.OTUFormerEncoder
+
+    def fake_encoder(*args, **kwargs):
+        captured_model["img_size"] = kwargs.get("img_size")
+        return real_encoder(*args, **kwargs)
+
+    def fake_dataset(**kwargs):
+        captured_dataset.update(kwargs)
+        raise _DatasetConstructionReached
+
+    monkeypatch.setattr(trainer, "OTUFormerEncoder", fake_encoder)
+    monkeypatch.setattr(trainer, "MetricDataset", fake_dataset)
+    args = _finetune_args(tmp_path, checkpoint_path)
+
+    with pytest.raises(_DatasetConstructionReached):
+        trainer.run_finetune(args)
+
+    assert captured_model["img_size"] == 32
+    assert captured_dataset["image_size"] == 32
+    assert captured_dataset["augmentation_profile"] == "none"
+    assert captured_dataset["orientation_policy"] == "invariant"
+    out = capsys.readouterr().out
+    assert "Augmentation profile: none" in out
+    assert '"image_size": 32' in out

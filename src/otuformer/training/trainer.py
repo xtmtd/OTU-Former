@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import math
 import random
 import shutil
@@ -27,11 +28,14 @@ from otuformer.embedding.evaluator import (
     run_umap,
 )
 from otuformer.training.dataset import (
+    ORIENTATION_POLICIES,
     MetricDataset,
     MultiCropDataset,
     _build_recursive_index,
     _resolve_image_path,
     _supports_recursive_lookup,
+    build_finetune_augmentation_config,
+    build_pretrain_augmentation_config,
     center_crop_eval_transform,
 )
 from otuformer.training.loss import (
@@ -928,6 +932,272 @@ def _compute_and_log_all_metrics(
             )
 
 
+_AUGMENTATION_STAGES = ("pretrain", "finetune")
+
+
+def _validate_stage(stage: str) -> None:
+    if stage not in _AUGMENTATION_STAGES:
+        raise ValueError(
+            f"Unsupported augmentation stage '{stage}'; "
+            f"choose from: {', '.join(_AUGMENTATION_STAGES)}"
+        )
+
+
+def _valid_local_crop_size(value: Any) -> int | None:
+    """Return ``value`` as a positive non-boolean int, or ``None`` if invalid."""
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return int(value)
+
+
+def _valid_local_crops(value: Any) -> int | None:
+    """Return ``value`` as a non-negative non-boolean int, or ``None`` if invalid."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return int(value)
+
+
+def _checkpoint_augmentation_metadata(
+    checkpoint: dict[str, Any] | None,
+) -> tuple[str, dict[str, Any]] | None:
+    """Return ``(profile, expanded_config)`` or ``None`` for absent/old metadata.
+
+    A checkpoint is old only when both augmentation keys are absent from its
+    ``config`` dict. Any other malformed combination raises ``ValueError``.
+    """
+    if checkpoint is None:
+        return None
+    cfg = checkpoint.get("config")
+    if not isinstance(cfg, dict):
+        return None
+    has_profile = "augmentation_profile" in cfg
+    has_config = "augmentation_config" in cfg
+    if not has_profile and not has_config:
+        return None
+    if not has_profile or not has_config:
+        raise ValueError(
+            "malformed augmentation metadata: checkpoint must contain both "
+            "'augmentation_profile' and 'augmentation_config'."
+        )
+    profile = cfg["augmentation_profile"]
+    config = cfg["augmentation_config"]
+    if not isinstance(profile, str):
+        raise ValueError(
+            "malformed augmentation metadata: 'augmentation_profile' must be a string."
+        )
+    if not isinstance(config, dict):
+        raise ValueError(
+            "malformed augmentation metadata: 'augmentation_config' must be a dict."
+        )
+    return profile, config
+
+
+def _select_augmentation_profile(
+    requested_profile: str | None,
+    checkpoint: dict[str, Any] | None,
+    *,
+    stage: str,
+) -> str:
+    """Resolve the effective augmentation profile for ``stage``.
+
+    Omitted values default per stage, inherit the saved profile on resume, and
+    never inherit the pretraining profile when starting a new fine-tuning run
+    (the caller passes ``checkpoint=None`` for that case).
+    """
+    _validate_stage(stage)
+    default_profile = "global-barcode" if stage == "pretrain" else "none"
+    metadata = _checkpoint_augmentation_metadata(checkpoint)
+    if metadata is None:
+        if checkpoint is None:
+            if requested_profile is None:
+                return default_profile
+            return requested_profile
+        compatible = "legacy" if stage == "pretrain" else "none"
+        if requested_profile is None or requested_profile == compatible:
+            return compatible
+        raise ValueError(
+            f"Cannot resume: checkpoint predates augmentation metadata; the only "
+            f"compatible profile is '{compatible}'. Start a new run to change "
+            "augmentation settings."
+        )
+    saved_profile, _ = metadata
+    if requested_profile is None or requested_profile == saved_profile:
+        return saved_profile
+    raise ValueError(
+        f"Cannot resume: augmentation profile '{requested_profile}' differs from "
+        f"checkpoint profile '{saved_profile}'. Start a new run to change "
+        "augmentation settings."
+    )
+
+
+def _select_orientation_policy(
+    requested_policy: str | None,
+    checkpoint: dict[str, Any] | None,
+    *,
+    stage: str,
+    resume: bool = False,
+) -> str:
+    """Resolve the effective orientation policy for ``stage``.
+
+    ``resume=True`` means the checkpoint is being continued and must match the
+    requested policy exactly. ``resume=False`` with a checkpoint means a new
+    fine-tuning run initialized via ``--checkpoint``: the saved policy is
+    inherited when omitted and an explicit policy is honored.
+    """
+    _validate_stage(stage)
+    if requested_policy is not None and requested_policy not in ORIENTATION_POLICIES:
+        raise ValueError(
+            f"Unknown orientation policy '{requested_policy}'; "
+            f"choose from: {', '.join(ORIENTATION_POLICIES)}"
+        )
+    metadata = _checkpoint_augmentation_metadata(checkpoint)
+    if metadata is None:
+        if checkpoint is None:
+            return requested_policy if requested_policy is not None else "invariant"
+        if stage == "pretrain" or resume:
+            if requested_policy in (None, "invariant"):
+                return "invariant"
+            raise ValueError(
+                "Cannot resume: checkpoint predates augmentation metadata and has no "
+                "saved orientation policy. Use invariant or start a new run."
+            )
+        # New fine-tuning run initialized from an old pretraining checkpoint:
+        # an explicit policy is honored, otherwise fall back to invariant.
+        return requested_policy if requested_policy is not None else "invariant"
+    _, saved_config = metadata
+    saved_policy = saved_config.get("orientation_policy")
+    if not isinstance(saved_policy, str):
+        raise ValueError(
+            "malformed augmentation metadata: 'augmentation_config.orientation_policy' "
+            "must be a string."
+        )
+    if stage == "pretrain" or resume:
+        if requested_policy is None or requested_policy == saved_policy:
+            return saved_policy
+        raise ValueError(
+            f"Cannot resume: orientation policy '{requested_policy}' differs from "
+            f"checkpoint policy '{saved_policy}'. Start a new run to change it."
+        )
+    if requested_policy is None:
+        return saved_policy
+    return requested_policy
+
+
+def _resolve_pretrain_local_views(
+    requested_local_crop_size: int | None,
+    requested_local_crops: int | None,
+    checkpoint: dict[str, Any] | None,
+) -> tuple[int, int]:
+    """Resolve pretraining local-view size/count for a new run or resume.
+
+    A new run uses the requested values or the historical defaults ``96``/``6``.
+    A resume inherits the saved expanded config (new-style checkpoint) or saved
+    ``args`` (old checkpoint), falling back to ``96``/``6`` only for missing or
+    invalid old fields. Explicit values must match the resolved saved values.
+    """
+    if requested_local_crop_size is not None and _valid_local_crop_size(
+        requested_local_crop_size
+    ) is None:
+        raise ValueError(
+            "local_crop_size must be a non-boolean positive integer, got "
+            f"{requested_local_crop_size!r}."
+        )
+    if requested_local_crops is not None and _valid_local_crops(
+        requested_local_crops
+    ) is None:
+        raise ValueError(
+            "local_crops must be a non-boolean non-negative integer, got "
+            f"{requested_local_crops!r}."
+        )
+    if checkpoint is None:
+        return (
+            int(requested_local_crop_size)
+            if requested_local_crop_size is not None
+            else 96,
+            int(requested_local_crops) if requested_local_crops is not None else 6,
+        )
+
+    metadata = _checkpoint_augmentation_metadata(checkpoint)
+    if metadata is not None:
+        _, saved_config = metadata
+        local_crop = saved_config.get("local_crop")
+        if not isinstance(local_crop, dict):
+            raise ValueError(
+                "malformed augmentation metadata: 'augmentation_config.local_crop' "
+                "must be a dict."
+            )
+        saved_size = _valid_local_crop_size(local_crop.get("size"))
+        saved_crops = _valid_local_crops(saved_config.get("local_crops"))
+        if saved_size is None or saved_crops is None:
+            raise ValueError(
+                "malformed augmentation metadata: checkpoint records invalid "
+                "local-view settings."
+            )
+    else:
+        saved_args = checkpoint.get("args")
+        if not isinstance(saved_args, dict):
+            saved_args = {}
+        saved_size = _valid_local_crop_size(saved_args.get("local_crop_size")) or 96
+        saved_crops = _valid_local_crops(saved_args.get("local_crops"))
+        if saved_crops is None:
+            saved_crops = 6
+
+    if requested_local_crop_size is not None and (
+        int(requested_local_crop_size) != saved_size
+    ):
+        raise ValueError(
+            f"Cannot resume: local crop size {requested_local_crop_size} differs from "
+            f"checkpoint value {saved_size}. Start a new run to change local-view "
+            "settings."
+        )
+    if requested_local_crops is not None and int(requested_local_crops) != saved_crops:
+        raise ValueError(
+            f"Cannot resume: local crops {requested_local_crops} differs from "
+            f"checkpoint value {saved_crops}. Start a new run to change local-view "
+            "settings."
+        )
+    return saved_size, saved_crops
+
+
+def _validate_augmentation_config(
+    profile: str,
+    policy: str,
+    current_config: dict[str, object],
+    checkpoint: dict[str, Any] | None,
+    *,
+    stage: str,
+) -> dict[str, object]:
+    """Validate the freshly built config against checkpoint metadata.
+
+    Returns ``current_config`` unchanged when no comparable metadata exists or
+    when it matches exactly; raises on malformed metadata or any difference.
+    """
+    _validate_stage(stage)
+    if not isinstance(current_config, dict):
+        raise ValueError(
+            "malformed augmentation metadata: current augmentation config must "
+            "be a dict."
+        )
+    if (
+        current_config.get("profile") != profile
+        or current_config.get("orientation_policy") != policy
+    ):
+        raise ValueError(
+            "Augmentation configuration differs from the requested profile/policy."
+        )
+    metadata = _checkpoint_augmentation_metadata(checkpoint)
+    if metadata is None:
+        return current_config
+    _, saved_config = metadata
+    if current_config != saved_config:
+        raise ValueError(
+            f"Augmentation configuration differs from checkpoint for profile "
+            f"'{profile}'. Start a new run or resume with the exact saved "
+            "configuration."
+        )
+    return current_config
+
+
 def run_pretrain(args: argparse.Namespace) -> None:
     _set_seed(args.seed)
     _set_cpus(args.cpus)
@@ -963,6 +1233,43 @@ def run_pretrain(args: argparse.Namespace) -> None:
         )
     args.global_crop_size = global_crop_size
     validate_model_name_size(args.model_name, global_crop_size)
+
+    requested_profile = getattr(args, "augmentation", None)
+    requested_policy = getattr(args, "orientation_policy", None)
+    profile = _select_augmentation_profile(
+        requested_profile, resume_ckpt, stage="pretrain"
+    )
+    policy = _select_orientation_policy(
+        requested_policy,
+        resume_ckpt,
+        stage="pretrain",
+        resume=resume_ckpt is not None,
+    )
+    local_crop_size, local_crops = _resolve_pretrain_local_views(
+        getattr(args, "local_crop_size", None),
+        getattr(args, "local_crops", None),
+        resume_ckpt,
+    )
+    args.local_crop_size = local_crop_size
+    args.local_crops = local_crops
+    augmentation_config = build_pretrain_augmentation_config(
+        profile,
+        global_crop_size,
+        args.local_crop_size,
+        args.local_crops,
+        orientation_policy=policy,
+    )
+    augmentation_config = _validate_augmentation_config(
+        profile, policy, augmentation_config, resume_ckpt, stage="pretrain"
+    )
+    args.augmentation = profile
+    args.orientation_policy = policy
+    print(f"Augmentation profile: {profile}")
+    print(
+        "Augmentation config: "
+        + json.dumps(augmentation_config, indent=2, sort_keys=True)
+    )
+
     # local crops are processed by the same patch embed: when used, they must
     # satisfy the same divisibility constraint (the default 96 is invalid for
     # patch-14). With --local-crops 0 the local size is unused, so skip it.
@@ -975,6 +1282,8 @@ def run_pretrain(args: argparse.Namespace) -> None:
         global_crop_size=global_crop_size,
         local_crop_size=args.local_crop_size,
         local_crops=args.local_crops,
+        augmentation_profile=profile,
+        orientation_policy=policy,
     )
     loader = DataLoader(
         ds,
@@ -1225,6 +1534,8 @@ def run_pretrain(args: argparse.Namespace) -> None:
                     "model_name": args.model_name,
                     "out_dim": args.out_dim,
                     "image_size": global_crop_size,
+                    "augmentation_profile": profile,
+                    "augmentation_config": augmentation_config,
                 },
                 "schedule": {
                     **schedule_state,
@@ -1308,6 +1619,35 @@ def run_finetune(args: argparse.Namespace) -> None:
     out_dim = cfg.get("out_dim", args.metric_embed_dim)
     finetune_image_size = resolve_training_image_size(ckpt)
 
+    requested_profile = getattr(args, "augmentation", None)
+    requested_policy = getattr(args, "orientation_policy", None)
+    # ``--checkpoint`` starts a new run: the pretraining augmentation profile is
+    # never inherited, but an omitted orientation policy still inherits the
+    # pretraining checkpoint's saved policy.
+    resume_ckpt = ckpt if resume_path is not None else None
+    profile = _select_augmentation_profile(
+        requested_profile, resume_ckpt, stage="finetune"
+    )
+    policy = _select_orientation_policy(
+        requested_policy,
+        ckpt,
+        stage="finetune",
+        resume=resume_path is not None,
+    )
+    augmentation_config = build_finetune_augmentation_config(
+        profile, finetune_image_size, orientation_policy=policy
+    )
+    augmentation_config = _validate_augmentation_config(
+        profile, policy, augmentation_config, resume_ckpt, stage="finetune"
+    )
+    args.augmentation = profile
+    args.orientation_policy = policy
+    print(f"Augmentation profile: {profile}")
+    print(
+        "Augmentation config: "
+        + json.dumps(augmentation_config, indent=2, sort_keys=True)
+    )
+
     model = OTUFormerEncoder(
         model_name=model_name,
         out_dim=out_dim,
@@ -1322,6 +1662,8 @@ def run_finetune(args: argparse.Namespace) -> None:
         csv_path=Path(args.train_data),
         images_dir=Path(args.input_images_dir),
         image_size=finetune_image_size,
+        augmentation_profile=profile,
+        orientation_policy=policy,
     )
     loader = DataLoader(
         ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers
@@ -1449,6 +1791,8 @@ def run_finetune(args: argparse.Namespace) -> None:
                     "metric_embed_dim": out_dim,
                     "out_dim": out_dim,
                     "image_size": finetune_image_size,
+                    "augmentation_profile": profile,
+                    "augmentation_config": augmentation_config,
                 },
                 "class_labels": sorted(str(label) for label in ds.class_to_idx),
             }

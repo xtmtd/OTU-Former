@@ -199,6 +199,15 @@ def test_pretrain_runs_one_epoch(tmp_path):
     ).exists()
     assert not (tmp_path / "pretrain_out" / "logs" / "metrics_instant.jsonl").exists()
     assert not (tmp_path / "pretrain_out" / "best.pt").exists()
+    saved = torch.load(
+        tmp_path / "pretrain_out" / "SSL_latest.pth",
+        map_location="cpu",
+        weights_only=False,
+    )
+    assert saved["config"]["augmentation_profile"] == "global-barcode"
+    assert saved["config"]["augmentation_config"]["profile"] == "global-barcode"
+    assert saved["config"]["augmentation_config"]["orientation_policy"] == "invariant"
+    assert "orientation_policy" not in saved["config"]
 
 
 def test_pretrain_runs_one_epoch_without_train_data(tmp_path):
@@ -376,6 +385,15 @@ def test_finetune_runs_one_epoch(tmp_path):
     )
     assert result.exit_code == 0
     assert (tmp_path / "finetune_out" / "finetune_latest.pth").exists()
+    saved = torch.load(
+        tmp_path / "finetune_out" / "finetune_latest.pth",
+        map_location="cpu",
+        weights_only=False,
+    )
+    assert saved["config"]["augmentation_profile"] == "none"
+    assert saved["config"]["augmentation_config"]["profile"] == "none"
+    assert saved["config"]["augmentation_config"]["orientation_policy"] == "invariant"
+    assert "orientation_policy" not in saved["config"]
 
 
 def _make_ckpt(tmp_path, out_dim=64):
