@@ -1,5 +1,7 @@
 import argparse
+import importlib.util
 import json
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -1188,3 +1190,77 @@ def test_finetune_passes_resolved_training_size_to_model_and_dataset(
     out = capsys.readouterr().out
     assert "Augmentation profile: none" in out
     assert '"image_size": 32' in out
+
+
+# --- Rotation/reflection validation script ------------------------------------------
+
+_VALIDATION_SCRIPT = (
+    Path(__file__).resolve().parents[2]
+    / "scripts"
+    / "validate_augmentation_rotation.py"
+)
+
+
+def _load_rotation_validation_script():
+    spec = importlib.util.spec_from_file_location(
+        "validate_augmentation_rotation", _VALIDATION_SCRIPT
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_rotation_validation_script_summarizes_similarities():
+    script = _load_rotation_validation_script()
+    summary = script.summarize_similarities(np.array([0.1, 0.2, 0.3]))
+    assert summary["median"] == pytest.approx(0.2)
+    assert summary["p10"] == pytest.approx(0.12)
+    assert summary["minimum"] == pytest.approx(0.1)
+
+
+@pytest.mark.parametrize(
+    "values",
+    [np.array([]), np.array([0.1, np.nan]), np.array([0.2, np.inf])],
+)
+def test_rotation_validation_script_rejects_empty_or_non_finite(values):
+    script = _load_rotation_validation_script()
+    with pytest.raises(ValueError, match="non-empty and finite"):
+        script.summarize_similarities(values)
+
+
+def test_rotation_validation_script_reflection_summary():
+    script = _load_rotation_validation_script()
+    reference = np.array([[1.0, 0.0], [0.0, 1.0], [1.0, 0.0]])
+    reflected = np.array([[1.0, 0.0], [1.0, 0.0], [0.6, 0.8]])
+
+    summary = script.summarize_paired_similarities(reference, reflected)
+
+    assert summary["median"] == pytest.approx(0.6)
+    assert summary["p10"] == pytest.approx(0.12)
+    assert summary["minimum"] == pytest.approx(0.0)
+
+
+def test_rotation_validation_script_accepts_shared_fixed_evaluation_size():
+    script = _load_rotation_validation_script()
+    baseline = {
+        "config": {"model_name": "vit_tiny_patch16_224", "out_dim": 16},
+        "args": {"global_crop_size": 224},
+    }
+    candidate = {
+        "config": {
+            "model_name": "vit_tiny_patch16_224",
+            "out_dim": 16,
+            "augmentation_config": {"global_crop": {"size": 448}},
+        }
+    }
+
+    assert script.resolve_evaluation_size(baseline) == 224
+    assert script.resolve_evaluation_size(candidate) == 448
+    with pytest.raises(ValueError, match="differ"):
+        script.require_matching_evaluation_sizes(224, 448)
+
+    shared = script.resolve_evaluation_size(baseline, 224)
+    assert shared == 224
+    assert script.resolve_evaluation_size(candidate, 224) == 224
+    assert script.require_matching_evaluation_sizes(shared, 224) == 224
