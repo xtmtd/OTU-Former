@@ -1,3 +1,4 @@
+import argparse
 import pytest
 import pandas as pd
 from PIL import Image
@@ -1569,7 +1570,9 @@ def test_training_enables_mps_fallback_before_augmentation_validation(
 ):
     """PyTorch latches PYTORCH_ENABLE_MPS_FALLBACK at import time, so the CLI
     must set it before the augmentation validators import torch."""
+    prior_fallback = os.environ.get("PYTORCH_ENABLE_MPS_FALLBACK")
     monkeypatch.delenv("PYTORCH_ENABLE_MPS_FALLBACK", raising=False)
+    assert "PYTORCH_ENABLE_MPS_FALLBACK" not in os.environ
     seen = {}
 
     def spy_validate_augmentation(value, *, stage):
@@ -1580,25 +1583,31 @@ def test_training_enables_mps_fallback_before_augmentation_validation(
     )
     monkeypatch.setattr(run_attr, lambda _args: None)
 
-    result = runner.invoke(
-        app,
-        [
-            command,
-            "--train-data",
-            str(tmp_path / "data.csv"),
-            "--input-images-dir",
-            str(tmp_path),
-            "--out-dir",
-            str(tmp_path / "out"),
-            "--device",
-            "mps",
-            "--augmentation",
-            augmentation,
-        ],
-    )
+    try:
+        result = runner.invoke(
+            app,
+            [
+                command,
+                "--train-data",
+                str(tmp_path / "data.csv"),
+                "--input-images-dir",
+                str(tmp_path),
+                "--out-dir",
+                str(tmp_path / "out"),
+                "--device",
+                "mps",
+                "--augmentation",
+                augmentation,
+            ],
+        )
+    finally:
+        if prior_fallback is None:
+            os.environ.pop("PYTORCH_ENABLE_MPS_FALLBACK", None)
+        else:
+            os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = prior_fallback
 
     assert result.exit_code == 0, result.output
-    assert seen["fallback"] == "1"
+    assert seen.get("fallback") == "1"
 
 
 # ---- Resolution & preprocessing consistency (2026-09-07 plan) ----
@@ -2384,3 +2393,56 @@ def test_pretrain_resume_rejects_conflicting_local_views(tmp_path):
 
     assert result.exit_code != 0
     assert "Cannot resume" in result.output
+
+
+class _DatasetCaptured(Exception):
+    """Stop run_pretrain right after dataset construction."""
+
+
+def test_run_pretrain_resume_inherits_new_style_augmentation_into_dataset(
+    tmp_path, monkeypatch
+):
+    """run_pretrain must forward the profile, policy, and local-view settings
+    inherited from a new-style checkpoint to the pretrain dataset."""
+    from otuformer.training import trainer
+
+    ckpt = _write_augmented_pretrain_checkpoint(
+        tmp_path,
+        local_crop_size=112,
+        local_crops=3,
+        profile="color-robust",
+        policy="sensitive",
+    )
+    seen = {}
+
+    def capturing_multi_crop_dataset(**kwargs):
+        seen.update(kwargs)
+        raise _DatasetCaptured
+
+    monkeypatch.setattr(trainer, "MultiCropDataset", capturing_multi_crop_dataset)
+
+    args = argparse.Namespace(
+        seed=42,
+        cpus=1,
+        device="cpu",
+        out_dir=str(tmp_path / "resume_out"),
+        resume=str(ckpt),
+        train_data=str(tmp_path / "data.csv"),
+        input_images_dir=str(tmp_path),
+        model_name="vit_tiny_patch16_224",
+        global_crop_size=None,
+        augmentation=None,
+        orientation_policy=None,
+        local_crop_size=None,
+        local_crops=None,
+        batch_size=2,
+        num_workers=0,
+    )
+    with pytest.raises(_DatasetCaptured):
+        trainer.run_pretrain(args)
+
+    assert seen["augmentation_profile"] == "color-robust"
+    assert seen["orientation_policy"] == "sensitive"
+    assert seen["local_crop_size"] == 112
+    assert seen["local_crops"] == 3
+    assert seen["global_crop_size"] == 224

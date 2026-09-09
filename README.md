@@ -199,7 +199,7 @@ otuformer pretrain \
 | `--local-crop-size` | Local crop resolution (must be divisible by the backbone patch size, e.g. 98 or 112 for patch-14 models) | 96 |
 | `--local-crops` | Number of local crops | 6 |
 | `--augmentation` | Pretraining augmentation profile: `global-barcode` (new-run default), `color-robust`, or `legacy`; omit to inherit the saved profile on `--resume` | `global-barcode` |
-| `--orientation-policy` | Orientation policy for every global and local view: `invariant` (broad rotation and reflection) or `sensitive` (rotation `[-15°, 15°]`, no horizontal reflection); omit to inherit the saved policy on `--resume` | `invariant` |
+| `--orientation-policy` | Orientation policy for every global and local view (no transform effect for `legacy`): `invariant` (broad rotation and reflection) or `sensitive` (rotation `[-15°, 15°]`, no horizontal reflection); omit to inherit the saved policy on `--resume` | `invariant` |
 | `--mask-ratio` | Masked token ratio | 0.5 |
 | `--lambda-local` | Local crop loss weight | 1.5 |
 | `--lambda-mask` | Masked token loss weight | 1.0 |
@@ -226,6 +226,8 @@ otuformer pretrain \
 | `--cpus` | PyTorch/MKL CPU threads | 12 |
 | `--device` | `auto`/`cpu`/`cuda`/`mps` | `auto` |
 | `--seed` | Random seed | 42 |
+
+**Local-view resume inheritance.** On `--resume`, omitted `--local-crop-size` and `--local-crops` inherit the checkpoint's saved values; explicit conflicting values fail, and changing them requires a new run.
 
 **Output**:
 - `logs/pretrain.log` — Run log

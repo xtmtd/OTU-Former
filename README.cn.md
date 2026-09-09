@@ -194,7 +194,7 @@ otuformer pretrain \
 | `--local-crop-size` | 局部裁剪分辨率（必须能被骨干网络 patch size 整除，patch-14 模型如 98 或 112） | 96 |
 | `--local-crops` | 局部裁剪数量 | 6 |
 | `--augmentation` | 预训练数据增强配置：`global-barcode`（新运行默认）、`color-robust` 或 `legacy`；`--resume` 时省略则继承已保存配置 | `global-barcode` |
-| `--orientation-policy` | 所有全局与局部视图的方向策略：`invariant`（宽角度旋转与翻转）或 `sensitive`（旋转 `[-15°, 15°]`，不做水平翻转）；`--resume` 时省略则继承已保存策略 | `invariant` |
+| `--orientation-policy` | 所有全局与局部视图的方向策略（对 `legacy` 无变换效果）：`invariant`（宽角度旋转与翻转）或 `sensitive`（旋转 `[-15°, 15°]`，不做水平翻转）；`--resume` 时省略则继承已保存策略 | `invariant` |
 | `--mask-ratio` | 掩码 token 比例 | 0.5 |
 | `--lambda-local` | 局部裁剪损失权重 | 1.5 |
 | `--lambda-mask` | 掩码 token 损失权重 | 1.0 |
@@ -221,6 +221,8 @@ otuformer pretrain \
 | `--cpus` | PyTorch/MKL CPU 线程数 | 12 |
 | `--device` | `auto`/`cpu`/`cuda`/`mps` | `auto` |
 | `--seed` | 随机种子 | 42 |
+
+**局部视图的续训继承。** `--resume` 时，省略的 `--local-crop-size` 与 `--local-crops` 继承 checkpoint 已保存的值；显式指定冲突值会报错，修改这些值需要开启新运行。
 
 **输出**：
 - `logs/pretrain.log` — 运行日志

@@ -589,6 +589,23 @@ def test_pretrain_view_shape_mismatch_raises_value_error(tmp_path):
     assert "(3, 8, 8)" in message
 
 
+def test_pretrain_non_tensor_view_raises_value_error(tmp_path):
+    csv_path = make_dummy_images(tmp_path, n=1)
+    ds = MultiCropDataset(
+        csv_path=csv_path,
+        images_dir=tmp_path,
+        global_crop_size=32,
+        local_crop_size=16,
+        local_crops=2,
+    )
+    ds.global_tf2 = lambda image, fill: [1, 2, 3]
+    with pytest.raises(ValueError) as excinfo:
+        ds[0]
+    message = str(excinfo.value)
+    assert "(3, 32, 32)" in message
+    assert "None" in message
+
+
 def test_finetune_conservative_shape_mismatch_raises_value_error(tmp_path):
     csv_path = make_dummy_labeled_images(tmp_path, n=1)
     ds = MetricDataset(

@@ -631,7 +631,8 @@ def _validate_view_shape(
     view: torch.Tensor, expected_size: int, view_name: str
 ) -> None:
     """Reject a view whose tensor shape is not (3, expected, expected)."""
-    actual = tuple(view.shape)
+    shape = getattr(view, "shape", None)
+    actual = tuple(shape) if shape is not None else None
     expected = (3, expected_size, expected_size)
     if actual != expected:
         raise ValueError(

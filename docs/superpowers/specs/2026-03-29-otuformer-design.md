@@ -85,7 +85,7 @@ All parameters migrated from `ref/ibot20260115.py` `get_parser()`, mode=pretrain
 - `--out-dim` : SSL projector output dimension [default: 256]
 - `--max-epochs` [default: 50]
 - `--lr` [default: 5e-4], `--weight-decay` [default: 0.05], `--warmup-epochs` [default: 3]
-- `--global-crop-size` [default: auto; `auto` resolves to the backbone's native `default_cfg["input_size"]` on a new run or the checkpoint's recorded size on `--resume`; explicit values 224/384/448 are common, 518 is patch-14-only]; `--local-crop-size` [default: 96], `--local-crops` [default: 6]
+- `--global-crop-size` [default: auto; `auto` resolves to the backbone's native `default_cfg["input_size"]` on a new run or the checkpoint's recorded size on `--resume`; explicit values 224/384/448 are common, 518 is patch-14-only]; `--local-crop-size` [default: 96], `--local-crops` [default: 6]. On `--resume`, omitted `--local-crop-size` and `--local-crops` inherit the checkpoint's saved values; explicit conflicting values fail, and changing them requires a new run.
 - `--augmentation` : pretraining augmentation profile — `global-barcode` (new-run default), `color-robust`, or `legacy`
 - `--orientation-policy` : geometric orientation policy — `invariant` (new-run default) or `sensitive`
 - `--mask-ratio` [default: 0.5], `--lambda-local` [default: 1.5], `--lambda-mask` [default: 1.0]
@@ -99,6 +99,28 @@ All parameters migrated from `ref/ibot20260115.py` `get_parser()`, mode=pretrain
 - `--visualize-data` : CSV with `image` and optional `label` columns for periodic evaluation; without labels, only UMAP is generated
 
 **Outputs:** `SSL_latest.pth` (and epoch checkpoints `SSL_epoch_*.pth`), `metrics.pretrain.csv`, `instant_metrics.csv`, training curves PDF, log file. When labels are absent or contain fewer than two classes, supervised metric fields remain empty while the epoch row is retained; an image-only visualization CSV still produces UMAP. `--metrics-sample-size` limits both supervised metric and UMAP inputs when positive.
+
+---
+
+### Training augmentation contract
+
+```text
+pretrain: global-barcode (default), color-robust, legacy
+finetune: none (default), conservative
+orientation-policy: invariant (default for new runs), sensitive
+```
+
+- `global-barcode` is the default orientation-insensitive whole-specimen barcode: broad in-plane rotation, horizontal reflection, and modest photometric jitter; color is preserved (no grayscale).
+- `color-robust` uses the same geometry and blur as `global-barcode` with stronger color jitter and grayscale; it may reduce sensitivity to diagnostic body color, color patterns, or metallic sheen.
+- `legacy` reproduces OTU-Former 0.2.1 augmentation exactly for old-run continuation and comparison, not new runs; it records either orientation policy without changing its historical transforms.
+- `none` is the unchanged deterministic fine-tuning default: `Resize -> CenterCrop -> ToTensor -> Normalize`.
+- `conservative` is an experimental opt-in fine-tuning profile, not proven superior to `none`; evaluate it on held-out individuals and held-out species. It adds no crop, grayscale, blur, or solarization.
+- `orientation-policy=sensitive` is an explicit caller choice (never inferred) for direction-sensitive markers: rotation `[-15°, 15°]` and no horizontal reflection for every global/local pretraining view and for fine-tuning `conservative`. `invariant` preserves the existing broad rotation and reflection behavior. `legacy` accepts either policy but keeps its historical flips.
+- Dorsal, ventral, lateral, whole-body, and anatomical-part images are distinct markers and must not be mixed as interchangeable views of one marker; arbitrary in-plane orientation is supported. The complete-marker requirement applies to the source image, not to every stochastic SSL crop. Augmentation encourages but does not guarantee embedding invariance.
+
+Resume and inheritance: omitted `--augmentation`/`--orientation-policy` inherit on resume; explicit conflicts fail, and changing a profile's expanded parameters requires a new run. Old pretrain checkpoints map to `legacy`/`invariant`; old finetune checkpoints map to `none`/`invariant`. New fine-tuning from `--checkpoint` is initialization, not resume: it never inherits the pretraining augmentation profile, and an omitted policy inherits the pretraining checkpoint policy (fallback `invariant` for old checkpoints). Both fine-tuning profiles use the checkpoint-recorded training input size with a `224` fallback for old checkpoints. Checkpoint metadata (`config.augmentation_profile`, `config.augmentation_config`) provides configuration traceability, not bitwise deterministic replay.
+
+Transform-level profile definitions live in [`2026-09-07-otuformer-training-augmentation-design.md`](2026-09-07-otuformer-training-augmentation-design.md).
 
 ---
 
@@ -123,26 +145,6 @@ All parameters migrated from `ref/ibot20260115.py` `get_parser()`, mode=finetune
 - `--visualize-data` : CSV with `image` and optional `label` columns for periodic evaluation; without labels, only UMAP is generated
 
 **Outputs:** `finetune_latest.pth` (and epoch checkpoints `finetune_epoch_*.pth`), `metrics.finetune.csv`, `instant_metrics.csv`, training curves PDF, log file. When labels are absent or contain fewer than two classes, supervised metric fields remain empty while the epoch row is retained; an image-only visualization CSV still produces UMAP. `--metrics-sample-size` limits both supervised metric and UMAP inputs when positive.
-
-#### Training augmentation contract
-
-```text
-pretrain: global-barcode (default), color-robust, legacy
-finetune: none (default), conservative
-orientation-policy: invariant (default for new runs), sensitive
-```
-
-- `global-barcode` is the default orientation-insensitive whole-specimen barcode: broad in-plane rotation, horizontal reflection, and modest photometric jitter; color is preserved (no grayscale).
-- `color-robust` uses the same geometry and blur as `global-barcode` with stronger color jitter and grayscale; it may reduce sensitivity to diagnostic body color, color patterns, or metallic sheen.
-- `legacy` reproduces OTU-Former 0.2.1 augmentation exactly for old-run continuation and comparison, not new runs; it records either orientation policy without changing its historical transforms.
-- `none` is the unchanged deterministic fine-tuning default: `Resize -> CenterCrop -> ToTensor -> Normalize`.
-- `conservative` is an experimental opt-in fine-tuning profile, not proven superior to `none`; evaluate it on held-out individuals and held-out species. It adds no crop, grayscale, blur, or solarization.
-- `orientation-policy=sensitive` is an explicit caller choice (never inferred) for direction-sensitive markers: rotation `[-15°, 15°]` and no horizontal reflection for every global/local pretraining view and for fine-tuning `conservative`. `invariant` preserves the existing broad rotation and reflection behavior. `legacy` accepts either policy but keeps its historical flips.
-- Dorsal, ventral, lateral, whole-body, and anatomical-part images are distinct markers and must not be mixed as interchangeable views of one marker; arbitrary in-plane orientation is supported. The complete-marker requirement applies to the source image, not to every stochastic SSL crop. Augmentation encourages but does not guarantee embedding invariance.
-
-Resume and inheritance: omitted `--augmentation`/`--orientation-policy` inherit on resume; explicit conflicts fail, and changing a profile's expanded parameters requires a new run. Old pretrain checkpoints map to `legacy`/`invariant`; old finetune checkpoints map to `none`/`invariant`. New fine-tuning from `--checkpoint` is initialization, not resume: it never inherits the pretraining augmentation profile, and an omitted policy inherits the pretraining checkpoint policy (fallback `invariant` for old checkpoints). Both fine-tuning profiles use the checkpoint-recorded training input size with a `224` fallback for old checkpoints. Checkpoint metadata (`config.augmentation_profile`, `config.augmentation_config`) provides configuration traceability, not bitwise deterministic replay.
-
-Transform-level profile definitions live in `docs/superpowers/specs/2026-09-07-otuformer-training-augmentation-design.md`.
 
 ---
 
