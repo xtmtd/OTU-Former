@@ -1557,6 +1557,50 @@ def test_pretrain_enables_mps_fallback_env_for_auto(tmp_path, monkeypatch):
     assert seen["fallback"] == "1"
 
 
+@pytest.mark.parametrize(
+    ("command", "run_attr", "augmentation"),
+    [
+        ("pretrain", "otuformer.training.trainer.run_pretrain", "global-barcode"),
+        ("finetune", "otuformer.training.trainer.run_finetune", "conservative"),
+    ],
+)
+def test_training_enables_mps_fallback_before_augmentation_validation(
+    tmp_path, monkeypatch, command, run_attr, augmentation
+):
+    """PyTorch latches PYTORCH_ENABLE_MPS_FALLBACK at import time, so the CLI
+    must set it before the augmentation validators import torch."""
+    monkeypatch.delenv("PYTORCH_ENABLE_MPS_FALLBACK", raising=False)
+    seen = {}
+
+    def spy_validate_augmentation(value, *, stage):
+        seen["fallback"] = os.environ.get("PYTORCH_ENABLE_MPS_FALLBACK")
+
+    monkeypatch.setattr(
+        f"otuformer.cli.{command}._validate_augmentation", spy_validate_augmentation
+    )
+    monkeypatch.setattr(run_attr, lambda _args: None)
+
+    result = runner.invoke(
+        app,
+        [
+            command,
+            "--train-data",
+            str(tmp_path / "data.csv"),
+            "--input-images-dir",
+            str(tmp_path),
+            "--out-dir",
+            str(tmp_path / "out"),
+            "--device",
+            "mps",
+            "--augmentation",
+            augmentation,
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert seen["fallback"] == "1"
+
+
 # ---- Resolution & preprocessing consistency (2026-09-07 plan) ----
 
 

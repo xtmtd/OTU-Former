@@ -289,6 +289,9 @@ def pretrain(
     if ctx.invoked_subcommand is not None:
         return
 
+    if device in {"mps", "auto"}:
+        os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+
     from otuformer.utils.logging import TeeLogger
     from otuformer.utils.io import prepare_output_dir
 
@@ -356,9 +359,6 @@ def pretrain(
         print("Parameters:")
         print(json.dumps(params, ensure_ascii=False, indent=2, sort_keys=True))
         print("-" * 80)
-
-        if device in {"mps", "auto"}:
-            os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
         from otuformer.training.trainer import run_pretrain
 
