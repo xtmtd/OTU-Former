@@ -44,8 +44,15 @@ from otuformer.training.loss import (
     ArcFaceLoss,
     LOSS_REGISTRY,
 )
-from otuformer.training.model import OTUFormerEncoder
-from otuformer.utils.checkpoint import load_checkpoint, save_checkpoint
+from otuformer.training.model import ArcFaceEmbeddingHead, OTUFormerEncoder
+from otuformer.utils.checkpoint import (
+    ARCFACE_EMBEDDING_HEAD,
+    PROJECTION_EMBEDDING_HEAD,
+    load_checkpoint,
+    resolve_checkpoint_embedding_head,
+    resolve_projector_out_dim,
+    save_checkpoint,
+)
 from otuformer.utils.size import (
     _positive_int,
     resolve_backbone_native_size,
@@ -1610,6 +1617,82 @@ def _validate_finetune_resume(
         print("[Warning] Resume checkpoint lacks class labels; validating class count only.")
 
 
+def _select_finetune_embedding_head(checkpoint: dict[str, Any]) -> str:
+    config_head = checkpoint.get("config", {}).get("embedding_head")
+    if config_head:
+        return config_head
+    if "loss_state_dict" in checkpoint:
+        return PROJECTION_EMBEDDING_HEAD
+    if "loss_func" in checkpoint or "model" in checkpoint:
+        raise ValueError(
+            "Unsupported legacy fine-tune checkpoint format: expected "
+            "'model_state_dict' and 'loss_state_dict'. Ref-script checkpoints "
+            "('model' + 'loss_func') can be read by extract/export/cam but not "
+            "resumed by finetune."
+        )
+    return ARCFACE_EMBEDDING_HEAD
+
+
+def _validate_finetune_embedding_dim(cfg: dict[str, Any], out_dim: int) -> None:
+    """Reject a resume that changes the fine-tune embedding width.
+
+    The saved classifier and optimizer state are shaped for the recorded
+    dimension, so resizing is only valid for a new ``--checkpoint`` run.
+    """
+    saved = cfg.get("metric_embed_dim") or cfg.get("out_dim")
+    if saved is None or int(saved) == int(out_dim):
+        return
+    raise ValueError(
+        f"Cannot resume: checkpoint embedding dimension is {saved} but "
+        f"--metric-embed-dim is {out_dim}; resize only when starting a new "
+        "--checkpoint run."
+    )
+
+
+def _validate_finetune_freeze_ratio(checkpoint: dict[str, Any], freeze_ratio: float) -> None:
+    """Reject a resume whose ``--freeze-ratio`` differs from the saved run.
+
+    The optimizer only holds ``requires_grad`` backbone parameters, so a
+    different freeze ratio changes a group's parameter count and
+    ``optimizer.load_state_dict`` would fail with an opaque message.
+    """
+    saved = (checkpoint.get("config") or {}).get("freeze_ratio")
+    if saved is None:
+        return
+    if not math.isclose(float(saved), float(freeze_ratio), rel_tol=0.0, abs_tol=1e-9):
+        raise ValueError(
+            f"Cannot resume: checkpoint was trained with freeze_ratio={saved} "
+            f"but --freeze-ratio is {freeze_ratio}; pass --freeze-ratio {saved}."
+        )
+
+
+def _use_split_finetune_optimizer(
+    checkpoint: dict[str, Any], resume: bool
+) -> bool:
+    if not resume:
+        return True
+    param_groups = checkpoint.get("optimizer", {}).get("param_groups")
+    return len(param_groups or []) != 1
+
+
+def _build_finetune_optimizer(
+    model: OTUFormerEncoder,
+    loss_fn: nn.Module,
+    backbone_lr: float,
+    metric_head_lr: float | None,
+    weight_decay: float,
+) -> torch.optim.Optimizer:
+    effective_head_lr = backbone_lr if metric_head_lr is None else metric_head_lr
+    backbone_params = [p for p in model.backbone.parameters() if p.requires_grad]
+    metric_head_params = list(model.projector.parameters()) + list(loss_fn.parameters())
+    return torch.optim.AdamW(
+        [
+            {"params": backbone_params, "lr": backbone_lr, "weight_decay": weight_decay},
+            {"params": metric_head_params, "lr": effective_head_lr, "weight_decay": weight_decay},
+        ]
+    )
+
+
 def run_finetune(args: argparse.Namespace) -> None:
     _set_seed(args.seed)
     _set_cpus(args.cpus)
@@ -1628,7 +1711,18 @@ def run_finetune(args: argparse.Namespace) -> None:
     ckpt = load_checkpoint(ckpt_path)
     cfg = ckpt.get("config", {})
     model_name = cfg.get("model_name", args.model_name)
-    out_dim = cfg.get("out_dim", args.metric_embed_dim)
+    # ``encoder_out_dim`` sizes the pretrained projector; the fine-tune
+    # embedding width (``out_dim``) is resolved separately below so
+    # ``--metric-embed-dim`` can resize the ArcFace head independently.
+    encoder_out_dim = int(
+        cfg.get("out_dim") or cfg.get("metric_embed_dim") or args.metric_embed_dim or 256
+    )
+    out_dim = getattr(args, "metric_embed_dim", None)
+    if out_dim is None:
+        out_dim = cfg.get("metric_embed_dim") or cfg.get("out_dim") or encoder_out_dim
+    out_dim = int(out_dim)
+    if resume_path is not None:
+        _validate_finetune_embedding_dim(cfg, out_dim)
     finetune_image_size = resolve_training_image_size(ckpt)
 
     requested_profile = getattr(args, "augmentation", None)
@@ -1662,11 +1756,51 @@ def run_finetune(args: argparse.Namespace) -> None:
 
     model = OTUFormerEncoder(
         model_name=model_name,
-        out_dim=out_dim,
+        out_dim=encoder_out_dim,
         img_size=finetune_image_size,
     ).to(device)
     validate_input_size(finetune_image_size, model, model_name)
-    model.load_state_dict(ckpt["model_state_dict"], strict=False)
+    embedding_head = _select_finetune_embedding_head(ckpt)
+    used_arcface_head = embedding_head == ARCFACE_EMBEDDING_HEAD
+    if "model_state_dict" not in ckpt:
+        raise ValueError(
+            "Fine-tune checkpoint must contain 'model_state_dict'; "
+            "ref-script checkpoints are readable by extract/export/cam only."
+        )
+    state_dict = ckpt["model_state_dict"]
+    # ``center`` is SSL-only training state and is never read by fine-tuning;
+    # dropping it keeps a resized embedding head loadable.
+    state_dict = {key: value for key, value in state_dict.items() if key != "center"}
+    if used_arcface_head:
+        model.projector = ArcFaceEmbeddingHead(
+            model.backbone.num_features, out_dim
+        ).to(device)
+        # ``center`` is SSL-only state and is never read by fine-tuning, but it
+        # is saved with every checkpoint; size it to the metadata so readers
+        # can rebuild the model.
+        model.center = torch.zeros(1, out_dim, device=device)
+    elif embedding_head == PROJECTION_EMBEDDING_HEAD:
+        # A historical ProjectionHead feeds the loss directly, so the fine-tune
+        # embedding width is fixed by the pretrained projector.
+        if out_dim != encoder_out_dim:
+            raise ValueError(
+                f"--metric-embed-dim {out_dim} cannot be applied to a "
+                f"ProjectionHead checkpoint whose projector outputs "
+                f"{encoder_out_dim} dims; omit the flag to inherit it."
+            )
+    else:
+        raise ValueError(f"Unsupported embedding head: {embedding_head}")
+
+    # Reuse the saved projector only when it matches the head being trained.
+    source_head = resolve_checkpoint_embedding_head(ckpt, state_dict)
+    source_dim = resolve_projector_out_dim(state_dict)
+    if source_head != embedding_head or (
+        source_dim is not None and source_dim != out_dim
+    ):
+        state_dict = {
+            key: value for key, value in state_dict.items() if not key.startswith("projector.")
+        }
+    model.load_state_dict(state_dict, strict=False)
 
     _freeze_backbone_blocks(model, args.freeze_ratio)
 
@@ -1685,14 +1819,26 @@ def run_finetune(args: argparse.Namespace) -> None:
     loss_cls = LOSS_REGISTRY.get(args.loss, ArcFaceLoss)
     loss_fn = loss_cls(embed_dim=out_dim, num_classes=n_classes).to(device)
 
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
-    trainable_params += list(loss_fn.parameters())
-    optimizer = torch.optim.AdamW(trainable_params, lr=args.finetune_lr)
-
+    if not _use_split_finetune_optimizer(ckpt, resume_path is not None):
+        # Keep the single-group optimizer layout used by historical fine-tune checkpoints.
+        optimizer = torch.optim.AdamW(
+            [p for p in model.parameters() if p.requires_grad] + list(loss_fn.parameters()),
+            lr=args.finetune_lr,
+            weight_decay=getattr(args, "weight_decay", 1e-4),
+        )
+    else:
+        optimizer = _build_finetune_optimizer(
+            model,
+            loss_fn,
+            args.finetune_lr,
+            getattr(args, "metric_head_lr", None),
+            getattr(args, "weight_decay", 1e-4),
+        )
     start_epoch = 0
     if resume_path is not None:
         class_labels = sorted(str(label) for label in ds.class_to_idx)
         _validate_finetune_resume(ckpt, class_labels, args.finetune_epochs)
+        _validate_finetune_freeze_ratio(ckpt, args.freeze_ratio)
         saved_loss = ckpt.get("loss_state_dict")
         if saved_loss is not None:
             saved_classes = saved_loss["head.weight"].shape[0]
@@ -1702,8 +1848,8 @@ def run_finetune(args: argparse.Namespace) -> None:
                 )
         if "optimizer" in ckpt:
             optimizer.load_state_dict(ckpt["optimizer"])
-        if "loss_state_dict" in ckpt:
-            loss_fn.load_state_dict(ckpt["loss_state_dict"], strict=False)
+        if saved_loss is not None:
+            loss_fn.load_state_dict(saved_loss, strict=False)
         start_epoch = int(ckpt.get("epoch", -1)) + 1
         print(
             f"[Info] Resume from {resume_path} at epoch {start_epoch}, iteration {int(ckpt.get('iteration', 0))}"
@@ -1756,7 +1902,6 @@ def run_finetune(args: argparse.Namespace) -> None:
             optimizer.zero_grad()
             loss.backward()
             grad_norm = _compute_grad_norm(model)
-            nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
             optimizer.step()
 
             running += float(loss.item())
@@ -1802,6 +1947,8 @@ def run_finetune(args: argparse.Namespace) -> None:
                     "model_name": model_name,
                     "metric_embed_dim": out_dim,
                     "out_dim": out_dim,
+                    "embedding_head": embedding_head,
+                    "freeze_ratio": args.freeze_ratio,
                     "image_size": finetune_image_size,
                     "augmentation_profile": profile,
                     "augmentation_config": augmentation_config,

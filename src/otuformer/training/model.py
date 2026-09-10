@@ -29,6 +29,21 @@ class ProjectionHead(nn.Module):
         return F.normalize(x, dim=-1)
 
 
+class ArcFaceEmbeddingHead(nn.Module):
+    """Compact, unnormalized embedding head used for ArcFace fine-tuning."""
+
+    def __init__(self, embed_dim: int, metric_embed_dim: int) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(embed_dim, 512),
+            nn.ReLU(),
+            nn.Linear(512, metric_embed_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
 class OTUFormerEncoder(nn.Module):
     """ViT backbone plus projection head."""
 

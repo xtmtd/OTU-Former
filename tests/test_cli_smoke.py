@@ -320,6 +320,55 @@ def test_readmes_document_update_and_continued_training():
         assert "HF_TOKEN" in text
 
 
+def test_finetune_optimizer_arguments_are_forwarded(monkeypatch, tmp_path):
+    seen = {}
+
+    def fake_run_finetune(args):
+        seen.update(vars(args))
+
+    monkeypatch.setattr("otuformer.training.trainer.run_finetune", fake_run_finetune)
+    result = runner.invoke(
+        app,
+        [
+            "finetune",
+            "--checkpoint", str(tmp_path / "source.pth"),
+            "--train-data", str(tmp_path / "labels.csv"),
+            "--input-images-dir", str(tmp_path),
+            "--out-dir", str(tmp_path / "out"),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert seen["metric_head_lr"] is None
+    assert seen["weight_decay"] == 1e-4
+
+    result = runner.invoke(
+        app,
+        [
+            "finetune",
+            "--checkpoint", str(tmp_path / "source.pth"),
+            "--train-data", str(tmp_path / "labels.csv"),
+            "--input-images-dir", str(tmp_path),
+            "--out-dir", str(tmp_path / "out-override"),
+            "--finetune-lr", "3e-5",
+            "--metric-head-lr", "1e-4",
+            "--weight-decay", "0.05",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert seen["finetune_lr"] == 3e-5
+    assert seen["metric_head_lr"] == 1e-4
+    assert seen["weight_decay"] == 0.05
+
+
+def test_extract_help_explains_cls_and_task_embedding_use_cases():
+    result = runner.invoke(app, ["extract", "--help"])
+    assert result.exit_code == 0
+    output = result.output.lower()
+    assert "raw cls" in output
+    assert "arcface embedding" in output
+    assert "unseen classes" in output
+
+
 def test_finetune_runs_one_epoch(tmp_path):
     pretrain_csv = _make_tiny_pretrain_data(tmp_path)
     pretrain_result = runner.invoke(
@@ -392,6 +441,7 @@ def test_finetune_runs_one_epoch(tmp_path):
         weights_only=False,
     )
     assert saved["config"]["augmentation_profile"] == "none"
+    assert saved["config"]["embedding_head"] == "arcface_mlp_512"
     assert saved["config"]["augmentation_config"]["profile"] == "none"
     assert saved["config"]["augmentation_config"]["orientation_policy"] == "sensitive"
     assert "orientation_policy" not in saved["config"]
@@ -2540,3 +2590,47 @@ def test_run_pretrain_resume_inherits_new_style_augmentation_into_dataset(
     assert seen["local_crop_size"] == 112
     assert seen["local_crops"] == 3
     assert seen["global_crop_size"] == 224
+
+
+def test_export_forwards_model_name(monkeypatch, tmp_path):
+    seen = {}
+
+    def fake_export(**kwargs):
+        seen.update(kwargs)
+        return {"model_name": kwargs["model_name"], "out_dim": 8, "validated": False}
+
+    monkeypatch.setattr("otuformer.vision.export.export_to_onnx", fake_export)
+    result = runner.invoke(
+        app,
+        [
+            "export",
+            "--checkpoint", str(tmp_path / "source.pth"),
+            "--out-dir", str(tmp_path / "out"),
+            "--model-name", "vit_small_patch16_224",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert seen["model_name"] == "vit_small_patch16_224"
+
+
+def test_cam_forwards_model_name(monkeypatch, tmp_path):
+    seen = {}
+    monkeypatch.setattr("otuformer.vision.cam.run_cam", lambda **kwargs: seen.update(kwargs))
+    images_dir = tmp_path / "images"
+    images_dir.mkdir()
+
+    result = runner.invoke(
+        app,
+        [
+            "cam",
+            "--checkpoint", str(tmp_path / "source.pth"),
+            "--images-dir", str(images_dir),
+            "--out-dir", str(tmp_path / "out"),
+            "--device", "cpu",
+            "--model-name", "vit_small_patch16_224",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert seen["model_name"] == "vit_small_patch16_224"

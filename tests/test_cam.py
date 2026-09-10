@@ -506,3 +506,32 @@ def test_process_image_saves_raw_model_resolution_npy(monkeypatch, tmp_path):
     saved = np.load(result["cam_array_path"])
     assert saved.shape == (32, 32)  # raw model-resolution map, backward compatible
     assert float(saved.max()) == 1.0
+
+
+def test_cam_loads_arcface_embedding_head_checkpoint(tmp_path):
+    from otuformer.training.model import ArcFaceEmbeddingHead, OTUFormerEncoder
+
+    model = OTUFormerEncoder(
+        model_name="vit_tiny_patch16_224", out_dim=64, pretrained=False
+    )
+    model.projector = ArcFaceEmbeddingHead(model.backbone.num_features, 64)
+    checkpoint = tmp_path / "arcface.pth"
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "config": {
+                "model_name": "vit_tiny_patch16_224",
+                "out_dim": 64,
+                "embedding_head": "arcface_mlp_512",
+            },
+        },
+        checkpoint,
+    )
+
+    cam_model, size, name = load_model_from_checkpoint(
+        checkpoint, "vit_tiny_patch16_224", torch.device("cpu")
+    )
+
+    assert name == "vit_tiny_patch16_224"
+    assert size == 224
+    assert isinstance(cam_model, torch.nn.Module)

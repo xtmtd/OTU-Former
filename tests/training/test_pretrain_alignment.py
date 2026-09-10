@@ -655,6 +655,34 @@ def _write_pretrain_checkpoint(
     return path
 
 
+def _write_historical_sft_checkpoint(path, *, image_size=32, out_dim=16):
+    from otuformer.training.loss import ArcFaceLoss
+    from otuformer.training.model import OTUFormerEncoder
+
+    encoder = OTUFormerEncoder(
+        model_name="vit_tiny_patch16_224",
+        out_dim=out_dim,
+        pretrained=False,
+        img_size=image_size,
+    )
+    loss_fn = ArcFaceLoss(embed_dim=out_dim, num_classes=2)
+    torch.save(
+        {
+            "epoch": 0,
+            "model_state_dict": encoder.state_dict(),
+            "loss_state_dict": loss_fn.state_dict(),
+            "config": {
+                "model_name": "vit_tiny_patch16_224",
+                "out_dim": out_dim,
+                "image_size": image_size,
+            },
+            "class_labels": ["classA", "classB"],
+        },
+        path,
+    )
+    return path
+
+
 def _finetune_args(tmp_path, checkpoint_path, **overrides):
     values = dict(
         seed=42,
@@ -667,6 +695,8 @@ def _finetune_args(tmp_path, checkpoint_path, **overrides):
         input_images_dir=str(tmp_path),
         model_name="vit_tiny_patch16_224",
         metric_embed_dim=16,
+        finetune_lr=1e-4,
+        loss="arcface",
         freeze_ratio=0.7,
         extract_size=None,
         compute_embedding_metrics=False,
@@ -675,6 +705,68 @@ def _finetune_args(tmp_path, checkpoint_path, **overrides):
     )
     values.update(overrides)
     return argparse.Namespace(**values)
+
+
+def test_historical_sft_new_run_can_resume_saved_projection_checkpoint(tmp_path):
+    checkpoint = _write_historical_sft_checkpoint(tmp_path / "historical.pth")
+    img_dir = tmp_path / "images"
+    img_dir.mkdir()
+    for i in range(4):
+        Image.new("RGB", (64, 64), color=(i * 50, 0, 0)).save(img_dir / f"img_{i}.jpg")
+    labels = pd.DataFrame(
+        {
+            "image": [f"img_{i}.jpg" for i in range(4)],
+            "label": ["classA", "classA", "classB", "classB"],
+        }
+    )
+    labels_path = tmp_path / "labels.csv"
+    labels.to_csv(labels_path, index=False)
+
+    first_args = _finetune_args(
+        tmp_path,
+        checkpoint,
+        out_dir=str(tmp_path / "first"),
+        train_data=str(labels_path),
+        input_images_dir=str(img_dir),
+        finetune_epochs=1,
+        batch_size=2,
+        num_workers=0,
+        log_every_n_steps=100,
+        save_every_epochs=1,
+        keep_last_checkpoints=0,
+        weight_decay=1e-4,
+        metric_head_lr=None,
+    )
+    trainer.run_finetune(first_args)
+    first_path = tmp_path / "first" / "finetune_latest.pth"
+    first = torch.load(first_path, map_location="cpu", weights_only=False)
+    assert first["config"]["embedding_head"] == "projection_mlp_2048"
+    assert len(first["optimizer"]["param_groups"]) == 2
+
+    resume_args = _finetune_args(
+        tmp_path,
+        checkpoint,
+        out_dir=str(tmp_path / "second"),
+        resume=str(first_path),
+        train_data=str(labels_path),
+        input_images_dir=str(img_dir),
+        finetune_epochs=2,
+        batch_size=2,
+        num_workers=0,
+        log_every_n_steps=100,
+        save_every_epochs=1,
+        keep_last_checkpoints=0,
+        weight_decay=1e-4,
+        metric_head_lr=None,
+    )
+    trainer.run_finetune(resume_args)
+    second = torch.load(
+        tmp_path / "second" / "finetune_latest.pth",
+        map_location="cpu",
+        weights_only=False,
+    )
+    assert second["config"]["embedding_head"] == "projection_mlp_2048"
+    assert len(second["optimizer"]["param_groups"]) == 2
 
 
 @pytest.mark.parametrize(
@@ -1364,3 +1456,189 @@ def test_orientation_policy_note_describes_policies_and_legacy_sensitive():
     assert "legacy" in legacy_note
     assert "historical" in legacy_note
     assert "does not apply" in legacy_note
+
+
+def _write_tiny_ft_data(tmp_path):
+    img_dir = tmp_path / "images"
+    img_dir.mkdir(exist_ok=True)
+    for i in range(4):
+        Image.new("RGB", (64, 64), color=(i * 50, 0, 0)).save(img_dir / f"img_{i}.jpg")
+    labels_path = tmp_path / "labels.csv"
+    pd.DataFrame(
+        {
+            "image": [f"img_{i}.jpg" for i in range(4)],
+            "label": ["classA", "classA", "classB", "classB"],
+        }
+    ).to_csv(labels_path, index=False)
+    return img_dir, labels_path
+
+
+def _write_arcface_checkpoint(path, *, image_size=32, out_dim=16):
+    from otuformer.training.model import ArcFaceEmbeddingHead, OTUFormerEncoder
+
+    encoder = OTUFormerEncoder(
+        model_name="vit_tiny_patch16_224",
+        out_dim=out_dim,
+        pretrained=False,
+        img_size=image_size,
+    )
+    encoder.projector = ArcFaceEmbeddingHead(encoder.backbone.num_features, out_dim)
+    torch.save(
+        {
+            "model_state_dict": encoder.state_dict(),
+            "config": {
+                "model_name": "vit_tiny_patch16_224",
+                "out_dim": out_dim,
+                "metric_embed_dim": out_dim,
+                "image_size": image_size,
+                "embedding_head": "arcface_mlp_512",
+            },
+        },
+        path,
+    )
+    return path
+
+
+def _finetune_overrides(tmp_path, out_name="ft_out", **overrides):
+    img_dir, labels_path = _write_tiny_ft_data(tmp_path)
+    values = dict(
+        out_dir=str(tmp_path / out_name),
+        train_data=str(labels_path),
+        input_images_dir=str(img_dir),
+        batch_size=2,
+        num_workers=0,
+        log_every_n_steps=100,
+        save_every_epochs=1,
+        keep_last_checkpoints=0,
+        weight_decay=1e-4,
+        metric_head_lr=None,
+    )
+    values.update(overrides)
+    return values
+
+
+def _run_frozen_finetune(tmp_path, checkpoint_path, out_name, **overrides):
+    """One fine-tune epoch with a zeroed optimizer.
+
+    With ``lr=0`` and ``weight_decay=0`` the optimizer leaves parameters
+    untouched, so the saved head is exactly the head that was loaded.
+    """
+    args = _finetune_args(
+        tmp_path,
+        checkpoint_path,
+        finetune_epochs=1,
+        **_finetune_overrides(
+            tmp_path,
+            out_name,
+            finetune_lr=0.0,
+            metric_head_lr=0.0,
+            weight_decay=0.0,
+            **overrides,
+        ),
+    )
+    trainer.run_finetune(args)
+    return torch.load(
+        Path(args.out_dir) / "finetune_latest.pth", map_location="cpu", weights_only=False
+    )
+
+
+def test_arcface_checkpoint_init_keeps_trained_embedding_head(tmp_path):
+    source = _write_arcface_checkpoint(tmp_path / "src.pth", image_size=32, out_dim=16)
+    source_state = torch.load(source, map_location="cpu", weights_only=False)[
+        "model_state_dict"
+    ]
+
+    saved = _run_frozen_finetune(tmp_path, source, "from_arcface")
+
+    assert saved["config"]["embedding_head"] == "arcface_mlp_512"
+    assert torch.equal(
+        saved["model_state_dict"]["projector.net.0.weight"],
+        source_state["projector.net.0.weight"],
+    )
+    assert torch.equal(
+        saved["model_state_dict"]["projector.net.2.weight"],
+        source_state["projector.net.2.weight"],
+    )
+
+
+def test_metric_embed_dim_resizes_the_arcface_head(tmp_path):
+    from otuformer.embedding.extractor import _load_model
+
+    ssl = _write_pretrain_checkpoint(tmp_path / "ssl.pth", image_size=32, out_dim=16)
+
+    saved = _run_frozen_finetune(tmp_path, ssl, "resized", metric_embed_dim=8)
+
+    assert saved["config"]["out_dim"] == 8
+    assert saved["config"]["metric_embed_dim"] == 8
+    assert saved["model_state_dict"]["projector.net.2.weight"].shape == (8, 512)
+    assert saved["loss_state_dict"]["head.weight"].shape == (2, 8)
+    # A resized checkpoint must stay readable by extract/export/cam.
+    assert saved["model_state_dict"]["center"].shape == (1, 8)
+    loaded, _ = _load_model(
+        tmp_path / "resized" / "finetune_latest.pth",
+        "vit_tiny_patch16_224",
+        torch.device("cpu"),
+    )
+    assert loaded.projector.net[2].weight.shape == (8, 512)
+
+
+def test_finetune_resume_rejects_a_changed_embedding_dim(tmp_path):
+    ssl = _write_pretrain_checkpoint(tmp_path / "ssl.pth", image_size=32, out_dim=16)
+    first = _finetune_args(
+        tmp_path, ssl, finetune_epochs=1, **_finetune_overrides(tmp_path, "f1")
+    )
+    trainer.run_finetune(first)
+
+    resume = _finetune_args(
+        tmp_path,
+        ssl,
+        resume=str(tmp_path / "f1" / "finetune_latest.pth"),
+        finetune_epochs=2,
+        metric_embed_dim=8,
+        **_finetune_overrides(tmp_path, "f2"),
+    )
+    with pytest.raises(ValueError, match="Cannot resume"):
+        trainer.run_finetune(resume)
+
+
+def test_metric_embed_dim_is_rejected_for_a_projection_head_checkpoint(tmp_path):
+    sft = _write_historical_sft_checkpoint(tmp_path / "sft.pth", image_size=32, out_dim=16)
+
+    args = _finetune_args(
+        tmp_path,
+        sft,
+        finetune_epochs=1,
+        metric_embed_dim=8,
+        **_finetune_overrides(tmp_path, "bad_dim"),
+    )
+
+    with pytest.raises(ValueError, match="cannot be applied to a ProjectionHead"):
+        trainer.run_finetune(args)
+
+
+def test_finetune_resume_rejects_a_changed_freeze_ratio(tmp_path):
+    ssl = _write_pretrain_checkpoint(tmp_path / "ssl.pth", image_size=32, out_dim=16)
+
+    first = _finetune_args(
+        tmp_path,
+        ssl,
+        finetune_epochs=1,
+        freeze_ratio=0.5,
+        **_finetune_overrides(tmp_path, "f1"),
+    )
+    trainer.run_finetune(first)
+    saved = torch.load(
+        tmp_path / "f1" / "finetune_latest.pth", map_location="cpu", weights_only=False
+    )
+    assert saved["config"]["freeze_ratio"] == 0.5
+
+    resume = _finetune_args(
+        tmp_path,
+        ssl,
+        resume=str(tmp_path / "f1" / "finetune_latest.pth"),
+        finetune_epochs=2,
+        freeze_ratio=0.7,
+        **_finetune_overrides(tmp_path, "f2"),
+    )
+    with pytest.raises(ValueError, match="freeze_ratio"):
+        trainer.run_finetune(resume)

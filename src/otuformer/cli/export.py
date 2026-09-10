@@ -55,6 +55,14 @@ def export(
         ),
     ),
     opset: int = typer.Option(18, "--opset", help="ONNX opset version."),
+    model_name: str = typer.Option(
+        "vit_tiny_patch16_224",
+        "--model-name",
+        help=(
+            "Fallback timm backbone for checkpoints that record no model name "
+            "(ref-script fine-tune checkpoints store neither config nor args)."
+        ),
+    ),
     overwrite: bool = typer.Option(
         False, "--overwrite", help="Clear an existing non-empty output directory."
     ),
@@ -79,6 +87,7 @@ def export(
             "overwrite": overwrite,
             "imgsz": imgsz,
             "opset": opset,
+            "model_name": model_name,
         }
         print(f"Command: {_format_user_command(ctx, params)}")
         print("Parameters:")
@@ -91,6 +100,7 @@ def export(
             out_path=onnx_path,
             imgsz=_parse_size(imgsz, stage="--imgsz"),
             opset=opset,
+            model_name=model_name,
         )
         typer.echo(f"Export complete: {onnx_path}")
         typer.echo(f"  Model:     {report['model_name']}")

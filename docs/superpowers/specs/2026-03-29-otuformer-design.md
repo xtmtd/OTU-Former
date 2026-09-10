@@ -125,7 +125,13 @@ Transform-level profile definitions live in [`2026-09-07-otuformer-training-augm
 ---
 
 ### 3.2 `finetune`
-ArcFace metric learning supervised fine-tuning on top of a pretrained checkpoint.
+ArcFace metric learning supervised fine-tuning on top of a pretrained checkpoint. New fine-tune runs replace the SSL projector with a compact, unnormalized `backbone_dim -> 512 -> metric_embed_dim` embedding head; ArcFace owns feature and classifier normalization. Fine-tuning uses separate backbone and metric-head learning rates, defaults to AdamW `weight_decay=1e-4` as a conservative supervised-training choice rather than a full legacy-script reproduction, and does not apply gradient clipping.
+
+Initialization semantics for `--checkpoint`: an SSL pretrain checkpoint installs a fresh `ArcFaceEmbeddingHead`; a fine-tune checkpoint whose head and width match the head being trained keeps its trained projector; a `ProjectionHead` checkpoint (OTU historical SFT, or `projection_mlp_2048` metadata) keeps its projector and therefore fixes the embedding width.
+
+Checkpoints record the actual `config.embedding_head` (`arcface_mlp_512` for new runs, `projection_mlp_2048` for runs initialized from a historical SFT checkpoint) and `config.freeze_ratio`. The historical `loss_state_dict` marker is recognized when metadata is absent; missing metadata without fine-tune markers remains valid SSL initialization. On resume, the checkpoint's optimizer state restores its saved parameter-group settings, so CLI LR and weight-decay values are inert, and a changed `--freeze-ratio` is rejected because the optimizer parameter groups depend on it.
+
+Ref-script checkpoints (`ref/ibot20260115.py`: `model`/`teacher`/`student` weight keys, `projector.<i>` projector naming, an `args` dict instead of `config`, `loss_func.W` classifier) are readable by `extract`, `export`, and `cam`, but cannot be resumed by `finetune` — see 4.8.
 
 All parameters migrated from `ref/ibot20260115.py` `get_parser()`, mode=finetune. Full list:
 
@@ -134,9 +140,11 @@ All parameters migrated from `ref/ibot20260115.py` `get_parser()`, mode=finetune
 - `--input-images-dir` : root image directory
 - `--out-dir`
 - `--model-name` : timm backbone (must match pretrain) [default: vit_small_patch16_224]
-- `--metric-embed-dim` : embedding dimension for metric learning [default: 256]
-- `--finetune-epochs` [default: 20], `--finetune-lr` [default: 1e-4]
-- `--freeze-ratio` : fraction of transformer blocks to freeze [default: 0.7]
+- `--metric-embed-dim` : fine-tune embedding dimension (the ArcFace head output, not the raw CLS dimension) [default: inherit the checkpoint's recorded metric dimension, else the pretrained projector dimension]. An explicit value that conflicts with a `ProjectionHead` checkpoint is rejected, because that projector's output width is fixed by the pretrained weights. On `--resume` the value must match the checkpoint (resizing is only valid for a new `--checkpoint` run).
+- `--finetune-epochs` [default: 20], `--finetune-lr` : backbone learning rate [default: 1e-4]
+- `--metric-head-lr` : learning rate for the ArcFace embedding head and classifier; omitted means inherit `--finetune-lr`. On `--resume`, saved optimizer state takes precedence.
+- `--weight-decay` : AdamW weight decay [default: 1e-4, a conservative supervised SFT choice; pass 0.05 for the legacy script's setting]
+- `--freeze-ratio` : fraction of transformer blocks to freeze [default: 0.7]; recorded in `config.freeze_ratio` and required to match on `--resume`, because the optimizer only holds `requires_grad` backbone parameters
 - `--loss` : loss function [default: arcface] — registry supports future additions (ProxyAnchor planned)
 - `--augmentation` : fine-tuning augmentation profile — `none` (new-run default) or `conservative` (experimental)
 - `--orientation-policy` : orientation policy — `sensitive` (new-run default) or `invariant` (opt-in broad rotation and reflection); when initializing from `--checkpoint`, an omitted value inherits the pretraining checkpoint's saved policy
@@ -159,8 +167,8 @@ Parameters migrated from `ref/ibot20260115.py` `get_parser()`, mode=extract. Ful
 - `--model-name` : timm backbone (must match training) [default: vit_small_patch16_224]
 - `--extract-size` [default: auto; `auto` uses the checkpoint's recorded training size; explicit values (224/384/448, 518 = patch-14 models only) must be divisible by the backbone patch size]
 - `--eval-transform` : `center-crop` | `whole-specimen-pad` [default: center-crop; deterministic evaluation preprocessing protocol, applied to extraction and CAM]
-- `--use-projector-output` : use projector output instead of CLS token
-- `--token-mode` : `cls` | `patch-topk` | `attention-pool` [default: cls]
+- `--use-projector-output` : use SSL projector output for SSL checkpoints, or the ArcFace embedding for fine-tune checkpoints; recommended for fine-tuned-class retrieval and closed-set clustering
+- `--token-mode` : `cls` | `patch-topk` | `attention-pool` [default: cls]; `cls` is raw CLS and remains the comparison baseline for unseen classes, cross-dataset transfer, and general morphology representation
 - `--topk-patches` : for patch-topk mode, choices: 10/20/30 [default: 20]
 - `--attention-pooling-type` : `lightweight` | `multihead` | `gated` [default: lightweight]
 - `--attention-pooling-epochs` [default: 20]
@@ -170,6 +178,8 @@ Parameters migrated from `ref/ibot20260115.py` `get_parser()`, mode=extract. Ful
 - `--prefix` : OTU name prefix applied to cluster IDs downstream [default: OTU]
 
 **Batch mode:** When `--input-images-dir` contains subdirectories, each subdirectory is treated as an independent sample set. All embeddings are extracted and merged into a single CSV with a `sample` column recording the source subdirectory. This ensures consistent OTU naming across datasets when feeding into `cluster`.
+
+**Checkpoint formats:** Accepts OTU checkpoints (`model_state_dict`/`teacher`/`student` + `config`) and ref-script checkpoints (`teacher`/`student`/`model` + `args`). The embedding head and embedding dimension are read from `config.embedding_head` when present and otherwise inferred from the projector shapes, so a missing or wrong metadata value cannot cause a silent mis-load. Ref-script **SFT** checkpoints record no `config`/`args`, so they need an explicit `--model-name`.
 
 **Outputs:** `embeddings.csv` (columns: `id`, `sample` (batch only), then embedding dimensions), optional `umap.pdf`, and `metrics.csv` only when at least two label classes are available. Positive `--metrics-sample-size` limits both metric and UMAP inputs; values <=0 disable the cap.
 
@@ -286,8 +296,9 @@ Generate CAM heatmaps for visual explanation of morphological features.
 
 Implementation mirrors `entomokit classify cam` (`/Users/zf/data/coding/entomokit/entomokit/classify/cam.py` and `src/classification/cam.py`), adapted for OTU-Former checkpoints (timm ViT backbone, no AutoGluon).
 
-- `--checkpoint` : pretrain or finetune checkpoint
+- `--checkpoint` : pretrain or finetune checkpoint (OTU or ref-script format)
 - `--images-dir` : image directory
+- `--model-name` : fallback timm backbone for checkpoints that record no model name (ref-script SFT) [default: `vit_tiny_patch16_224`]
 - `--label-csv` : optional CSV with `image` and `label` columns; if omitted all images in `--images-dir` are used
 - `--out-dir`
 - `--cam-method` : `gradcam` | `gradcampp` | `scorecam` | `layercam` | `eigencam` | `ablationcam` [default: gradcam]
@@ -310,12 +321,13 @@ Heatmaps are overlaid on the full original image via the correct inverse of the 
 ### 3.9 `export`
 Export encoder + projector to ONNX for deployment.
 
-- `--checkpoint` : pretrain or finetune checkpoint
+- `--checkpoint` : pretrain or finetune checkpoint (OTU or ref-script format)
 - `--out-dir`
 - `--imgsz` : input image size [default: auto; `auto` uses the checkpoint's recorded training size]
 - `--opset` : ONNX opset version [default: 17]
+- `--model-name` : fallback timm backbone for checkpoints that record no model name (ref-script SFT) [default: `vit_tiny_patch16_224`]
 
-**Note:** Always exports encoder + projector only. Output embedding dimension is read from the checkpoint metadata (set by `--out-dim` or `--metric-embed-dim` at training time) — not hardcoded.
+**Note:** Always exports encoder + projector only. The projector is rebuilt from the checkpoint's `config.embedding_head`, falling back to the projector shapes, so fine-tune checkpoints with an `ArcFaceEmbeddingHead` export correctly; the ref-script `projector.<i>` naming is normalized on read. Output embedding dimension is read from the checkpoint metadata (set by `--out-dim` or `--metric-embed-dim` at training time) — not hardcoded. A backbone that does not fit the resolved model name raises an error naming whether the conflict is in the checkpoint metadata or in `--model-name`.
 
 **Outputs:** `encoder.onnx`, `export_report.json`.
 
@@ -354,6 +366,20 @@ NJ tree construction is removed (present in original `embeddings_tree20260206.py
 
 ### 4.7 Export embedding dimension
 The ONNX export output dimension is read directly from checkpoint metadata. It is not hardcoded to 256 — it reflects whatever `--out-dim` (pretrain) or `--metric-embed-dim` (finetune) was used.
+
+### 4.8 Checkpoint consumption contract
+The three read-only consumers (`extract`, `export`, `cam`) share one resolver, `otuformer.utils.checkpoint.resolve_checkpoint()`, so their format support cannot drift apart. `finetune` deliberately uses its own `_select_finetune_embedding_head()`: it answers a different question — which head the *new* run should train (SSL initialization installs a fresh ArcFace head; an existing fine-tune checkpoint keeps its own) rather than which head a checkpoint contains.
+
+| Consumer | `model_state_dict` | `teacher`/`student` | `model` (ref-script SFT) | `args` (no `config`) | `projector.<i>` naming |
+|---|---|---|---|---|---|
+| `extract` | yes | yes | yes | yes | yes |
+| `export` | yes | yes | yes | yes | yes |
+| `cam` | yes | yes | yes | yes | yes |
+| `finetune` | init; `--resume` requires it | rejected | rejected, with reason | rejected | rejected |
+
+The embedding head is taken from `config.embedding_head` when present, otherwise inferred from the projector's first linear width (512 → `arcface_mlp_512`, 2048 → `projection_mlp_2048`); any other width is rejected rather than silently mis-loaded. Buffers that do not fit the rebuilt model (the SSL-only `center`) are dropped, and a backbone whose tensors do not fit the resolved model name is rejected with a message that distinguishes a conflict inside the checkpoint metadata (which outranks `--model-name`) from a missing recorded name that `--model-name` must supply.
+
+Resuming a ref-script checkpoint in `finetune` stays unsupported: its classifier is `loss_func.W`, which is embedding-major and not interchangeable with `ArcFaceLoss.head.weight`. Ref-script **SSL** checkpoints are self-describing (they record `args` with `model_name`/`out_dim`); ref-script **SFT** checkpoints record neither `config` nor `args`, so they require an explicit `--model-name` (`extract`, `export`, and `cam` all expose it).
 
 ---
 

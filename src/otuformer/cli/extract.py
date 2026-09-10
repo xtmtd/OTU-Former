@@ -84,7 +84,11 @@ def extract(
     use_projector_output: bool = typer.Option(
         False,
         "--use-projector-output",
-        help="Use projector output instead of CLS token.",
+        help=(
+            "Use SSL projector output for SSL checkpoints, or the ArcFace embedding "
+            "for fine-tune checkpoints; useful for fine-tuned-class retrieval and "
+            "closed-set clustering."
+        ),
     ),
     use_student: bool = typer.Option(
         False,
@@ -99,8 +103,10 @@ def extract(
         "cls",
         "--token-mode",
         help=(
-            "Embedding token mode. cls=raw CLS token; patch-topk=top-K patch tokens + PCA; "
-            "attention-pool=learned query pooling over patch tokens."
+            "Embedding token mode. cls=raw CLS token (the comparison baseline for "
+            "unseen classes, cross-dataset transfer, and general morphology); "
+            "patch-topk=top-K patch tokens + PCA; attention-pool=learned query pooling "
+            "over patch tokens."
         ),
     ),
     topk_patches: int = typer.Option(

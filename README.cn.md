@@ -286,9 +286,11 @@ otuformer finetune \
 | `--input-images-dir` | 图像根目录 | 必填 |
 | `--out-dir` | 输出目录 | `runs/finetune` |
 | `--model-name` | timm 骨干网络名称 | `vit_tiny_patch16_224` |
-| `--metric-embed-dim` | ArcFace 投影器嵌入维度 | 256 |
+| `--metric-embed-dim` | 微调嵌入维度（ArcFace 头输出，非原始 CLS）。显式传值会重建该头；对历史 `ProjectionHead` 检查点会报错，其宽度由预训练投影器固定 | 继承检查点记录的维度 |
 | `--finetune-epochs` | 微调轮数 | 20 |
-| `--finetune-lr` | 微调学习率 | 1e-4 |
+| `--finetune-lr` | 骨干网络学习率 | 1e-4 |
+| `--metric-head-lr` | ArcFace 嵌入头和分类器学习率；省略时继承 `--finetune-lr` | `--finetune-lr` |
+| `--weight-decay` | 微调使用的 AdamW weight decay；默认 `1e-4` 是保守的监督训练选择，传 `0.05` 可复现旧脚本设置 | 1e-4 |
 | `--freeze-ratio` | 冻结骨干网络比例（0.0=不冻结，1.0=全冻结） | 0.7 |
 | `--loss` | 度量学习损失名称 | `arcface` |
 | `--augmentation` | 微调数据增强配置：`none`（新运行默认）或 `conservative`（实验性）；`--resume` 时省略则继承已保存配置 | `none` |
@@ -315,6 +317,12 @@ otuformer finetune \
 - `checkpoints/` — 模型检查点（`finetune_latest.pth`、`finetune_best.pth`）
 - `metrics.json` / `metrics.csv` — 训练指标
 - `umap.pdf` — UMAP 可视化（未禁用时）
+
+**检查点处理**：
+
+- `--checkpoint` 开启新运行。SSL 预训练检查点会安装全新的 ArcFace 嵌入头；头类型与宽度都匹配的微调检查点会保留已训练的投影器。历史 `ProjectionHead` 检查点保留其投影器，因此嵌入宽度由它决定。
+- `--resume` 会恢复保存的优化器状态，因此 `--finetune-lr`、`--metric-head-lr`、`--weight-decay` 不生效。`--freeze-ratio` 必须与保存值一致。
+- 旧脚本检查点（`ref/ibot20260115.py`）可被 `extract`、`export`、`cam` 读取，但不能被 `finetune` 续训。
 
 ---
 
@@ -345,6 +353,8 @@ checkpoint 元数据（`config.augmentation_profile`、`config.augmentation_conf
 ### extract 命令
 
 从图像中提取嵌入向量。支持 ONNX 模型加速 CPU 推理。
+
+可读取 OTU 检查点与旧脚本检查点（`ref/ibot20260115.py`）。嵌入头优先按 `config.embedding_head` 重建，缺失时按权重中的投影器形状推断。
 
 ```bash
 # 使用 PyTorch 检查点（CLS token 模式）
@@ -377,7 +387,7 @@ otuformer extract \
 | `--model-name` | timm 骨干网络名称 | `vit_tiny_patch16_224` |
 | `--extract-size` | 提取时图像缩放/裁剪尺寸；`auto` 使用检查点记录的训练尺寸 | auto |
 | `--eval-transform` | 评估预处理协议：`center-crop`（默认）或 `whole-specimen-pad`（保持宽高比的方形填充，预留） | `center-crop` |
-| `--use-projector-output` | 使用投影器输出而非 CLS token | 否 |
+| `--use-projector-output` | 使用 SSL 投影器输出；微调 checkpoint 则使用 ArcFace 任务嵌入 | 否 |
 | `--use-student` | 加载学生权重而非教师（EMA） | 否 |
 | `--token-mode` | `cls`/`patch-topk`/`attention-pool` | `cls` |
 | `--topk-patches` | patch-topk 模式的 top-K 值 | 20 |
@@ -588,6 +598,8 @@ otuformer diversity \
 
 生成 CAM 热力图用于模型可解释性分析。
 
+可读取 OTU 检查点与旧脚本检查点（`ref/ibot20260115.py`）；CAM 只使用 backbone。
+
 ```bash
 # 基本用法
 otuformer cam \
@@ -628,6 +640,7 @@ otuformer cam \
 | `--cam-batch-size` | CAM 推理批量大小 | 32 |
 | `--num-workers` | DataLoader 工作进程数 | 4 |
 | `--device` | `auto`/`cpu`/`cuda`/`mps` | `auto` |
+| `--model-name` | 检查点未记录模型名（旧脚本 SFT）时的 timm backbone 回退值 | `vit_tiny_patch16_224` |
 | `--eval-transform` | 评估预处理协议：`center-crop`（热力图限定在模型视野内）或 `whole-specimen-pad`（热力图覆盖整个标本） | `center-crop` |
 
 **输出**：
@@ -641,6 +654,8 @@ otuformer cam \
 ### export 命令
 
 将 PyTorch 检查点导出为 ONNX 格式用于部署和加速推理。
+
+可读取 OTU 检查点与旧脚本检查点（`ref/ibot20260115.py`）。投影器优先按 `config.embedding_head` 重建，缺失时按权重中的投影器形状推断。
 
 ```bash
 # 基本用法
@@ -662,6 +677,7 @@ otuformer export \
 | `--out-dir` | 输出目录 | `runs/export` |
 | `--imgsz` | ONNX 导出输入图像尺寸；`auto` 使用检查点记录的训练尺寸 | auto |
 | `--opset` | ONNX opset 版本 | 18 |
+| `--model-name` | 检查点未记录模型名（旧脚本 SFT）时的 timm backbone 回退值 | `vit_tiny_patch16_224` |
 
 **输出**：
 - `encoder.onnx` — ONNX 编码器模型

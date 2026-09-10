@@ -293,9 +293,11 @@ otuformer finetune \
 | `--input-images-dir` | Root image directory | Required |
 | `--out-dir` | Output directory | `runs/finetune` |
 | `--model-name` | timm backbone name | `vit_tiny_patch16_224` |
-| `--metric-embed-dim` | ArcFace projector embedding dimension | 256 |
+| `--metric-embed-dim` | Fine-tune embedding dimension (ArcFace head output, not raw CLS). An explicit value resizes the head; it is rejected for a historical `ProjectionHead` checkpoint, whose width is fixed by the pretrained projector | inherit the checkpoint's metric dimension |
 | `--finetune-epochs` | Finetuning epochs | 20 |
-| `--finetune-lr` | Finetuning learning rate | 1e-4 |
+| `--finetune-lr` | Backbone learning rate | 1e-4 |
+| `--metric-head-lr` | ArcFace embedding head and classifier learning rate; omitted inherits `--finetune-lr` | `--finetune-lr` |
+| `--weight-decay` | Fine-tune AdamW weight decay; default `1e-4` is a conservative supervised choice, while `0.05` reproduces the legacy script's setting | 1e-4 |
 | `--freeze-ratio` | Fraction of backbone blocks to freeze (0.0=none, 1.0=all) | 0.7 |
 | `--loss` | Metric-learning loss name | `arcface` |
 | `--augmentation` | Fine-tuning augmentation profile: `none` (new-run default) or `conservative` (experimental); omit to inherit the saved profile on `--resume` | `none` |
@@ -322,6 +324,12 @@ otuformer finetune \
 - `checkpoints/` — Model checkpoints (`finetune_latest.pth`, `finetune_best.pth`)
 - `metrics.json` / `metrics.csv` — Training metrics
 - `umap.pdf` — UMAP visualization (when not disabled)
+
+**Checkpoint handling**:
+
+- `--checkpoint` starts a new run. An SSL pretrain checkpoint installs a fresh ArcFace embedding head; a fine-tune checkpoint whose head and width match keeps its trained projector. A historical `ProjectionHead` checkpoint keeps its projector, which fixes the embedding width.
+- `--resume` restores the saved optimizer state, so `--finetune-lr`, `--metric-head-lr`, and `--weight-decay` have no effect. `--freeze-ratio` must match the saved value.
+- Ref-script checkpoints (`ref/ibot20260115.py`) can be read by `extract`, `export`, and `cam`, but cannot be resumed by `finetune`.
 
 ---
 
@@ -352,6 +360,8 @@ Checkpoint metadata (`config.augmentation_profile`, `config.augmentation_config`
 ### Extract Command
 
 Extract embeddings from images. Supports ONNX model for accelerated CPU inference.
+
+Accepts OTU checkpoints and ref-script checkpoints (`ref/ibot20260115.py`). The embedding head is rebuilt from `config.embedding_head`, falling back to the projector shapes in the weights.
 
 `--label-csv` requires an `image` column and accepts an optional `label` column. Image-only input generates UMAP without supervised metrics; attention-pool query training still requires labels.
 
@@ -386,7 +396,7 @@ otuformer extract \
 | `--model-name` | timm backbone name | `vit_tiny_patch16_224` |
 | `--extract-size` | Resize/crop size for extraction; `auto` uses the checkpoint's recorded training size | auto |
 | `--eval-transform` | Evaluation preprocessing protocol: `center-crop` (default) or `whole-specimen-pad` (aspect-preserving square padding, reserved) | `center-crop` |
-| `--use-projector-output` | Use projector output instead of CLS token | No |
+| `--use-projector-output` | Use SSL projector output, or the ArcFace task embedding for fine-tune checkpoints | No |
 | `--use-student` | Load student weights instead of teacher (EMA) | No |
 | `--token-mode` | `cls`/`patch-topk`/`attention-pool` | `cls` |
 | `--topk-patches` | Top-K patch tokens for patch-topk mode | 20 |
@@ -597,6 +607,8 @@ otuformer diversity \
 
 Generate CAM heatmaps for model interpretability analysis.
 
+Accepts OTU checkpoints and ref-script checkpoints (`ref/ibot20260115.py`); CAM uses the backbone only.
+
 ```bash
 # Basic usage
 otuformer cam \
@@ -637,6 +649,7 @@ otuformer cam \
 | `--cam-batch-size` | Batch size for CAM inference | 32 |
 | `--num-workers` | Dataloader worker processes | 4 |
 | `--device` | `auto`/`cpu`/`cuda`/`mps` | `auto` |
+| `--model-name` | Fallback timm backbone for checkpoints that record no model name (ref-script SFT) | `vit_tiny_patch16_224` |
 | `--eval-transform` | Evaluation preprocessing protocol: `center-crop` (heatmap confined to the model's field of view) or `whole-specimen-pad` (heatmap covers the whole specimen) | `center-crop` |
 
 **Output**:
@@ -650,6 +663,8 @@ otuformer cam \
 ### Export Command
 
 Export a PyTorch checkpoint to ONNX format for deployment and accelerated inference.
+
+Accepts OTU checkpoints and ref-script checkpoints (`ref/ibot20260115.py`). The projector is rebuilt from `config.embedding_head`, falling back to the projector shapes in the weights.
 
 ```bash
 # Basic usage
@@ -671,6 +686,7 @@ otuformer export \
 | `--out-dir` | Output directory | `runs/export` |
 | `--imgsz` | Input image size for ONNX export; `auto` uses the checkpoint's recorded training size | auto |
 | `--opset` | ONNX opset version | 18 |
+| `--model-name` | Fallback timm backbone for checkpoints that record no model name (ref-script SFT) | `vit_tiny_patch16_224` |
 
 **Output**:
 - `encoder.onnx` — ONNX encoder model

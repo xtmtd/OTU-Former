@@ -57,6 +57,67 @@ def make_legacy_checkpoint(
     return p
 
 
+def test_load_model_keeps_historical_projection_head_metadata(monkeypatch, tmp_path):
+    import otuformer.embedding.extractor as extractor_module
+
+    class FakeEncoder(torch.nn.Module):
+        def __init__(self, **kwargs):
+            super().__init__()
+            self.backbone = type("Backbone", (), {"num_features": 192})()
+            self.projector = torch.nn.Identity()
+
+    monkeypatch.setattr(extractor_module, "OTUFormerEncoder", FakeEncoder)
+    checkpoint = tmp_path / "historical-sft.pth"
+    torch.save(
+        {
+            "model_state_dict": {},
+            "config": {"out_dim": 64, "embedding_head": "projection_mlp_2048"},
+        },
+        checkpoint,
+    )
+    monkeypatch.setattr(extractor_module, "load_checkpoint", lambda _: torch.load(checkpoint))
+
+    model, _ = extractor_module._load_model(
+        checkpoint, "vit_tiny_patch16_224", torch.device("cpu")
+    )
+
+    assert isinstance(model.projector, torch.nn.Identity)
+
+
+def test_load_model_rebuilds_arcface_embedding_head(monkeypatch, tmp_path):
+    import otuformer.embedding.extractor as extractor_module
+    from otuformer.training.model import ArcFaceEmbeddingHead
+
+    class FakeEncoder(torch.nn.Module):
+        def __init__(self, **kwargs):
+            super().__init__()
+            self.backbone = type("Backbone", (), {"num_features": 192})()
+            self.projector = torch.nn.Identity()
+
+    monkeypatch.setattr(extractor_module, "OTUFormerEncoder", FakeEncoder)
+    source = ArcFaceEmbeddingHead(192, 64)
+    checkpoint = tmp_path / "arcface.pth"
+    torch.save(
+        {
+            "model_state_dict": {"projector.net.0.weight": source.net[0].weight.detach()},
+            "config": {
+                "model_name": "vit_tiny_patch16_224",
+                "out_dim": 64,
+                "embedding_head": "arcface_mlp_512",
+            },
+        },
+        checkpoint,
+    )
+    monkeypatch.setattr(extractor_module, "load_checkpoint", lambda _: torch.load(checkpoint))
+
+    model, _ = extractor_module._load_model(
+        checkpoint, "vit_tiny_patch16_224", torch.device("cpu")
+    )
+
+    assert isinstance(model.projector, ArcFaceEmbeddingHead)
+    assert torch.equal(model.projector.net[0].weight, source.net[0].weight)
+
+
 def test_load_model_constructs_at_recorded_checkpoint_size(monkeypatch, tmp_path):
     import otuformer.embedding.extractor as extractor_module
 
@@ -521,3 +582,66 @@ def test_extract_onnx_rejects_patch_topk(tmp_path: Path):
             token_mode="patch-topk",
             onnx_path=onnx_path,
         )
+
+
+def test_load_model_reads_ref_script_arcface_checkpoint(tmp_path: Path):
+    """Ref-script SFT layout: 'model' weights, no config, projector.<i> names."""
+    from otuformer.training.model import ArcFaceEmbeddingHead, OTUFormerEncoder
+
+    encoder = OTUFormerEncoder(
+        model_name="vit_tiny_patch16_224", out_dim=64, pretrained=False
+    )
+    encoder.projector = ArcFaceEmbeddingHead(encoder.backbone.num_features, 64)
+    expected = encoder.projector.net[0].weight.detach().clone()
+
+    state = dict(encoder.state_dict())
+    for i in (0, 2):
+        state[f"projector.{i}.weight"] = state.pop(f"projector.net.{i}.weight")
+        state[f"projector.{i}.bias"] = state.pop(f"projector.net.{i}.bias")
+
+    checkpoint = tmp_path / "arcface_epoch_0020.pth"
+    torch.save(
+        {"epoch": 0, "model": state, "loss_func": {"W": torch.zeros(64, 2)}},
+        checkpoint,
+    )
+
+    model, size = _load_model(checkpoint, "vit_tiny_patch16_224", torch.device("cpu"))
+
+    assert isinstance(model.projector, ArcFaceEmbeddingHead)
+    assert torch.equal(model.projector.net[0].weight, expected)
+    assert size == 224
+    # ``--use-student`` has no effect on a checkpoint that stores no student.
+    student_model, _ = _load_model(
+        checkpoint, "vit_tiny_patch16_224", torch.device("cpu"), use_student=True
+    )
+    assert torch.equal(student_model.projector.net[0].weight, expected)
+
+
+def test_load_model_reads_ref_script_ssl_checkpoint_metadata(tmp_path: Path):
+    """Ref-script SSL layout: 'teacher' weights and an ``args`` dict instead of config."""
+    from otuformer.training.model import OTUFormerEncoder
+
+    model = OTUFormerEncoder(
+        model_name="vit_tiny_patch16_224", out_dim=48, pretrained=False, img_size=224
+    )
+    checkpoint = tmp_path / "SSL_epoch_0020.pth"
+    torch.save(
+        {
+            "teacher": model.state_dict(),
+            "student": model.state_dict(),
+            "args": {
+                "model_name": "vit_tiny_patch16_224",
+                "out_dim": 48,
+                "global_crop_size": 224,
+            },
+        },
+        checkpoint,
+    )
+
+    # A wrong CLI default must not win over the checkpoint's recorded model name.
+    loaded, size = _load_model(checkpoint, "vit_small_patch16_224", torch.device("cpu"))
+
+    assert loaded.model_name == "vit_tiny_patch16_224"
+    assert loaded.backbone.num_features == model.backbone.num_features
+    assert size == 224
+    assert torch.equal(loaded.projector.net[0].weight, model.projector.net[0].weight)

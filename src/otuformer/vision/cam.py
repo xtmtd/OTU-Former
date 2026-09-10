@@ -18,7 +18,11 @@ from otuformer.training.dataset import (
     pad_to_square,
 )
 from otuformer.training.model import OTUFormerEncoder
-from otuformer.utils.checkpoint import load_checkpoint
+from otuformer.utils.checkpoint import (
+    apply_checkpoint_weights,
+    load_checkpoint,
+    resolve_checkpoint,
+)
 from otuformer.utils.device import resolve_device
 from otuformer.utils.size import resolve_training_image_size, validate_input_size
 
@@ -74,28 +78,16 @@ def load_model_from_checkpoint(
     not fooled by the CLI default model name.
     """
     ckpt = load_checkpoint(checkpoint_path)
-    cfg = ckpt.get("config", {})
-    resolved_name = cfg.get("model_name", model_name)
-    out_dim = cfg.get("out_dim") or cfg.get("metric_embed_dim", 256)
+    architecture = resolve_checkpoint(ckpt, model_name)
     checkpoint_size = resolve_training_image_size(ckpt)
     encoder = OTUFormerEncoder(
-        model_name=resolved_name,
-        out_dim=out_dim,
+        model_name=architecture.model_name,
+        out_dim=architecture.embedding_dim,
         pretrained=False,
         img_size=checkpoint_size,
     )
-    validate_input_size(checkpoint_size, encoder, resolved_name)
-    if "model_state_dict" in ckpt:
-        state_dict = ckpt["model_state_dict"]
-    elif "model" in ckpt:
-        state_dict = ckpt["model"]
-    elif "teacher" in ckpt:
-        state_dict = ckpt["teacher"]
-    else:
-        raise KeyError(
-            "Checkpoint must contain 'model_state_dict', legacy 'model', or SSL 'teacher'."
-        )
-    encoder.load_state_dict(state_dict, strict=False)
+    validate_input_size(checkpoint_size, encoder, architecture.model_name)
+    apply_checkpoint_weights(encoder, architecture)
     backbone = encoder.backbone
     backbone.eval().to(device)
 
@@ -112,7 +104,7 @@ def load_model_from_checkpoint(
 
     model = _CamWrapper(backbone)
     model.eval().to(device)
-    return model, checkpoint_size, resolved_name
+    return model, checkpoint_size, architecture.model_name
 
 
 def get_module_by_name(model: torch.nn.Module, name: str) -> torch.nn.Module:

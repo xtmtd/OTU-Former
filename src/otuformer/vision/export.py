@@ -10,7 +10,11 @@ import onnx
 import torch
 
 from otuformer.training.model import OTUFormerEncoder
-from otuformer.utils.checkpoint import load_checkpoint
+from otuformer.utils.checkpoint import (
+    apply_checkpoint_weights,
+    load_checkpoint,
+    resolve_checkpoint,
+)
 from otuformer.utils.io import write_json
 from otuformer.utils.size import resolve_training_image_size, validate_input_size
 
@@ -20,11 +24,12 @@ def export_to_onnx(
     out_path: Path,
     imgsz: int | None = None,
     opset: int = 18,
+    model_name: str = "vit_tiny_patch16_224",
 ) -> dict[str, Any]:
     ckpt = load_checkpoint(checkpoint_path)
-    cfg = ckpt.get("config", {})
-    model_name = cfg.get("model_name", "vit_tiny_patch16_224")
-    out_dim = cfg.get("out_dim") or cfg.get("metric_embed_dim", 256)
+    architecture = resolve_checkpoint(ckpt, model_name)
+    model_name = architecture.model_name
+    out_dim = architecture.embedding_dim
     checkpoint_size = resolve_training_image_size(ckpt)
 
     model = OTUFormerEncoder(
@@ -34,7 +39,7 @@ def export_to_onnx(
         img_size=checkpoint_size,
     )
     validate_input_size(checkpoint_size, model, model_name)
-    model.load_state_dict(ckpt["model_state_dict"], strict=False)
+    apply_checkpoint_weights(model, architecture)
     model.eval()
 
     if imgsz is None:

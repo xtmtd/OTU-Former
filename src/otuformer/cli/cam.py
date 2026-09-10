@@ -130,6 +130,14 @@ def cam(
         "--num-workers",
         help="Number of dataloader worker processes (reserved).",
     ),
+    model_name: str = typer.Option(
+        "vit_tiny_patch16_224",
+        "--model-name",
+        help=(
+            "Fallback timm backbone for checkpoints that record no model name "
+            "(ref-script fine-tune checkpoints store neither config nor args)."
+        ),
+    ),
     device: str = typer.Option(
         "auto",
         "--device",
@@ -175,6 +183,7 @@ def cam(
             "max_images": max_images if max_images is not None else "",
             "cam_batch_size": cam_batch_size,
             "num_workers": num_workers,
+            "model_name": model_name,
             "device": device,
             "eval_transform": eval_transform,
         }
@@ -189,6 +198,7 @@ def cam(
             checkpoint=checkpoint,
             images_dir=images_dir,
             out_dir=out_dir,
+            model_name=model_name,
             label_csv=label_csv,
             cam_method=cam_method,
             arch=arch,

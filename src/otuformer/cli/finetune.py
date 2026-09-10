@@ -77,8 +77,10 @@ def finetune(
         "",
         "--checkpoint",
         help=(
-            "Pretrained checkpoint path (typically runs/pretrain/SSL_latest.pth). "
-            "Used as initialization when --resume is not set."
+            "Initialization checkpoint used when --resume is not set. An SSL "
+            "pretrain checkpoint installs a fresh ArcFace embedding head; a "
+            "fine-tune checkpoint with a matching head keeps its trained "
+            "projector."
         ),
     ),
     train_data: Path = typer.Option(
@@ -95,12 +97,13 @@ def finetune(
         "--model-name",
         help="timm backbone name for metric-learning encoder.",
     ),
-    metric_embed_dim: int = typer.Option(
-        256,
+    metric_embed_dim: int | None = typer.Option(
+        None,
         "--metric-embed-dim",
         help=(
-            "Projector embedding dimension used by ArcFace (not raw CLS dimension). "
-            "If checkpoint provides config.out_dim, that value is used by default."
+            "Fine-tune embedding dimension (the ArcFace head output, not the raw "
+            "CLS dimension). Default: the checkpoint's recorded metric "
+            "dimension, else the pretrained projector dimension."
         ),
     ),
     finetune_epochs: int = typer.Option(
@@ -109,12 +112,25 @@ def finetune(
     finetune_lr: float = typer.Option(
         1e-4,
         "--finetune-lr",
-        help="Learning rate for ArcFace fine-tuning optimizer.",
+        help="Learning rate for the fine-tuned backbone.",
+    ),
+    metric_head_lr: float | None = typer.Option(
+        None,
+        "--metric-head-lr",
+        help="Learning rate for the ArcFace embedding head and classifier; defaults to --finetune-lr.",
+    ),
+    weight_decay: float = typer.Option(
+        1e-4,
+        "--weight-decay",
+        help="AdamW weight decay for fine-tuning; pass 0.05 for the legacy script's setting.",
     ),
     freeze_ratio: float = typer.Option(
         0.7,
         "--freeze-ratio",
-        help="Fraction of backbone blocks to freeze (0.0=none, 1.0=all).",
+        help=(
+            "Fraction of backbone blocks to freeze (0.0=none, 1.0=all). Must "
+            "match the saved value on --resume."
+        ),
     ),
     loss: str = typer.Option(
         "arcface",
@@ -206,7 +222,11 @@ def finetune(
     resume: str = typer.Option(
         "",
         "--resume",
-        help="Fine-tune checkpoint path to resume from (restores model/optimizer state).",
+        help=(
+            "Fine-tune checkpoint path to resume from (restores model/optimizer "
+            "state; saved optimizer settings override the LR and weight-decay "
+            "options)."
+        ),
     ),
     overwrite: bool = typer.Option(
         False, "--overwrite", help="Clear an existing non-empty output directory."
@@ -247,6 +267,8 @@ def finetune(
             metric_embed_dim=metric_embed_dim,
             finetune_epochs=finetune_epochs,
             finetune_lr=finetune_lr,
+            metric_head_lr=metric_head_lr,
+            weight_decay=weight_decay,
             freeze_ratio=freeze_ratio,
             loss=loss,
             augmentation=augmentation,

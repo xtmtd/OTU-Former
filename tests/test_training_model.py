@@ -1,7 +1,13 @@
 import pytest
 import torch
 
-from otuformer.training.model import ArcFaceHead, OTUFormerEncoder
+from otuformer.training.loss import ArcFaceLoss
+from otuformer.training.model import ArcFaceEmbeddingHead, ArcFaceHead, OTUFormerEncoder
+from otuformer.training.trainer import (
+    _build_finetune_optimizer,
+    _select_finetune_embedding_head,
+    _use_split_finetune_optimizer,
+)
 
 
 def test_encoder_does_not_silently_fall_back_to_random_weights(monkeypatch):
@@ -60,6 +66,58 @@ def test_encoder_output_is_l2_normalized():
     out = model(x)
     norms = out.norm(dim=1)
     assert torch.allclose(norms, torch.ones(2), atol=1e-5)
+
+
+def test_arcface_embedding_head_uses_small_unnormalized_mlp():
+    head = ArcFaceEmbeddingHead(embed_dim=192, metric_embed_dim=256)
+    output = head(torch.randn(4, 192))
+
+    assert tuple(head.net[0].weight.shape) == (512, 192)
+    assert tuple(head.net[2].weight.shape) == (256, 512)
+    assert output.shape == (4, 256)
+    assert not torch.allclose(output.norm(dim=1), torch.ones(4), atol=1e-5)
+
+
+def test_finetune_head_selection_preserves_historical_sft_projector():
+    assert _select_finetune_embedding_head({"model_state_dict": {}}) == (
+        "arcface_mlp_512"
+    )
+    assert _select_finetune_embedding_head({"loss_state_dict": {}}) == (
+        "projection_mlp_2048"
+    )
+    with pytest.raises(ValueError, match="legacy fine-tune checkpoint format"):
+        _select_finetune_embedding_head({"loss_func": {}})
+    assert _select_finetune_embedding_head(
+        {"config": {"embedding_head": "arcface_mlp_512"}}
+    ) == "arcface_mlp_512"
+
+
+def test_resume_reuses_saved_finetune_optimizer_group_count():
+    historical_sft = {
+        "config": {"embedding_head": "projection_mlp_2048"},
+        "optimizer": {"param_groups": [{}, {}]},
+    }
+    assert _use_split_finetune_optimizer(historical_sft, resume=True)
+    assert not _use_split_finetune_optimizer(
+        {"config": {"embedding_head": "projection_mlp_2048"},
+         "optimizer": {"param_groups": [{}]}},
+        resume=True,
+    )
+
+
+def test_finetune_optimizer_uses_distinct_backbone_and_head_learning_rates():
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.backbone = torch.nn.Linear(4, 4)
+            self.projector = torch.nn.Linear(4, 2)
+
+    optimizer = _build_finetune_optimizer(
+        Model(), ArcFaceLoss(embed_dim=2, num_classes=3), 3e-5, 1e-4, 1e-4
+    )
+
+    assert [group["lr"] for group in optimizer.param_groups] == [3e-5, 1e-4]
+    assert [group["weight_decay"] for group in optimizer.param_groups] == [1e-4, 1e-4]
 
 
 def test_arcface_head_output_shape():

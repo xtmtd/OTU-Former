@@ -21,7 +21,11 @@ from otuformer.training.dataset import (
     build_eval_transform,
 )
 from otuformer.training.model import OTUFormerEncoder
-from otuformer.utils.checkpoint import load_checkpoint
+from otuformer.utils.checkpoint import (
+    apply_checkpoint_weights,
+    load_checkpoint,
+    resolve_checkpoint,
+)
 from otuformer.utils.device import resolve_device
 from otuformer.utils.size import (
     resolve_onnx_input_size,
@@ -434,33 +438,26 @@ def _load_model(
     script and DINO/iBOT convention).  Pass ``use_student=True`` to load the
     student weights instead.
 
-    Priority for weight selection:
-      - ``use_student=True``  → ``ckpt["student"]`` → ``ckpt["model_state_dict"]``
-      - ``use_student=False`` → ``ckpt["teacher"]`` → ``ckpt["model_state_dict"]``
+    Weight-key priority is owned by
+    :func:`otuformer.utils.checkpoint.resolve_checkpoint_state_dict`.
+
+    Ref-script checkpoints (``model``/``teacher``/``student`` weight keys,
+    ``projector.<i>`` projector names, ``args`` instead of ``config``) are
+    supported for reading; see :mod:`otuformer.utils.checkpoint`.
     """
     ckpt = load_checkpoint(checkpoint_path)
-    cfg = ckpt.get("config", {})
-    out_dim = cfg.get("out_dim") or cfg.get("metric_embed_dim", 256)
-    resolved_model = cfg.get("model_name", model_name)
+    architecture = resolve_checkpoint(ckpt, model_name, prefer_student=use_student)
     checkpoint_size = resolve_training_image_size(ckpt)
     model = OTUFormerEncoder(
-        model_name=resolved_model,
-        out_dim=out_dim,
+        model_name=architecture.model_name,
+        out_dim=architecture.embedding_dim,
         pretrained=False,
         img_size=checkpoint_size,
     )
-    validate_input_size(checkpoint_size, model, resolved_model)
-
-    if use_student:
-        state_dict = ckpt.get("student") or ckpt.get("model_state_dict")
-        source = "student" if "student" in ckpt else "model_state_dict"
-    else:
-        state_dict = ckpt.get("teacher") or ckpt.get("model_state_dict")
-        source = "teacher" if "teacher" in ckpt else "model_state_dict"
-
-    model.load_state_dict(state_dict, strict=False)
+    validate_input_size(checkpoint_size, model, architecture.model_name)
+    apply_checkpoint_weights(model, architecture)
     model.eval().to(device)
-    print(f"[Info] Loaded weights from checkpoint key: '{source}'")
+    print(f"[Info] Loaded weights from checkpoint key: '{architecture.source_key}'")
     return model, checkpoint_size
 
 
@@ -526,7 +523,7 @@ def _extract_one_dir(
                 pooled, _ = model.attention_pool(patch_tokens)
                 embs = pooled
             elif use_projector_output:
-                # projector output: L2-normalised embedding
+                # Projector output: SSL output or the task embedding for fine-tuned checkpoints.
                 embs = model(imgs)
                 if isinstance(embs, tuple):
                     embs = embs[0]
@@ -807,8 +804,8 @@ def extract_embeddings(
     consistent with the ref script and DINO/iBOT convention.  Pass
     ``use_student=True`` to load the student weights instead.
 
-    By default extracts the raw CLS token from the backbone.  Pass
-    ``use_projector_output=True`` to use the L2-normalised projector output.
+    By default extracts the raw CLS token from the backbone. Pass
+    ``use_projector_output=True`` to use the checkpoint's projector or task embedding.
 
     Token modes:
       - ``cls``: CLS token (or projector output if enabled)
