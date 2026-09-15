@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Literal, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -48,20 +48,119 @@ except Exception:
     show_cam_on_image = None
     ClassifierOutputTarget = None
 
-CAM_METHODS = (
-    {
-        "gradcam": GradCAM,
-        "gradcampp": GradCAMPlusPlus,
-        "layercam": LayerCAM,
-        "ablationcam": AblationCAM,
-        "scorecam": ScoreCAM,
-        "eigencam": EigenCAM,
+
+class UnnormalizedCAMMixin:
+    """Mirror pytorch-grad-cam 1.5.5 BaseCAM without scale_cam_image().
+
+    ReLU, target-size resize, layer concatenation, and layer averaging remain
+    identical to BaseCAM. Only its two min-max normalization calls are skipped.
+    Re-read these methods when upgrading grad-cam.
+    """
+
+    @staticmethod
+    def _resize_batch(cam: np.ndarray, target_size: Tuple[int, int]) -> np.ndarray:
+        import cv2
+
+        return np.stack(
+            [
+                cv2.resize(
+                    np.float32(image), target_size, interpolation=cv2.INTER_LINEAR
+                )
+                for image in cam
+            ]
+        )
+
+    def compute_cam_per_layer(self, input_tensor, targets, eigen_smooth):
+        if self.detach:
+            activations_list = [
+                activation.cpu().data.numpy()
+                for activation in self.activations_and_grads.activations
+            ]
+            grads_list = [
+                gradient.cpu().data.numpy()
+                for gradient in self.activations_and_grads.gradients
+            ]
+        else:
+            activations_list = list(self.activations_and_grads.activations)
+            grads_list = list(self.activations_and_grads.gradients)
+
+        target_size = self.get_target_width_height(input_tensor)
+        cam_per_target_layer = []
+        for index, target_layer in enumerate(self.target_layers):
+            activations = (
+                activations_list[index] if index < len(activations_list) else None
+            )
+            gradients = grads_list[index] if index < len(grads_list) else None
+            cam = self.get_cam_image(
+                input_tensor,
+                target_layer,
+                targets,
+                activations,
+                gradients,
+                eigen_smooth,
+            )
+            cam = np.maximum(cam, 0)
+            scaled = self._resize_batch(cam, target_size)
+            cam_per_target_layer.append(scaled[:, None, :])
+
+        return cam_per_target_layer
+
+    def aggregate_multi_layers(self, cam_per_target_layer):
+        cam_per_target_layer = np.concatenate(cam_per_target_layer, axis=1)
+        cam_per_target_layer = np.maximum(cam_per_target_layer, 0)
+        return np.mean(cam_per_target_layer, axis=1)
+
+
+if _HAS_CAM:
+
+    class RawGradCAM(UnnormalizedCAMMixin, GradCAM):
+        pass
+
+    class RawGradCAMPlusPlus(UnnormalizedCAMMixin, GradCAMPlusPlus):
+        pass
+
+    class RawLayerCAM(UnnormalizedCAMMixin, LayerCAM):
+        pass
+
+    class RawScoreCAM(UnnormalizedCAMMixin, ScoreCAM):
+        pass
+
+    class RawEigenCAM(UnnormalizedCAMMixin, EigenCAM):
+        pass
+
+    class RawAblationCAM(UnnormalizedCAMMixin, AblationCAM):
+        pass
+
+    CAM_METHODS = {
+        "gradcam": RawGradCAM,
+        "gradcampp": RawGradCAMPlusPlus,
+        "layercam": RawLayerCAM,
+        "ablationcam": RawAblationCAM,
+        "scorecam": RawScoreCAM,
+        "eigencam": RawEigenCAM,
     }
-    if _HAS_CAM
-    else {}
-)
+else:
+    CAM_METHODS = {}
+
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
+
+SaveMode = Literal["none", "raw", "normalized"]
+
+SAVE_MODES = ("none", "raw", "normalized")
+
+
+def _validate_save_mode(save_npy: str) -> None:
+    """Reject non-string or unknown save modes at the module API boundary.
+
+    The CLI already restricts values via ``click.Choice``; this keeps direct
+    ``process_image()``/``run_cam()`` calls from silently accepting a bool or a
+    typo and treating it as ``normalized``.
+    """
+    if save_npy not in SAVE_MODES:
+        raise ValueError(
+            f"Unknown save_npy '{save_npy}'; choose from: {', '.join(SAVE_MODES)}"
+        )
 
 
 def load_model_from_checkpoint(
@@ -323,12 +422,13 @@ def process_image(
     array_dir: Optional[Path],
     image_weight: float,
     fig_format: str,
-    save_npy: bool,
+    save_npy: SaveMode,
     eval_transform: str = "center-crop",
     model_size: int = 224,
 ) -> Dict:
     import cv2
 
+    _validate_save_mode(save_npy)
     pil_img = Image.open(img_path).convert("RGB")
     original_img = pil_img.copy()
     rgb_display = np.array(original_img).astype(np.float32) / 255.0
@@ -377,9 +477,10 @@ def process_image(
     combined.save(fig_path)
 
     cam_array_path = ""
-    if save_npy and array_dir is not None:
+    if save_npy != "none" and array_dir is not None:
         npy_path = array_dir / f"{stem}.npy"
-        np.save(npy_path, cam_norm.astype(np.float32))
+        cam_array = grayscale_cam if save_npy == "raw" else cam_norm
+        np.save(npy_path, cam_array.astype(np.float32))
         cam_array_path = str(npy_path)
 
     return {
@@ -403,7 +504,7 @@ def run_cam(
     target_layer_name: Optional[str] = None,
     image_weight: float = 0.5,
     fig_format: str = "png",
-    save_npy: bool = False,
+    save_npy: SaveMode = "none",
     dump_model_structure: bool = False,
     max_images: Optional[int] = None,
     cam_batch_size: int = 1,
@@ -412,6 +513,7 @@ def run_cam(
 ) -> None:
     from otuformer.utils.io import write_csv
 
+    _validate_save_mode(save_npy)
     if eval_transform not in EVAL_TRANSFORMS:
         raise ValueError(
             f"Unknown eval transform '{eval_transform}'; "
@@ -439,7 +541,7 @@ def run_cam(
 
     fig_dir = out_dir / "figures"
     fig_dir.mkdir(parents=True, exist_ok=True)
-    array_dir = (out_dir / "arrays") if save_npy else None
+    array_dir = (out_dir / "arrays") if save_npy != "none" else None
     if array_dir:
         array_dir.mkdir(parents=True, exist_ok=True)
 

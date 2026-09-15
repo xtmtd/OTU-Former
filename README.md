@@ -621,7 +621,7 @@ otuformer cam \
     --checkpoint runs/finetune/finetune_latest.pth \
     --images-dir ./images \
     --cam-method gradcampp \
-    --save-npy \
+    --save-npy raw \
     --out-dir runs/cam
 
 # Inspect model layer structure first
@@ -643,7 +643,7 @@ otuformer cam \
 | `--target-layer-name` | Specific CAM target layer (auto-selected if omitted) | Auto |
 | `--image-weight` | Blend weight of original image in CAM overlay (0-1) | 0.5 |
 | `--fig-format` | Output format: `png`/`jpg`/`pdf` | `png` |
-| `--save-npy` | Save raw CAM arrays as NumPy files | No |
+| `--save-npy` | `none` (default, no array), `raw` (positive unnormalized CAM), or `normalized` (per-image min-max `[0, 1]`) | `none` |
 | `--dump-model-structure` | Write model layer names to `model_layers.txt` | No |
 | `--max-images` | Maximum images to process (None = all) | All |
 | `--cam-batch-size` | Batch size for CAM inference | 32 |
@@ -655,8 +655,12 @@ otuformer cam \
 **Output**:
 - `figures/` — CAM overlay images
 - `cam_summary.csv` — Metadata summary
-- `arrays/` — Raw CAM arrays (with `--save-npy`)
+- `arrays/` — CAM arrays, created only for `--save-npy raw` or `--save-npy normalized` (no array is written by default). Saved arrays stay `float32` at model input resolution.
 - `model_layers.txt` — Model layer names (with `--dump-model-structure`)
+
+**CAM array semantics**:
+- `--save-npy raw` keeps the positive unnormalized CAM magnitude (after ReLU and resize to model resolution). `--save-npy normalized` writes the per-image min-max `[0, 1]` copy, which preserves the previous saved-array semantics. The overlay always uses a separate normalized copy, and pixel-identical PNG output is not a contract.
+- Raw magnitudes are comparable only within the same model, target layer, and preprocessing configuration; they are not comparable across backbones, layers, or CAM methods. `eigencam` raw values come from an SVD projection with arbitrary sign and are exported for completeness, but are unsuitable for response-strength statistics.
 
 ---
 

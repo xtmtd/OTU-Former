@@ -122,6 +122,139 @@ def test_cam_methods_complete_if_dependency_available():
     assert expected == set(CAM_METHODS.keys())
 
 
+CAM_METHOD_NAMES = (
+    "ablationcam",
+    "eigencam",
+    "gradcam",
+    "gradcampp",
+    "layercam",
+    "scorecam",
+)
+
+
+def _tiny_conv_model() -> torch.nn.Module:
+    torch.manual_seed(0)
+    return torch.nn.Sequential(
+        torch.nn.Conv2d(3, 8, 3, stride=2, padding=1),
+        torch.nn.ReLU(),
+        torch.nn.Conv2d(8, 16, 3, stride=2, padding=1),
+        torch.nn.ReLU(),
+        torch.nn.Conv2d(16, 32, 3, stride=2, padding=1),
+        torch.nn.ReLU(),
+        torch.nn.AdaptiveAvgPool2d(1),
+        torch.nn.Flatten(),
+        torch.nn.Linear(32, 3),
+    )
+
+
+def _fixed_cam_input() -> torch.Tensor:
+    torch.manual_seed(0)
+    return torch.rand(1, 3, 32, 32)
+
+
+def test_cam_methods_use_raw_subclasses():
+    pytest.importorskip("pytorch_grad_cam")
+    from otuformer.vision.cam import CAM_METHODS, UnnormalizedCAMMixin
+
+    assert set(CAM_METHODS) == set(CAM_METHOD_NAMES)
+    for name, cls in CAM_METHODS.items():
+        assert issubclass(cls, UnnormalizedCAMMixin), name
+
+
+def test_raw_cam_does_not_call_scale_cam_image(monkeypatch):
+    """Structural proof: the raw path never reaches upstream normalization.
+
+    The official class must raise under the same patch, otherwise this test
+    would pass vacuously.
+    """
+    pytest.importorskip("pytorch_grad_cam")
+    import pytorch_grad_cam.base_cam as base_cam_module
+    from pytorch_grad_cam import GradCAM
+    from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
+
+    from otuformer.vision.cam import CAM_METHODS
+
+    def _boom(*_args, **_kwargs):
+        raise AssertionError("scale_cam_image must not be called")
+
+    monkeypatch.setattr(base_cam_module, "scale_cam_image", _boom)
+    tensor = _fixed_cam_input()
+    targets = [ClassifierOutputTarget(1)]
+
+    torch.manual_seed(0)
+    official_model = _tiny_conv_model().eval()
+    with pytest.raises(AssertionError):
+        GradCAM(model=official_model, target_layers=[official_model[4]])(
+            input_tensor=tensor, targets=targets
+        )
+
+    torch.manual_seed(0)
+    raw_model = _tiny_conv_model().eval()
+    raw = CAM_METHODS["gradcam"](model=raw_model, target_layers=[raw_model[4]])(
+        input_tensor=tensor, targets=targets
+    )[0]
+
+    assert raw.shape == (32, 32)
+
+
+def test_raw_cam_agrees_with_official_cam_after_min_max():
+    """Protect display equivalence; does not pin any CAM magnitude.
+
+    Catches a changed resize, a changed ReLU policy, a changed aggregation, a
+    new non-affine upstream step, and an upstream that stops normalizing (via
+    ``official.max()``). It does not catch a pure magnitude scaling of raw CAMs,
+    which min-max would hide.
+    """
+    pytest.importorskip("pytorch_grad_cam")
+    from pytorch_grad_cam import GradCAM
+    from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
+
+    from otuformer.vision.cam import CAM_METHODS
+
+    torch.manual_seed(0)
+    model = _tiny_conv_model().eval()
+    tensor = _fixed_cam_input()
+    targets = [ClassifierOutputTarget(1)]
+
+    official = GradCAM(model=model, target_layers=[model[4]])(
+        input_tensor=tensor, targets=targets
+    )[0]
+    raw = CAM_METHODS["gradcam"](model=model, target_layers=[model[4]])(
+        input_tensor=tensor, targets=targets
+    )[0]
+
+    display = raw - raw.min()
+    display = display / display.max()
+
+    assert official.max() == pytest.approx(1.0, abs=1e-6)
+    assert np.abs(display - official).max() < 1e-6
+
+
+@pytest.mark.parametrize("name", CAM_METHOD_NAMES)
+def test_every_cam_method_returns_unnormalized_map(name):
+    pytest.importorskip("pytorch_grad_cam")
+    from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
+
+    from otuformer.vision.cam import CAM_METHODS
+
+    torch.manual_seed(0)
+    model = _tiny_conv_model().eval()
+    cam = CAM_METHODS[name](model=model, target_layers=[model[4]])
+
+    raw = cam(input_tensor=_fixed_cam_input(), targets=[ClassifierOutputTarget(1)])[0]
+
+    # Structural invariants only: no value here is an acceptance criterion.
+    assert raw.shape == (32, 32)
+    assert raw.dtype == np.float32
+    assert np.isfinite(raw).all()
+    assert raw.min() >= 0.0
+    # No positivity assertion. A fully ReLU'd-zero map is legal (scorecam returns
+    # exactly zero on this tiny fixture), and eigencam is additionally exposed to
+    # the SVD sign. Magnitude is environment/backend dependent and is never
+    # acceptance evidence; the binding evidence is the raw-subclass mapping, the
+    # scale_cam_image sentinel, and the test-owned save-path array.
+
+
 def test_infer_architecture_vit():
     model = make_tiny_vit()
     arch = infer_architecture("vit_tiny_patch16_224", model)
@@ -315,7 +448,7 @@ def test_process_image_uint8_overlay_does_not_overflow(monkeypatch, tmp_path):
         array_dir=None,
         image_weight=0.8,
         fig_format="png",
-        save_npy=False,
+        save_npy="none",
         eval_transform="center-crop",
         model_size=32,
     )
@@ -408,7 +541,7 @@ def test_process_image_dims_out_of_view_for_center_crop(monkeypatch, tmp_path):
         array_dir=None,
         image_weight=0.8,
         fig_format="png",
-        save_npy=False,
+        save_npy="none",
         eval_transform="center-crop",
         model_size=32,
     )
@@ -450,7 +583,7 @@ def test_process_image_whole_specimen_pad_keeps_full_frame(monkeypatch, tmp_path
         array_dir=None,
         image_weight=0.8,
         fig_format="png",
-        save_npy=False,
+        save_npy="none",
         eval_transform="whole-specimen-pad",
         model_size=32,
     )
@@ -483,6 +616,9 @@ def test_process_image_saves_raw_model_resolution_npy(monkeypatch, tmp_path):
         ),
     )
 
+    expected_raw = np.zeros((32, 32), dtype=np.float32)
+    expected_raw[8:16, 10:22] = 2.0
+
     fig_dir = tmp_path / "figs"
     fig_dir.mkdir()
     arr_dir = tmp_path / "arrays"
@@ -493,19 +629,217 @@ def test_process_image_saves_raw_model_resolution_npy(monkeypatch, tmp_path):
         model=FakeModel(),
         preprocess=cam_module.build_eval_transform("center-crop", 32),
         display_transform=cam_module.build_display_transform("center-crop", 32),
-        cam_extractor=_fake_cam_extractor(),
+        cam_extractor=lambda **_kwargs: [expected_raw.copy()],
         device=torch.device("cpu"),
         fig_dir=fig_dir,
         array_dir=arr_dir,
         image_weight=0.5,
         fig_format="png",
-        save_npy=True,
+        save_npy="raw",
         eval_transform="center-crop",
         model_size=32,
     )
     saved = np.load(result["cam_array_path"])
-    assert saved.shape == (32, 32)  # raw model-resolution map, backward compatible
-    assert float(saved.max()) == 1.0
+    assert saved.shape == (32, 32)
+    assert saved.dtype == np.float32
+    np.testing.assert_allclose(saved, expected_raw)
+
+
+FAKE_CAM = np.array([[0.0, 2.0], [1.0, 0.5]], dtype=np.float32)
+
+
+def _run_fake_cam_process_image(tmp_path, monkeypatch, save_npy):
+    import otuformer.vision.cam as cam_module
+
+    image_path = tmp_path / "image.png"
+    Image.new("RGB", (32, 32), (200, 200, 200)).save(image_path)
+    array_dir = tmp_path / "arrays"
+    array_dir.mkdir(exist_ok=True)
+
+    monkeypatch.setattr(
+        cam_module,
+        "show_cam_on_image",
+        lambda *_args, **_kwargs: np.full((32, 32, 3), 240, dtype=np.uint8),
+    )
+
+    class FakeModel(torch.nn.Module):
+        def forward(self, x):
+            return torch.tensor([[2.0, 1.0]], device=x.device).repeat(x.shape[0], 1)
+
+    return cam_module.process_image(
+        img_path=image_path,
+        label="x",
+        model=FakeModel(),
+        preprocess=lambda _image: torch.zeros(3, 32, 32),
+        display_transform=cam_module.build_display_transform("center-crop", 2),
+        cam_extractor=lambda **_kwargs: [FAKE_CAM.copy()],
+        device=torch.device("cpu"),
+        fig_dir=tmp_path,
+        array_dir=array_dir,
+        image_weight=0.5,
+        fig_format="png",
+        save_npy=save_npy,
+        eval_transform="center-crop",
+        model_size=2,
+    )
+
+
+def test_process_image_saves_unnormalized_raw_array(tmp_path, monkeypatch):
+    record = _run_fake_cam_process_image(tmp_path, monkeypatch, "raw")
+
+    saved = np.load(tmp_path / "arrays" / "image.npy")
+    assert saved.dtype == np.float32
+    np.testing.assert_allclose(saved, FAKE_CAM)
+    assert float(saved.max()) == 2.0
+    assert record["cam_array_path"].endswith("image.npy")
+
+
+def test_process_image_saves_normalized_array_on_request(tmp_path, monkeypatch):
+    _run_fake_cam_process_image(tmp_path, monkeypatch, "normalized")
+
+    saved = np.load(tmp_path / "arrays" / "image.npy")
+    np.testing.assert_allclose(
+        saved, np.array([[0.0, 1.0], [0.5, 0.25]], dtype=np.float32)
+    )
+
+
+def test_process_image_writes_no_array_when_disabled(tmp_path, monkeypatch):
+    record = _run_fake_cam_process_image(tmp_path, monkeypatch, "none")
+
+    assert record["cam_array_path"] == ""
+    assert list((tmp_path / "arrays").iterdir()) == []
+
+
+def test_process_image_overlay_receives_normalized_mask(tmp_path, monkeypatch):
+    """The overlay must always receive the normalized, mapped copy.
+
+    ``FAKE_CAM`` peaks at ``2.0``; if the raw array leaked into the overlay the
+    mapped mask would peak at ``2.0`` and the bound below would fail.
+    """
+    import otuformer.vision.cam as cam_module
+
+    image_path = tmp_path / "image.png"
+    Image.new("RGB", (32, 32), (200, 200, 200)).save(image_path)
+    array_dir = tmp_path / "arrays"
+    array_dir.mkdir()
+
+    captured = {}
+
+    def _capture(_rgb, mask, **_kwargs):
+        captured["mask"] = np.asarray(mask).copy()
+        return np.full((32, 32, 3), 240, dtype=np.uint8)
+
+    monkeypatch.setattr(cam_module, "show_cam_on_image", _capture)
+
+    class FakeModel(torch.nn.Module):
+        def forward(self, x):
+            return torch.tensor([[2.0, 1.0]], device=x.device).repeat(x.shape[0], 1)
+
+    cam_module.process_image(
+        img_path=image_path,
+        label="x",
+        model=FakeModel(),
+        preprocess=lambda _image: torch.zeros(3, 32, 32),
+        display_transform=cam_module.build_display_transform("center-crop", 2),
+        cam_extractor=lambda **_kwargs: [FAKE_CAM.copy()],
+        device=torch.device("cpu"),
+        fig_dir=tmp_path,
+        array_dir=array_dir,
+        image_weight=0.5,
+        fig_format="png",
+        save_npy="raw",
+        eval_transform="center-crop",
+        model_size=2,
+    )
+
+    cam_display = FAKE_CAM - FAKE_CAM.min()
+    cam_display = cam_display / cam_display.max()
+    expected, _fov = cam_module.map_cam_to_original(
+        cam_display, (32, 32), "center-crop", 2
+    )
+
+    mask = captured["mask"]
+    assert mask.shape == (32, 32)
+    assert mask.min() >= 0.0
+    assert mask.max() <= 1.0
+    np.testing.assert_allclose(mask, expected)
+
+
+@pytest.mark.parametrize("name", ["gradcam", "scorecam"])
+def test_overlay_figure_matches_between_official_and_raw_cam(name):
+    """Overlay rendering must not change beyond a bounded uint8 LSB difference.
+
+    ``scorecam`` is included deliberately: it is the method most exposed to the
+    normalization-before/after-resize ordering, so a gradcam-only check could
+    not detect the regression this test exists for. Pixel identity is not a
+    contract; the bound is a tolerance, not equality.
+    """
+    pytest.importorskip("pytorch_grad_cam")
+    import pytorch_grad_cam
+    from pytorch_grad_cam.utils.image import show_cam_on_image
+    from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
+
+    import otuformer.vision.cam as cam_module
+
+    official_cls = {
+        "gradcam": pytorch_grad_cam.GradCAM,
+        "scorecam": pytorch_grad_cam.ScoreCAM,
+    }[name]
+    torch.manual_seed(0)
+    tensor = torch.rand(1, 3, 64, 64)
+    targets = [ClassifierOutputTarget(1)]
+    rgb = np.full((64, 64, 3), 0.5, dtype=np.float32)
+
+    def render(cls):
+        torch.manual_seed(0)
+        model = _tiny_conv_model().eval()
+        cam_map = cls(model=model, target_layers=[model[4]])(
+            input_tensor=tensor, targets=targets
+        )[0]
+        display = cam_map - cam_map.min()
+        if display.max() > 0:
+            display = display / display.max()
+        mapped, _fov = cam_module.map_cam_to_original(
+            display, (64, 64), "center-crop", 64
+        )
+        return show_cam_on_image(rgb, mapped, use_rgb=True)
+
+    official = render(official_cls).astype(np.int16)
+    raw = render(cam_module.CAM_METHODS[name]).astype(np.int16)
+    difference = np.abs(official - raw)
+
+    assert difference.max() <= 2
+    assert (difference > 0).mean() < 0.01
+
+
+def test_run_cam_rejects_invalid_save_npy(tmp_path):
+    """A bool or unknown string must fail at the API boundary, not save arrays."""
+    from otuformer.vision.cam import process_image, run_cam
+
+    for invalid in (True, False, "bogus", None):
+        with pytest.raises(ValueError, match="save_npy"):
+            run_cam(
+                checkpoint=tmp_path / "missing.ckpt",
+                images_dir=tmp_path,
+                out_dir=tmp_path / "out",
+                save_npy=invalid,
+            )
+
+    with pytest.raises(ValueError, match="save_npy"):
+        process_image(
+            img_path=tmp_path / "missing.png",
+            label="",
+            model=None,
+            preprocess=None,
+            display_transform=None,
+            cam_extractor=None,
+            device=None,
+            fig_dir=tmp_path,
+            array_dir=None,
+            image_weight=0.5,
+            fig_format="png",
+            save_npy="bogus",
+        )
 
 
 def test_cam_loads_arcface_embedding_head_checkpoint(tmp_path):

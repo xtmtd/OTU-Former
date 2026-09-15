@@ -19,7 +19,7 @@ app = typer.Typer(
         "images showing which image regions the model focuses on.\n\n"
         "Quick example:\n\n"
         "  otuformer cam --checkpoint runs/finetune/best.pt --images-dir ./images\n"
-        "  otuformer cam --checkpoint best.pt --images-dir ./images --cam-method gradcampp --save-npy\n"
+        "  otuformer cam --checkpoint best.pt --images-dir ./images --cam-method gradcampp --save-npy raw\n"
         "  otuformer cam --checkpoint best.pt --images-dir ./images --dump-model-structure  # list layers first\n"
     ),
 )
@@ -93,10 +93,15 @@ def cam(
         click_type=click.Choice(["png", "jpg", "pdf"]),
         help="Output format for CAM figures.",
     ),
-    save_npy: bool = typer.Option(
-        False,
+    save_npy: str = typer.Option(
+        "none",
         "--save-npy",
-        help="Save raw CAM heatmaps as NumPy arrays.",
+        click_type=click.Choice(["none", "raw", "normalized"]),
+        show_choices=False,
+        help=(
+            "Save CAM arrays: none (default), raw (positive unnormalized CAM), "
+            "or normalized (per-image min-max [0, 1])."
+        ),
     ),
     dump_model_structure: bool = typer.Option(
         False,

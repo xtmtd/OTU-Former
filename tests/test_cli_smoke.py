@@ -1997,6 +1997,77 @@ def test_cam_forwards_eval_transform(monkeypatch, tmp_path):
     assert seen["eval_transform"] == "whole-specimen-pad"
 
 
+def test_cam_forwards_save_npy_mode(monkeypatch, tmp_path):
+    seen = []
+
+    def fake_run_cam(**kwargs):
+        seen.append(kwargs["save_npy"])
+
+    monkeypatch.setattr("otuformer.vision.cam.run_cam", fake_run_cam)
+
+    ckpt = _make_ckpt(tmp_path)
+    images_dir = tmp_path / "images"
+    images_dir.mkdir()
+    Image.new("RGB", (32, 32), (200, 200, 200)).save(images_dir / "one.png")
+
+    default_result = runner.invoke(
+        app,
+        [
+            "cam",
+            "--checkpoint",
+            str(ckpt),
+            "--images-dir",
+            str(images_dir),
+            "--out-dir",
+            str(tmp_path / "cam_default"),
+        ],
+    )
+    raw_result = runner.invoke(
+        app,
+        [
+            "cam",
+            "--checkpoint",
+            str(ckpt),
+            "--images-dir",
+            str(images_dir),
+            "--out-dir",
+            str(tmp_path / "cam_raw"),
+            "--save-npy",
+            "raw",
+        ],
+    )
+
+    assert default_result.exit_code == 0
+    assert raw_result.exit_code == 0
+    assert seen == ["none", "raw"]
+
+
+def test_cam_rejects_bare_or_unknown_save_npy(monkeypatch, tmp_path):
+    def fake_run_cam(**_kwargs):
+        raise AssertionError("run_cam must not be called for invalid --save-npy")
+
+    monkeypatch.setattr("otuformer.vision.cam.run_cam", fake_run_cam)
+
+    ckpt = _make_ckpt(tmp_path)
+    base = [
+        "cam",
+        "--checkpoint",
+        str(ckpt),
+        "--images-dir",
+        str(tmp_path),
+        "--out-dir",
+        str(tmp_path / "cam_invalid"),
+    ]
+
+    bare_result = runner.invoke(app, base + ["--save-npy"])
+    unknown_result = runner.invoke(app, base + ["--save-npy", "bogus"])
+
+    assert bare_result.exit_code != 0
+    assert unknown_result.exit_code != 0
+    assert "save-npy" in bare_result.output.lower()
+    assert "save-npy" in unknown_result.output.lower()
+
+
 def test_pretrain_local_crop_size_validated_against_patch(tmp_path):
     csv_path = _make_tiny_pretrain_data(tmp_path)
     result = runner.invoke(

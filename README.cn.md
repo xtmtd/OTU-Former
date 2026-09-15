@@ -612,7 +612,7 @@ otuformer cam \
     --checkpoint runs/finetune/finetune_latest.pth \
     --images-dir ./images \
     --cam-method gradcampp \
-    --save-npy \
+    --save-npy raw \
     --out-dir runs/cam
 
 # 先查看模型层结构
@@ -634,7 +634,7 @@ otuformer cam \
 | `--target-layer-name` | 指定 CAM 目标层（省略则自动选择） | 自动 |
 | `--image-weight` | CAM 叠加中原始图像的混合权重（0-1） | 0.5 |
 | `--fig-format` | 输出格式：`png`/`jpg`/`pdf` | `png` |
-| `--save-npy` | 保存原始 CAM 数组为 NumPy 格式 | 否 |
+| `--save-npy` | `none`（默认，不保存）、`raw`（未归一化正值 CAM）或 `normalized`（逐图 min-max，落在 `[0, 1]`） | `none` |
 | `--dump-model-structure` | 输出模型层名称到 `model_layers.txt` | 否 |
 | `--max-images` | 最大处理图像数（None = 全部） | 全部 |
 | `--cam-batch-size` | CAM 推理批量大小 | 32 |
@@ -646,8 +646,12 @@ otuformer cam \
 **输出**：
 - `figures/` — CAM 叠加图像
 - `cam_summary.csv` — 元数据摘要
-- `arrays/` — 原始 CAM 数组（使用 `--save-npy` 时）
+- `arrays/` — CAM 数组，仅在 `--save-npy raw` 或 `--save-npy normalized` 时生成（默认不写任何数组）。保存的数组为模型输入分辨率的 `float32`。
 - `model_layers.txt` — 模型层名称（使用 `--dump-model-structure` 时）
+
+**CAM 数组语义**：
+- `--save-npy raw` 保留 ReLU 后、缩放到模型分辨率后的正值未归一化 CAM 幅值（在逐图 min-max 归一化之前）；`--save-npy normalized` 写入逐图 min-max `[0, 1]` 副本，与旧版本的保存数组语义一致。叠加图始终使用独立的归一化副本，PNG 像素级一致不是契约。
+- raw 幅值仅在同一模型、同一目标层、同一预处理配置内可比，不适用于跨 backbone、跨层或跨 CAM 方法比较。`eigencam` 的 raw 数值来自符号任意的 SVD 投影，为完整性而导出，但不适合用于响应强度统计。
 
 ---
 
