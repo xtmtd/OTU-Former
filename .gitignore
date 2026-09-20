@@ -18,3 +18,6 @@ ref/
 .idea/
 .vscode/
 *.swp
+
+# codegraph
+.codegraph/
