@@ -52,22 +52,67 @@ class LocalToGlobalLoss(nn.Module):
         return total_loss / max(len(local_student_outs), 1)
 
 
-class MaskedPatchRegressionLoss(nn.Module):
-    """MSE between normalized student and teacher patch tokens at masked positions."""
+def _validate_patch_mask(mask: torch.Tensor, tokens: torch.Tensor) -> None:
+    """Reject empty, wrongly shaped, or non-boolean patch masks."""
+    if mask.dtype != torch.bool:
+        raise ValueError(f"mask must be a boolean tensor, got {mask.dtype}.")
+    if mask.shape != tokens.shape[:2]:
+        raise ValueError(
+            f"mask must match the patch token grid {tuple(tokens.shape[:2])}, "
+            f"got {tuple(mask.shape)}."
+        )
+    if int(mask.sum()) == 0:
+        raise ValueError("mask selects no patch positions; refusing to return 0.")
 
-    def forward(
-        self,
-        student_patches: torch.Tensor,
-        teacher_patches: torch.Tensor,
-        mask: torch.Tensor,
-    ) -> torch.Tensor:
-        if mask.sum() == 0:
-            return torch.tensor(0.0, device=student_patches.device)
-        s = student_patches[mask]
-        t = teacher_patches[mask].detach()
-        s = F.normalize(s, dim=-1)
-        t = F.normalize(t, dim=-1)
-        return F.mse_loss(s, t)
+
+def masked_patch_cosine_loss(
+    student: torch.Tensor,
+    teacher: torch.Tensor,
+    mask: torch.Tensor,
+) -> torch.Tensor:
+    """Normalized cosine regression at selected patch positions.
+
+    Used by both ``consistency`` (selected fully-visible positions) and
+    ``masked-feature`` (truly masked student positions). The teacher side is
+    always stop-gradient and the loss is normalized by the selected count.
+    """
+    if student.shape != teacher.shape:
+        raise ValueError(
+            f"student and teacher patch tokens must match, got "
+            f"{tuple(student.shape)} and {tuple(teacher.shape)}."
+        )
+    _validate_patch_mask(mask, student)
+    s = F.normalize(student[mask], dim=-1)
+    t = F.normalize(teacher[mask].detach(), dim=-1)
+    return (2.0 - 2.0 * (s * t).sum(dim=-1)).mean()
+
+
+def ibot_patch_loss(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    mask: torch.Tensor,
+    patch_center: torch.Tensor,
+    student_temp: float,
+    teacher_temp: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Centered prototype cross-entropy at masked positions.
+
+    Returns ``(loss, teacher_probs)`` where ``teacher_probs`` is detached and
+    holds the pre-EMA teacher probabilities used by diagnostics and by the
+    patch-center update. The cross-entropy is never divided by ``log(K)``.
+    """
+    if student_logits.shape != teacher_logits.shape:
+        raise ValueError(
+            f"student and teacher patch logits must match, got "
+            f"{tuple(student_logits.shape)} and {tuple(teacher_logits.shape)}."
+        )
+    _validate_patch_mask(mask, student_logits)
+    teacher_probs = F.softmax(
+        (teacher_logits[mask].detach() - patch_center) / teacher_temp, dim=-1
+    )
+    student_log_probs = F.log_softmax(student_logits[mask] / student_temp, dim=-1)
+    loss = -(teacher_probs * student_log_probs).sum(dim=-1).mean()
+    return loss, teacher_probs
 
 
 class ArcFaceLoss(nn.Module):

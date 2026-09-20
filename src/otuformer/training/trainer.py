@@ -43,8 +43,15 @@ from otuformer.training.dataset import (
 from otuformer.training.loss import (
     ArcFaceLoss,
     LOSS_REGISTRY,
+    ibot_patch_loss,
+    masked_patch_cosine_loss,
 )
-from otuformer.training.model import ArcFaceEmbeddingHead, OTUFormerEncoder
+from otuformer.training.model import (
+    PATCH_TARGET_LAYERS,
+    ArcFaceEmbeddingHead,
+    OTUFormerEncoder,
+    PatchObjective,
+)
 from otuformer.utils.checkpoint import (
     ARCFACE_EMBEDDING_HEAD,
     PROJECTION_EMBEDDING_HEAD,
@@ -75,6 +82,30 @@ def _set_cpus(cpus: int) -> None:
         torch.set_num_threads(cpus)
 
 
+def _capture_rng_state() -> dict[str, object]:
+    """Snapshot Python, NumPy, PyTorch CPU, and CUDA RNG states."""
+    state: dict[str, object] = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def _restore_rng_state(state: dict[str, object] | None) -> None:
+    """Restore a snapshot produced by :func:`_capture_rng_state`."""
+    if not state:
+        return
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch"])
+    cuda = state.get("cuda")
+    if cuda is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(cuda)
+
+
 def _resolve_device(device: str) -> torch.device:
     requested = (device or "auto").lower()
     if requested == "auto":
@@ -93,8 +124,31 @@ def _resolve_device(device: str) -> torch.device:
 
 @torch.no_grad()
 def update_teacher(student: nn.Module, teacher: nn.Module, momentum: float) -> None:
-    for s_param, t_param in zip(student.parameters(), teacher.parameters()):
-        t_param.data.mul_(momentum).add_(s_param.data, alpha=1.0 - momentum)
+    """Name-matched EMA update.
+
+    Positional ``zip`` is unsafe once the student owns parameters the teacher
+    does not (mask token, A+ predictor), so parameters are matched by name and a
+    missing teacher counterpart is a hard error.
+    """
+    student_params = dict(student.named_parameters())
+    for name, teacher_param in teacher.named_parameters():
+        if name not in student_params:
+            raise ValueError(
+                f"Cannot EMA-update '{name}': the student module has no parameter "
+                "with that name. Student-only parameters must not appear on the "
+                "teacher module."
+            )
+        teacher_param.mul_(momentum).add_(student_params[name], alpha=1.0 - momentum)
+
+
+def _student_optimizer_parameters(
+    student: nn.Module, patch_objective: nn.Module | None
+) -> list[nn.Parameter]:
+    """Student-side parameters plus the selected objective's trainable state."""
+    params = [p for p in student.parameters() if p.requires_grad]
+    if patch_objective is not None:
+        params.extend(patch_objective.trainable_parameters())
+    return params
 
 
 def _cosine_scheduler(
@@ -305,36 +359,488 @@ def _ssl_loss(
     return -(teacher_probs * student_log_probs).sum(dim=1).mean()
 
 
-def _masked_token_loss(
-    student_tokens: torch.Tensor,
-    teacher_tokens: torch.Tensor,
-    mask_ratio: float,
-    model_name: str,
-) -> torch.Tensor:
-    b, n, c = student_tokens.shape
-    num_mask = max(1, int(mask_ratio * n))
-    mask_indices = torch.rand(b, n, device=student_tokens.device).argsort(dim=1)[
-        :, :num_mask
-    ]
+PATCH_LOSS_MODES = ("none", "consistency", "masked-feature", "ibot")
+MASKING_STRATEGIES = ("random", "blockwise", "hybrid")
+IBOT_PROTOTYPES_MIN = 2
+PATCH_CENTER_MOMENTUM = 0.9
+_DEFAULT_PATCH_RATIOS = {
+    "consistency": 0.30,
+    "random": 0.30,
+    "blockwise": 0.20,
+    "hybrid": 0.30,
+}
 
-    student_masked = torch.gather(
-        student_tokens,
-        dim=1,
-        index=mask_indices.unsqueeze(-1).expand(-1, -1, c),
+
+def _parse_requested_mask_ratio(value: object) -> object:
+    """Return ``"auto"`` or a validated float in ``(0, 1)``."""
+    if value is None or value == "auto":
+        return "auto"
+    try:
+        ratio = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"mask_ratio must be 'auto' or a float in (0, 1), got {value!r}."
+        ) from None
+    if not 0.0 < ratio < 1.0:
+        raise ValueError(
+            f"mask_ratio must be 'auto' or a float in (0, 1), got {value!r}."
+        )
+    return ratio
+
+
+def _resolve_patch_config(
+    args: argparse.Namespace,
+    checkpoint: dict[str, Any] | None,
+) -> dict[str, object]:
+    """Resolve the effective patch-loss configuration for a run or resume.
+
+    One helper owns resolution so startup validation, checkpoint comparison,
+    logging and tests all read the same effective values.
+    """
+    if checkpoint is not None:
+        return _resolve_resumed_patch_config(args, checkpoint)
+    return _resolve_new_patch_config(args)
+
+
+_PATCH_CONFIG_KEYS = (
+    "patch_loss",
+    "masking_strategy",
+    "mask_ratio_requested",
+    "mask_ratio_resolved",
+    "ibot_prototypes",
+    "patch_target_layers",
+    "patch_center_momentum",
+)
+_PATCH_RESUME_COMPARISON_KEYS = (
+    "patch_loss",
+    "masking_strategy",
+    "mask_ratio_resolved",
+    "ibot_prototypes",
+    "patch_target_layers",
+    "patch_center_momentum",
+)
+
+
+def _validate_patch_resume(current: dict, saved: dict) -> None:
+    """Reject any effective patch setting that differs from the checkpoint."""
+    for key in _PATCH_RESUME_COMPARISON_KEYS:
+        if saved.get(key) != current.get(key):
+            raise ValueError(
+                f"Cannot resume: patch setting '{key}' is {saved.get(key)!r} in the "
+                f"checkpoint but {current.get(key)!r} for this invocation. Start a "
+                "new run to change patch settings."
+            )
+
+
+def _resolve_resumed_patch_config(
+    args: argparse.Namespace, checkpoint: dict[str, Any]
+) -> dict[str, object]:
+    cfg = checkpoint.get("config")
+    if not isinstance(cfg, dict):
+        cfg = {}
+    if "patch_loss" not in cfg:
+        return _resolve_legacy_patch_config(args, checkpoint)
+
+    saved = {key: cfg.get(key) for key in _PATCH_CONFIG_KEYS}
+    merged = argparse.Namespace(
+        patch_loss=(
+            getattr(args, "patch_loss", "consistency")
+            if getattr(args, "patch_loss_explicit", False)
+            else saved["patch_loss"]
+        ),
+        masking_strategy=(
+            getattr(args, "masking_strategy", "random")
+            if getattr(args, "masking_strategy_explicit", False)
+            else (saved["masking_strategy"] or "random")
+        ),
+        mask_ratio=(
+            getattr(args, "mask_ratio", "auto")
+            if getattr(args, "mask_ratio_explicit", False)
+            else saved["mask_ratio_requested"]
+        ),
+        ibot_prototypes=(
+            getattr(args, "ibot_prototypes", 512)
+            if getattr(args, "ibot_prototypes_explicit", False)
+            else (saved["ibot_prototypes"] or 512)
+        ),
+        lambda_mask=getattr(args, "lambda_mask", 1.0),
+        mask_ratio_explicit=bool(getattr(args, "mask_ratio_explicit", False)),
+        patch_loss_explicit=bool(getattr(args, "patch_loss_explicit", False)),
+        masking_strategy_explicit=bool(
+            getattr(args, "masking_strategy_explicit", False)
+        ),
+        ibot_prototypes_explicit=bool(
+            getattr(args, "ibot_prototypes_explicit", False)
+        ),
+        lambda_mask_explicit=bool(getattr(args, "lambda_mask_explicit", False)),
     )
-    teacher_masked = torch.gather(
-        teacher_tokens,
-        dim=1,
-        index=mask_indices.unsqueeze(-1).expand(-1, -1, c),
-    ).detach()
+    current = _resolve_new_patch_config(merged)
+    _validate_patch_resume(current, saved)
+    return current
 
-    if "eva" in model_name.lower():
-        return F.mse_loss(student_masked, teacher_masked)
 
-    student_masked = F.normalize(student_masked, dim=-1)
-    teacher_masked = F.normalize(teacher_masked, dim=-1)
-    loss = 2.0 - 2.0 * (student_masked * teacher_masked).sum(dim=-1)
-    return loss.mean()
+def _resolve_legacy_patch_config(
+    args: argparse.Namespace, checkpoint: dict[str, Any]
+) -> dict[str, object]:
+    """Resolve a pre-v0.7 checkpoint to consistency with the historical ratio."""
+    requested_mode = getattr(args, "patch_loss", "consistency")
+    if getattr(args, "patch_loss_explicit", False) and requested_mode != "consistency":
+        raise ValueError(
+            f"Cannot resume a legacy checkpoint as patch_loss={requested_mode!r}: it "
+            "has no mask token, predictor, or iBOT state. Start a new run for "
+            "masked-feature or ibot."
+        )
+    saved_args = checkpoint.get("args")
+    raw_ratio = saved_args.get("mask_ratio") if isinstance(saved_args, dict) else None
+    if raw_ratio is None:
+        saved_ratio = 0.50
+    else:
+        try:
+            saved_ratio = float(raw_ratio)
+        except (TypeError, ValueError):
+            raise ValueError(
+                "Cannot resume: legacy checkpoint records an invalid mask_ratio "
+                f"{raw_ratio!r}."
+            ) from None
+    if not 0.0 < saved_ratio < 1.0:
+        raise ValueError(
+            "Cannot resume: legacy checkpoint records mask_ratio "
+            f"{saved_ratio!r}, which is outside (0, 1)."
+        )
+    if getattr(args, "mask_ratio_explicit", False):
+        requested = _parse_requested_mask_ratio(getattr(args, "mask_ratio", "auto"))
+        if requested != "auto" and abs(float(requested) - saved_ratio) > 1e-9:
+            raise ValueError(
+                f"Cannot resume: --mask-ratio {requested} differs from the legacy "
+                f"checkpoint value {saved_ratio}. Omit --mask-ratio to inherit it."
+            )
+    if getattr(args, "masking_strategy_explicit", False):
+        raise ValueError(
+            "masking_strategy is not applicable to a legacy consistency checkpoint; "
+            "omit it or start a new run."
+        )
+    if getattr(args, "ibot_prototypes_explicit", False):
+        raise ValueError(
+            "ibot_prototypes is not applicable to a legacy consistency checkpoint; "
+            "omit it or start a new run."
+        )
+    return {
+        "patch_loss": "consistency",
+        "masking_strategy": None,
+        "mask_ratio_requested": saved_ratio,
+        "mask_ratio_resolved": saved_ratio,
+        "ibot_prototypes": None,
+        "patch_target_layers": None,
+        "patch_center_momentum": None,
+    }
+
+
+def _resolve_new_patch_config(args: argparse.Namespace) -> dict[str, object]:
+    mode = getattr(args, "patch_loss", "consistency")
+    if mode not in PATCH_LOSS_MODES:
+        raise ValueError(
+            f"Unsupported patch_loss {mode!r}; choose from: "
+            f"{', '.join(PATCH_LOSS_MODES)}."
+        )
+    strategy = getattr(args, "masking_strategy", "random")
+    requested = _parse_requested_mask_ratio(getattr(args, "mask_ratio", "auto"))
+    ratio_explicit = bool(getattr(args, "mask_ratio_explicit", False)) or (
+        requested != "auto"
+    )
+    strategy_explicit = bool(getattr(args, "masking_strategy_explicit", False))
+    prototypes_explicit = bool(getattr(args, "ibot_prototypes_explicit", False))
+    lambda_mask = getattr(args, "lambda_mask", 1.0)
+    lambda_explicit = bool(getattr(args, "lambda_mask_explicit", False))
+    prototypes = getattr(args, "ibot_prototypes", 512)
+
+    if mode == "none":
+        if ratio_explicit:
+            raise ValueError(
+                "mask_ratio is not applicable to patch_loss='none'; omit it "
+                "or choose a masking patch loss."
+            )
+        if strategy_explicit:
+            raise ValueError(
+                "masking_strategy is not applicable to patch_loss='none'; omit it "
+                "or choose masked-feature/ibot."
+            )
+        if prototypes_explicit:
+            raise ValueError(
+                "ibot_prototypes is not applicable to patch_loss='none'; omit it "
+                "or choose ibot."
+            )
+        if lambda_explicit and float(lambda_mask) != 1.0:
+            raise ValueError(
+                "lambda_mask is not applicable to patch_loss='none'; omit it or "
+                "reset it to 1.0."
+            )
+        strategy_effective: str | None = None
+        resolved: float | None = None
+        prototypes_effective: int | None = None
+        requested_effective: object = None
+    elif mode == "consistency":
+        if strategy_explicit:
+            raise ValueError(
+                "masking_strategy is not applicable to patch_loss='consistency'; "
+                "consistency selects visible positions and never masks input."
+            )
+        if prototypes_explicit:
+            raise ValueError(
+                "ibot_prototypes is not applicable to patch_loss='consistency'; "
+                "omit it or choose ibot."
+            )
+        strategy_effective = None
+        resolved = (
+            float(requested)
+            if requested != "auto"
+            else _DEFAULT_PATCH_RATIOS["consistency"]
+        )
+        prototypes_effective = None
+        requested_effective = requested
+    else:
+        if strategy not in MASKING_STRATEGIES:
+            raise ValueError(
+                f"Unsupported masking_strategy {strategy!r}; choose from: "
+                f"{', '.join(MASKING_STRATEGIES)}."
+            )
+        if mode == "masked-feature" and prototypes_explicit:
+            raise ValueError(
+                "ibot_prototypes is not applicable to patch_loss='masked-feature'; "
+                "omit it or choose ibot."
+            )
+        if mode == "ibot":
+            if (
+                isinstance(prototypes, bool)
+                or not isinstance(prototypes, int)
+                or prototypes < IBOT_PROTOTYPES_MIN
+            ):
+                raise ValueError(
+                    f"Unsupported ibot_prototypes {prototypes!r}; must be an integer "
+                    f">= {IBOT_PROTOTYPES_MIN}. Larger dictionaries suit larger "
+                    "datasets (for example 4096 or 16384)."
+                )
+            prototypes_effective = int(prototypes)
+        else:
+            prototypes_effective = None
+        strategy_effective = strategy
+        resolved = (
+            float(requested)
+            if requested != "auto"
+            else _DEFAULT_PATCH_RATIOS[strategy]
+        )
+        requested_effective = requested
+
+    return {
+        "patch_loss": mode,
+        "masking_strategy": strategy_effective,
+        "mask_ratio_requested": requested_effective,
+        "mask_ratio_resolved": resolved,
+        "ibot_prototypes": prototypes_effective,
+        "patch_target_layers": (
+            PATCH_TARGET_LAYERS if mode == "masked-feature" else None
+        ),
+        "patch_center_momentum": (
+            PATCH_CENTER_MOMENTUM if mode == "ibot" else None
+        ),
+    }
+
+
+# --- Mask generation --------------------------------------------------------
+
+_MAX_BLOCK_ROUNDS = 16
+
+
+def _target_patch_count(ratio: float, patch_count: int) -> int:
+    """Resolve the number of masked positions, leaving one visible patch."""
+    return min(max(round(ratio * patch_count), 1), patch_count - 1)
+
+
+def _legal_block_shapes(grid_size: tuple[int, int]) -> list[tuple[int, int]]:
+    """Enumerate integer block shapes legal for ``(H, W)``.
+
+    A shape needs sides of at least two patches, an aspect ratio within
+    ``[0.5, 2.0]``, and an area of at most ``floor(0.20 * H * W)``.
+    """
+    height, width = int(grid_size[0]), int(grid_size[1])
+    if height < 1 or width < 1:
+        return []
+    max_area = (20 * height * width) // 100
+    shapes: list[tuple[int, int]] = []
+    for block_h in range(2, height + 1):
+        for block_w in range(2, width + 1):
+            if block_h * block_w > max_area:
+                continue
+            if 0.5 <= block_h / block_w <= 2.0:
+                shapes.append((block_h, block_w))
+    return shapes
+
+
+def _validate_blockwise_grid(grid_size: tuple[int, int]) -> None:
+    """Fail fast when no legal block rectangle fits the actual patch grid."""
+    if _legal_block_shapes(grid_size):
+        return
+    height, width = int(grid_size[0]), int(grid_size[1])
+    raise ValueError(
+        "blockwise masking is infeasible for patch grid "
+        f"({height}, {width}): no integer rectangle with sides >= 2, aspect ratio "
+        "in [0.5, 2.0] and area <= floor(0.20 * H * W) fits the grid. Choose a "
+        "different input size or use --masking-strategy random."
+    )
+
+
+def _sample_rectangle(
+    shapes: list[tuple[int, int]],
+    grid_size: tuple[int, int],
+    device: torch.device,
+) -> torch.BoolTensor:
+    """Sample one rectangle and return its flattened ``[H * W]`` position mask."""
+    height, width = int(grid_size[0]), int(grid_size[1])
+    index = int(torch.randint(len(shapes), (1,), device=device).item())
+    block_h, block_w = shapes[index]
+    top = int(torch.randint(height - block_h + 1, (1,), device=device).item())
+    left = int(torch.randint(width - block_w + 1, (1,), device=device).item())
+    mask = torch.zeros(height * width, dtype=torch.bool, device=device)
+    mask.view(height, width)[top : top + block_h, left : left + block_w] = True
+    return mask
+
+
+def _random_positions_mask(
+    count: int,
+    total: int,
+    device: torch.device,
+    available: torch.Tensor | None = None,
+) -> torch.BoolTensor:
+    """Sample ``count`` unique positions, optionally excluding ``available``."""
+    mask = torch.zeros(total, dtype=torch.bool, device=device)
+    if count <= 0:
+        return mask
+    if available is None:
+        candidates = torch.arange(total, device=device)
+    else:
+        candidates = torch.nonzero(~available, as_tuple=False).flatten()
+    count = min(count, int(candidates.numel()))
+    if count <= 0:
+        return mask
+    picked = candidates[torch.randperm(candidates.numel(), device=device)[:count]]
+    mask[picked] = True
+    return mask
+
+
+def _sample_blockwise_positions(
+    target: int, grid_size: tuple[int, int], device: torch.device
+) -> torch.BoolTensor:
+    """Merge overlapping rectangle proposals until ``target`` is reached."""
+    height, width = int(grid_size[0]), int(grid_size[1])
+    total = height * width
+    shapes = _legal_block_shapes((height, width))
+    selected = torch.zeros(total, dtype=torch.bool, device=device)
+    rounds = 0
+    while int(selected.sum()) < target and rounds < _MAX_BLOCK_ROUNDS:
+        proposals = int(torch.randint(2, 5, (1,), device=device).item())
+        for _ in range(proposals):
+            selected |= _sample_rectangle(shapes, (height, width), device)
+        rounds += 1
+    return selected
+
+
+def _exact_mask(
+    selected: torch.BoolTensor,
+    target: int,
+    total: int,
+    device: torch.device,
+) -> torch.BoolTensor:
+    """Trim or random-fill ``selected`` so it holds exactly ``target`` positions."""
+    count = int(selected.sum())
+    if count == target:
+        return selected
+    if count > target:
+        index = torch.nonzero(selected, as_tuple=False).flatten()
+        keep = index[torch.randperm(index.numel(), device=device)[:target]]
+        trimmed = torch.zeros(total, dtype=torch.bool, device=device)
+        trimmed[keep] = True
+        return trimmed
+    return selected | _random_positions_mask(
+        target - count, total, device, available=selected
+    )
+
+
+def _sample_patch_masks(
+    batch_size: int,
+    grid_size: tuple[int, int],
+    ratio: float,
+    strategy: str,
+    device: torch.device,
+) -> torch.BoolTensor:
+    """Sample independent masks for ``batch_size`` samples and one global view."""
+    if strategy not in MASKING_STRATEGIES:
+        raise ValueError(
+            f"Unsupported masking_strategy {strategy!r}; choose from: "
+            f"{', '.join(MASKING_STRATEGIES)}."
+        )
+    height, width = int(grid_size[0]), int(grid_size[1])
+    total = height * width
+    target = _target_patch_count(ratio, total)
+    if strategy in ("blockwise", "hybrid"):
+        _validate_blockwise_grid((height, width))
+
+    rows: list[torch.BoolTensor] = []
+    for _ in range(batch_size):
+        if strategy == "random":
+            row = _random_positions_mask(target, total, device)
+        elif strategy == "blockwise":
+            blocks = _sample_blockwise_positions(target, (height, width), device)
+            row = _exact_mask(blocks, target, total, device)
+        else:
+            block_share = target // 2
+            blocks = _sample_blockwise_positions(
+                block_share, (height, width), device
+            )
+            blocks = _exact_mask(blocks, block_share, total, device)
+            row = _exact_mask(blocks, target, total, device)
+        rows.append(row)
+    return torch.stack(rows, dim=0)
+
+
+_PRETRAIN_BASE_FIELDS = ["iteration", "epoch", "step"]
+_PRETRAIN_LEGACY_METRIC_FIELDS = [
+    "loss",
+    "global_loss",
+    "local_loss",
+    "mask_loss",
+    "lr",
+    "teacher_temp",
+    "grad_norm",
+    "feature_std",
+    "embedding_norm_mean",
+    "cls_token_norm_mean",
+    "teacher_center_norm",
+    "cosine_similarity",
+]
+_PRETRAIN_PATCH_FIELDS = [
+    "patch_loss_raw",
+    "patch_loss_weighted",
+    "patch_loss_fraction_of_total",
+    "requested_mask_ratio",
+    "selected_patch_ratio",
+    "actual_mask_ratio_mean",
+    "actual_mask_ratio_min",
+    "actual_mask_ratio_max",
+    "prototype_perplexity",
+    "active_prototype_ratio",
+    "assignment_entropy",
+    "max_prototype_occupancy",
+    "patch_center_norm",
+]
+_PRETRAIN_LEGACY_FIELDS = _PRETRAIN_BASE_FIELDS + _PRETRAIN_LEGACY_METRIC_FIELDS
+_PRETRAIN_CURRENT_FIELDS = _PRETRAIN_LEGACY_FIELDS + _PRETRAIN_PATCH_FIELDS
+_FINETUNE_FIELDS = [
+    "loss",
+    "lr",
+    "grad_norm",
+    "feature_std",
+    "embedding_norm_mean",
+    "cls_token_norm_mean",
+]
 
 
 @dataclass
@@ -344,36 +850,98 @@ class InstantMetricsLogger:
 
     def __post_init__(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        base_fields = ["iteration", "epoch", "step"]
         if self.mode == "pretrain":
-            metric_fields = [
-                "loss",
-                "global_loss",
-                "local_loss",
-                "mask_loss",
-                "lr",
-                "teacher_temp",
-                "grad_norm",
-                "feature_std",
-                "embedding_norm_mean",
-                "cls_token_norm_mean",
-                "teacher_center_norm",
-                "cosine_similarity",
-            ]
+            self.fieldnames = list(_PRETRAIN_CURRENT_FIELDS)
         else:
-            metric_fields = [
-                "loss",
-                "lr",
-                "grad_norm",
-                "feature_std",
-                "embedding_norm_mean",
-                "cls_token_norm_mean",
-            ]
-        self.fieldnames = base_fields + metric_fields
-        if not self.path.exists():
-            with self.path.open("w", newline="", encoding="utf-8") as f:
-                writer = csv.DictWriter(f, fieldnames=self.fieldnames)
-                writer.writeheader()
+            self.fieldnames = list(_PRETRAIN_BASE_FIELDS) + list(_FINETUNE_FIELDS)
+        if self.path.exists() and self.path.stat().st_size > 0:
+            self._validate_or_migrate_existing()
+            return
+        with self.path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=self.fieldnames)
+            writer.writeheader()
+
+    def _read_existing_csv(self) -> tuple[list[str], list[list[str]]]:
+        try:
+            with self.path.open("r", newline="", encoding="utf-8") as handle:
+                reader = csv.reader(handle)
+                try:
+                    header = next(reader)
+                except StopIteration:
+                    raise ValueError(
+                        f"instant-metrics schema in {self.path} is empty; refusing "
+                        "to append."
+                    ) from None
+                rows: list[list[str]] = []
+                for line_number, row in enumerate(reader, start=2):
+                    if len(row) != len(header):
+                        raise ValueError(
+                            f"instant-metrics schema in {self.path} is malformed: "
+                            f"row {line_number} has {len(row)} fields but the header "
+                            f"has {len(header)}."
+                        )
+                    rows.append(row)
+        except csv.Error as exc:
+            raise ValueError(
+                f"instant-metrics schema in {self.path} is malformed CSV: {exc}"
+            ) from exc
+        return header, rows
+
+    def _validate_or_migrate_existing(self) -> None:
+        header, rows = self._read_existing_csv()
+        if len(set(header)) != len(header):
+            raise ValueError(
+                f"instant-metrics schema in {self.path} has duplicate columns; "
+                "refusing to append."
+            )
+        if header == self.fieldnames:
+            return
+        if self.mode == "pretrain" and header == _PRETRAIN_LEGACY_FIELDS:
+            self._migrate_pretrain_schema(header, rows)
+            return
+        raise ValueError(
+            f"Unrecognized instant-metrics schema in {self.path}: {header}. "
+            "Refusing to append. Move or remove the file to start a new log."
+        )
+
+    def _migrate_pretrain_schema(
+        self, header: list[str], rows: list[list[str]]
+    ) -> None:
+        """Atomically rewrite a recognized legacy header to the v0.7.0 schema."""
+        import os
+        import tempfile
+
+        index = {name: position for position, name in enumerate(header)}
+        temp_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w",
+                newline="",
+                encoding="utf-8",
+                dir=self.path.parent,
+                prefix=self.path.name + ".",
+                suffix=".tmp",
+                delete=False,
+            ) as handle:
+                temp_path = Path(handle.name)
+                writer = csv.writer(handle)
+                writer.writerow(self.fieldnames)
+                for row in rows:
+                    writer.writerow(
+                        [
+                            row[index[name]] if name in index else ""
+                            for name in self.fieldnames
+                        ]
+                    )
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_path, self.path)
+            temp_path = None
+        finally:
+            if temp_path is not None and temp_path.exists():
+                temp_path.unlink(missing_ok=True)
+            for leftover in self.path.parent.glob(self.path.name + ".*.tmp"):
+                leftover.unlink(missing_ok=True)
 
     def log(self, **kwargs: Any) -> None:
         row = {k: kwargs.get(k, "") for k in self.fieldnames}
@@ -430,10 +998,23 @@ class InstantMetricsLogger:
                 label="Local loss",
                 alpha=0.8,
             )
-        if "mask_loss" in df_instant.columns:
+        if "patch_loss_raw" in df_instant.columns:
+            patch_series = pd.to_numeric(
+                df_instant["patch_loss_raw"], errors="coerce"
+            )
+        else:
+            patch_series = None
+        if patch_series is not None and patch_series.notna().any():
             ax.plot(
                 df_instant["iteration"],
-                df_instant["mask_loss"],
+                patch_series,
+                label="Patch loss (raw)",
+                alpha=0.8,
+            )
+        elif "mask_loss" in df_instant.columns:
+            ax.plot(
+                df_instant["iteration"],
+                pd.to_numeric(df_instant["mask_loss"], errors="coerce"),
                 label="Mask loss",
                 alpha=0.8,
             )
@@ -734,12 +1315,66 @@ def _extract_tokens(model: OTUFormerEncoder, images: torch.Tensor) -> torch.Tens
 
 
 def _compute_grad_norm(model: nn.Module) -> float:
+    return _compute_grad_norm_parameters(model.parameters())
+
+
+def _compute_grad_norm_parameters(params) -> float:
     total = 0.0
-    for p in model.parameters():
+    for p in params:
         if p.grad is not None:
             n = p.grad.data.norm(2)
             total += float(n.item() ** 2)
     return float(total**0.5)
+
+
+def _update_patch_center(
+    patch_center: torch.Tensor, teacher_logits: torch.Tensor
+) -> torch.Tensor:
+    """EMA of the iBOT patch center from current pre-EMA teacher logits."""
+    return patch_center * PATCH_CENTER_MOMENTUM + teacher_logits.mean(
+        dim=0, keepdim=True
+    ) * (1.0 - PATCH_CENTER_MOMENTUM)
+
+
+@torch.no_grad()
+def _ibot_diagnostics(
+    teacher_probs: torch.Tensor, patch_center: torch.Tensor
+) -> dict[str, float]:
+    """Per-step iBOT stability diagnostics from teacher probabilities."""
+    mean_assignment = teacher_probs.mean(dim=0)
+    mean_entropy = -(
+        mean_assignment * torch.log(mean_assignment.clamp_min(1e-12))
+    ).sum()
+    hard = teacher_probs.argmax(dim=-1)
+    counts = torch.bincount(
+        hard, minlength=teacher_probs.shape[1]
+    ).float()
+    per_position_entropy = -(
+        teacher_probs * torch.log(teacher_probs.clamp_min(1e-12))
+    ).sum(dim=-1).mean()
+    return {
+        "prototype_perplexity": float(torch.exp(mean_entropy)),
+        "active_prototype_ratio": float((counts > 0).sum())
+        / teacher_probs.shape[1],
+        "assignment_entropy": float(per_position_entropy),
+        "max_prototype_occupancy": float(counts.max())
+        / teacher_probs.shape[0],
+        "patch_center_norm": float(patch_center.norm()),
+    }
+
+
+def _mask_ratio_diagnostics(
+    masks: list[torch.Tensor], patch_count: int
+) -> dict[str, float]:
+    """Per-sample actual masked fraction across the current step's views."""
+    fractions = torch.cat(
+        [mask.float().sum(dim=1) / patch_count for mask in masks]
+    )
+    return {
+        "actual_mask_ratio_mean": float(fractions.mean()),
+        "actual_mask_ratio_min": float(fractions.min()),
+        "actual_mask_ratio_max": float(fractions.max()),
+    }
 
 
 @torch.no_grad()
@@ -1253,6 +1888,12 @@ def run_pretrain(args: argparse.Namespace) -> None:
     args.global_crop_size = global_crop_size
     validate_model_name_size(args.model_name, global_crop_size)
 
+    patch_config = _resolve_patch_config(args, resume_ckpt)
+    patch_mode = str(patch_config["patch_loss"])
+    patch_strategy = patch_config["masking_strategy"]
+    patch_ratio = patch_config["mask_ratio_resolved"]
+    print("Patch config: " + json.dumps(patch_config, sort_keys=True))
+
     requested_profile = getattr(args, "augmentation", None)
     requested_policy = getattr(args, "orientation_policy", None)
     profile = _select_augmentation_profile(
@@ -1336,8 +1977,35 @@ def run_pretrain(args: argparse.Namespace) -> None:
     for p in teacher.parameters():
         p.requires_grad = False
 
+    objective = PatchObjective(
+        patch_mode,
+        hidden_dim=student.backbone.num_features,
+        ibot_prototypes=patch_config["ibot_prototypes"],
+    ).to(device)
+    # The training loop always uses forward_pretrain (even for patch_loss=none),
+    # so every mode validates the backbone before the loop starts.
+    require_intermediates = patch_mode == "masked-feature"
+    student.validate_pretrain_backbone(require_intermediates=require_intermediates)
+    teacher.validate_pretrain_backbone(require_intermediates=require_intermediates)
+    grid_size = student._patch_grid_size(
+        torch.empty(1, 3, global_crop_size, global_crop_size)
+    )
+    patch_count = grid_size[0] * grid_size[1]
+    if patch_mode != "none":
+        if patch_strategy in ("blockwise", "hybrid"):
+            _validate_blockwise_grid(grid_size)
+        if patch_count < 2:
+            raise ValueError(
+                f"patch grid {grid_size} has fewer than two patch tokens; the "
+                "selected patch objective needs at least one masked and one "
+                "visible position. Increase the input size or use "
+                "--patch-loss none."
+            )
+
     optimizer = torch.optim.AdamW(
-        student.parameters(), lr=args.lr, weight_decay=args.weight_decay
+        _student_optimizer_parameters(student, objective),
+        lr=args.lr,
+        weight_decay=args.weight_decay,
     )
     logs_dir = out_dir / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
@@ -1358,6 +2026,22 @@ def run_pretrain(args: argparse.Namespace) -> None:
             student.load_state_dict(resume_ckpt["model_state_dict"], strict=False)
         if "teacher" in resume_ckpt:
             teacher.load_state_dict(resume_ckpt["teacher"], strict=False)
+        saved_patch_state = resume_ckpt.get("patch_objective")
+        if patch_mode in ("masked-feature", "ibot") and (
+            not isinstance(saved_patch_state, dict) or not saved_patch_state
+        ):
+            raise ValueError(
+                "Cannot resume: this checkpoint has no patch_objective state for "
+                f"patch_loss={patch_mode!r}. Start a new run to use real masking."
+            )
+        if isinstance(saved_patch_state, dict) and saved_patch_state:
+            try:
+                objective.load_state_dict(saved_patch_state, strict=True)
+            except RuntimeError as exc:
+                raise ValueError(
+                    "Cannot resume: patch_objective state is malformed or "
+                    f"incompatible with patch_loss={patch_mode!r}: {exc}"
+                ) from exc
         if "optimizer" in resume_ckpt:
             optimizer.load_state_dict(resume_ckpt["optimizer"])
         if "center" in resume_ckpt:
@@ -1418,7 +2102,23 @@ def run_pretrain(args: argparse.Namespace) -> None:
             f"[Info] Starting/Resuming with learning rate: {float(lr_schedule[min(global_step, total_steps - 1)]):.6f}"
         )
 
+    pending_rng_restore = (
+        resume_ckpt.get("rng_state") if resume_ckpt is not None else None
+    )
+    if resume_ckpt is not None and not pending_rng_restore:
+        print(
+            "[Warning] Legacy checkpoint has no RNG state; the random sequence "
+            "cannot continue exactly. Mask sampling and the main-process shuffle "
+            "resume best-effort."
+        )
+
     for epoch in range(start_epoch, args.max_epochs):
+        # Restore the resumed RNG exactly once. Restoring every epoch would
+        # restart every non-saving epoch from the last checkpoint's state and
+        # repeat the mask and shuffle sequence.
+        if pending_rng_restore is not None:
+            _restore_rng_state(pending_rng_restore)
+            pending_rng_restore = None
         cosine_sim = 0.0
         student.train()
         pbar = tqdm(loader, desc=f"Epoch {epoch + 1}/{args.max_epochs}", ncols=150)
@@ -1434,19 +2134,30 @@ def run_pretrain(args: argparse.Namespace) -> None:
             student_global: list[torch.Tensor] = []
             student_tokens: list[torch.Tensor] = []
             for gv in global_views:
-                s_proj, s_tok = student(gv)
-                student_global.append(s_proj)
-                student_tokens.append(s_tok)
+                s_out = student.forward_pretrain(gv)
+                student_global.append(s_out.cls)
+                student_tokens.append(s_out.tokens)
 
             teacher_global: list[torch.Tensor] = []
             teacher_tokens: list[torch.Tensor] = []
+            teacher_final_four: list[list[torch.Tensor] | None] = []
+            teacher_logits: list[torch.Tensor] = []
+            prefix = student.backbone.num_prefix_tokens
             with torch.no_grad():
                 for gv in global_views:
-                    t_proj, t_tok = teacher(gv)
-                    t_proj = t_proj - teacher.center
+                    t_out = teacher.forward_pretrain(
+                        gv,
+                        return_intermediates=patch_mode == "masked-feature",
+                    )
+                    t_proj = t_out.cls - teacher.center
                     t_proj = F.normalize(t_proj, dim=-1)
                     teacher_global.append(t_proj)
-                    teacher_tokens.append(t_tok)
+                    teacher_tokens.append(t_out.tokens)
+                    teacher_final_four.append(t_out.final_four)
+                    if patch_mode == "ibot":
+                        teacher_logits.append(
+                            objective.teacher_ibot_head(t_out.tokens[:, prefix:])
+                        )
                 all_teacher = torch.cat(teacher_global, dim=0)
                 teacher.center = _update_teacher_center(teacher.center, all_teacher)
 
@@ -1461,12 +2172,76 @@ def run_pretrain(args: argparse.Namespace) -> None:
                 disable_cross_view_loss=args.disable_cross_view_loss,
             )
 
-            loss_mask = torch.tensor(0.0, device=device)
-            for s_tok, t_tok in zip(student_tokens, teacher_tokens):
-                loss_mask += _masked_token_loss(
-                    s_tok, t_tok, args.mask_ratio, args.model_name
-                )
-            loss_mask /= max(1, len(student_tokens))
+            patch_loss_raw = torch.zeros((), device=device)
+            center_logits: list[torch.Tensor] = []
+            step_masks: list[torch.Tensor] = []
+            ibot_probs: list[torch.Tensor] = []
+            if patch_mode == "consistency":
+                view_losses = []
+                for s_tok, t_tok in zip(student_tokens, teacher_tokens):
+                    mask = _sample_patch_masks(
+                        s_tok.shape[0], grid_size, patch_ratio, "random", device
+                    )
+                    step_masks.append(mask)
+                    view_losses.append(
+                        masked_patch_cosine_loss(
+                            s_tok[:, prefix:], t_tok[:, prefix:], mask
+                        )
+                    )
+                patch_loss_raw = torch.stack(view_losses).mean()
+            elif patch_mode == "masked-feature":
+                final_norm = teacher.pretrain_final_norm
+                view_losses = []
+                for index, gv in enumerate(global_views):
+                    mask = _sample_patch_masks(
+                        gv.shape[0], grid_size, patch_ratio, patch_strategy, device
+                    )
+                    step_masks.append(mask)
+                    with torch.no_grad():
+                        layers = [
+                            final_norm(block)[:, prefix:]
+                            for block in teacher_final_four[index]
+                        ]
+                        target = F.normalize(
+                            torch.stack(layers).mean(dim=0), dim=-1
+                        )
+                    masked_out = student.forward_pretrain(
+                        gv, mask=mask, mask_token=objective.mask_token
+                    )
+                    prediction = objective.predict_masked_features(
+                        masked_out.tokens[:, prefix:]
+                    )
+                    view_losses.append(
+                        masked_patch_cosine_loss(prediction, target, mask)
+                    )
+                patch_loss_raw = torch.stack(view_losses).mean()
+            elif patch_mode == "ibot":
+                view_losses = []
+                for index, gv in enumerate(global_views):
+                    mask = _sample_patch_masks(
+                        gv.shape[0], grid_size, patch_ratio, patch_strategy, device
+                    )
+                    step_masks.append(mask)
+                    masked_out = student.forward_pretrain(
+                        gv, mask=mask, mask_token=objective.mask_token
+                    )
+                    view_loss, view_probs = ibot_patch_loss(
+                        objective.student_ibot_head(
+                            masked_out.tokens[:, prefix:]
+                        ),
+                        teacher_logits[index],
+                        mask,
+                        objective.patch_center,
+                        temp_student,
+                        temp_teacher,
+                    )
+                    view_losses.append(view_loss)
+                    ibot_probs.append(view_probs)
+                    center_logits.append(teacher_logits[index][mask].detach())
+                patch_loss_raw = torch.stack(view_losses).mean()
+
+            loss_mask = patch_loss_raw
+            patch_loss_weighted = args.lambda_mask * patch_loss_raw
 
             local_student_projs: list[torch.Tensor] = []
             for lv in local_views:
@@ -1479,17 +2254,26 @@ def run_pretrain(args: argparse.Namespace) -> None:
             total_loss = (
                 loss_global
                 + args.lambda_local * loss_local
-                + args.lambda_mask * loss_mask
+                + patch_loss_weighted
             )
 
             optimizer.zero_grad()
             total_loss.backward()
-            grad_norm = _compute_grad_norm(student)
-            nn.utils.clip_grad_norm_(student.parameters(), max_norm=3.0)
+            trainable_params = optimizer.param_groups[0]["params"]
+            grad_norm = _compute_grad_norm_parameters(trainable_params)
+            nn.utils.clip_grad_norm_(trainable_params, max_norm=3.0)
             optimizer.step()
 
             m = float(momentum_schedule[iter_idx])
             update_teacher(student, teacher, m)
+            if patch_mode == "ibot":
+                update_teacher(
+                    objective.student_ibot_head, objective.teacher_ibot_head, m
+                )
+                objective.patch_center = _update_patch_center(
+                    objective.patch_center,
+                    torch.cat(center_logits, dim=0),
+                )
 
             with torch.no_grad():
                 cosine_sim = F.cosine_similarity(
@@ -1501,6 +2285,32 @@ def run_pretrain(args: argparse.Namespace) -> None:
                 with torch.no_grad():
                     instant_metrics = _compute_instant_metrics(
                         student, global_views[0], device
+                    )
+                total_value = float(total_loss.item())
+                weighted_value = float(patch_loss_weighted.item())
+                patch_metrics: dict[str, object] = {
+                    "patch_loss_raw": float(patch_loss_raw.item()),
+                    "patch_loss_weighted": weighted_value,
+                    "patch_loss_fraction_of_total": (
+                        weighted_value / total_value if total_value != 0.0 else 0.0
+                    ),
+                    "requested_mask_ratio": patch_config["mask_ratio_requested"],
+                }
+                if patch_mode == "consistency" and step_masks:
+                    patch_metrics["selected_patch_ratio"] = float(
+                        torch.stack(
+                            [mask.float().mean() for mask in step_masks]
+                        ).mean()
+                    )
+                if patch_mode in ("masked-feature", "ibot") and step_masks:
+                    patch_metrics.update(
+                        _mask_ratio_diagnostics(step_masks, patch_count)
+                    )
+                if patch_mode == "ibot" and ibot_probs:
+                    patch_metrics.update(
+                        _ibot_diagnostics(
+                            torch.cat(ibot_probs, dim=0), objective.patch_center
+                        )
                     )
                 instant_logger.log(
                     iteration=global_step,
@@ -1516,6 +2326,7 @@ def run_pretrain(args: argparse.Namespace) -> None:
                     teacher_center_norm=float(teacher.center.norm().item()),
                     cosine_similarity=float(cosine_sim),
                     **instant_metrics,
+                    **patch_metrics,
                 )
 
             if step % 10 == 0 or step == len(loader) - 1:
@@ -1539,6 +2350,19 @@ def run_pretrain(args: argparse.Namespace) -> None:
         should_save = (epoch + 1) % max(1, args.save_every_epochs) == 0 or (
             epoch + 1
         ) == args.max_epochs
+        if should_save and compute_embedding_metrics and epoch_logger is not None:
+            # Epoch-end evaluation and UMAP must run before the RNG snapshot so
+            # the saved state is the boundary after all logging.
+            _compute_and_log_all_metrics(
+                args=args,
+                model=teacher,
+                device=device,
+                epoch=epoch,
+                logs_dir=logs_dir,
+                metrics_logger=epoch_logger,
+                eval_image_size=eval_image_size,
+                force_linear_probe=False,
+            )
         if should_save:
             ckpt = {
                 "epoch": epoch,
@@ -1548,6 +2372,8 @@ def run_pretrain(args: argparse.Namespace) -> None:
                 "teacher": teacher.state_dict(),
                 "optimizer": optimizer.state_dict(),
                 "center": teacher.center.detach().cpu(),
+                "patch_objective": objective.state_dict(),
+                "rng_state": _capture_rng_state(),
                 "args": vars(args),
                 "config": {
                     "model_name": args.model_name,
@@ -1555,6 +2381,7 @@ def run_pretrain(args: argparse.Namespace) -> None:
                     "image_size": global_crop_size,
                     "augmentation_profile": profile,
                     "augmentation_config": augmentation_config,
+                    **patch_config,
                 },
                 "schedule": {
                     **schedule_state,
@@ -1573,18 +2400,6 @@ def run_pretrain(args: argparse.Namespace) -> None:
                     for old_ckpt in ckpts[:-keep]:
                         old_ckpt.unlink(missing_ok=True)
                         print(f"[Info] Deleted old checkpoint {old_ckpt.name}")
-
-            if compute_embedding_metrics and epoch_logger is not None:
-                _compute_and_log_all_metrics(
-                    args=args,
-                    model=teacher,
-                    device=device,
-                    epoch=epoch,
-                    logs_dir=logs_dir,
-                    metrics_logger=epoch_logger,
-                    eval_image_size=eval_image_size,
-                    force_linear_probe=False,
-                )
 
     instant_logger.plot(
         logs_dir, epoch_logger.path if epoch_logger is not None else None

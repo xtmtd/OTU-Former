@@ -200,3 +200,34 @@ def test_normalize_legacy_projector_keys_leaves_current_names_untouched():
 
 def test_projector_out_dim_is_none_without_a_projector():
     assert resolve_projector_out_dim({"backbone.cls_token": torch.zeros(1)}) is None
+
+
+def test_general_encoder_checkpoint_ignores_patch_objective_state():
+    """Read-only consumers load the encoder and never touch training-only state."""
+    from otuformer.training.model import OTUFormerEncoder
+    from otuformer.utils.checkpoint import apply_checkpoint_weights
+
+    source = OTUFormerEncoder(
+        model_name="vit_tiny_patch16_224", out_dim=8, pretrained=False
+    )
+    checkpoint = {
+        "model_state_dict": source.state_dict(),
+        "config": {"model_name": "vit_tiny_patch16_224", "out_dim": 8},
+        "patch_objective": {
+            "mask_token": torch.zeros(1, 1, source.backbone.num_features),
+            "predictor.0.weight": torch.zeros(
+                source.backbone.num_features, source.backbone.num_features
+            ),
+        },
+        "rng_state": {"python": None},
+    }
+
+    resolved = resolve_checkpoint(checkpoint, "vit_tiny_patch16_224")
+    model = OTUFormerEncoder(
+        model_name="vit_tiny_patch16_224", out_dim=8, pretrained=False
+    )
+    apply_checkpoint_weights(model, resolved)
+
+    assert torch.equal(model.backbone.cls_token, source.backbone.cls_token)
+    assert model.projector.net[4].weight.shape[0] == 8
+    assert all(not key.startswith(("mask_token", "predictor.")) for key in resolved.state_dict)

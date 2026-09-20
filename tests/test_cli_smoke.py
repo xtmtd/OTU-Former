@@ -1384,6 +1384,238 @@ def test_pretrain_default_model_name_and_device_auto(tmp_path, monkeypatch):
     assert seen["local_crops"] is None
 
 
+def test_pretrain_forwards_patch_defaults_and_implicit_sources(tmp_path, monkeypatch):
+    seen = {}
+
+    def fake_run_pretrain(args):
+        seen.update(vars(args))
+
+    monkeypatch.setattr("otuformer.training.trainer.run_pretrain", fake_run_pretrain)
+
+    result = runner.invoke(
+        app,
+        [
+            "pretrain",
+            "--train-data",
+            str(tmp_path / "images.csv"),
+            "--input-images-dir",
+            str(tmp_path),
+            "--out-dir",
+            str(tmp_path / "pretrain_out"),
+        ],
+    )
+    assert result.exit_code == 0
+    assert seen["patch_loss"] == "consistency"
+    assert seen["masking_strategy"] == "random"
+    assert seen["mask_ratio"] == "auto"
+    assert seen["ibot_prototypes"] == 512
+    for name in ("mask_ratio", "masking_strategy", "ibot_prototypes", "lambda_mask"):
+        assert seen[f"{name}_explicit"] is False
+
+
+def test_pretrain_records_commandline_patch_sources(tmp_path, monkeypatch):
+    seen = {}
+
+    def fake_run_pretrain(args):
+        seen.update(vars(args))
+
+    monkeypatch.setattr("otuformer.training.trainer.run_pretrain", fake_run_pretrain)
+
+    result = runner.invoke(
+        app,
+        [
+            "pretrain",
+            "--train-data",
+            str(tmp_path / "images.csv"),
+            "--input-images-dir",
+            str(tmp_path),
+            "--out-dir",
+            str(tmp_path / "pretrain_out"),
+            "--patch-loss",
+            "ibot",
+            "--mask-ratio",
+            "0.4",
+            "--masking-strategy",
+            "blockwise",
+            "--ibot-prototypes",
+            "256",
+            "--lambda-mask",
+            "0.5",
+        ],
+    )
+    assert result.exit_code == 0
+    assert seen["patch_loss"] == "ibot"
+    assert seen["mask_ratio"] == 0.4
+    assert seen["masking_strategy"] == "blockwise"
+    assert seen["ibot_prototypes"] == 256
+    assert seen["lambda_mask"] == 0.5
+    for name in ("mask_ratio", "masking_strategy", "ibot_prototypes", "lambda_mask"):
+        assert seen[f"{name}_explicit"] is True
+
+
+@pytest.mark.parametrize("value", ["0", "1", "1.5", "-0.2", "half", ""])
+def test_pretrain_mask_ratio_rejects_invalid_values_before_output_dir(tmp_path, value):
+    out_dir = tmp_path / "pretrain_out"
+    result = runner.invoke(
+        app,
+        [
+            "pretrain",
+            "--train-data",
+            str(tmp_path / "images.csv"),
+            "--input-images-dir",
+            str(tmp_path),
+            "--out-dir",
+            str(out_dir),
+            "--mask-ratio",
+            value,
+        ],
+    )
+    assert result.exit_code != 0
+    assert "mask-ratio" in result.output.lower()
+    assert not out_dir.exists()
+
+
+def test_pretrain_forwards_large_ibot_prototype_counts(tmp_path, monkeypatch):
+    seen = {}
+
+    def fake_run_pretrain(args):
+        seen.update(vars(args))
+
+    monkeypatch.setattr("otuformer.training.trainer.run_pretrain", fake_run_pretrain)
+
+    result = runner.invoke(
+        app,
+        [
+            "pretrain",
+            "--train-data",
+            str(tmp_path / "images.csv"),
+            "--input-images-dir",
+            str(tmp_path),
+            "--out-dir",
+            str(tmp_path / "pretrain_out"),
+            "--patch-loss",
+            "ibot",
+            "--ibot-prototypes",
+            "4096",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert seen["ibot_prototypes"] == 4096
+
+
+@pytest.mark.parametrize("value", ["0", "1", "-5"])
+def test_pretrain_rejects_non_positive_ibot_prototypes(tmp_path, value):
+    out_dir = tmp_path / "pretrain_out"
+    result = runner.invoke(
+        app,
+        [
+            "pretrain",
+            "--train-data",
+            str(tmp_path / "images.csv"),
+            "--input-images-dir",
+            str(tmp_path),
+            "--out-dir",
+            str(out_dir),
+            "--patch-loss",
+            "ibot",
+            "--ibot-prototypes",
+            value,
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "ibot-prototypes" in result.output.lower()
+    assert not out_dir.exists()
+
+
+def test_pretrain_invalid_patch_combo_preserves_existing_output_dir(tmp_path):
+    """A semantic patch-option conflict must fail before --overwrite clears out-dir."""
+    out_dir = tmp_path / "pretrain_out"
+    out_dir.mkdir()
+    keep = out_dir / "keep.txt"
+    keep.write_text("keep", encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        [
+            "pretrain",
+            "--train-data",
+            str(tmp_path / "images.csv"),
+            "--input-images-dir",
+            str(tmp_path),
+            "--out-dir",
+            str(out_dir),
+            "--overwrite",
+            "--patch-loss",
+            "none",
+            "--mask-ratio",
+            "0.3",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert keep.exists(), "the semantic conflict was detected after the output dir was cleared"
+
+
+def test_pretrain_help_documents_patch_modes_and_mask_migration():
+    import re
+
+    result = runner.invoke(app, ["pretrain", "--help"])
+    assert result.exit_code == 0
+    output = result.output
+    # Strip Rich table borders so a phrase wrapped across a cell boundary is
+    # still searchable as contiguous text.
+    normalized = " ".join(
+        re.sub(r"[^a-zA-Z0-9.\-]+", " ", output).lower().split()
+    )
+    assert "masked-feature" in normalized
+    assert "ibot" in normalized
+    assert "experimental" in normalized
+    assert "auto" in normalized
+    assert "0.30" in normalized
+    assert "selected" in normalized
+    # Consistency must be described as visible-position selection, not masking.
+    assert "input masking" in normalized
+    assert "A+" not in output
+    assert "lower it" in normalized  # ibot lambda-mask guidance
+    for flag in (
+        "--patch-loss",
+        "--masking-strategy",
+        "--mask-ratio",
+        "--ibot-prototypes",
+        "--lambda-mask",
+    ):
+        assert flag in output
+
+
+def test_pretrain_help_defers_the_full_contract_to_the_readme():
+    result = runner.invoke(app, ["pretrain", "--help"])
+    assert result.exit_code == 0
+    assert "Patch-loss contract" not in result.output
+    assert "README" in result.output
+
+
+def test_readmes_document_v07_patch_loss_contract():
+    for name in ["README.md", "README.cn.md"]:
+        text = Path(name).read_text(encoding="utf-8")
+        for token in ("--patch-loss", "--masking-strategy", "--ibot-prototypes"):
+            assert token in text, (name, token)
+        for token in ("none", "consistency", "masked-feature", "ibot"):
+            assert token in text, (name, token)
+        for token in ("random", "blockwise", "hybrid"):
+            assert token in text, (name, token)
+        assert "A+" not in text, name
+        assert (
+            "continuous masked feature prediction" in text
+            or "连续掩码特征预测" in text
+        ), name
+        assert "experimental" in text.lower() or "实验" in text, name
+        # New-run migration notice and legacy resume rule.
+        assert "0.50" in text and "0.30" in text and "auto" in text, name
+        assert "0.7.0" in text, name
+
+
 def test_pretrain_help_mentions_umap_metric_choices_and_extract_auto():
     result = runner.invoke(app, ["pretrain", "--help"])
     assert result.exit_code == 0

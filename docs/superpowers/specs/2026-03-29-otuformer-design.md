@@ -74,8 +74,7 @@ The CLI layer is thin (argument parsing + logging scope + result printing). Core
 ## 3. Sub-commands
 
 ### 3.1 `pretrain`
-SSL self-supervised pre-training (teacher-student self-distillation + masked token regression).
-
+SSL self-supervised pre-training (teacher-student self-distillation + patch-level objective).
 All parameters migrated from `ref/ibot20260115.py` `get_parser()`, mode=pretrain. Full list:
 
 - `--train-data` : CSV with `image` column (no label required for SSL)
@@ -88,7 +87,10 @@ All parameters migrated from `ref/ibot20260115.py` `get_parser()`, mode=pretrain
 - `--global-crop-size` [default: auto; `auto` resolves to the backbone's native `default_cfg["input_size"]` on a new run or the checkpoint's recorded size on `--resume`; explicit values 224/384/448 are common, 518 is patch-14-only]; `--local-crop-size` [default: 96], `--local-crops` [default: 6]. On `--resume`, omitted `--local-crop-size` and `--local-crops` inherit the checkpoint's saved values; explicit conflicting values fail, and changing them requires a new run.
 - `--augmentation` : pretraining augmentation profile — `global-barcode` (new-run default), `color-robust`, or `legacy`
 - `--orientation-policy` : geometric orientation policy — `sensitive` (new-run default) or `invariant` (opt-in broad rotation and reflection)
-- `--mask-ratio` [default: 0.5], `--lambda-local` [default: 1.5], `--lambda-mask` [default: 1.0]
+- `--patch-loss` : patch-level objective — `none`, `consistency` (default; visible same-position cosine consistency, not input masking), `masked-feature` (A+; continuous masked feature prediction), or `ibot` (experimental prototype prediction)
+- `--masking-strategy` : real-masking geometry for `masked-feature`/`ibot` — `random` (default), `blockwise`, or `hybrid`
+- `--mask-ratio` [default: auto; `auto` resolves to 0.30 on a new run, while v0.6.x defaulted to 0.50; a legacy `--resume` keeps its recorded value or falls back to 0.50], `--lambda-local` [default: 1.5], `--lambda-mask` [default: 1.0]
+- `--ibot-prototypes` [default: 512; any integer >= 2, larger values suit larger datasets]
 - `--teacher-momentum` [default: 0.995], `--teacher-momentum-end` [default: 0.999]
 - `--student-temp` [default: 0.1], `--teacher-temp-start` [default: 0.04], `--teacher-temp-end` [default: 0.07]
 - `--disable-cross-view-loss` : disable cross-view pairing (view1×view2)

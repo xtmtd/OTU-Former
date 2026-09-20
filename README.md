@@ -146,6 +146,75 @@ do not require Hugging Face access.
 
 Self-supervised contrastive pretraining using DINO/iBOT-style teacher-student ViT, no labels required.
 
+**Patch-level objectives (v0.7.0).** `--patch-loss` selects the patch objective:
+
+| `--patch-loss` | Student input | Objective |
+|---|---|---|
+| `none` | unmasked | no patch objective |
+| `consistency` (default) | unmasked | normalized cosine regression at selected visible same-position patches |
+| `masked-feature` | masked | continuous masked feature prediction |
+| `ibot` (experimental) | masked | prototype-distribution prediction |
+
+`consistency` selects fully visible patch positions, so it is **masked-position
+patch consistency**, not masked image modeling: the student still observes every
+selected pixel. `masked-feature` (continuous masked feature prediction) and
+`ibot` (experimental) replace the selected student patch
+embeddings with a learnable mask token before positional encoding, so the
+student never sees the selected content while its position is preserved. The
+teacher target for masked-feature is the L2-normalized mean of the teacher's
+final four block outputs. iBOT predicts the teacher's centered prototype
+distribution
+(`--ibot-prototypes`, default 512; any integer >= 2, with larger dictionaries
+for larger datasets) with moving-average centering.
+`masked-feature` and `ibot` are mutually exclusive and are never combined.
+
+`--masking-strategy` chooses the real-masking geometry for `masked-feature` and
+`ibot`; it has no effect for `none` or `consistency`:
+
+- `random` (default) — `round(ratio * N)` unique patch positions, sampled
+  independently per sample and per global view.
+- `blockwise` — two to four rectangle proposals per round, merged on overlap. A
+  legal rectangle has sides of at least two patches, an aspect ratio within
+  `[0.5, 2.0]`, and an area of at most `floor(0.20 * N)` patches. Overlap is
+  counted once, and the result is trimmed or random-filled to exactly
+  `round(ratio * N)` positions. A grid where no legal rectangle fits (for
+  example `4 x 4`, whose maximum block area is 3 while a `2 x 2` block needs 4)
+  fails before the training loop instead of silently degrading to `random`.
+- `hybrid` — exactly `floor(target / 2)` blockwise positions, then random fill
+  to the target count.
+
+Every strategy clamps the count to at least one masked and at least one visible
+patch.
+
+`--lambda-mask` (default `1.0`) weights the patch loss. iBOT's cross-entropy is
+on a different scale from the cosine patch losses, so `--patch-loss ibot` often
+needs a lower value (for example `0.25`-`0.5`). Loss values are not comparable
+across patch modes.
+
+**Migration notice: `--mask-ratio` now defaults to `auto` and a new run resolves
+it to 0.30, where v0.6.x used a 0.50 default.** Resuming a legacy checkpoint
+keeps its recorded ratio (0.50 when absent) and cannot switch to
+`masked-feature` or `ibot`. For `consistency`, `--mask-ratio` is the visible
+same-position share; for `masked-feature`/`ibot` it is the masked student-input
+fraction. Explicitly passing an option that the selected mode does not use is
+rejected rather than ignored.
+
+Masked-feature and iBOT add one masked student forward per global view, so
+student encoder work grows by roughly 1.65x at the default two-global/six-local
+crop layout. Extraction, fine-tuning, CAM, and export are unchanged: the default
+path is still the raw CLS token, they never load the training-only patch state,
+and they never invoke the mask token, predictor, or iBOT heads. Pretraining and
+pretraining resume support standard timm ViT backbones only. v0.7.0 resume is
+strict: patch mode, resolved ratio, masking strategy, prototype count, and the
+fixed target/center settings must match the checkpoint, and masked-feature/iBOT
+checkpoints
+must carry their `patch_objective` state. RNG state round-trips for v0.7.0
+checkpoints; legacy checkpoints resume best-effort with a warning.
+
+These objectives are self-supervised contextual feature prediction. They do not
+by themselves establish anatomical part semantics or dense morphology
+supervision, and v0.7.0 makes no dense-representation claim.
+
 When `--visualize-data` has no `label` column, periodic supervised metrics are skipped and UMAP is still generated from the visualization embeddings.
 
 To continue pretraining after adding images, create a CSV containing both old and
@@ -200,9 +269,12 @@ otuformer pretrain \
 | `--local-crops` | Number of local crops | 6 |
 | `--augmentation` | Pretraining augmentation profile: `global-barcode` (new-run default), `color-robust`, or `legacy`; omit to inherit the saved profile on `--resume` | `global-barcode` |
 | `--orientation-policy` | Orientation policy for every global and local view (no transform effect for `legacy`): `sensitive` (new-run default; rotation `[-15°, 15°]`, no horizontal reflection) or `invariant` (opt-in broad rotation and reflection); omit to inherit the saved policy on `--resume` | `sensitive` |
-| `--mask-ratio` | Masked token ratio | 0.5 |
+| `--patch-loss` | Patch-level objective: `none`, `consistency` (default; visible same-position cosine consistency, not input masking), `masked-feature` (continuous masked feature prediction) or `ibot` (experimental prototype prediction) | `consistency` |
+| `--masking-strategy` | Real-masking geometry for `masked-feature`/`ibot`: `random`, `blockwise` or `hybrid` | `random` |
+| `--mask-ratio` | `auto` or a float in (0, 1). `auto` resolves to 0.30 for a new run (v0.6.x used 0.50); a legacy resume keeps its recorded value (0.50 when absent) | auto |
+| `--ibot-prototypes` | Prototype dictionary size for `ibot`; any integer >= 2, default 512, larger for larger datasets | 512 |
 | `--lambda-local` | Local crop loss weight | 1.5 |
-| `--lambda-mask` | Masked token loss weight | 1.0 |
+| `--lambda-mask` | Patch-loss weight; lower it for `ibot` (for example 0.25-0.5) | 1.0 |
 | `--teacher-momentum` | Initial EMA momentum | 0.995 |
 | `--teacher-momentum-end` | Final EMA momentum | 0.999 |
 | `--student-temp` | Student temperature | 0.1 |

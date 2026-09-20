@@ -24,9 +24,11 @@ from otuformer.cli import (
 app = typer.Typer(
     help=(
         "SSL self-supervised pre-training (DINO/iBOT style).\n\n"
-        "Trains a student-teacher ViT backbone using global/local crops and masked-token\n"
-        "consistency. Outputs checkpoints that can be used for fine-tuning or direct\n"
-        "embedding extraction.\n\n"
+        "Trains a student-teacher ViT backbone using global/local crops and a\n"
+        "patch-level objective (none | consistency | masked-feature | ibot).\n"
+        "Outputs checkpoints that can be used for fine-tuning or direct\n"
+        "embedding extraction. See the pretrain section of the README for the\n"
+        "full patch-loss and masking contract.\n\n"
         "Quick example:\n\n"
         "  otuformer pretrain --train-data images.csv --input-images-dir ./images\n"
         "  otuformer pretrain --input-images-dir ./images --model-name vit_small_patch16_224 --max-epochs 100\n"
@@ -56,6 +58,49 @@ app = typer.Typer(
         "  parameter changes require a new run.\n"
     )
 )
+
+
+def _parse_mask_ratio(value: object) -> object:
+    """Parse ``auto`` or a float in ``(0, 1)``; return ``"auto"`` or the float."""
+    if value is None or value == "auto":
+        return "auto"
+    try:
+        ratio = float(value)
+    except (TypeError, ValueError):
+        raise typer.BadParameter(
+            f"--mask-ratio must be 'auto' or a float in (0, 1), got '{value}'"
+        ) from None
+    if not 0.0 < ratio < 1.0:
+        raise typer.BadParameter(
+            f"--mask-ratio must be 'auto' or a float in (0, 1), got '{value}'"
+        )
+    return ratio
+
+
+PATCH_LOSS_CHOICES = ("none", "consistency", "masked-feature", "ibot")
+MASKING_STRATEGY_CHOICES = ("random", "blockwise", "hybrid")
+IBOT_PROTOTYPES_MIN = 2
+
+
+def _validate_patch_options(
+    patch_loss: str, masking_strategy: str, ibot_prototypes: int
+) -> None:
+    """Reject unknown enum values before any output directory is touched."""
+    if patch_loss not in PATCH_LOSS_CHOICES:
+        raise typer.BadParameter(
+            f"--patch-loss must be one of {', '.join(PATCH_LOSS_CHOICES)}, "
+            f"got '{patch_loss}'"
+        )
+    if masking_strategy not in MASKING_STRATEGY_CHOICES:
+        raise typer.BadParameter(
+            f"--masking-strategy must be one of {', '.join(MASKING_STRATEGY_CHOICES)}, "
+            f"got '{masking_strategy}'"
+        )
+    if ibot_prototypes < IBOT_PROTOTYPES_MIN:
+        raise typer.BadParameter(
+            f"--ibot-prototypes must be an integer >= {IBOT_PROTOTYPES_MIN}, "
+            f"got '{ibot_prototypes}'"
+        )
 
 
 def _format_user_command(ctx: typer.Context, params: dict[str, object]) -> str:
@@ -162,16 +207,62 @@ def pretrain(
             "the checkpoint value on --resume."
         ),
     ),
-    mask_ratio: float = typer.Option(
-        0.5,
+    patch_loss: str = typer.Option(
+        "consistency",
+        "--patch-loss",
+        help=(
+            "Patch-level objective. 'none', 'consistency' (default; selects "
+            "visible same-position patches for normalized cosine regression, "
+            "i.e. masked-position consistency, never input masking), "
+            "'masked-feature' (true continuous masked feature prediction "
+            "of the teacher's final-four-block patch target) or 'ibot' "
+            "(experimental prototype-distribution prediction)."
+        ),
+    ),
+    masking_strategy: str = typer.Option(
+        "random",
+        "--masking-strategy",
+        help=(
+            "Masking geometry for masked-feature/ibot only. 'random' samples "
+            "independent patch positions; 'blockwise' merges bounded rectangular "
+            "regions; 'hybrid' takes half blockwise and half random positions. "
+            "Not applicable to none/consistency; the exact geometry limits are "
+            "documented in the README."
+        ),
+    ),
+    mask_ratio: str = typer.Option(
+        "auto",
         "--mask-ratio",
-        help="Fraction of patch tokens masked for masked-token consistency loss.",
+        help=(
+            "'auto' or a float in (0, 1). Fraction of patch positions used by "
+            "the selected patch objective. A new run resolves 'auto' to 0.30 "
+            "(v0.6.x used a 0.50 default). Used as the visible same-position "
+            "share for consistency and as the masked student-input fraction "
+            "for masked-feature/ibot."
+        ),
+    ),
+    ibot_prototypes: int = typer.Option(
+        512,
+        "--ibot-prototypes",
+        help=(
+            "Prototype dictionary size for the experimental ibot mode: any "
+            "integer >= 2, default 512. Larger dictionaries suit larger "
+            "datasets (for example 4096 or 16384); powers of two are a "
+            "convenient habit, not a requirement. Not applicable to other "
+            "patch modes."
+        ),
     ),
     lambda_local: float = typer.Option(
         1.5, "--lambda-local", help="Weight for local-crop SSL loss term."
     ),
     lambda_mask: float = typer.Option(
-        1.0, "--lambda-mask", help="Weight for masked-token loss term."
+        1.0,
+        "--lambda-mask",
+        help=(
+            "Weight for the patch-loss term. ibot's cross-entropy is on a "
+            "different scale from the cosine patch losses, so lower it (for "
+            "example 0.25-0.5) when using --patch-loss ibot."
+        ),
     ),
     teacher_momentum: float = typer.Option(
         0.995, "--teacher-momentum", help="Initial EMA momentum."
@@ -282,6 +373,39 @@ def pretrain(
         raise typer.BadParameter(f"Resume checkpoint not found: {resume}")
     _validate_augmentation(augmentation, stage="pretrain")
     _validate_orientation_policy(orientation_policy)
+    _validate_patch_options(patch_loss, masking_strategy, ibot_prototypes)
+    requested_mask_ratio = _parse_mask_ratio(mask_ratio)
+    explicit_sources = {
+        name: ctx.get_parameter_source(name) is click.core.ParameterSource.COMMANDLINE
+        for name in (
+            "patch_loss",
+            "masking_strategy",
+            "mask_ratio",
+            "ibot_prototypes",
+            "lambda_mask",
+        )
+    }
+    if not resume:
+        # Reject semantic patch-option conflicts before --overwrite can clear an
+        # existing output directory. Resume never clears it, and its saved mode
+        # is only known once the checkpoint is loaded in run_pretrain().
+        from otuformer.training.trainer import _resolve_patch_config
+
+        _resolve_patch_config(
+            argparse.Namespace(
+                patch_loss=patch_loss,
+                masking_strategy=masking_strategy,
+                mask_ratio=requested_mask_ratio,
+                ibot_prototypes=ibot_prototypes,
+                lambda_mask=lambda_mask,
+                patch_loss_explicit=explicit_sources["patch_loss"],
+                masking_strategy_explicit=explicit_sources["masking_strategy"],
+                mask_ratio_explicit=explicit_sources["mask_ratio"],
+                ibot_prototypes_explicit=explicit_sources["ibot_prototypes"],
+                lambda_mask_explicit=explicit_sources["lambda_mask"],
+            ),
+            None,
+        )
     prepare_output_dir(out_dir, overwrite=overwrite, allow_existing=bool(resume))
     tee = TeeLogger(
         out_dir / "logs" / "pretrain.log",
@@ -307,9 +431,17 @@ def pretrain(
             global_crop_size=_parse_size(global_crop_size, stage="--global-crop-size"),
             local_crop_size=local_crop_size,
             local_crops=local_crops,
-            mask_ratio=mask_ratio,
+            mask_ratio=requested_mask_ratio,
             lambda_local=lambda_local,
             lambda_mask=lambda_mask,
+            patch_loss=patch_loss,
+            patch_loss_explicit=explicit_sources["patch_loss"],
+            masking_strategy=masking_strategy,
+            masking_strategy_explicit=explicit_sources["masking_strategy"],
+            mask_ratio_explicit=explicit_sources["mask_ratio"],
+            ibot_prototypes=ibot_prototypes,
+            ibot_prototypes_explicit=explicit_sources["ibot_prototypes"],
+            lambda_mask_explicit=explicit_sources["lambda_mask"],
             teacher_momentum=teacher_momentum,
             teacher_momentum_end=teacher_momentum_end,
             student_temp=student_temp,

@@ -2,6 +2,17 @@
 
 Date: 2026-03-30
 
+> **Status note (added 2026-09-20, not a rewrite of the historical decisions
+> below).** The patch-level objective described here as masked-token
+> consistency was superseded by the v0.7.0 design
+> (`docs/superpowers/specs/2026-09-20-otuformer-masked-pretrain-v070-design.md`)
+> and its implementation plan
+> (`docs/superpowers/plans/2026-09-20-otuformer-masked-pretrain-v070.md`).
+> The objective is now named **masked-position patch consistency** and remains
+> the `--patch-loss consistency` default; true masked-feature prediction (A+)
+> and experimental iBOT are opt-in. The global/local alignment decisions in this
+> document still hold unchanged.
+
 ## Goal
 
 Align the current `otuformer pretrain` implementation with the reference SSL workflow in `ref/ibot20260115.py`, with scope limited to pretraining behavior, periodic embedding evaluation, and pretraining-related plots. The objective is to reduce behavioral drift from the reference implementation while preserving the current package and CLI structure.

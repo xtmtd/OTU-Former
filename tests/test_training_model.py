@@ -144,3 +144,40 @@ def test_encoder_accepts_local_crop_size():
     x = torch.randn(2, 3, 96, 96)
     out = model(x)
     assert out.shape == (2, 64)
+
+
+def test_encoder_inference_contract_is_unchanged_by_pretrain_work():
+    """v0.7.0 must not alter the normal forward/extraction contract."""
+    model = OTUFormerEncoder(
+        model_name="vit_tiny_patch16_224",
+        out_dim=32,
+        return_patch_tokens=True,
+        pretrained=False,
+    )
+    model.eval()
+    x = torch.randn(2, 3, 224, 224)
+    with torch.no_grad():
+        projected, patch_tokens = model(x)
+        raw = model.backbone.forward_features(x)
+
+    assert projected.shape == (2, 32)
+    assert torch.allclose(
+        projected.norm(dim=1), torch.ones(2), atol=1e-5
+    )
+    # Patch tokens stay raw final-norm backbone tokens.
+    assert torch.allclose(patch_tokens, raw[:, 1:], atol=1e-6)
+    assert raw[:, 0].shape[1] == model.backbone.num_features
+    assert patch_tokens.shape[1] == (224 // 16) ** 2
+
+
+def test_encoder_patch_token_count_follows_input_size():
+    model = OTUFormerEncoder(
+        model_name="vit_tiny_patch16_224",
+        out_dim=16,
+        return_patch_tokens=True,
+    )
+    model.eval()
+    for size, expected in ((224, 196), (96, 36)):
+        with torch.no_grad():
+            _, tokens = model(torch.randn(1, 3, size, size))
+        assert tokens.shape == (1, expected, model.backbone.num_features)

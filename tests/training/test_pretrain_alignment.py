@@ -131,24 +131,6 @@ def test_teacher_center_update_uses_current_iteration_global_outputs():
     assert updated[0, 1] == pytest.approx(0.05)
 
 
-def test_masked_token_loss_matches_reference_branching():
-    torch.manual_seed(0)
-    student_tokens = torch.randn(2, 8, 4)
-    teacher_tokens = torch.randn(2, 8, 4)
-    # non-EVA model: cosine loss, must be >= 0
-    loss = trainer._masked_token_loss(
-        student_tokens, teacher_tokens, 0.5, "vit_tiny_patch16_224"
-    )
-    assert float(loss) >= 0
-    # EVA model: mse loss, must be >= 0
-    loss_eva = trainer._masked_token_loss(
-        student_tokens, teacher_tokens, 0.5, "eva_tiny"
-    )
-    assert float(loss_eva) >= 0
-    # non-EVA and EVA should produce different values for same inputs
-    assert float(loss) != pytest.approx(float(loss_eva))
-
-
 def test_global_loss_uses_cartesian_pairing_when_cross_view_enabled(monkeypatch):
     student = [torch.tensor([[1.0]]), torch.tensor([[2.0]])]
     teacher = [torch.tensor([[3.0]]), torch.tensor([[4.0]])]

@@ -1,5 +1,12 @@
 # OTU-Former Pretrain Alignment Implementation Plan
 
+> **Status note (added 2026-09-20, not a rewrite of the historical steps
+> below).** The masked-token objective implemented by this plan was superseded
+> by the v0.7.0 masked-pretraining design
+> (`docs/superpowers/specs/2026-09-20-otuformer-masked-pretrain-v070-design.md`)
+> and plan (`docs/superpowers/plans/2026-09-20-otuformer-masked-pretrain-v070.md`).
+> Its global/local SSL alignment work and evaluation wiring remain in force.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Align `otuformer pretrain` with the reference SSL workflow in `ref/ibot20260115.py`, while fixing the train-only UMAP labeling issue and preserving the current package structure.

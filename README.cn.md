@@ -145,6 +145,63 @@ otuformer update --yes
 
 基于 DINO/iBOT 风格的教师-学生 ViT 对比学习进行自监督预训练，无需标注数据。
 
+**patch 级目标（v0.7.0）。** `--patch-loss` 选择 patch 目标：
+
+| `--patch-loss` | student 输入 | 目标 |
+|---|---|---|
+| `none` | 未遮挡 | 无 patch 目标 |
+| `consistency`（默认） | 未遮挡 | 在选中的可见同位 patch 上做归一化余弦回归 |
+| `masked-feature` | 遮挡 | continuous masked feature prediction（连续掩码特征预测） |
+| `ibot`（实验性） | 遮挡 | 原型分布预测 |
+
+`consistency` 选择完全可见的 patch 位置，因此它是 **masked-position patch
+consistency**，而不是 masked image modeling：student 仍能看到被选中的每个像素。
+`masked-feature`（即 continuous masked feature prediction）与 `ibot`
+（实验性）会在位置编码之前把选中的 student patch embedding 替换为可学习的 mask
+token，因此 student 看不到被选中的内容，但位置信息保留。`masked-feature` 的
+teacher 目标是 teacher 最后四个 block 输出的 L2 归一化均值。iBOT 预测 teacher 的
+中心化原型分布
+（`--ibot-prototypes`，默认 512；任意 >= 2 的整数，数据集越大可用越大），使用移动平均中心。
+`masked-feature` 与 `ibot` 互斥，不会叠加。
+
+`--masking-strategy` 为 `masked-feature` 与 `ibot` 选择真实遮挡几何；对 `none`
+与 `consistency` 无效：
+
+- `random`（默认）——每个样本、每个 global view 独立采样 `round(ratio * N)` 个
+  互不重复的 patch 位置。
+- `blockwise`——每轮生成二到四个矩形提案，重叠部分合并。合法矩形的边长至少为 2
+  个 patch，长宽比在 `[0.5, 2.0]` 内，面积不超过 `floor(0.20 * N)` 个 patch。
+  重叠只计一次，最后裁剪或随机填充到恰好 `round(ratio * N)` 个位置。若网格无法
+  容纳任何合法矩形（例如 `4 x 4`：最大块面积为 3，而 `2 x 2` 块需要 4），会在
+  训练循环开始前报错，而不是静默降级为 `random`。
+- `hybrid`——先取恰好 `floor(target / 2)` 个块状位置，再随机填充到目标数量。
+
+所有策略都会把数量限制为至少遮挡一个、至少保留一个可见 patch。
+
+`--lambda-mask`（默认 `1.0`）是 patch 损失的权重。iBOT 的交叉熵与余弦类 patch
+损失不在同一量级，因此使用 `--patch-loss ibot` 时通常需要调低（例如 `0.25`-`0.5`）。
+不同 patch 模式的损失值不可直接比较。
+
+**迁移提示：`--mask-ratio` 现在默认 `auto`，新运行会解析为 0.30，而 v0.6.x 的
+默认值是 0.50。** 恢复旧检查点会保留其记录的比值（缺失时为 0.50），且不能切换到
+`masked-feature` 或 `ibot`。对 `consistency`，`--mask-ratio` 是参与损失的可见同位
+比例；对 `masked-feature`/`ibot`，它是被替换为 mask token 的 student patch 比例。
+显式传入当前模式不使用的选项会被拒绝，而不是静默忽略。
+
+`masked-feature` 与 iBOT 会为每个 global view 增加一次 masked student 前向，在默认
+的两 global / 六 local 裁剪布局下，student 编码器计算量约增至 1.65 倍。
+extract、finetune、CAM、export 均未改变：默认仍使用原始 CLS token，它们从不加载
+训练专用的 patch 状态，也从不调用 mask token、predictor 或 iBOT head。预训练与
+预训练续训仅支持标准 timm ViT 骨干网络。v0.7.0 的续训是严格的：patch 模式、解析后的
+比值、遮挡策略、原型数量以及固定的 target/center 设置都必须与检查点一致，
+`masked-feature`/iBOT 检查点必须携带其 `patch_objective` 状态。v0.7.0 检查点会完整往返 RNG 状态；旧检查点
+只能尽力恢复并会给出警告。
+
+这些目标属于自监督上下文特征预测，本身并不建立解剖部位语义或稠密形态学监督，
+v0.7.0 也不对稠密表示做出任何声明。
+
+当 `--visualize-data` 没有 `label` 列时，周期性监督指标会被跳过，但仍会基于可视化嵌入生成 UMAP。
+
 如需加入新图像继续预训练，请创建同时包含旧图和新图的 CSV，保持相同的
 `--out-dir`，使用最新 checkpoint 的 `--resume`，并增加 `--max-epochs`：
 
@@ -195,9 +252,12 @@ otuformer pretrain \
 | `--local-crops` | 局部裁剪数量 | 6 |
 | `--augmentation` | 预训练数据增强配置：`global-barcode`（新运行默认）、`color-robust` 或 `legacy`；`--resume` 时省略则继承已保存配置 | `global-barcode` |
 | `--orientation-policy` | 所有全局与局部视图的方向策略（对 `legacy` 无变换效果）：`sensitive`（新运行默认；旋转 `[-15°, 15°]`，不做水平翻转）或 `invariant`（可选加入的宽角度旋转与翻转）；`--resume` 时省略则继承已保存策略 | `sensitive` |
-| `--mask-ratio` | 掩码 token 比例 | 0.5 |
+| `--patch-loss` | patch 级目标：`none`、`consistency`（默认；可见同位余弦一致性，不是输入遮挡）、`masked-feature`（连续掩码特征预测）或 `ibot`（实验性原型预测） | `consistency` |
+| `--masking-strategy` | `masked-feature`/`ibot` 的真实遮挡几何：`random`、`blockwise` 或 `hybrid` | `random` |
+| `--mask-ratio` | `auto` 或 (0, 1) 内的浮点数。新运行 `auto` 解析为 0.30（v0.6.x 为 0.50）；旧检查点续训保留其记录值（缺失时为 0.50） | auto |
+| `--ibot-prototypes` | `ibot` 的原型字典大小；任意 >= 2 的整数，默认 512，数据集越大可越大 | 512 |
 | `--lambda-local` | 局部裁剪损失权重 | 1.5 |
-| `--lambda-mask` | 掩码 token 损失权重 | 1.0 |
+| `--lambda-mask` | patch 损失权重；`ibot` 建议调低（例如 0.25-0.5） | 1.0 |
 | `--teacher-momentum` | 初始 EMA 动量 | 0.995 |
 | `--teacher-momentum-end` | 最终 EMA 动量 | 0.999 |
 | `--student-temp` | 学生温度 | 0.1 |
