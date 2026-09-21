@@ -153,7 +153,7 @@ SAVE_MODES = ("none", "raw", "normalized")
 def _validate_save_mode(save_npy: str) -> None:
     """Reject non-string or unknown save modes at the module API boundary.
 
-    The CLI already restricts values via ``click.Choice``; this keeps direct
+    The CLI restricts values via its own ``--save-npy`` choices; this keeps direct
     ``process_image()``/``run_cam()`` calls from silently accepting a bool or a
     typo and treating it as ``normalized``.
     """

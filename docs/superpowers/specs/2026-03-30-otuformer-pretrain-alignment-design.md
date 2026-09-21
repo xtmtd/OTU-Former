@@ -13,6 +13,14 @@ Date: 2026-03-30
 > and experimental iBOT are opt-in. The global/local alignment decisions in this
 > document still hold unchanged.
 
+> **Evaluator-vintage note (added 2026-09-21, not a rewrite).** The epoch-50
+> metric values recorded in this document were produced by the pre-v0.7.1
+> evaluator and are not numerically comparable with v0.7.1 outputs: CV fold
+> selection, subsample ordering, `mAP` self-inclusion, and unsupported-value
+> handling changed. See
+> `docs/superpowers/specs/2026-09-21-otuformer-v071-cli-metrics-corrections.md`.
+> The recorded values and directional criteria are preserved unchanged.
+
 ## Goal
 
 Align the current `otuformer pretrain` implementation with the reference SSL workflow in `ref/ibot20260115.py`, with scope limited to pretraining behavior, periodic embedding evaluation, and pretraining-related plots. The objective is to reduce behavioral drift from the reference implementation while preserving the current package and CLI structure.

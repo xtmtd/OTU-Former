@@ -287,7 +287,7 @@ otuformer pretrain \
 **输出**：
 - `logs/pretrain.log` — 运行日志
 - `checkpoints/` — 模型检查点（`SSL_latest.pth`、`SSL_best.pth`）
-- `metrics.json` / `metrics.csv` — 训练指标
+- `logs/metrics.pretrain.csv` — 周期嵌入指标
 - `umap.pdf` — UMAP 可视化（未禁用时）
 
 ---
@@ -375,7 +375,7 @@ otuformer finetune \
 **输出**：
 - `logs/finetune.log` — 运行日志
 - `checkpoints/` — 模型检查点（`finetune_latest.pth`、`finetune_best.pth`）
-- `metrics.json` / `metrics.csv` — 训练指标
+- `logs/metrics.finetune.csv` — 周期嵌入指标
 - `umap.pdf` — UMAP 可视化（未禁用时）
 
 **检查点处理**：
@@ -383,6 +383,33 @@ otuformer finetune \
 - `--checkpoint` 开启新运行。SSL 预训练检查点会安装全新的 ArcFace 嵌入头；头类型与宽度都匹配的微调检查点会保留已训练的投影器。历史 `ProjectionHead` 检查点保留其投影器，因此嵌入宽度由它决定。
 - `--resume` 会恢复保存的优化器状态，因此 `--finetune-lr`、`--metric-head-lr`、`--weight-decay` 不生效。`--freeze-ratio` 必须与保存值一致。
 - 旧脚本检查点（`ref/ibot20260115.py`）可被 `extract`、`export`、`cam` 读取，但不能被 `finetune` 续训。
+
+---
+
+### 嵌入指标（v0.7.1）
+
+`pretrain`、`finetune` 与 `extract` 以相同字段名计算嵌入质量指标。周期日志位于
+`logs/metrics.pretrain.csv` 与 `logs/metrics.finetune.csv`；`extract` 写入 `metrics.csv`。
+
+- kNN 与线性探测共用同一个显式打乱的
+  `StratifiedKFold(shuffle=True, random_state=42)`；折数为 `min(5, 最小类别样本数)`，
+  两类数据不再被强制为两折。某类只有 1 个样本时，所有 CV 指标不可用。
+- 保留历史字段 `kNN_Acc_k1`、`kNN_Acc_k5`、`kNN_Acc_k20`。请求的 `k` 超过最小训练折
+  （`Recall@k` 为 `n_samples - 1`）时按不可用处理，不再静默改名。
+- `Linear_Probing_Acc` 为普通 CV 准确率；新增的 `Linear_Probing_Balanced_Acc` 为同一
+  CV 过程的类别均衡准确率。
+- 无法计算的指标写为空 CSV 字段，绘图时表现为断点而非 0。当归一化后的不同嵌入数少于
+  类别数时，聚类指标按不可用处理，不再伪造单一簇。
+- `mAP` 只对非查询样本排序，并排除没有非自身相关项的查询。`Recall@k` 刻意保留全部查询
+  （含单例标签）作为分母；两者的单例查询口径不同，用于保持历史可比性。
+- `Silhouette_Score` 是相对真实标签的余弦轮廓系数。
+
+`cam` 与 `extract` 使用原生校验：在创建任何输出目录之前，对枚举取值之外的输入直接拒绝。
+
+**可比性。** v0.7.1 之前的数值与 v0.7.1 输出不可直接比较：CV 折选择、子采样顺序、`mAP`
+自包含以及不可用值处理均已改变。字段名与历史行仍可读取；`--resume` 的 v0.7.0
+`metrics.pretrain.csv`/`metrics.finetune.csv` 会就地迁移，补一列空的
+`Linear_Probing_Balanced_Acc`。
 
 ---
 

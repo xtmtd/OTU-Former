@@ -7,7 +7,6 @@ import sys
 import traceback
 from pathlib import Path
 
-import click
 import typer
 
 from otuformer.cli import SIZE_EXAMPLES, _parse_size
@@ -29,7 +28,7 @@ def _format_user_command(ctx: typer.Context, params: dict[str, object]) -> str:
     parts = ["otuformer", "export"]
     for key, value in params.items():
         source = ctx.get_parameter_source(key)
-        if source is not click.core.ParameterSource.COMMANDLINE:
+        if getattr(source, "name", None) != "COMMANDLINE":
             continue
         option = f"--{key.replace('_', '-')}"
         if value in (None, ""):

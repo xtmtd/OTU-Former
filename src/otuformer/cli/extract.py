@@ -8,7 +8,6 @@ import sys
 import traceback
 from pathlib import Path
 
-import click
 import typer
 
 from otuformer.cli import SIZE_EXAMPLES, _parse_size
@@ -27,11 +26,28 @@ app = typer.Typer(
 )
 
 
+_EVAL_TRANSFORM_CHOICES = ("center-crop", "whole-specimen-pad")
+
+
+def _validate_extract_options(*, eval_transform: str) -> None:
+    """Reject extract options outside their enumerated values before any output.
+
+    Uses Typer-native validation instead of a Click-specific choice type so
+    Typer builds commands the same way whether Click is installed or vendored
+    by Typer.
+    """
+    if eval_transform not in _EVAL_TRANSFORM_CHOICES:
+        raise typer.BadParameter(
+            "--eval-transform must be one of: "
+            f"{', '.join(_EVAL_TRANSFORM_CHOICES)}; got {eval_transform!r}"
+        )
+
+
 def _format_user_command(ctx: typer.Context, params: dict[str, object]) -> str:
     parts = ["otuformer", "extract"]
     for key, value in params.items():
         source = ctx.get_parameter_source(key)
-        if source is not click.core.ParameterSource.COMMANDLINE:
+        if getattr(source, "name", None) != "COMMANDLINE":
             continue
         option = f"--{key.replace('_', '-')}"
         if isinstance(value, bool):
@@ -73,8 +89,6 @@ def extract(
     eval_transform: str = typer.Option(
         "center-crop",
         "--eval-transform",
-        click_type=click.Choice(["center-crop", "whole-specimen-pad"]),
-        show_choices=False,
         help=(
             "Evaluation preprocessing protocol: center-crop (Resize + CenterCrop) "
             "or whole-specimen-pad (aspect-preserving square padding). "
@@ -184,6 +198,8 @@ def extract(
     if ctx.invoked_subcommand is not None:
         return
 
+    _validate_extract_options(eval_transform=eval_transform)
+
     from otuformer.embedding.extractor import extract_embeddings
     from otuformer.utils.io import prepare_output_dir, write_csv
 
@@ -276,7 +292,7 @@ def extract(
             from otuformer.embedding.evaluator import (
                 compute_clustering_metrics,
                 compute_knn_accuracy,
-                compute_linear_probing,
+                compute_linear_probing_metrics,
                 compute_map,
                 compute_recall_at_k,
                 run_umap,
@@ -290,6 +306,14 @@ def extract(
             emb_ids = df["id"].tolist()
             emb_id_set = set(emb_ids)
             label_df = label_df[label_df["image"].isin(emb_id_set)].copy()
+            duplicate_images = (
+                label_df["image"][label_df["image"].duplicated()].unique().tolist()
+            )
+            if duplicate_images:
+                raise ValueError(
+                    "--label-csv contains duplicate 'image' rows: "
+                    f"{', '.join(str(name) for name in duplicate_images[:5])}"
+                )
             label_indexed = label_df.set_index("image")
             valid_ids = [x for x in emb_ids if x in label_indexed.index]
             emb_mask = df["id"].isin(set(valid_ids))
@@ -304,6 +328,9 @@ def extract(
             n = len(embeddings)
             if metrics_sample_size > 0 and n > metrics_sample_size:
                 rng = np.random.default_rng(seed)
+                # Sorted indices: trainer._maybe_subsample_for_metrics applies the
+                # same seeded, sorted subsample order so both paths score the same
+                # rows in the same order.
                 idx = np.sort(rng.choice(n, size=metrics_sample_size, replace=False))
                 embeddings = embeddings[idx]
                 if labels is not None:
@@ -325,9 +352,11 @@ def extract(
                 except Exception as e:
                     print(f"[Warning] kNN accuracy failed: {e}")
                 try:
-                    metrics["Linear_Probing_Acc"] = compute_linear_probing(
-                        embeddings, labels
-                    )
+                    probing = compute_linear_probing_metrics(embeddings, labels)
+                    metrics["Linear_Probing_Acc"] = probing["Linear_Probing_Acc"]
+                    metrics["Linear_Probing_Balanced_Acc"] = probing[
+                        "Linear_Probing_Balanced_Acc"
+                    ]
                 except Exception as e:
                     print(f"[Warning] Linear probing failed: {e}")
                 try:
@@ -340,7 +369,10 @@ def extract(
                     print(f"[Warning] Clustering metrics failed: {e}")
 
                 metrics_path = out_dir / "metrics.csv"
-                metrics_rows = [{"metric": k, "value": v} for k, v in metrics.items()]
+                metrics_rows = [
+                    {"metric": k, "value": "" if v is None else v}
+                    for k, v in metrics.items()
+                ]
                 pd.DataFrame(metrics_rows).to_csv(metrics_path, index=False)
                 print(f"[Metrics] Results saved to: {metrics_path}")
                 for k, v in metrics.items():

@@ -22,7 +22,7 @@ from tqdm import tqdm
 from otuformer.embedding.evaluator import (
     compute_clustering_metrics,
     compute_knn_accuracy,
-    compute_linear_probing,
+    compute_linear_probing_metrics,
     compute_map,
     compute_recall_at_k,
     run_umap,
@@ -1188,7 +1188,7 @@ class InstantMetricsLogger:
                 (["Recall@1", "Recall@5", "Recall@10"], "Recall@K"),
                 (["kNN_Acc_k1", "kNN_Acc_k5", "kNN_Acc_k20"], "kNN Accuracy"),
                 (["NMI", "ARI"], "Clustering"),
-                (["mAP", "Linear_Probing_Acc"], "Retrieval/Probe"),
+                (["mAP", "Linear_Probing_Acc", "Linear_Probing_Balanced_Acc"], "Retrieval/Probe"),
                 (["Silhouette_Score", "Purity"], "Structure Quality"),
             ]:
                 if plot_idx >= len(axes):
@@ -1270,33 +1270,135 @@ class InstantMetricsLogger:
         print(f"[Info] Saved training curves to {out_path}")
 
 
+_ENHANCED_BASE_FIELDS = ["epoch", "split"]
+_ENHANCED_V070_METRIC_FIELDS = [
+    "NMI",
+    "ARI",
+    "Recall@1",
+    "Recall@5",
+    "Recall@10",
+    "kNN_Acc_k1",
+    "kNN_Acc_k5",
+    "kNN_Acc_k20",
+    "Linear_Probing_Acc",
+    "mAP",
+    "Silhouette_Score",
+    "Purity",
+]
+_ENHANCED_V070_FIELDS = _ENHANCED_BASE_FIELDS + _ENHANCED_V070_METRIC_FIELDS
+_ENHANCED_METRIC_FIELDS = [
+    "NMI",
+    "ARI",
+    "Recall@1",
+    "Recall@5",
+    "Recall@10",
+    "kNN_Acc_k1",
+    "kNN_Acc_k5",
+    "kNN_Acc_k20",
+    "Linear_Probing_Acc",
+    "Linear_Probing_Balanced_Acc",
+    "mAP",
+    "Silhouette_Score",
+    "Purity",
+]
+
+
 @dataclass
 class EnhancedMetricsLogger:
+    """Append-only embedding-metric log with a recognized v0.7.0 migration."""
+
     path: Path
     mode: str = "pretrain"
 
     def __post_init__(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        base_fields = ["epoch", "split"]
-        metric_fields = [
-            "NMI",
-            "ARI",
-            "Recall@1",
-            "Recall@5",
-            "Recall@10",
-            "kNN_Acc_k1",
-            "kNN_Acc_k5",
-            "kNN_Acc_k20",
-            "Linear_Probing_Acc",
-            "mAP",
-            "Silhouette_Score",
-            "Purity",
-        ]
-        self.fieldnames = base_fields + metric_fields
-        if not self.path.exists():
-            with self.path.open("w", newline="", encoding="utf-8") as f:
-                writer = csv.DictWriter(f, fieldnames=self.fieldnames)
-                writer.writeheader()
+        self.fieldnames = _ENHANCED_BASE_FIELDS + _ENHANCED_METRIC_FIELDS
+        if self.path.exists() and self.path.stat().st_size > 0:
+            self._validate_or_migrate_existing()
+            return
+        with self.path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=self.fieldnames)
+            writer.writeheader()
+
+    def _read_existing_csv(self) -> tuple[list[str], list[list[str]]]:
+        try:
+            with self.path.open("r", newline="", encoding="utf-8") as handle:
+                reader = csv.reader(handle)
+                try:
+                    header = next(reader)
+                except StopIteration:
+                    raise ValueError(
+                        f"enhanced-metrics schema in {self.path} is empty; refusing "
+                        "to append."
+                    ) from None
+                rows: list[list[str]] = []
+                for line_number, row in enumerate(reader, start=2):
+                    if len(row) != len(header):
+                        raise ValueError(
+                            f"enhanced-metrics schema in {self.path} is malformed: "
+                            f"row {line_number} has {len(row)} fields but the header "
+                            f"has {len(header)}."
+                        )
+                    rows.append(row)
+        except csv.Error as exc:
+            raise ValueError(
+                f"enhanced-metrics schema in {self.path} is malformed CSV: {exc}"
+            ) from exc
+        return header, rows
+
+    def _validate_or_migrate_existing(self) -> None:
+        header, rows = self._read_existing_csv()
+        if len(set(header)) != len(header):
+            raise ValueError(
+                f"enhanced-metrics schema in {self.path} has duplicate columns; "
+                "refusing to append."
+            )
+        if header == self.fieldnames:
+            return
+        if header == _ENHANCED_V070_FIELDS:
+            self._migrate_v070_schema(rows)
+            return
+        raise ValueError(
+            f"Unrecognized enhanced-metrics schema in {self.path}: {header}. "
+            "Refusing to append. Move or remove the file to start a new log."
+        )
+
+    def _migrate_v070_schema(self, rows: list[list[str]]) -> None:
+        """Atomically add an empty balanced-probe column to a v0.7.0 log."""
+        import os
+        import tempfile
+
+        index = {name: position for position, name in enumerate(_ENHANCED_V070_FIELDS)}
+        temp_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w",
+                newline="",
+                encoding="utf-8",
+                dir=self.path.parent,
+                prefix=self.path.name + ".",
+                suffix=".tmp",
+                delete=False,
+            ) as handle:
+                temp_path = Path(handle.name)
+                writer = csv.writer(handle)
+                writer.writerow(self.fieldnames)
+                for row in rows:
+                    writer.writerow(
+                        [
+                            row[index[name]] if name in index else ""
+                            for name in self.fieldnames
+                        ]
+                    )
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_path, self.path)
+            temp_path = None
+        finally:
+            if temp_path is not None and temp_path.exists():
+                temp_path.unlink(missing_ok=True)
+            for leftover in self.path.parent.glob(self.path.name + ".*.tmp"):
+                leftover.unlink(missing_ok=True)
 
     def log(self, epoch: int, split: str, metrics: dict[str, Any]) -> None:
         row = {"epoch": epoch, "split": split}
@@ -1458,7 +1560,7 @@ def _maybe_subsample_for_metrics(
     if max_samples <= 0 or len(embeddings) <= max_samples:
         return embeddings, labels
     rng = np.random.default_rng(seed)
-    idx = rng.choice(len(embeddings), size=max_samples, replace=False)
+    idx = np.sort(rng.choice(len(embeddings), size=max_samples, replace=False))
     if labels is None:
         return embeddings[idx], None
     return embeddings[idx], labels[idx]
@@ -1479,6 +1581,7 @@ def _compute_all_metrics(
         "kNN_Acc_k5": "",
         "kNN_Acc_k20": "",
         "Linear_Probing_Acc": "",
+        "Linear_Probing_Balanced_Acc": "",
         "mAP": "",
         "Silhouette_Score": "",
         "Purity": "",
@@ -1502,10 +1605,14 @@ def _compute_all_metrics(
         )
         fields["Purity"] = clustering.get("Purity", "")
         if compute_linear_probe:
-            fields["Linear_Probing_Acc"] = compute_linear_probing(embeddings, labels)
+            probing = compute_linear_probing_metrics(embeddings, labels)
+            fields["Linear_Probing_Acc"] = probing["Linear_Probing_Acc"]
+            fields["Linear_Probing_Balanced_Acc"] = probing[
+                "Linear_Probing_Balanced_Acc"
+            ]
     except Exception as exc:
         print(f"[Warning] Error computing metrics: {exc}")
-    return fields
+    return {key: "" if value is None else value for key, value in fields.items()}
 
 
 def _compute_and_log_all_metrics(

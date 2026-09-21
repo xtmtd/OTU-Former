@@ -1624,3 +1624,133 @@ def test_finetune_resume_rejects_a_changed_freeze_ratio(tmp_path):
     )
     with pytest.raises(ValueError, match="freeze_ratio"):
         trainer.run_finetune(resume)
+
+
+_V070_ENHANCED_HEADER = [
+    "epoch",
+    "split",
+    "NMI",
+    "ARI",
+    "Recall@1",
+    "Recall@5",
+    "Recall@10",
+    "kNN_Acc_k1",
+    "kNN_Acc_k5",
+    "kNN_Acc_k20",
+    "Linear_Probing_Acc",
+    "mAP",
+    "Silhouette_Score",
+    "Purity",
+]
+
+
+def _write_v070_enhanced_csv(path):
+    import csv
+
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(_V070_ENHANCED_HEADER)
+        writer.writerow(["1", "train"] + ["0.10"] * (len(_V070_ENHANCED_HEADER) - 2))
+
+
+def test_maybe_subsample_for_metrics_returns_sorted_indices():
+    embeddings = np.arange(30, dtype=np.float32).reshape(-1, 1)
+    labels = np.arange(30)
+
+    sampled, sampled_labels = trainer._maybe_subsample_for_metrics(
+        embeddings, labels, max_samples=10, seed=42
+    )
+
+    expected = np.sort(np.random.default_rng(42).choice(30, size=10, replace=False))
+    assert np.array_equal(sampled[:, 0].astype(int), expected)
+    assert np.array_equal(sampled_labels, expected)
+
+
+def test_compute_all_metrics_uses_empty_strings_for_unavailable_metrics():
+    embeddings = np.random.default_rng(0).standard_normal((6, 4)).astype(np.float32)
+    labels = np.array(["a", "a", "a", "b", "b", "b"])
+
+    fields = trainer._compute_all_metrics(embeddings, labels, compute_linear_probe=True)
+
+    assert fields["Recall@10"] == ""
+    assert fields["kNN_Acc_k20"] == ""
+    assert isinstance(fields["Linear_Probing_Acc"], float)
+    assert isinstance(fields["Linear_Probing_Balanced_Acc"], float)
+    for value in fields.values():
+        assert value == "" or isinstance(value, float)
+
+
+def test_enhanced_metrics_logger_keeps_history_and_adds_balanced_probe(tmp_path):
+    logger = trainer.EnhancedMetricsLogger(
+        tmp_path / "metrics.pretrain.csv", mode="pretrain"
+    )
+
+    for field in (
+        "kNN_Acc_k1",
+        "kNN_Acc_k5",
+        "kNN_Acc_k20",
+        "Linear_Probing_Acc",
+        "Linear_Probing_Balanced_Acc",
+        "mAP",
+    ):
+        assert field in logger.fieldnames
+
+
+@pytest.mark.parametrize("filename", ["metrics.pretrain.csv", "metrics.finetune.csv"])
+def test_v070_enhanced_header_is_migrated_atomically(tmp_path, filename):
+    import csv
+
+    path = tmp_path / filename
+    _write_v070_enhanced_csv(path)
+
+    logger = trainer.EnhancedMetricsLogger(path, mode="pretrain")
+    logger.log(2, "train", {"NMI": 0.5})
+
+    rows = list(csv.reader(path.read_text(encoding="utf-8").splitlines()))
+    assert rows[0] == logger.fieldnames
+    assert "Linear_Probing_Balanced_Acc" in rows[0]
+    assert len(rows) == 3
+    for row in rows[1:]:
+        assert len(row) == len(logger.fieldnames)
+    balanced_col = rows[0].index("Linear_Probing_Balanced_Acc")
+    assert rows[1][balanced_col] == ""
+    assert rows[2][balanced_col] == ""
+    assert rows[1][rows[0].index("NMI")] == "0.10"
+    assert rows[2][rows[0].index("NMI")] == "0.5"
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_current_enhanced_schema_is_appended_without_migration(tmp_path):
+    import csv
+
+    path = tmp_path / "metrics.pretrain.csv"
+    logger = trainer.EnhancedMetricsLogger(path, mode="pretrain")
+    logger.log(1, "train", {"NMI": 0.2})
+
+    logger_again = trainer.EnhancedMetricsLogger(path, mode="pretrain")
+    logger_again.log(2, "train", {"NMI": 0.3})
+
+    rows = list(csv.reader(path.read_text(encoding="utf-8").splitlines()))
+    assert rows[0] == logger.fieldnames
+    assert len(rows) == 3
+    assert all(len(row) == len(rows[0]) for row in rows)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "epoch,split,NMI,epoch\n1,train,0.1,2\n",
+        "epoch,split,unknown_metric\n1,train,0.1\n",
+        "epoch,split,NMI\n1,train\n",
+    ],
+)
+def test_malformed_enhanced_schema_fails_without_touching_the_file(tmp_path, content):
+    path = tmp_path / "metrics.pretrain.csv"
+    path.write_text(content, encoding="utf-8")
+    original = path.read_bytes()
+
+    with pytest.raises(ValueError, match="schema"):
+        trainer.EnhancedMetricsLogger(path, mode="pretrain")
+
+    assert path.read_bytes() == original
+    assert list(tmp_path.glob("*.tmp")) == []

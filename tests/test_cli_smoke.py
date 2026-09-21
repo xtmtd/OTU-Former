@@ -1,4 +1,5 @@
 import argparse
+import re
 import pytest
 import pandas as pd
 from PIL import Image
@@ -6,6 +7,7 @@ import torch
 import os
 import logging
 from pathlib import Path
+import typer
 from typer.testing import CliRunner
 
 from otuformer.cli.main import app
@@ -2937,3 +2939,244 @@ def test_cam_forwards_model_name(monkeypatch, tmp_path):
 
     assert result.exit_code == 0, result.output
     assert seen["model_name"] == "vit_small_patch16_224"
+
+
+class _ForeignCommandlineSource:
+    """Mimics a foreign (vendored-Click) ParameterSource enum member."""
+
+    name = "COMMANDLINE"
+
+
+class _ForeignContext:
+    """Duck-typed context whose source object is not click.core.ParameterSource."""
+
+    def __init__(self, commandline_names):
+        self._commandline_names = set(commandline_names)
+
+    def get_parameter_source(self, name):
+        return _ForeignCommandlineSource() if name in self._commandline_names else None
+
+
+def test_format_user_command_accepts_foreign_parameter_source():
+    from otuformer.cli.pretrain import _format_user_command
+
+    ctx = _ForeignContext(["train_data", "out_dir"])
+    command = _format_user_command(
+        ctx, {"train_data": "images.csv", "out_dir": "runs/x", "max_epochs": 5}
+    )
+
+    assert "--train-data images.csv" in command
+    assert "--out-dir runs/x" in command
+    assert "--max-epochs" not in command
+
+
+def test_pretrain_source_helper_recognizes_foreign_commandline_enum():
+    from otuformer.cli import pretrain as pretrain_cli
+
+    assert pretrain_cli._source_is_commandline(_ForeignCommandlineSource()) is True
+    assert pretrain_cli._source_is_commandline(None) is False
+
+    class DefaultSource:
+        name = "DEFAULT"
+
+    assert pretrain_cli._source_is_commandline(DefaultSource()) is False
+
+
+def test_cli_modules_do_not_couple_to_external_click():
+    cli_dir = Path(__file__).resolve().parents[1] / "src" / "otuformer" / "cli"
+    offenders = {}
+    for path in sorted(cli_dir.glob("*.py")):
+        text = path.read_text(encoding="utf-8")
+        if (
+            re.search(r"^\s*(?:import click|from click\b)", text, re.MULTILINE)
+            or "click.Choice" in text
+            or "click.core" in text
+        ):
+            offenders[path.name] = text.count("click")
+    assert offenders == {}
+
+
+def test_cam_help_lists_native_choice_values():
+    result = runner.invoke(app, ["cam", "--help"])
+    assert result.exit_code == 0, result.output
+    # Typer's rich help inserts box-drawing column separators mid-phrase.
+    flat = " ".join(re.sub(r"[\u2500-\u257f]", " ", result.output).split())
+    assert "cnn, vit" in flat
+    assert "png, jpg, pdf" in flat
+    assert "auto, cpu, cuda, mps" in flat
+
+
+def test_cam_option_validator_accepts_valid_values():
+    from otuformer.cli.cam import _validate_cam_options
+
+    _validate_cam_options(
+        cam_method="gradcam",
+        arch=None,
+        fig_format="png",
+        save_npy="none",
+        eval_transform="center-crop",
+        device="auto",
+    )
+    _validate_cam_options(
+        cam_method="eigencam",
+        arch="vit",
+        fig_format="pdf",
+        save_npy="normalized",
+        eval_transform="whole-specimen-pad",
+        device="mps",
+    )
+
+
+@pytest.mark.parametrize(
+    "overrides, offending",
+    [
+        ({"cam_method": "bogus"}, "bogus"),
+        ({"arch": "bogus"}, "bogus"),
+        ({"fig_format": "bogus"}, "bogus"),
+        ({"save_npy": "bogus"}, "bogus"),
+        ({"eval_transform": "bogus"}, "bogus"),
+        ({"device": "bogus"}, "bogus"),
+    ],
+)
+def test_cam_option_validator_rejects_invalid_values(overrides, offending):
+    from otuformer.cli.cam import _validate_cam_options
+
+    kwargs = {
+        "cam_method": "gradcam",
+        "arch": "cnn",
+        "fig_format": "png",
+        "save_npy": "none",
+        "eval_transform": "center-crop",
+        "device": "auto",
+    }
+    kwargs.update(overrides)
+
+    with pytest.raises(typer.BadParameter) as excinfo:
+        _validate_cam_options(**kwargs)
+
+    assert offending in str(excinfo.value)
+
+
+def test_cam_invalid_native_choice_fails_before_output_dir(tmp_path):
+    ckpt = _make_ckpt(tmp_path)
+    out_dir = tmp_path / "out"
+    result = runner.invoke(
+        app,
+        [
+            "cam",
+            "--checkpoint",
+            str(ckpt),
+            "--images-dir",
+            str(tmp_path),
+            "--out-dir",
+            str(out_dir),
+            "--device",
+            "bogus",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "bogus" in result.output
+    assert not out_dir.exists()
+
+
+def test_extract_option_validator_rejects_invalid_eval_transform():
+    from otuformer.cli.extract import _validate_extract_options
+
+    _validate_extract_options(eval_transform="center-crop")
+    _validate_extract_options(eval_transform="whole-specimen-pad")
+
+    with pytest.raises(typer.BadParameter) as excinfo:
+        _validate_extract_options(eval_transform="bogus")
+
+    assert "bogus" in str(excinfo.value)
+
+
+def _write_extract_fixture(tmp_path, labels):
+    ckpt = _make_ckpt(tmp_path)
+    img_dir = tmp_path / "images"
+    img_dir.mkdir(parents=True, exist_ok=True)
+    names = sorted({name for name in labels})
+    for index, name in enumerate(names):
+        Image.new("RGB", (224, 224), color=(index * 30, 20, 10)).save(img_dir / name)
+    csv_path = tmp_path / "labels.csv"
+    pd.DataFrame(
+        {"image": list(labels), "label": ["a" if i % 2 == 0 else "b" for i in range(len(labels))]}
+    ).to_csv(csv_path, index=False)
+    return ckpt, img_dir, csv_path
+
+
+def test_extract_metrics_include_balanced_probe_and_empty_unavailable_values(tmp_path):
+    labels = [f"img_{i}.jpg" for i in range(6)]
+    ckpt, img_dir, csv_path = _write_extract_fixture(tmp_path, labels)
+
+    result = runner.invoke(
+        app,
+        [
+            "extract",
+            "--checkpoint",
+            str(ckpt),
+            "--input-images-dir",
+            str(img_dir),
+            "--label-csv",
+            str(csv_path),
+            "--out-dir",
+            str(tmp_path / "extract_metrics"),
+            "--extract-size",
+            "224",
+            "--batch-size",
+            "6",
+            "--num-workers",
+            "0",
+            "--device",
+            "cpu",
+            "--disable-umap",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+
+    metrics = pd.read_csv(tmp_path / "extract_metrics" / "metrics.csv")
+    values = dict(zip(metrics["metric"], metrics["value"]))
+
+    from otuformer.training.trainer import EnhancedMetricsLogger
+
+    trainer_logger = EnhancedMetricsLogger(tmp_path / "trainer_fields.csv")
+    expected_keys = set(trainer_logger.fieldnames) - {"epoch", "split"}
+    assert expected_keys <= set(values)
+
+    assert float(values["Linear_Probing_Acc"]) >= 0.0
+    assert float(values["Linear_Probing_Balanced_Acc"]) >= 0.0
+    assert pd.isna(values["kNN_Acc_k20"])
+    assert pd.isna(values["Recall@10"])
+
+
+def test_extract_rejects_duplicate_label_images(tmp_path):
+    labels = ["img_0.jpg", "img_0.jpg", "img_1.jpg"]
+    ckpt, img_dir, csv_path = _write_extract_fixture(tmp_path, labels)
+
+    result = runner.invoke(
+        app,
+        [
+            "extract",
+            "--checkpoint",
+            str(ckpt),
+            "--input-images-dir",
+            str(img_dir),
+            "--label-csv",
+            str(csv_path),
+            "--out-dir",
+            str(tmp_path / "extract_dupes"),
+            "--extract-size",
+            "224",
+            "--batch-size",
+            "2",
+            "--num-workers",
+            "0",
+            "--device",
+            "cpu",
+            "--disable-umap",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "duplicate" in str(result.exception).lower()

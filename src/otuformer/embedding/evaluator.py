@@ -8,40 +8,55 @@ from typing import Optional
 import numpy as np
 
 
-def _safe_cv_splits(labels: np.ndarray, max_cv: int = 5) -> int:
-    n_classes = len(np.unique(labels))
-    if n_classes == 0:
-        return 1
-    min_class_count = int(np.min(np.unique(labels, return_counts=True)[1]))
-    return max(1, min(max_cv, n_classes, min_class_count))
+def _make_stratified_cv(
+    labels: np.ndarray, max_splits: int = 5
+):
+    """Return a shuffled StratifiedKFold, or None when stratified CV is impossible.
+
+    The fold count is bounded by the smallest class count (not by the number of
+    classes), so a two-class dataset with enough samples per class still gets
+    the full ``max_splits`` folds.
+    """
+    from sklearn.model_selection import StratifiedKFold
+
+    unique_labels, counts = np.unique(labels, return_counts=True)
+    if len(unique_labels) < 2:
+        return None
+    min_class_count = int(np.min(counts))
+    if min_class_count < 2:
+        return None
+    return StratifiedKFold(
+        n_splits=min(max_splits, min_class_count),
+        shuffle=True,
+        random_state=42,
+    )
 
 
 def compute_knn_accuracy(
     embeddings: np.ndarray,
     labels: np.ndarray,
     k_values: list[int] = [1, 5, 20],
-) -> dict[str, float]:
+) -> dict[str, float | None]:
     from sklearn.model_selection import cross_val_score
     from sklearn.neighbors import KNeighborsClassifier
     from sklearn.preprocessing import normalize
 
     x = normalize(embeddings, norm="l2")
-    result: dict[str, float] = {}
-    cv = _safe_cv_splits(labels)
-    if cv < 2:
-        return {f"kNN_Acc_k{k}": 0.0 for k in k_values}
-    max_train_size = len(labels) - int(np.ceil(len(labels) / cv))
+    result: dict[str, float | None] = {f"kNN_Acc_k{k}": None for k in k_values}
+    cv = _make_stratified_cv(labels)
+    if cv is None:
+        return result
+    max_train_size = len(labels) - int(np.ceil(len(labels) / cv.n_splits))
     for k in k_values:
         key = f"kNN_Acc_k{k}"
         if k < 1 or k > max_train_size:
-            result[key] = 0.0
             continue
         knn = KNeighborsClassifier(n_neighbors=k, metric="cosine")
         try:
             scores = cross_val_score(knn, x, labels, cv=cv)
             result[key] = float(np.nanmean(scores))
         except Exception:
-            result[key] = 0.0
+            result[key] = None
     return result
 
 
@@ -49,46 +64,59 @@ def compute_recall_at_k(
     embeddings: np.ndarray,
     labels: np.ndarray,
     k_values: list[int] = [1, 5, 10],
-) -> dict[str, float]:
+) -> dict[str, float | None]:
     from sklearn.metrics.pairwise import cosine_similarity
     from sklearn.preprocessing import normalize
 
+    n = len(labels)
+    result: dict[str, float | None] = {f"Recall@{k}": None for k in k_values}
+    if n < 2:
+        return result
     x = normalize(embeddings, norm="l2")
     sim = cosine_similarity(x)
-    np.fill_diagonal(sim, -np.inf)
-    result: dict[str, float] = {}
+    positions = np.arange(n)
     for k in k_values:
-        k_actual = max(1, min(k, len(labels) - 1))
-        correct = sum(
-            labels[i] in labels[np.argsort(sim[i])[-k_actual:]]
-            for i in range(len(labels))
-        )
-        result[f"Recall@{k}"] = float(correct / len(labels))
+        key = f"Recall@{k}"
+        if k < 1 or k > n - 1:
+            continue
+        correct = 0
+        for i in range(n):
+            candidates = positions[positions != i]
+            ranked = candidates[np.argsort(sim[i, candidates])[::-1][:k]]
+            if labels[i] in labels[ranked]:
+                correct += 1
+        result[key] = float(correct / n)
     return result
 
 
-def compute_map(embeddings: np.ndarray, labels: np.ndarray) -> float:
+def compute_map(embeddings: np.ndarray, labels: np.ndarray) -> float | None:
     from sklearn.metrics.pairwise import cosine_similarity
     from sklearn.preprocessing import normalize
 
+    n = len(labels)
+    if n < 2:
+        return None
     x = normalize(embeddings, norm="l2")
     sim = cosine_similarity(x)
-    np.fill_diagonal(sim, -np.inf)
+    positions = np.arange(n)
     aps: list[float] = []
-    for i in range(len(labels)):
-        ranked = np.argsort(sim[i])[::-1]
+    for i in range(n):
+        candidates = positions[positions != i]
+        ranked = candidates[np.argsort(sim[i, candidates])[::-1]]
         relevant = labels[ranked] == labels[i]
         n_rel = int(relevant.sum())
         if n_rel == 0:
             continue
         precisions = np.cumsum(relevant) / (np.arange(len(relevant)) + 1)
         aps.append(float((precisions * relevant).sum() / n_rel))
-    return float(np.mean(aps)) if aps else 0.0
+    if not aps:
+        return None
+    return float(np.mean(aps))
 
 
 def compute_clustering_metrics(
     embeddings: np.ndarray, labels: np.ndarray
-) -> dict[str, float]:
+) -> dict[str, float | None]:
     from sklearn.cluster import KMeans
     from sklearn.metrics import (
         adjusted_mutual_info_score,
@@ -98,25 +126,28 @@ def compute_clustering_metrics(
     )
     from sklearn.preprocessing import normalize
 
+    keys = ("NMI", "ARI", "AMI", "Silhouette_Score", "Purity")
     unique_labels, label_codes = np.unique(labels, return_inverse=True)
     n_clusters = len(unique_labels)
     x = normalize(embeddings, norm="l2")
-    if np.unique(x, axis=0).shape[0] < n_clusters:
-        pred = np.zeros(len(x), dtype=int)
-    else:
-        km = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-        pred = km.fit_predict(x)
+    if (
+        n_clusters < 2
+        or len(x) < 2
+        or np.unique(x, axis=0).shape[0] < n_clusters
+    ):
+        return {key: None for key in keys}
+
+    km = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+    pred = km.fit_predict(x)
 
     purity = sum(
         np.bincount(label_codes[pred == c], minlength=n_clusters).max()
         for c in range(n_clusters)
     ) / len(label_codes)
-    if len(x) < 2 or len(np.unique(label_codes)) < 2:
-        sil = 0.0
-    elif len(label_codes) > n_clusters:
-        sil = float(silhouette_score(x, label_codes, metric="cosine"))
+    if len(label_codes) > n_clusters:
+        sil: float | None = float(silhouette_score(x, label_codes, metric="cosine"))
     else:
-        sil = 0.0
+        sil = None
     return {
         "NMI": float(normalized_mutual_info_score(label_codes, pred)),
         "ARI": float(adjusted_rand_score(label_codes, pred)),
@@ -159,21 +190,41 @@ def compute_metric_learning_diagnostics(
     }
 
 
-def compute_linear_probing(embeddings: np.ndarray, labels: np.ndarray) -> float:
+def compute_linear_probing_metrics(
+    embeddings: np.ndarray, labels: np.ndarray
+) -> dict[str, float | None]:
+    """Ordinary and balanced linear-probe accuracy from one shared CV pass."""
     from sklearn.linear_model import LogisticRegression
-    from sklearn.model_selection import cross_val_score
+    from sklearn.model_selection import cross_validate
     from sklearn.preprocessing import normalize
 
     x = normalize(embeddings, norm="l2")
+    result: dict[str, float | None] = {
+        "Linear_Probing_Acc": None,
+        "Linear_Probing_Balanced_Acc": None,
+    }
+    cv = _make_stratified_cv(labels)
+    if cv is None:
+        return result
     clf = LogisticRegression(max_iter=1000, random_state=42)
-    cv = _safe_cv_splits(labels)
-    if cv < 2:
-        return 0.0
     try:
-        scores = cross_val_score(clf, x, labels, cv=cv)
-        return float(scores.mean())
+        scores = cross_validate(
+            clf,
+            x,
+            labels,
+            cv=cv,
+            scoring={
+                "accuracy": "accuracy",
+                "balanced_accuracy": "balanced_accuracy",
+            },
+        )
+        result["Linear_Probing_Acc"] = float(np.mean(scores["test_accuracy"]))
+        result["Linear_Probing_Balanced_Acc"] = float(
+            np.mean(scores["test_balanced_accuracy"])
+        )
     except Exception:
-        return 0.0
+        pass
+    return result
 
 
 def run_umap(

@@ -13,6 +13,13 @@ suitability of the new default.
 > `Technical implementation result: ISSUE` therefore concerns the `invariant`
 > run only.
 
+> **Evaluator-vintage note (added 2026-09-21).** The metric values recorded in
+> this report were produced by the pre-v0.7.1 evaluator and are not numerically
+> comparable with v0.7.1 outputs: CV fold selection, subsample ordering, `mAP`
+> self-inclusion, and unsupported-value handling changed. See
+> `docs/superpowers/specs/2026-09-21-otuformer-v071-cli-metrics-corrections.md`.
+> The recorded numbers below are preserved unchanged.
+
 ## Data identity and sample counts
 
 | Item | Value |

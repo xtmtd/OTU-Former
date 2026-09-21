@@ -304,7 +304,7 @@ otuformer pretrain \
 **Output**:
 - `logs/pretrain.log` — Run log
 - `checkpoints/` — Model checkpoints (`SSL_latest.pth`, `SSL_best.pth`)
-- `metrics.json` / `metrics.csv` — Training metrics
+- `logs/metrics.pretrain.csv` — Periodic embedding metrics
 - `umap.pdf` — UMAP visualization (when not disabled)
 
 ---
@@ -394,7 +394,7 @@ otuformer finetune \
 **Output**:
 - `logs/finetune.log` — Run log
 - `checkpoints/` — Model checkpoints (`finetune_latest.pth`, `finetune_best.pth`)
-- `metrics.json` / `metrics.csv` — Training metrics
+- `logs/metrics.finetune.csv` — Periodic embedding metrics
 - `umap.pdf` — UMAP visualization (when not disabled)
 
 **Checkpoint handling**:
@@ -402,6 +402,43 @@ otuformer finetune \
 - `--checkpoint` starts a new run. An SSL pretrain checkpoint installs a fresh ArcFace embedding head; a fine-tune checkpoint whose head and width match keeps its trained projector. A historical `ProjectionHead` checkpoint keeps its projector, which fixes the embedding width.
 - `--resume` restores the saved optimizer state, so `--finetune-lr`, `--metric-head-lr`, and `--weight-decay` have no effect. `--freeze-ratio` must match the saved value.
 - Ref-script checkpoints (`ref/ibot20260115.py`) can be read by `extract`, `export`, and `cam`, but cannot be resumed by `finetune`.
+
+---
+
+### Embedding Metrics (v0.7.1)
+
+`pretrain`, `finetune`, and `extract` compute the same embedding-quality metrics
+under the same field names. Periodic logs live in `logs/metrics.pretrain.csv` and
+`logs/metrics.finetune.csv`; `extract` writes `metrics.csv`.
+
+- Cross-validated kNN and linear-probe scores share one explicit shuffled
+  `StratifiedKFold(shuffle=True, random_state=42)`. The fold count is
+  `min(5, smallest class count)`, so a two-class dataset is no longer forced to
+  two folds. Every CV metric is unavailable when a class has a single sample.
+- The historical fields `kNN_Acc_k1`, `kNN_Acc_k5`, and `kNN_Acc_k20` are
+  retained. A requested `k` larger than the smallest training fold (or than
+  `n_samples - 1` for `Recall@k`) is unavailable rather than silently renamed.
+- `Linear_Probing_Acc` is the ordinary CV accuracy; the new
+  `Linear_Probing_Balanced_Acc` is the class-balanced accuracy from the same CV
+  pass.
+- Metrics that cannot be computed are written as empty CSV fields and appear as
+  gaps, not zeros, in training plots. Clustering metrics are unavailable when
+  there are fewer distinct normalized embeddings than classes, instead of
+  fabricating a single cluster.
+- `mAP` ranks only non-query samples and excludes queries with no non-self
+  relevant item. `Recall@k` intentionally keeps every query in its denominator,
+  including singleton labels; the two singleton-query conventions differ on
+  purpose for historical comparability.
+- `Silhouette_Score` is the cosine silhouette computed against the true labels.
+
+`cam` and `extract` validate enumerated query parameters natively and reject
+values outside their choices before any output directory is created.
+
+**Comparability.** Values recorded before v0.7.1 are not numerically comparable
+with v0.7.1 outputs: CV fold selection, subsample ordering, `mAP` self-inclusion,
+and unsupported-value handling all changed. Field names and historical rows stay
+readable, and a resumed v0.7.0 `metrics.pretrain.csv`/`metrics.finetune.csv` is
+migrated in place by adding an empty `Linear_Probing_Balanced_Acc` column.
 
 ---
 

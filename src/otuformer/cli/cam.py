@@ -8,7 +8,6 @@ import sys
 import traceback
 from pathlib import Path
 
-import click
 import typer
 
 app = typer.Typer(
@@ -25,11 +24,57 @@ app = typer.Typer(
 )
 
 
+_CAM_METHOD_CHOICES = (
+    "gradcam",
+    "gradcampp",
+    "layercam",
+    "scorecam",
+    "eigencam",
+    "ablationcam",
+)
+_ARCH_CHOICES = ("cnn", "vit")
+_FIG_FORMAT_CHOICES = ("png", "jpg", "pdf")
+_SAVE_NPY_CHOICES = ("none", "raw", "normalized")
+_EVAL_TRANSFORM_CHOICES = ("center-crop", "whole-specimen-pad")
+_DEVICE_CHOICES = ("auto", "cpu", "cuda", "mps")
+
+
+def _validate_cam_options(
+    *,
+    cam_method: str,
+    arch: str | None,
+    fig_format: str,
+    save_npy: str,
+    eval_transform: str,
+    device: str,
+) -> None:
+    """Reject CAM options outside their enumerated values before any output.
+
+    Uses Typer-native validation instead of a Click-specific choice type so
+    Typer builds commands the same way whether Click is installed or vendored
+    by Typer.
+    """
+    for option, value, allowed in (
+        ("--cam-method", cam_method, _CAM_METHOD_CHOICES),
+        ("--arch", arch, _ARCH_CHOICES),
+        ("--fig-format", fig_format, _FIG_FORMAT_CHOICES),
+        ("--save-npy", save_npy, _SAVE_NPY_CHOICES),
+        ("--eval-transform", eval_transform, _EVAL_TRANSFORM_CHOICES),
+        ("--device", device, _DEVICE_CHOICES),
+    ):
+        if value is None:
+            continue
+        if value not in allowed:
+            raise typer.BadParameter(
+                f"{option} must be one of: {', '.join(allowed)}; got {value!r}"
+            )
+
+
 def _format_user_command(ctx: typer.Context, params: dict[str, object]) -> str:
     parts = ["otuformer", "cam"]
     for key, value in params.items():
         source = ctx.get_parameter_source(key)
-        if source is not click.core.ParameterSource.COMMANDLINE:
+        if getattr(source, "name", None) != "COMMANDLINE":
             continue
         option = f"--{key.replace('_', '-')}"
         if isinstance(value, bool):
@@ -65,17 +110,12 @@ def cam(
     cam_method: str = typer.Option(
         "gradcam",
         "--cam-method",
-        click_type=click.Choice(
-            ["gradcam", "gradcampp", "layercam", "scorecam", "eigencam", "ablationcam"]
-        ),
-        show_choices=False,
         help="CAM algorithm: gradcam, gradcampp, layercam, scorecam, eigencam, ablationcam",
     ),
     arch: str | None = typer.Option(
         None,
         "--arch",
-        click_type=click.Choice(["cnn", "vit"]),
-        help="Force architecture type (auto-detected from model name if not set).",
+        help="Force architecture type (cnn, vit; auto-detected from model name if not set).",
     ),
     target_layer_name: str | None = typer.Option(
         None,
@@ -90,14 +130,11 @@ def cam(
     fig_format: str = typer.Option(
         "png",
         "--fig-format",
-        click_type=click.Choice(["png", "jpg", "pdf"]),
-        help="Output format for CAM figures.",
+        help="Output format for CAM figures: png, jpg, pdf.",
     ),
     save_npy: str = typer.Option(
         "none",
         "--save-npy",
-        click_type=click.Choice(["none", "raw", "normalized"]),
-        show_choices=False,
         help=(
             "Save CAM arrays: none (default), raw (positive unnormalized CAM), "
             "or normalized (per-image min-max [0, 1])."
@@ -121,8 +158,6 @@ def cam(
     eval_transform: str = typer.Option(
         "center-crop",
         "--eval-transform",
-        click_type=click.Choice(["center-crop", "whole-specimen-pad"]),
-        show_choices=False,
         help=(
             "Evaluation preprocessing protocol: center-crop (Resize + CenterCrop; "
             "heatmap confined to the model's field of view) or whole-specimen-pad "
@@ -146,8 +181,7 @@ def cam(
     device: str = typer.Option(
         "auto",
         "--device",
-        click_type=click.Choice(["auto", "cpu", "cuda", "mps"]),
-        help="Compute device for CAM generation.",
+        help="Compute device for CAM generation: auto, cpu, cuda, mps.",
     ),
     overwrite: bool = typer.Option(
         False, "--overwrite", help="Clear an existing non-empty output directory."
@@ -155,6 +189,15 @@ def cam(
 ) -> None:
     if ctx.invoked_subcommand is not None:
         return
+
+    _validate_cam_options(
+        cam_method=cam_method,
+        arch=arch,
+        fig_format=fig_format,
+        save_npy=save_npy,
+        eval_transform=eval_transform,
+        device=device,
+    )
 
     from otuformer.utils.logging import TeeLogger
     from otuformer.utils.io import prepare_output_dir

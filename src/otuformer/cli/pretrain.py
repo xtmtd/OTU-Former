@@ -9,7 +9,6 @@ import sys
 import traceback
 from pathlib import Path
 
-import click
 import typer
 
 from otuformer.cli import (
@@ -103,11 +102,20 @@ def _validate_patch_options(
         )
 
 
+def _source_is_commandline(source: object) -> bool:
+    """True when a parameter came from the command line.
+
+    Compares by name so both external Click and Typer's vendored Click
+    ``ParameterSource`` enums are accepted.
+    """
+    return getattr(source, "name", None) == "COMMANDLINE"
+
+
 def _format_user_command(ctx: typer.Context, params: dict[str, object]) -> str:
     parts = ["otuformer", "pretrain"]
     for key, value in params.items():
         source = ctx.get_parameter_source(key)
-        if source is not click.core.ParameterSource.COMMANDLINE:
+        if not _source_is_commandline(source):
             continue
         option = f"--{key.replace('_', '-')}"
         if isinstance(value, bool):
@@ -376,7 +384,7 @@ def pretrain(
     _validate_patch_options(patch_loss, masking_strategy, ibot_prototypes)
     requested_mask_ratio = _parse_mask_ratio(mask_ratio)
     explicit_sources = {
-        name: ctx.get_parameter_source(name) is click.core.ParameterSource.COMMANDLINE
+        name: _source_is_commandline(ctx.get_parameter_source(name))
         for name in (
             "patch_loss",
             "masking_strategy",
