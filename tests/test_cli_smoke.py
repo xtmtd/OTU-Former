@@ -2117,6 +2117,7 @@ def test_cam_help_documents_eval_transform():
 
 
 def test_extract_rejects_invalid_eval_transform(tmp_path):
+    out_dir = tmp_path / "out"
     result = runner.invoke(
         app,
         [
@@ -2124,13 +2125,14 @@ def test_extract_rejects_invalid_eval_transform(tmp_path):
             "--input-images-dir",
             str(tmp_path),
             "--out-dir",
-            str(tmp_path / "out"),
+            str(out_dir),
             "--eval-transform",
             "bogus",
         ],
     )
     assert result.exit_code != 0
     assert "bogus" in result.output
+    assert not out_dir.exists()
 
 
 def test_cam_rejects_invalid_eval_transform(tmp_path):

@@ -16,7 +16,8 @@ the evaluator-vintage notes in
 
 Single shared evaluator: `src/otuformer/embedding/evaluator.py`.
 Adapters: `src/otuformer/training/trainer.py` (periodic logs and plots) and
-`src/otuformer/cli/extract.py` (standalone `metrics.csv`).
+`src/otuformer/cli/extract.py` (standalone `metrics.csv`, written only when
+`--label-csv` has at least two classes).
 
 | Key | Adapters | Meaning |
 | --- | --- | --- |
@@ -30,7 +31,12 @@ Adapters: `src/otuformer/training/trainer.py` (periodic logs and plots) and
 | `Purity` | trainer, extract | Cluster-purity of the KMeans assignment |
 
 Field names are stable: existing keys are never renamed or removed, and
-`extract` emits every trainer field.
+`extract` emits every trainer field whenever it writes `metrics.csv`.
+
+`extract` writes `metrics.csv` only when `--label-csv` is given and the aligned
+labels contain at least two distinct classes; unlabelled extraction, and labelled
+extraction with a single class, produce `embeddings.csv` (and UMAP when
+eligible) without `metrics.csv`.
 
 ## CV splitter contract
 
@@ -67,6 +73,9 @@ Unsupported results are `None` at the evaluator boundary, `""` in CSV, and gaps
   fallback is fabricated.
 - `Silhouette_Score` is unavailable when silhouette is undefined (all classes
   are singletons).
+- Cross-validated kNN and linear-probe metrics are unavailable when a fold fails
+  to fit or score (`error_score="raise"`) or when any fold score is non-finite;
+  NaN is never returned to the adapters, so it cannot reach a CSV field.
 
 ## Sampling-order rule
 

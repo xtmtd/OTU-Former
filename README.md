@@ -409,7 +409,8 @@ otuformer finetune \
 
 `pretrain`, `finetune`, and `extract` compute the same embedding-quality metrics
 under the same field names. Periodic logs live in `logs/metrics.pretrain.csv` and
-`logs/metrics.finetune.csv`; `extract` writes `metrics.csv`.
+`logs/metrics.finetune.csv`; `extract` writes `metrics.csv` when `--label-csv`
+provides at least two classes.
 
 - Cross-validated kNN and linear-probe scores share one explicit shuffled
   `StratifiedKFold(shuffle=True, random_state=42)`. The fold count is
@@ -526,7 +527,7 @@ otuformer extract \
 
 **Output**:
 - `embeddings.csv` — Embedding vectors (`id`, `dim_0`, `dim_1`, ...)
-- `metrics.csv` — Quality metrics (when `--label-csv` is provided)
+- `metrics.csv` — Quality metrics (when `--label-csv` provides at least two classes)
 - `umap.pdf` — UMAP visualization (when `--label-csv` is provided and not disabled)
 
 ---

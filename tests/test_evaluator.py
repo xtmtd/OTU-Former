@@ -196,6 +196,62 @@ def test_clustering_unavailable_when_fewer_distinct_embeddings_than_classes():
     assert all(value is None for value in result.values())
 
 
+def test_non_finite_fold_scores_return_unavailable(monkeypatch):
+    import sklearn.model_selection as skms
+
+    from otuformer.embedding.evaluator import compute_linear_probing_metrics
+
+    partial_nan = np.array([np.nan, 0.9, 0.9, 0.9, 0.9])
+    monkeypatch.setattr(skms, "cross_val_score", lambda *args, **kwargs: partial_nan)
+    monkeypatch.setattr(
+        skms,
+        "cross_validate",
+        lambda *args, **kwargs: {
+            "test_accuracy": partial_nan,
+            "test_balanced_accuracy": partial_nan,
+        },
+    )
+    embs = np.random.default_rng(0).standard_normal((20, 8))
+    labels = np.array([0] * 10 + [1] * 10)
+
+    knn = compute_knn_accuracy(embs, labels, k_values=[1])
+    probe = compute_linear_probing_metrics(embs, labels)
+
+    assert knn["kNN_Acc_k1"] is None
+    assert probe["Linear_Probing_Acc"] is None
+    assert probe["Linear_Probing_Balanced_Acc"] is None
+
+
+def test_cv_call_sites_raise_instead_of_scoring_failed_folds(monkeypatch):
+    import sklearn.model_selection as skms
+
+    from otuformer.embedding.evaluator import compute_linear_probing_metrics
+
+    captured = {}
+
+    def fake_cross_val_score(*args, **kwargs):
+        captured["cross_val_score"] = kwargs
+        return np.array([0.5])
+
+    def fake_cross_validate(*args, **kwargs):
+        captured["cross_validate"] = kwargs
+        return {
+            "test_accuracy": np.array([0.5]),
+            "test_balanced_accuracy": np.array([0.5]),
+        }
+
+    monkeypatch.setattr(skms, "cross_val_score", fake_cross_val_score)
+    monkeypatch.setattr(skms, "cross_validate", fake_cross_validate)
+    embs = np.random.default_rng(0).standard_normal((20, 8))
+    labels = np.array([0] * 10 + [1] * 10)
+
+    compute_knn_accuracy(embs, labels, k_values=[1])
+    compute_linear_probing_metrics(embs, labels)
+
+    assert captured["cross_val_score"].get("error_score") == "raise"
+    assert captured["cross_validate"].get("error_score") == "raise"
+
+
 def test_run_umap_caps_neighbors_to_sample_count(tmp_path, monkeypatch):
     seen = {}
 

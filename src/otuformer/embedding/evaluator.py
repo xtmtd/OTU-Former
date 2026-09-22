@@ -32,6 +32,20 @@ def _make_stratified_cv(
     )
 
 
+def _finite_mean(scores: np.ndarray) -> float | None:
+    """Mean of fold scores, or None when any fold score is non-finite.
+
+    The cross-validation call sites pass ``error_score="raise"`` so a failed
+    fold raises instead of being silently scored NaN; this guard additionally
+    keeps a non-finite scorer result from reaching the CSV adapters, which only
+    convert ``None`` to an empty field.
+    """
+    values = np.asarray(scores, dtype=float)
+    if values.size == 0 or not np.all(np.isfinite(values)):
+        return None
+    return float(np.mean(values))
+
+
 def compute_knn_accuracy(
     embeddings: np.ndarray,
     labels: np.ndarray,
@@ -53,8 +67,8 @@ def compute_knn_accuracy(
             continue
         knn = KNeighborsClassifier(n_neighbors=k, metric="cosine")
         try:
-            scores = cross_val_score(knn, x, labels, cv=cv)
-            result[key] = float(np.nanmean(scores))
+            scores = cross_val_score(knn, x, labels, cv=cv, error_score="raise")
+            result[key] = _finite_mean(scores)
         except Exception:
             result[key] = None
     return result
@@ -217,10 +231,11 @@ def compute_linear_probing_metrics(
                 "accuracy": "accuracy",
                 "balanced_accuracy": "balanced_accuracy",
             },
+            error_score="raise",
         )
-        result["Linear_Probing_Acc"] = float(np.mean(scores["test_accuracy"]))
-        result["Linear_Probing_Balanced_Acc"] = float(
-            np.mean(scores["test_balanced_accuracy"])
+        result["Linear_Probing_Acc"] = _finite_mean(scores["test_accuracy"])
+        result["Linear_Probing_Balanced_Acc"] = _finite_mean(
+            scores["test_balanced_accuracy"]
         )
     except Exception:
         pass

@@ -389,7 +389,8 @@ otuformer finetune \
 ### 嵌入指标（v0.7.1）
 
 `pretrain`、`finetune` 与 `extract` 以相同字段名计算嵌入质量指标。周期日志位于
-`logs/metrics.pretrain.csv` 与 `logs/metrics.finetune.csv`；`extract` 写入 `metrics.csv`。
+`logs/metrics.pretrain.csv` 与 `logs/metrics.finetune.csv`；`extract` 在 `--label-csv`
+至少包含两个类别时写入 `metrics.csv`。
 
 - kNN 与线性探测共用同一个显式打乱的
   `StratifiedKFold(shuffle=True, random_state=42)`；折数为 `min(5, 最小类别样本数)`，
