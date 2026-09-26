@@ -10,6 +10,8 @@ from typing import Literal
 
 import typer
 
+from otuformer.cli import format_user_command
+
 app = typer.Typer(
     help=(
         "Cluster embeddings into morphOTUs via UPGMA hierarchical clustering.\n\n"
@@ -780,22 +782,6 @@ def _parse_bool_option(name: str, value: str) -> bool:
     )
 
 
-def _format_user_command(ctx: typer.Context, params: dict[str, object]) -> str:
-    parts = ["otuformer", "cluster"]
-    for key, value in params.items():
-        source = ctx.get_parameter_source(key)
-        if getattr(source, "name", None) != "COMMANDLINE":
-            continue
-        option = f"--{key.replace('_', '-')}"
-        if isinstance(value, bool):
-            parts.extend([option, str(value).lower()])
-            continue
-        if value in (None, ""):
-            continue
-        parts.extend([option, str(value)])
-    return " ".join(parts)
-
-
 def _l2_normalize_rows(x):
     import numpy as np
 
@@ -969,7 +955,7 @@ def cluster(
             "cpus": cpus,
             "random_state": random_state,
         }
-        print(f"Command: {_format_user_command(ctx, params)}")
+        print(f"Command: {format_user_command(ctx, params, 'cluster')}")
         print("Parameters:")
         print(json.dumps(params, ensure_ascii=False, indent=2, sort_keys=True))
         print("-" * 80)

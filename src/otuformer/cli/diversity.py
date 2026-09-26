@@ -9,6 +9,8 @@ from pathlib import Path
 
 import typer
 
+from otuformer.cli import format_user_command
+
 app = typer.Typer(
     help=(
         "Compute diversity indices from OTU assignments or OTU tables.\n\n"
@@ -47,23 +49,6 @@ def validate_input_sources(
 ) -> None:
     if (assignments is None) == (otu_table_csv is None):
         raise ValueError("Provide exactly one of --assignments or --otu-table-csv")
-
-
-def _format_user_command(ctx: typer.Context, params: dict[str, object]) -> str:
-    parts = ["otuformer", "diversity"]
-    for key, value in params.items():
-        source = ctx.get_parameter_source(key)
-        if getattr(source, "name", None) != "COMMANDLINE":
-            continue
-        option = f"--{key.replace('_', '-')}"
-        if isinstance(value, bool):
-            if value:
-                parts.append(option)
-            continue
-        if value in (None, ""):
-            continue
-        parts.extend([option, str(value)])
-    return " ".join(parts)
 
 
 @app.callback(invoke_without_command=True)
@@ -188,7 +173,7 @@ def diversity(
             "nj_subsample_ratio": nj_subsample_ratio,
             "cpus": cpus,
         }
-        print(f"Command: {_format_user_command(ctx, params)}")
+        print(f"Command: {format_user_command(ctx, params, 'diversity')}")
         print("Parameters:")
         print(json.dumps(params, ensure_ascii=False, indent=2, sort_keys=True))
         print("-" * 80)

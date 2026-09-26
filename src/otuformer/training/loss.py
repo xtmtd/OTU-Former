@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from otuformer.training.model import ArcFaceHead
+from otuformer.training.model import ArcFaceHead, SubCenterArcFaceHead
 
 
 class GlobalDistillationLoss(nn.Module):
@@ -130,6 +132,99 @@ class ArcFaceLoss(nn.Module):
         return self.ce(logits, labels)
 
 
+class SubCenterArcFaceLoss(nn.Module):
+    """Sub-center ArcFace, plus an optional same-class center-distance hinge.
+
+    ``compact_weight=0`` is plain Sub-center ArcFace and matches the CE of its
+    head logits exactly. The compact penalty averages
+    ``relu(cosine_distance(center_i, center_j) - cap)`` over every distinct
+    same-class center pair, so a center distance below ``cap`` exerts no
+    pressure to merge. It constrains classifier weights only, never images.
+    """
+
+    def __init__(
+        self,
+        embed_dim: int,
+        num_classes: int,
+        k: int = 2,
+        s: float = 64.0,
+        m: float = 0.5,
+        compact_weight: float = 0.0,
+        cap: float = 0.5,
+    ) -> None:
+        super().__init__()
+        if not math.isfinite(cap) or cap <= 0.0 or cap > 2.0:
+            raise ValueError(f"cap must be in (0, 2], got {cap}.")
+        if not math.isfinite(compact_weight) or compact_weight < 0.0:
+            raise ValueError(
+                f"compact_weight must be a finite value >= 0, got {compact_weight}."
+            )
+        self.head = SubCenterArcFaceHead(embed_dim, num_classes, k=k, s=s, m=m)
+        self.compact_weight = float(compact_weight)
+        self.cap = float(cap)
+        self.ce = nn.CrossEntropyLoss()
+
+    def forward(self, embeddings: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        loss = self.ce(self.head(embeddings, labels), labels)
+        if self.compact_weight == 0.0 or self.head.k < 2:
+            return loss
+        centers = F.normalize(self.head.weight, dim=-1)
+        total = embeddings.new_zeros(())
+        pairs = 0
+        for i in range(self.head.k):
+            for j in range(i + 1, self.head.k):
+                distance = 1.0 - (centers[:, i] * centers[:, j]).sum(dim=-1)
+                total = total + F.relu(distance - self.cap).sum()
+                pairs += centers.shape[0]
+        return loss + self.compact_weight * total / pairs
+
+
+class SupConLoss(nn.Module):
+    """Single-view supervised contrastive loss on normalized embeddings.
+
+    For each anchor, same-species images other than itself are positives and
+    different-species images are negatives; the temperature-controlled
+    log-softmax denominator spans every non-self pair. Batches with no valid
+    positive anchor, or with no different-species images, return ``None``
+    instead of a differentiable zero so the trainer can skip them. Morphology
+    metadata is never read.
+    """
+
+    def __init__(self, temperature: float = 0.07) -> None:
+        super().__init__()
+        if not math.isfinite(temperature) or temperature <= 0.0:
+            raise ValueError(
+                f"temperature must be a finite value > 0, got {temperature}."
+            )
+        self.temperature = float(temperature)
+        self.last_valid_anchors = 0
+
+    def forward(
+        self, embeddings: torch.Tensor, labels: torch.Tensor
+    ) -> torch.Tensor | None:
+        self.last_valid_anchors = 0
+        n = embeddings.shape[0]
+        if n < 2:
+            return None
+        features = F.normalize(embeddings, dim=-1)
+        logits = features @ features.T / self.temperature
+        self_mask = ~torch.eye(n, dtype=torch.bool, device=features.device)
+        pos_mask = labels[:, None].eq(labels[None, :]) & self_mask
+        pos_counts = pos_mask.sum(dim=1)
+        valid = pos_counts > 0
+        if not bool(valid.any()) or not bool((pos_counts < n - 1).any()):
+            return None
+        self.last_valid_anchors = int(valid.sum())
+        logsumexp = torch.logsumexp(
+            logits.masked_fill(~self_mask, float("-inf")), dim=1
+        )
+        pos_mean = (logits * pos_mask).sum(dim=1) / pos_counts.clamp(min=1)
+        return (logsumexp[valid] - pos_mean[valid]).mean()
+
+
 LOSS_REGISTRY: dict[str, type] = {
     "arcface": ArcFaceLoss,
+    "supcon": SupConLoss,
+    "subcenter-arcface": SubCenterArcFaceLoss,
+    "subcenter-arcface-compact": SubCenterArcFaceLoss,
 }

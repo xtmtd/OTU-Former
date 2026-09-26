@@ -2,7 +2,7 @@
 
 **中文** | [English](README.md)
 
-一个基于图像形态学的 OTU（操作分类单元）划分工具包。提供统一的 `otuformer` 命令行工具，支持自监督预训练、ArcFace 度量学习微调、嵌入向量提取（提供标签时可直接输出质量指标/UMAP）、UPGMA 层次聚类、专家校正标注、群落多样性分析、CAM 可视化以及 ONNX 模型导出等功能。
+一个基于图像形态学的 OTU（操作分类单元）划分工具包。提供统一的 `otuformer` 命令行工具，支持自监督预训练、监督度量学习微调（`--loss` 可选 `arcface`、`supcon`、`subcenter-arcface` 或 `subcenter-arcface-compact`）、嵌入向量提取（提供标签时可直接输出质量指标/UMAP）、UPGMA 层次聚类、专家校正标注、群落多样性分析、CAM 可视化以及 ONNX 模型导出等功能。
 
 ## 概述
 
@@ -16,7 +16,7 @@ otuformer <command> [options]
 |---------|-------------|
 | `doctor` | 诊断环境与依赖状态 |
 | `pretrain` | 自监督对比学习预训练（DINO/iBOT 风格） |
-| `finetune` | ArcFace 度量学习微调 |
+| `finetune` | 监督度量学习微调（`--loss` 选择目标函数） |
 | `extract` | 提取图像嵌入向量（支持 ONNX 加速） |
 | `cluster` | UPGMA 层次聚类划分形态学 OTU |
 | `annotate` | 应用专家校正，生成 refined OTU 标注 |
@@ -29,7 +29,7 @@ otuformer <command> [options]
 
 - **统一命令行接口**：单一 `otuformer` 入口，覆盖从预训练到多样性分析的完整流程
 - **自监督预训练**：基于 DINO/iBOT 风格的教师-学生 ViT 对比学习，支持全局/局部裁剪与掩码 token 一致性
-- **ArcFace 度量学习微调**：利用标注数据优化模型，产出判别性嵌入用于 OTU 聚类
+- **监督度量学习微调**：利用标注数据和可选监督目标（默认 `arcface`，另有 `supcon`、`subcenter-arcface`、`subcenter-arcface-compact`）优化模型，产出判别性嵌入用于 OTU 聚类
 - **多模式嵌入提取**：支持 CLS token、patch-topk、attention-pool 三种模式，可选 ONNX 加速
 - **嵌入质量评估**：NMI、ARI、Recall@K、kNN 准确率、mAP@R、轮廓系数、线性探测准确率等
 - **UPGMA 层次聚类**：构建距离矩阵与系统发育树，在多个距离阈值下自动划分 OTU
@@ -95,7 +95,7 @@ pip install -e .
 
 1. `doctor` — 检查环境
 2. `pretrain` — 自监督预训练
-3. `finetune` — ArcFace 微调
+3. `finetune` — 监督度量学习微调
 4. `extract` — 提取嵌入向量
 5. `cluster` — UPGMA 聚类为 OTU
 6. `annotate` — 应用专家校正
@@ -286,15 +286,17 @@ otuformer pretrain \
 
 **输出**：
 - `logs/pretrain.log` — 运行日志
-- `checkpoints/` — 模型检查点（`SSL_latest.pth`、`SSL_best.pth`）
+- `SSL_latest.pth`、`SSL_epoch_*.pth` — 模型检查点，写入 `--out-dir` 根目录（不存在 `checkpoints/` 子目录，也没有 `SSL_best.pth`）
 - `logs/metrics.pretrain.csv` — 周期嵌入指标
-- `umap.pdf` — UMAP 可视化（未禁用时）
+- `logs/instant_metrics.pretrain.csv` — 每次迭代的训练指标
+- `logs/training_curves_pretrain.pdf` — 训练曲线图
+- `logs/umap.train.epoch_<N>.pdf` — 周期 UMAP 图（未禁用时）
 
 ---
 
 ### finetune 命令
 
-利用标注数据进行 ArcFace 度量学习微调。
+利用标注数据进行监督度量学习微调；`--loss` 选择目标函数（参见“度量损失模式（v0.8.0）”）。
 
 如需为已有类别加入新图像，请使用同时包含旧图和新图标注的 CSV，保持相同的
 `--out-dir`，从最新微调 checkpoint 使用 `--resume`，并增加
@@ -346,13 +348,17 @@ otuformer finetune \
 | `--input-images-dir` | 图像根目录 | 必填 |
 | `--out-dir` | 输出目录 | `runs/finetune` |
 | `--model-name` | timm 骨干网络名称 | `vit_tiny_patch16_224` |
-| `--metric-embed-dim` | 微调嵌入维度（ArcFace 头输出，非原始 CLS）。显式传值会重建该头；对历史 `ProjectionHead` 检查点会报错，其宽度由预训练投影器固定 | 继承检查点记录的维度 |
+| `--metric-embed-dim` | 微调嵌入维度（度量嵌入头输出，非原始 CLS）。显式传值会重建该头；对历史 `ProjectionHead` 检查点会报错，其宽度由预训练投影器固定 | 继承检查点记录的维度 |
 | `--finetune-epochs` | 微调轮数 | 20 |
 | `--finetune-lr` | 骨干网络学习率 | 1e-4 |
-| `--metric-head-lr` | ArcFace 嵌入头和分类器学习率；省略时继承 `--finetune-lr` | `--finetune-lr` |
+| `--metric-head-lr` | 嵌入头与（原型损失时的）分类器学习率；省略时继承 `--finetune-lr` | `--finetune-lr` |
 | `--weight-decay` | 微调使用的 AdamW weight decay；默认 `1e-4` 是保守的监督训练选择，传 `0.05` 可复现旧脚本设置 | 1e-4 |
 | `--freeze-ratio` | 冻结骨干网络比例（0.0=不冻结，1.0=全冻结） | 0.7 |
-| `--loss` | 度量学习损失名称 | `arcface` |
+| `--loss` | 度量学习损失：`arcface`（默认）、`supcon`、`subcenter-arcface` 或 `subcenter-arcface-compact`；参见“度量损失模式（v0.8.0）” | `arcface` |
+| `--subcenters` | `--loss subcenter-arcface` 或 `subcenter-arcface-compact` 的每类中心数（K）：2 到 8 的整数；`arcface` 与 `supcon` 会拒绝该参数 | 2 |
+| `--compact-weight` | `--loss subcenter-arcface-compact` 的同类别中心距离 hinge 权重（cap 固定为 0.5） | 0.1 |
+| `--supcon-temperature` | `--loss supcon` 的温度；必须大于 0 | 0.07 |
+| `--trace-batch-ids` | 将每个训练批次的图像 ID 按顺序写入 `logs/batch_ids.finetune.jsonl`（需显式开启，文件可能较大） | 否 |
 | `--augmentation` | 微调数据增强配置：`none`（新运行默认）或 `conservative`（实验性）；`--resume` 时省略则继承已保存配置 | `none` |
 | `--orientation-policy` | 方向策略：`sensitive`（新运行默认）或 `invariant`；仅影响 `conservative`。`--checkpoint` 初始化时省略则继承预训练 checkpoint 的策略；`--resume` 时省略则继承已保存策略 | `sensitive` |
 | `--batch-size` | 批量大小 | 32 |
@@ -374,15 +380,35 @@ otuformer finetune \
 
 **输出**：
 - `logs/finetune.log` — 运行日志
-- `checkpoints/` — 模型检查点（`finetune_latest.pth`、`finetune_best.pth`）
+- `finetune_latest.pth`、`finetune_epoch_*.pth` — 模型检查点，写入 `--out-dir` 根目录（不存在 `checkpoints/` 子目录，也没有 `finetune_best.pth`）
 - `logs/metrics.finetune.csv` — 周期嵌入指标
-- `umap.pdf` — UMAP 可视化（未禁用时）
+- `logs/instant_metrics.finetune.csv` — 每次迭代的训练指标
+- `logs/loss_diagnostics.finetune.csv` — v0.8.0 每轮损失诊断
+- `logs/batch_ids.finetune.jsonl` — 训练批次 ID 轨迹（仅当传入 `--trace-batch-ids`）
+- `logs/training_curves_finetune.pdf` — 训练曲线图
+- `logs/umap.train.epoch_<N>.pdf` — 周期 UMAP 图（未禁用时）
 
 **检查点处理**：
 
-- `--checkpoint` 开启新运行。SSL 预训练检查点会安装全新的 ArcFace 嵌入头；头类型与宽度都匹配的微调检查点会保留已训练的投影器。历史 `ProjectionHead` 检查点保留其投影器，因此嵌入宽度由它决定。
+- `--checkpoint` 开启新运行。SSL 预训练检查点会安装全新的嵌入头；头类型与宽度都匹配的微调检查点会保留已训练的投影器。历史 `ProjectionHead` 检查点保留其投影器，因此嵌入宽度由它决定。
 - `--resume` 会恢复保存的优化器状态，因此 `--finetune-lr`、`--metric-head-lr`、`--weight-decay` 不生效。`--freeze-ratio` 必须与保存值一致。
 - 旧脚本检查点（`ref/ibot20260115.py`）可被 `extract`、`export`、`cam` 读取，但不能被 `finetune` 续训。
+
+**度量损失模式（v0.8.0）。** `--loss` 接受四种显式监督目标；未知名称或与解析出的模式不匹配的设置会在创建任何输出之前报错。ArcFace 仍是默认值，也是 v0.8.0 的参考损失。
+
+| 模式 | 目标 |
+|------|------|
+| `arcface` | 每个已标注物种一个角度间隔分类中心（默认） |
+| `supcon` | 单视图监督对比损失，基于批内图像对 |
+| `subcenter-arcface` | 每个物种 K 个中心；样本靠近最近的中心 |
+| `subcenter-arcface-compact` | 子中心 ArcFace 加同类别中心距离上限惩罚 |
+
+- 分类中心是**仅训练期**状态：`extract`、`cluster` 及默认下游流程都不会读取它们，形态学元数据也从不进入训练。
+- **原始 CLS 仍是对比目标。** 损失作用于微调头，而默认 `extract` 向量是骨干网络的原始 CLS 嵌入，因此训练损失更低并不能单独证明距离更好。跨模式比较应固定 `--freeze-ratio`、骨干与微调头学习率、轮数、数据增强、训练清单、批量大小和随机种子。**开集**比较需要在留出的已知物种上标定每种损失，再不重新调参地应用于未见物种。
+- 首轮探索性设置：SupCon 温度 `0.07`、K `2`、余弦距离上限 `0.5`、compact 权重 `0.1`。这些是起始值，不是已验证的最优值；首轮不设参数网格，也不包含 benchmark runner。
+- `supcon` 会跳过没有有效正样本或没有不同物种负样本的批次并报告跳过数量；若整个 epoch 都不可用则直接失败，而不是在空信号上保存 checkpoint。
+- 新的 v0.8.0 checkpoint 会记录损失名称及其有效设置、随机种子、源 checkpoint 的 SHA-256、`train_manifest_sha256`、优化器布局与原型 weight decay 规则。新的 v0.8.0 ArcFace 运行对前向中 L2 归一化的原型使用**零 weight decay**，而 v0.7.x 会施加请求的 decay（默认 `1e-4`）。由于前向会归一化原型，该 decay 只缩放其范数，而损失不观测范数；在默认 `--finetune-lr 1e-4` 与 `--weight-decay 1e-4` 下，每步缩放低于 float32 分辨率，因此结果与 v0.7.x 数值完全一致。只有当学习率 × weight decay 的乘积更大时，原始原型范数才会改变并扰动轨迹，因此跨版本 checkpoint 不保证是仅损失不同的对照比较。旧 checkpoint 使用 `--resume` 会保留其保存的优化器语义；对 SSL 或无分类器的初始化 checkpoint 使用 `--resume` 会被拒绝。
+- `logs/loss_diagnostics.finetune.csv` 每个完成的 epoch 记录一行（可用/跳过批次数、有效锚点数、满足间隔的比例、compact hinge 激活比例与惩罚、每类每中心的分配计数、中心方向余弦）。`logs/batch_ids.finetune.jsonl` 仅在 `--trace-batch-ids` 时写出。既有 `logs/metrics.finetune.csv` 与 `logs/instant_metrics.finetune.csv` 的 schema 不变。
 
 ---
 
@@ -475,7 +501,7 @@ otuformer extract \
 | `--model-name` | timm 骨干网络名称 | `vit_tiny_patch16_224` |
 | `--extract-size` | 提取时图像缩放/裁剪尺寸；`auto` 使用检查点记录的训练尺寸 | auto |
 | `--eval-transform` | 评估预处理协议：`center-crop`（默认）或 `whole-specimen-pad`（保持宽高比的方形填充，预留） | `center-crop` |
-| `--use-projector-output` | 使用 SSL 投影器输出；微调 checkpoint 则使用 ArcFace 任务嵌入 | 否 |
+| `--use-projector-output` | 使用 SSL 投影器输出；微调 checkpoint 则使用微调任务嵌入 | 否 |
 | `--use-student` | 加载学生权重而非教师（EMA） | 否 |
 | `--token-mode` | `cls`/`patch-topk`/`attention-pool` | `cls` |
 | `--topk-patches` | patch-topk 模式的 top-K 值 | 20 |

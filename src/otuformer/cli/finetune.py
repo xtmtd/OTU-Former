@@ -1,4 +1,4 @@
-"""finetune command - ArcFace metric learning fine-tuning."""
+"""finetune command - supervised metric-learning fine-tuning."""
 
 from __future__ import annotations
 
@@ -17,14 +17,18 @@ from otuformer.cli import (
     _validate_augmentation,
     _validate_orientation_policy,
     finetune_augmentation_choices,
+    format_user_command,
     orientation_policy_choices,
 )
+from otuformer.constants import MAX_SUBCENTERS, MIN_SUBCENTERS
 
 app = typer.Typer(
     help=(
-        "ArcFace metric learning fine-tuning.\n\n"
-        "Fine-tunes a pretrained backbone with ArcFace loss to produce discriminative\n"
-        "embeddings for OTU clustering. Requires a pretrain checkpoint and labeled data.\n\n"
+        "Supervised metric-learning fine-tuning.\n\n"
+        "Fine-tunes a pretrained backbone with a selectable supervised objective to\n"
+        "produce discriminative embeddings for OTU clustering. --loss chooses arcface\n"
+        "(default), supcon, subcenter-arcface, or subcenter-arcface-compact. Requires a\n"
+        "pretrain checkpoint and labeled data.\n\n"
         "Quick example:\n\n"
         "  otuformer finetune --checkpoint runs/pretrain/best.pt --train-data labels.csv --input-images-dir ./images\n"
         "  otuformer finetune --checkpoint runs/pretrain/SSL_latest.pth --train-data labels.csv --input-images-dir ./images --finetune-epochs 50\n"
@@ -52,23 +56,6 @@ app = typer.Typer(
 )
 
 
-def _format_user_command(ctx: typer.Context, params: dict[str, object]) -> str:
-    parts = ["otuformer", "finetune"]
-    for key, value in params.items():
-        source = ctx.get_parameter_source(key)
-        if getattr(source, "name", None) != "COMMANDLINE":
-            continue
-        option = f"--{key.replace('_', '-')}"
-        if isinstance(value, bool):
-            if value:
-                parts.append(option)
-            continue
-        if value in (None, ""):
-            continue
-        parts.extend([option, str(value)])
-    return " ".join(parts)
-
-
 @app.callback(invoke_without_command=True)
 def finetune(
     ctx: typer.Context,
@@ -77,7 +64,7 @@ def finetune(
         "--checkpoint",
         help=(
             "Initialization checkpoint used when --resume is not set. An SSL "
-            "pretrain checkpoint installs a fresh ArcFace embedding head; a "
+            "pretrain checkpoint installs a fresh embedding head; a "
             "fine-tune checkpoint with a matching head keeps its trained "
             "projector."
         ),
@@ -100,13 +87,14 @@ def finetune(
         None,
         "--metric-embed-dim",
         help=(
-            "Fine-tune embedding dimension (the ArcFace head output, not the raw "
+            "Fine-tune embedding dimension (the metric-embedding head output, not "
+            "the raw "
             "CLS dimension). Default: the checkpoint's recorded metric "
             "dimension, else the pretrained projector dimension."
         ),
     ),
     finetune_epochs: int = typer.Option(
-        20, "--finetune-epochs", help="Total ArcFace fine-tuning epochs."
+        20, "--finetune-epochs", help="Total fine-tuning epochs."
     ),
     finetune_lr: float = typer.Option(
         1e-4,
@@ -116,7 +104,10 @@ def finetune(
     metric_head_lr: float | None = typer.Option(
         None,
         "--metric-head-lr",
-        help="Learning rate for the ArcFace embedding head and classifier; defaults to --finetune-lr.",
+        help=(
+            "Learning rate for the embedding head and, for prototype losses, the "
+            "classifier; defaults to --finetune-lr."
+        ),
     ),
     weight_decay: float = typer.Option(
         1e-4,
@@ -134,7 +125,47 @@ def finetune(
     loss: str = typer.Option(
         "arcface",
         "--loss",
-        help="Metric-learning loss name from LOSS_REGISTRY (default: arcface).",
+        help=(
+            "Metric-learning loss: arcface (default), supcon, subcenter-arcface, "
+            "or subcenter-arcface-compact. Rejected before any output when the "
+            "name is unknown. On --resume an omitted --loss inherits the "
+            "recorded mode; an explicit conflicting value fails."
+        ),
+    ),
+    subcenters: int = typer.Option(
+        2,
+        "--subcenters",
+        help=(
+            "Centers per class (K) for --loss subcenter-arcface or "
+            f"subcenter-arcface-compact: an integer from {MIN_SUBCENTERS} to "
+            f"{MAX_SUBCENTERS}. arcface and supcon reject this flag."
+        ),
+    ),
+    compact_weight: float = typer.Option(
+        0.1,
+        "--compact-weight",
+        help=(
+            "Same-class center-distance hinge weight for --loss "
+            "subcenter-arcface-compact (cap is fixed at 0.5). Rejected for other "
+            "loss modes."
+        ),
+    ),
+    supcon_temperature: float = typer.Option(
+        0.07,
+        "--supcon-temperature",
+        help=(
+            "Temperature for --loss supcon; must be > 0. Rejected for other loss "
+            "modes."
+        ),
+    ),
+    trace_batch_ids: bool = typer.Option(
+        False,
+        "--trace-batch-ids",
+        help=(
+            "Opt in to logs/batch_ids.finetune.jsonl, recording the ordered "
+            "image IDs of every training batch. Can be large; morphology is "
+            "never read."
+        ),
     ),
     augmentation: str | None = typer.Option(
         None,
@@ -246,6 +277,47 @@ def finetune(
         raise typer.BadParameter(f"Resume checkpoint not found: {resume}")
     _validate_augmentation(augmentation, stage="finetune")
     _validate_orientation_policy(orientation_policy)
+    # v0.8.0 loss settings are validated read-only before any output directory
+    # or log file exists, so a rejected run leaves no trace on disk.
+    explicit_options = frozenset(
+        key
+        for key in ("loss", "subcenters", "compact_weight", "supcon_temperature")
+        if getattr(ctx.get_parameter_source(key), "name", None) == "COMMANDLINE"
+    )
+    from otuformer.training.trainer import (
+        _classify_finetune_source,
+        _resolve_finetune_loss_config,
+        _validate_finetune_resume_source,
+    )
+    from otuformer.utils.checkpoint import load_checkpoint
+
+    loss_preflight = argparse.Namespace(
+        loss=loss,
+        subcenters=subcenters,
+        compact_weight=compact_weight,
+        supcon_temperature=supcon_temperature,
+    )
+    # Validate the initialization or resume source before any output exists.
+    # An empty --checkpoint is left to run_finetune, which reports it in place.
+    source_path = Path(resume) if resume else (Path(checkpoint) if checkpoint else None)
+    try:
+        source_checkpoint = (
+            load_checkpoint(source_path) if source_path is not None else None
+        )
+        resolved_loss = _resolve_finetune_loss_config(
+            loss_preflight,
+            source_checkpoint if resume else None,
+            explicit_options=explicit_options,
+        )
+        if source_checkpoint is not None:
+            if resume:
+                _validate_finetune_resume_source(
+                    source_checkpoint, str(resolved_loss["loss"])
+                )
+            else:
+                _classify_finetune_source(source_checkpoint)
+    except (ValueError, OSError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
     prepare_output_dir(out_dir, overwrite=overwrite, allow_existing=bool(resume))
     tee = TeeLogger(
         out_dir / "logs" / "finetune.log",
@@ -270,6 +342,10 @@ def finetune(
             weight_decay=weight_decay,
             freeze_ratio=freeze_ratio,
             loss=loss,
+            subcenters=subcenters,
+            compact_weight=compact_weight,
+            supcon_temperature=supcon_temperature,
+            trace_batch_ids=trace_batch_ids,
             augmentation=augmentation,
             orientation_policy=orientation_policy,
             batch_size=batch_size,
@@ -290,15 +366,31 @@ def finetune(
             compute_embedding_metrics=not disable_embedding_metrics,
         )
         params = vars(ns)
-        cli_command = _format_user_command(ctx, params)
+        cli_command = format_user_command(ctx, params, "finetune")
+        # Echo the effective loss settings so an inapplicable flag reads null
+        # instead of its CLI default, matching the recorded checkpoint config.
+        displayed = {
+            **params,
+            "loss": resolved_loss["loss"],
+            "subcenters": resolved_loss["subcenters"],
+            "compact_weight": resolved_loss["compact_weight"],
+            "supcon_temperature": resolved_loss["supcon_temperature"],
+        }
         print(f"Command: {cli_command}")
         print("Parameters:")
-        print(json.dumps(params, ensure_ascii=False, indent=2, sort_keys=True))
+        print(json.dumps(displayed, ensure_ascii=False, indent=2, sort_keys=True))
         print("-" * 80)
 
         from otuformer.training.trainer import run_finetune
 
-        run_finetune(ns)
+        # Hand over the checkpoint the preflight already read; passing it only
+        # when present keeps direct callers (and their mocks) unchanged.
+        extra = (
+            {"source_checkpoint": source_checkpoint}
+            if source_checkpoint is not None
+            else {}
+        )
+        run_finetune(ns, explicit_options=explicit_options, **extra)
     except Exception:
         traceback.print_exc(file=tee)
         raise

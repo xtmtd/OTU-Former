@@ -10,7 +10,7 @@ from pathlib import Path
 
 import typer
 
-from otuformer.cli import SIZE_EXAMPLES, _parse_size
+from otuformer.cli import SIZE_EXAMPLES, _parse_size, format_user_command
 
 app = typer.Typer(
     help=(
@@ -41,23 +41,6 @@ def _validate_extract_options(*, eval_transform: str) -> None:
             "--eval-transform must be one of: "
             f"{', '.join(_EVAL_TRANSFORM_CHOICES)}; got {eval_transform!r}"
         )
-
-
-def _format_user_command(ctx: typer.Context, params: dict[str, object]) -> str:
-    parts = ["otuformer", "extract"]
-    for key, value in params.items():
-        source = ctx.get_parameter_source(key)
-        if getattr(source, "name", None) != "COMMANDLINE":
-            continue
-        option = f"--{key.replace('_', '-')}"
-        if isinstance(value, bool):
-            if value:
-                parts.append(option)
-            continue
-        if value in (None, ""):
-            continue
-        parts.extend([option, str(value)])
-    return " ".join(parts)
 
 
 @app.callback(invoke_without_command=True)
@@ -250,7 +233,7 @@ def extract(
                 out_dir / "checkpoints" / f"model.{attention_pooling_type}_pooling.pth"
             )
         params["attention_pooling_checkpoint"] = str(attention_pooling_checkpoint)
-        cli_command = _format_user_command(ctx, params)
+        cli_command = format_user_command(ctx, params, "extract")
         print(f"Command: {cli_command}")
         print("Parameters:")
         print(json.dumps(params, ensure_ascii=False, indent=2, sort_keys=True))

@@ -9,7 +9,7 @@ from pathlib import Path
 
 import typer
 
-from otuformer.cli import SIZE_EXAMPLES, _parse_size
+from otuformer.cli import SIZE_EXAMPLES, _parse_size, format_user_command
 
 app = typer.Typer(
     help=(
@@ -22,19 +22,6 @@ app = typer.Typer(
         "  otuformer export --checkpoint best.pt --imgsz 224 --opset 17\n"
     )
 )
-
-
-def _format_user_command(ctx: typer.Context, params: dict[str, object]) -> str:
-    parts = ["otuformer", "export"]
-    for key, value in params.items():
-        source = ctx.get_parameter_source(key)
-        if getattr(source, "name", None) != "COMMANDLINE":
-            continue
-        option = f"--{key.replace('_', '-')}"
-        if value in (None, ""):
-            continue
-        parts.extend([option, str(value)])
-    return " ".join(parts)
 
 
 @app.callback(invoke_without_command=True)
@@ -88,7 +75,7 @@ def export(
             "opset": opset,
             "model_name": model_name,
         }
-        print(f"Command: {_format_user_command(ctx, params)}")
+        print(f"Command: {format_user_command(ctx, params, 'export')}")
         print("Parameters:")
         print(json.dumps(params, ensure_ascii=False, indent=2, sort_keys=True))
         print("-" * 80)

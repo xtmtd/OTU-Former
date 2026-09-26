@@ -15,6 +15,7 @@ from otuformer.utils.io import (
     write_json,
 )
 from otuformer.utils.logging import TeeLogger
+from otuformer.utils import logging as logging_mod
 
 
 def test_tee_logger_writes_to_file(tmp_path):
@@ -26,7 +27,11 @@ def test_tee_logger_writes_to_file(tmp_path):
     sys.stdout = original_stdout
     logger.close()
     content = log_file.read_text()
-    assert re.match(r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] hello world\n$", content)
+    lines = content.splitlines()
+    assert lines[0].startswith("[") and "otuformer" in lines[0]
+    assert re.match(
+        r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] hello world$", lines[-1]
+    )
 
 
 def test_tee_logger_skips_progress_bars(tmp_path):
@@ -41,6 +46,56 @@ def test_tee_logger_skips_progress_bars(tmp_path):
     content = log_file.read_text()
     assert "[progress bar]" not in content
     assert "real line" in content
+
+
+def _fake_git_run(monkeypatch, *, toplevel, commit="abc1234", dirty=False):
+    from types import SimpleNamespace
+
+    def fake_run(args, **_kwargs):
+        if "--show-toplevel" in args:
+            stdout = str(toplevel)
+        elif "status" in args:
+            stdout = " M src/otuformer/utils/logging.py\n" if dirty else ""
+        else:
+            stdout = commit
+        return SimpleNamespace(returncode=0, stdout=stdout + "\n")
+
+    monkeypatch.setattr(logging_mod.subprocess, "run", fake_run)
+
+
+def _otuformer_checkout(tmp_path, name="otuformer"):
+    root = tmp_path / "checkout"
+    root.mkdir()
+    (root / "pyproject.toml").write_text(
+        f'[project]\nname = "{name}"\nversion = "0.8.0"\n', encoding="utf-8"
+    )
+    return root
+
+
+@pytest.mark.parametrize(
+    ("dirty", "expected"), [(False, "abc1234"), (True, "abc1234-dirty")]
+)
+def test_git_commit_reports_the_otuformer_checkout(
+    tmp_path, monkeypatch, dirty, expected
+):
+    _fake_git_run(monkeypatch, toplevel=_otuformer_checkout(tmp_path), dirty=dirty)
+    assert logging_mod._git_commit(tmp_path) == expected
+
+
+def test_git_commit_rejects_a_foreign_repository(tmp_path, monkeypatch):
+    """A package vendored in another repo must not report the host's commit."""
+    _fake_git_run(
+        monkeypatch, toplevel=_otuformer_checkout(tmp_path, name="host-project")
+    )
+    assert logging_mod._git_commit(tmp_path) == "unknown"
+
+
+def test_git_commit_is_unknown_when_git_is_missing(tmp_path, monkeypatch):
+    def fake_run(*_args, **_kwargs):
+        raise FileNotFoundError("git")
+
+    monkeypatch.setattr(logging_mod.subprocess, "run", fake_run)
+    assert logging_mod._git_commit(tmp_path) == "unknown"
 
 
 def test_csv_roundtrip(tmp_path):

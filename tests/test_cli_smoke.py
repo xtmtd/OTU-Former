@@ -1,4 +1,5 @@
 import argparse
+import functools
 import re
 import pytest
 import pandas as pd
@@ -292,13 +293,12 @@ def test_pretrain_resume_allows_existing_output_and_appends_log(tmp_path, monkey
 
 
 def test_finetune_checkpoint_initialization_requires_empty_or_overwrite(tmp_path, monkeypatch):
-    checkpoint = tmp_path / "pretrained.pth"
-    torch.save({}, checkpoint)
+    checkpoint = _write_init_checkpoint(tmp_path / "pretrained.pth")
     out_dir = tmp_path / "finetune_out"
     out_dir.mkdir()
     stale = out_dir / "stale.txt"
     stale.write_text("stale", encoding="utf-8")
-    monkeypatch.setattr("otuformer.training.trainer.run_finetune", lambda _args: None)
+    monkeypatch.setattr("otuformer.training.trainer.run_finetune", lambda _args, **_kw: None)
     args = [
         "finetune", "--checkpoint", str(checkpoint), "--train-data", str(tmp_path / "labels.csv"),
         "--input-images-dir", str(tmp_path), "--out-dir", str(out_dir),
@@ -324,8 +324,9 @@ def test_readmes_document_update_and_continued_training():
 
 def test_finetune_optimizer_arguments_are_forwarded(monkeypatch, tmp_path):
     seen = {}
+    _write_init_checkpoint(tmp_path / "source.pth")
 
-    def fake_run_finetune(args):
+    def fake_run_finetune(args, *, explicit_options=frozenset(), source_checkpoint=None):
         seen.update(vars(args))
 
     monkeypatch.setattr("otuformer.training.trainer.run_finetune", fake_run_finetune)
@@ -1865,7 +1866,7 @@ def test_training_enables_mps_fallback_before_augmentation_validation(
     monkeypatch.setattr(
         f"otuformer.cli.{command}._validate_augmentation", spy_validate_augmentation
     )
-    monkeypatch.setattr(run_attr, lambda _args: None)
+    monkeypatch.setattr(run_attr, lambda _args, **_kw: None)
 
     try:
         result = runner.invoke(
@@ -2631,7 +2632,7 @@ def test_finetune_augmentation_argument_forwarding_defaults_to_none(
 ):
     seen = {}
 
-    def fake_run_finetune(args):
+    def fake_run_finetune(args, *, explicit_options=frozenset(), source_checkpoint=None):
         seen["augmentation"] = args.augmentation
         seen["orientation_policy"] = args.orientation_policy
 
@@ -2659,7 +2660,7 @@ def test_finetune_augmentation_argument_forwarding_explicit_values(
 ):
     seen = {}
 
-    def fake_run_finetune(args):
+    def fake_run_finetune(args, *, explicit_options=frozenset(), source_checkpoint=None):
         seen["augmentation"] = args.augmentation
         seen["orientation_policy"] = args.orientation_policy
 
@@ -2700,7 +2701,7 @@ def test_finetune_initialization_inherits_policy_but_not_profile(
     )
     seen = {}
 
-    def fake_run_finetune(args):
+    def fake_run_finetune(args, *, explicit_options=frozenset(), source_checkpoint=None):
         loaded = torch.load(ckpt, map_location="cpu", weights_only=False)
         seen["augmentation"] = args.augmentation
         seen["orientation_policy"] = args.orientation_policy
@@ -2752,7 +2753,7 @@ def test_training_augmentation_argument_rejects_invalid_before_training(
         "otuformer.training.trainer.run_pretrain", lambda _args: called.append("p")
     )
     monkeypatch.setattr(
-        "otuformer.training.trainer.run_finetune", lambda _args: called.append("f")
+        "otuformer.training.trainer.run_finetune", lambda _args, **_kw: called.append("f")
     )
     out_dir = tmp_path / "augmentation_out"
 
@@ -2960,11 +2961,13 @@ class _ForeignContext:
 
 
 def test_format_user_command_accepts_foreign_parameter_source():
-    from otuformer.cli.pretrain import _format_user_command
+    from otuformer.cli import format_user_command
 
     ctx = _ForeignContext(["train_data", "out_dir"])
-    command = _format_user_command(
-        ctx, {"train_data": "images.csv", "out_dir": "runs/x", "max_epochs": 5}
+    command = format_user_command(
+        ctx,
+        {"train_data": "images.csv", "out_dir": "runs/x", "max_epochs": 5},
+        "pretrain",
     )
 
     assert "--train-data images.csv" in command
@@ -2972,16 +2975,31 @@ def test_format_user_command_accepts_foreign_parameter_source():
     assert "--max-epochs" not in command
 
 
-def test_pretrain_source_helper_recognizes_foreign_commandline_enum():
-    from otuformer.cli import pretrain as pretrain_cli
+def test_format_user_command_renders_boolean_flags_without_a_value():
+    """A copied log command must not contain ``--flag true``."""
+    from otuformer.cli import format_user_command
 
-    assert pretrain_cli._source_is_commandline(_ForeignCommandlineSource()) is True
-    assert pretrain_cli._source_is_commandline(None) is False
+    ctx = _ForeignContext(["overwrite", "resume"])
+    command = format_user_command(
+        ctx, {"overwrite": True, "resume": False, "out_dir": "runs/x"}, "extract"
+    )
+
+    assert command.startswith("otuformer extract ")
+    assert "--overwrite" in command.split()
+    assert "--overwrite true" not in command
+    assert "--resume" not in command
+
+
+def test_source_helper_recognizes_foreign_commandline_enum():
+    from otuformer.cli import source_is_commandline
+
+    assert source_is_commandline(_ForeignCommandlineSource()) is True
+    assert source_is_commandline(None) is False
 
     class DefaultSource:
         name = "DEFAULT"
 
-    assert pretrain_cli._source_is_commandline(DefaultSource()) is False
+    assert source_is_commandline(DefaultSource()) is False
 
 
 def test_cli_modules_do_not_couple_to_external_click():
@@ -3182,3 +3200,496 @@ def test_extract_rejects_duplicate_label_images(tmp_path):
 
     assert result.exit_code != 0
     assert "duplicate" in str(result.exception).lower()
+
+
+# --- v0.8.0 loss CLI validation ---------------------------------------------
+
+
+def _write_init_checkpoint(path, *, model_name="vit_tiny_patch16_224", out_dim=16):
+    """A minimal but genuine SSL initialization checkpoint.
+
+    The encoder state is a real ``OTUFormerEncoder`` state dict (built once and
+    cached), so the fixture is loadable by the real trainer and cannot make a
+    mocked test pass on metadata the trainer would reject.
+    """
+    torch.save(
+        {
+            "model_state_dict": {
+                key: value.clone() for key, value in _init_checkpoint_state().items()
+            },
+            "config": {
+                "model_name": model_name,
+                "out_dim": out_dim,
+                "image_size": 32,
+            },
+        },
+        path,
+    )
+    return path
+
+
+@functools.lru_cache(maxsize=1)
+def _init_checkpoint_state():
+    from otuformer.training.model import OTUFormerEncoder
+
+    return OTUFormerEncoder(
+        model_name="vit_tiny_patch16_224", out_dim=16, pretrained=False, img_size=32
+    ).state_dict()
+
+
+@functools.lru_cache(maxsize=1)
+def _arcface_checkpoint_state():
+    """A real fine-tune encoder state: backbone plus an ArcFaceEmbeddingHead."""
+    from otuformer.training.model import ArcFaceEmbeddingHead, OTUFormerEncoder
+
+    encoder = OTUFormerEncoder(
+        model_name="vit_tiny_patch16_224", out_dim=16, pretrained=False, img_size=32
+    )
+    encoder.projector = ArcFaceEmbeddingHead(encoder.backbone.num_features, 16)
+    return encoder.state_dict()
+
+
+@functools.lru_cache(maxsize=1)
+def _supcon_resume_optimizer_state():
+    """A real v0.8.0 SupCon optimizer state: frozen backbone plus projector.
+
+    Built through the production layout so the fixture restores with
+    ``optimizer.load_state_dict`` instead of merely declaring a group count.
+    """
+    from otuformer.training import trainer
+    from otuformer.training.loss import SupConLoss
+    from otuformer.training.model import ArcFaceEmbeddingHead, OTUFormerEncoder
+
+    encoder = OTUFormerEncoder(
+        model_name="vit_tiny_patch16_224", out_dim=16, pretrained=False, img_size=32
+    )
+    encoder.projector = ArcFaceEmbeddingHead(encoder.backbone.num_features, 16)
+    trainer._freeze_backbone_blocks(encoder, 0.7)
+    optimizer = trainer._build_finetune_optimizer_for_layout(
+        "v080_supcon",
+        encoder,
+        SupConLoss(temperature=0.07),
+        3e-5,
+        None,
+        1e-4,
+    )
+    return optimizer.state_dict()
+
+
+def _write_supcon_resume_checkpoint(path):
+    """A genuinely resumable v0.8.0 SupCon checkpoint: arcface head, no classifier."""
+    torch.save(
+        {
+            "model_state_dict": {
+                key: value.clone()
+                for key, value in _arcface_checkpoint_state().items()
+            },
+            "config": {
+                "model_name": "vit_tiny_patch16_224",
+                "out_dim": 16,
+                "metric_embed_dim": 16,
+                "image_size": 32,
+                "embedding_head": "arcface_mlp_512",
+                "loss": "supcon",
+                "supcon_temperature": 0.07,
+                "optimizer_groups": "v080_supcon",
+                "freeze_ratio": 0.7,
+            },
+            "loss_state_dict": {},
+            "optimizer": _supcon_resume_optimizer_state(),
+            "epoch": 0,
+        },
+        path,
+    )
+    return path
+
+
+def test_supcon_resume_fixture_is_a_real_resumable_source(tmp_path):
+    from otuformer.training import trainer
+    from otuformer.training.loss import SupConLoss
+    from otuformer.training.model import ArcFaceEmbeddingHead, OTUFormerEncoder
+
+    path = _write_supcon_resume_checkpoint(tmp_path / "supcon.pth")
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+
+    encoder = OTUFormerEncoder(
+        model_name="vit_tiny_patch16_224", out_dim=16, pretrained=False, img_size=32
+    )
+    encoder.projector = ArcFaceEmbeddingHead(encoder.backbone.num_features, 16)
+    # strict=True proves the fixture is a complete, loadable fine-tune source.
+    encoder.load_state_dict(checkpoint["model_state_dict"], strict=True)
+    assert trainer._classify_finetune_source(checkpoint) == "v080"
+    assert (
+        trainer._finetune_optimizer_layout(checkpoint, True, "supcon")
+        == "v080_supcon"
+    )
+    # The recorded optimizer must actually restore into the rebuilt layout;
+    # the real resume path calls exactly this load.
+    trainer._freeze_backbone_blocks(encoder, 0.7)
+    optimizer = trainer._build_finetune_optimizer_for_layout(
+        "v080_supcon",
+        encoder,
+        SupConLoss(temperature=0.07),
+        3e-5,
+        None,
+        1e-4,
+    )
+    optimizer.load_state_dict(checkpoint["optimizer"])
+
+
+def test_init_checkpoint_fixture_is_a_loadable_ssl_source(tmp_path):
+    from otuformer.training.model import OTUFormerEncoder
+
+    path = _write_init_checkpoint(tmp_path / "init.pth")
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+
+    assert checkpoint["model_state_dict"]
+    # strict=True proves the fixture is a complete, real encoder checkpoint
+    # rather than metadata that only the preflight accepts.
+    OTUFormerEncoder(
+        model_name="vit_tiny_patch16_224", out_dim=16, pretrained=False, img_size=32
+    ).load_state_dict(checkpoint["model_state_dict"], strict=True)
+
+
+def _finetune_cli_argv(tmp_path, *extra, out_dir=None, checkpoint=None):
+    if checkpoint is None:
+        # The preflight now reads --checkpoint before creating any output, so a
+        # valid initialization source must exist for the default invocation.
+        checkpoint = _write_init_checkpoint(tmp_path / "source.pth")
+    return [
+        "finetune",
+        "--checkpoint",
+        str(checkpoint),
+        "--train-data",
+        str(tmp_path / "labels.csv"),
+        "--input-images-dir",
+        str(tmp_path),
+        "--out-dir",
+        str(out_dir if out_dir is not None else tmp_path / "ft_out"),
+        *extra,
+    ]
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ["--loss", "bogus"],
+        ["--loss", "supcon", "--subcenters", "3"],
+        ["--loss", "arcface", "--supcon-temperature", "0.1"],
+        ["--loss", "subcenter-arcface", "--compact-weight", "0.2"],
+        ["--loss", "subcenter-arcface", "--subcenters", "9"],
+        ["--loss", "subcenter-arcface-compact", "--subcenters", "9"],
+        ["--loss", "subcenter-arcface", "--subcenters", "0"],
+        ["--loss", "supcon", "--supcon-temperature", "0"],
+        ["--loss", "subcenter-arcface-compact", "--compact-weight", "-0.1"],
+    ],
+)
+def test_finetune_loss_option_rejects_invalid_before_creating_output(tmp_path, extra):
+    out_dir = tmp_path / "ft_out"
+    result = runner.invoke(app, _finetune_cli_argv(tmp_path, *extra, out_dir=out_dir))
+
+    assert result.exit_code != 0, result.output
+    assert not out_dir.exists()
+    assert not (out_dir / "logs" / "finetune.log").exists()
+
+
+def test_finetune_compact_accepts_k_above_two(tmp_path, monkeypatch):
+    seen = {}
+
+    def fake_run_finetune(args, *, explicit_options=frozenset(), source_checkpoint=None):
+        seen["subcenters"] = args.subcenters
+
+    monkeypatch.setattr("otuformer.training.trainer.run_finetune", fake_run_finetune)
+    result = runner.invoke(
+        app,
+        _finetune_cli_argv(
+            tmp_path, "--loss", "subcenter-arcface-compact", "--subcenters", "3"
+        ),
+    )
+
+    assert result.exit_code == 0, result.output
+    assert seen["subcenters"] == 3
+
+
+def test_finetune_loss_mode_forwards_explicit_options_without_namespace_markers(
+    tmp_path, monkeypatch
+):
+    seen = {}
+
+    def fake_run_finetune(args, *, explicit_options=frozenset(), source_checkpoint=None):
+        seen["args"] = args
+        seen["explicit"] = set(explicit_options)
+
+    monkeypatch.setattr("otuformer.training.trainer.run_finetune", fake_run_finetune)
+    result = runner.invoke(
+        app,
+        _finetune_cli_argv(
+            tmp_path, "--loss", "supcon", "--supcon-temperature", "0.1"
+        ),
+    )
+
+    assert result.exit_code == 0, result.output
+    assert seen["explicit"] == {"loss", "supcon_temperature"}
+    assert "explicit_options" not in vars(seen["args"])
+    dumped = result.output.split("Parameters:", 1)[1]
+    assert "explicit_options" not in dumped
+    assert "supcon_temperature" in dumped
+
+
+def test_finetune_loss_mode_defaults_to_no_explicit_options(tmp_path, monkeypatch):
+    seen = {}
+
+    def fake_run_finetune(args, *, explicit_options=frozenset(), source_checkpoint=None):
+        seen["explicit"] = set(explicit_options)
+
+    monkeypatch.setattr("otuformer.training.trainer.run_finetune", fake_run_finetune)
+    result = runner.invoke(app, _finetune_cli_argv(tmp_path))
+
+    assert result.exit_code == 0, result.output
+    assert seen["explicit"] == set()
+
+
+def test_finetune_resume_rejects_legacy_compact_k_conflict_before_output(tmp_path):
+    """A compact checkpoint with subcenters=None was trained at the fixed K=2.
+
+    An explicit conflicting --subcenters must be rejected by the CLI preflight,
+    before prepare_output_dir creates anything on disk.
+    """
+    checkpoint = tmp_path / "legacy_compact.pth"
+    torch.save(
+        {
+            "model_state_dict": {
+                key: value.clone()
+                for key, value in _arcface_checkpoint_state().items()
+            },
+            "config": {
+                "model_name": "vit_tiny_patch16_224",
+                "out_dim": 16,
+                "metric_embed_dim": 16,
+                "image_size": 32,
+                "embedding_head": "arcface_mlp_512",
+                "loss": "subcenter-arcface-compact",
+                "compact_weight": 0.1,
+                "compact_cap": 0.5,
+                "optimizer_groups": "v080_prototype",
+                "freeze_ratio": 0.7,
+            },
+            "loss_state_dict": {"head.weight": torch.zeros(2, 2, 16)},
+            "optimizer": {"state": {}, "param_groups": [{}, {}, {}]},
+            "epoch": 0,
+        },
+        checkpoint,
+    )
+
+    out_dir = tmp_path / "legacy_compact_out"
+    result = runner.invoke(
+        app,
+        _finetune_cli_argv(
+            tmp_path,
+            "--resume",
+            str(checkpoint),
+            "--subcenters",
+            "3",
+            out_dir=out_dir,
+        ),
+    )
+
+    assert result.exit_code != 0, result.output
+    assert "subcenters" in result.output
+    assert not out_dir.exists()
+    assert not (out_dir / "logs" / "finetune.log").exists()
+
+
+def test_finetune_loss_mode_supcon_resume_requires_matching_temperature(
+    tmp_path, monkeypatch
+):
+    checkpoint = _write_supcon_resume_checkpoint(tmp_path / "supcon_ft.pth")
+    calls = []
+
+    def fake_run_finetune(
+        args, *, explicit_options=frozenset(), source_checkpoint=None
+    ):
+        calls.append(set(explicit_options))
+
+    monkeypatch.setattr("otuformer.training.trainer.run_finetune", fake_run_finetune)
+
+    equal_out = tmp_path / "equal_out"
+    equal = runner.invoke(
+        app,
+        _finetune_cli_argv(
+            tmp_path, "--resume", str(checkpoint), "--supcon-temperature", "0.07",
+            out_dir=equal_out,
+        ),
+    )
+    assert equal.exit_code == 0, equal.output
+    assert calls == [{"supcon_temperature"}]
+
+    conflict_out = tmp_path / "conflict_out"
+    conflict = runner.invoke(
+        app,
+        _finetune_cli_argv(
+            tmp_path, "--resume", str(checkpoint), "--supcon-temperature", "0.1",
+            out_dir=conflict_out,
+        ),
+    )
+    assert conflict.exit_code != 0, conflict.output
+    assert not conflict_out.exists()
+
+
+def test_finetune_loss_mode_resume_preflight_rejects_bad_sources_before_output(
+    tmp_path,
+):
+    ssl = tmp_path / "SSL_latest.pth"
+    torch.save(
+        {
+            "model_state_dict": {"projector.net.0.weight": torch.zeros(4, 4)},
+            "optimizer": {"state": {}, "param_groups": [{}]},
+            "epoch": 3,
+            "args": {"model_name": "m"},
+            "config": {"model_name": "m", "out_dim": 16},
+        },
+        ssl,
+    )
+    ref_script = tmp_path / "ref_script.pth"
+    torch.save({"model": {}, "loss_func": {}}, ref_script)
+    bad_layout = tmp_path / "bad_layout.pth"
+    torch.save(
+        {
+            "model_state_dict": _init_checkpoint_state(),
+            "config": {"loss": "arcface", "embedding_head": "arcface_mlp_512"},
+            "loss_state_dict": {"head.weight": torch.zeros(2, 16)},
+            "optimizer": {"state": {}, "param_groups": [{}]},
+        },
+        bad_layout,
+    )
+    # A v0.8.0 source without any model state must fail before any output too.
+    no_model_state = tmp_path / "no_model_state.pth"
+    torch.save(
+        {
+            "config": {"loss": "supcon", "embedding_head": "arcface_mlp_512"},
+            "loss_state_dict": {},
+            "optimizer": {"state": {}, "param_groups": [{}, {}]},
+        },
+        no_model_state,
+    )
+
+    for index, source in enumerate(
+        (ssl, ref_script, bad_layout, no_model_state)
+    ):
+        out_dir = tmp_path / f"preflight_out_{index}"
+        result = runner.invoke(
+            app,
+            _finetune_cli_argv(tmp_path, "--resume", str(source), out_dir=out_dir),
+        )
+
+        assert result.exit_code != 0, result.output
+        assert not out_dir.exists()
+        assert not (out_dir / "logs" / "finetune.log").exists()
+
+
+def test_finetune_loss_mode_resume_hands_the_preloaded_checkpoint_to_the_trainer(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "preloaded.pth"
+    torch.save(
+        {
+            "model_state_dict": {
+                key: value.clone()
+                for key, value in _arcface_checkpoint_state().items()
+            },
+            "config": {
+                "model_name": "vit_tiny_patch16_224",
+                "out_dim": 16,
+                "metric_embed_dim": 16,
+                "image_size": 32,
+                "embedding_head": "arcface_mlp_512",
+                "loss": "arcface",
+                "optimizer_groups": "v080_prototype",
+            },
+            "loss_state_dict": {"head.weight": torch.zeros(2, 16)},
+            "optimizer": {"state": {}, "param_groups": [{}, {}, {}]},
+        },
+        source,
+    )
+    seen = {}
+
+    def fake_run_finetune(
+        args, *, explicit_options=frozenset(), source_checkpoint=None
+    ):
+        seen["preloaded"] = source_checkpoint
+
+    monkeypatch.setattr("otuformer.training.trainer.run_finetune", fake_run_finetune)
+    result = runner.invoke(app, _finetune_cli_argv(tmp_path, "--resume", str(source)))
+
+    assert result.exit_code == 0, result.output
+    # The preflight read is handed over instead of being repeated in the trainer.
+    assert isinstance(seen["preloaded"], dict)
+    assert "model_state_dict" in seen["preloaded"]
+
+
+def test_finetune_loss_mode_checkpoint_preflight_rejects_bad_sources_before_output(
+    tmp_path,
+):
+    """The decision table also applies to new-run --checkpoint sources."""
+    ambiguous = tmp_path / "ambiguous.pth"
+    torch.save({"loss_state_dict": {}}, ambiguous)
+    ref_script = tmp_path / "init_ref_script.pth"
+    torch.save({"model": {}, "loss_func": {}}, ref_script)
+
+    for index, source in enumerate((ambiguous, ref_script, tmp_path / "missing.pth")):
+        out_dir = tmp_path / f"init_preflight_out_{index}"
+        result = runner.invoke(
+            app,
+            _finetune_cli_argv(tmp_path, out_dir=out_dir, checkpoint=source),
+        )
+
+        assert result.exit_code != 0, result.output
+        assert not out_dir.exists()
+        assert not (out_dir / "logs" / "finetune.log").exists()
+
+
+def test_finetune_loss_mode_preflight_rejects_weightless_init_source(tmp_path):
+    """A checkpoint without encoder weights is not a valid SSL initialization."""
+    weightless = tmp_path / "weightless.pth"
+    torch.save({}, weightless)
+    empty_state = tmp_path / "empty_state.pth"
+    torch.save({"model_state_dict": {}}, empty_state)
+
+    for index, source in enumerate((weightless, empty_state)):
+        out_dir = tmp_path / f"weightless_out_{index}"
+        result = runner.invoke(
+            app,
+            _finetune_cli_argv(
+                tmp_path, out_dir=out_dir, checkpoint=source
+            ),
+        )
+
+        assert result.exit_code != 0, result.output
+        assert not out_dir.exists()
+        assert not (out_dir / "logs" / "finetune.log").exists()
+
+
+def test_finetune_help_names_loss_modes_and_flag_applicability():
+    result = runner.invoke(app, ["finetune", "--help"])
+
+    assert result.exit_code == 0
+    output = result.output
+    for mode in (
+        "arcface",
+        "supcon",
+        "subcenter-arcface",
+        "subcenter-arcface-compact",
+    ):
+        assert mode in output
+    for flag in ("--subcenters", "--compact-weight", "--supcon-temperature"):
+        assert flag in output
+    # The rendered help wraps inside a bordered panel, so drop borders and
+    # normalize spaces before matching the K range.
+    from otuformer.constants import MAX_SUBCENTERS, MIN_SUBCENTERS
+
+    normalized = " ".join(output.replace("│", " ").split())
+    assert f"an integer from {MIN_SUBCENTERS} to {MAX_SUBCENTERS}" in normalized
+    # The command description is not ArcFace-only anymore.
+    assert "Supervised metric-learning fine-tuning" in normalized
+    assert "ArcFace metric learning fine-tuning" not in normalized
+    assert "benchmark" not in output.lower()

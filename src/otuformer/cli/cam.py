@@ -10,6 +10,8 @@ from pathlib import Path
 
 import typer
 
+from otuformer.cli import format_user_command
+
 app = typer.Typer(
     help=(
         "Generate CAM heatmaps for visualizing model attention on images.\n\n"
@@ -68,22 +70,6 @@ def _validate_cam_options(
             raise typer.BadParameter(
                 f"{option} must be one of: {', '.join(allowed)}; got {value!r}"
             )
-
-
-def _format_user_command(ctx: typer.Context, params: dict[str, object]) -> str:
-    parts = ["otuformer", "cam"]
-    for key, value in params.items():
-        source = ctx.get_parameter_source(key)
-        if getattr(source, "name", None) != "COMMANDLINE":
-            continue
-        option = f"--{key.replace('_', '-')}"
-        if isinstance(value, bool):
-            parts.extend([option, str(value).lower()])
-            continue
-        if value in (None, ""):
-            continue
-        parts.extend([option, str(value)])
-    return " ".join(parts)
 
 
 @app.callback(invoke_without_command=True)
@@ -235,7 +221,7 @@ def cam(
             "device": device,
             "eval_transform": eval_transform,
         }
-        print(f"Command: {_format_user_command(ctx, params)}")
+        print(f"Command: {format_user_command(ctx, params, 'cam')}")
         print("Parameters:")
         print(json.dumps(params, ensure_ascii=False, indent=2, sort_keys=True))
         print("-" * 80)

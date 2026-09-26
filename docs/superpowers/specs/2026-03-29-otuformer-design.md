@@ -147,7 +147,7 @@ All parameters migrated from `ref/ibot20260115.py` `get_parser()`, mode=finetune
 - `--metric-head-lr` : learning rate for the ArcFace embedding head and classifier; omitted means inherit `--finetune-lr`. On `--resume`, saved optimizer state takes precedence.
 - `--weight-decay` : AdamW weight decay [default: 1e-4, a conservative supervised SFT choice; pass 0.05 for the legacy script's setting]
 - `--freeze-ratio` : fraction of transformer blocks to freeze [default: 0.7]; recorded in `config.freeze_ratio` and required to match on `--resume`, because the optimizer only holds `requires_grad` backbone parameters
-- `--loss` : loss function [default: arcface] — registry supports future additions (ProxyAnchor planned)
+- `--loss` : loss function [default: arcface]; the proposed v0.8.0 extension and its compatibility contract are specified in [the metric-loss design](2026-09-24-otuformer-metric-loss-v080-design.md)
 - `--augmentation` : fine-tuning augmentation profile — `none` (new-run default) or `conservative` (experimental)
 - `--orientation-policy` : orientation policy — `sensitive` (new-run default) or `invariant` (opt-in broad rotation and reflection); when initializing from `--checkpoint`, an omitted value inherits the pretraining checkpoint's saved policy
 - `--batch-size`, `--num-workers`, `--cpus`, `--device`, `--seed`
@@ -352,7 +352,9 @@ Both cosine and Euclidean distances support: PCA whitening, k-NN based local sca
 ```python
 LOSS_REGISTRY = {"arcface": ArcFaceLoss, ...}
 ```
-ProxyAnchor is planned as the next addition. Adding it requires only registering a new class, no CLI changes needed.
+The original registry contains only ArcFace. The proposed v0.8.0 SupCon and
+Sub-center variants require loss-aware CLI validation, batch handling, and
+checkpoint/resume compatibility; see [the metric-loss design](2026-09-24-otuformer-metric-loss-v080-design.md).
 
 ### 4.3 Batch extract
 Auto-detection logic in `extractor.py`: if `--input-images-dir` contains at least one subdirectory with images, batch mode is activated. All batches share the same checkpoint and `--prefix`, ensuring consistent OTU naming.
@@ -411,7 +413,7 @@ tqdm >= 4.66
 
 ## 6. Future Roadmap
 
-- ProxyAnchor loss (metric learning alternative to ArcFace)
+- Metric-loss comparisons for morphOTU delineation: see [the v0.8.0 design](2026-09-24-otuformer-metric-loss-v080-design.md). ProxyAnchor remains a possible later experiment, not a v0.8.0 requirement.
 - `report` sub-command (HTML/PDF summary of a full analysis run)
 - Beta diversity matrix + cross-sample OTU comparison
 - Python API / skill for notebook-based non-CLI analysis (after interfaces stabilise)

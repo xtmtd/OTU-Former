@@ -1,4 +1,5 @@
 import inspect
+import math
 
 import torch
 import torch.nn.functional as F
@@ -9,6 +10,8 @@ from otuformer.training.loss import (
     GlobalDistillationLoss,
     LOSS_REGISTRY,
     LocalToGlobalLoss,
+    SupConLoss,
+    SubCenterArcFaceLoss,
     ibot_patch_loss,
     masked_patch_cosine_loss,
 )
@@ -168,3 +171,186 @@ def test_arcface_loss_forward():
 
 def test_loss_registry_contains_arcface():
     assert "arcface" in LOSS_REGISTRY
+
+
+def test_loss_registry_has_exactly_the_four_v080_modes():
+    assert set(LOSS_REGISTRY) == {
+        "arcface",
+        "supcon",
+        "subcenter-arcface",
+        "subcenter-arcface-compact",
+    }
+
+
+# --- Sub-center ArcFace -----------------------------------------------------
+
+
+def test_subcenter_loss_k1_matches_arcface_loss_and_gradients():
+    torch.manual_seed(0)
+    labels = torch.tensor([0, 2, 1, 1])
+    arc = ArcFaceLoss(embed_dim=8, num_classes=3, s=16.0, m=0.25)
+    sub = SubCenterArcFaceLoss(embed_dim=8, num_classes=3, k=1, s=16.0, m=0.25)
+    with torch.no_grad():
+        sub.head.weight.copy_(arc.head.weight.unsqueeze(1))
+
+    x_arc = torch.randn(4, 8, requires_grad=True)
+    x_sub = x_arc.detach().clone().requires_grad_(True)
+    arc_loss = arc(x_arc, labels)
+    sub_loss = sub(x_sub, labels)
+
+    assert torch.allclose(arc_loss, sub_loss, atol=1e-6)
+    arc_loss.backward()
+    sub_loss.backward()
+    assert torch.allclose(x_arc.grad, x_sub.grad, atol=1e-6)
+    assert torch.allclose(
+        arc.head.weight.grad, sub.head.weight.grad.squeeze(1), atol=1e-6
+    )
+
+
+def _set_centers(loss_fn, centers):
+    with torch.no_grad():
+        loss_fn.head.weight.copy_(F.normalize(centers, dim=-1))
+
+
+def _two_centers(second_cosine):
+    """One class, two centers whose cosine similarity is ``second_cosine``."""
+    centers = torch.zeros(1, 2, 4)
+    centers[0, 0] = torch.tensor([1.0, 0.0, 0.0, 0.0])
+    centers[0, 1] = torch.tensor(
+        [second_cosine, math.sqrt(1.0 - second_cosine**2), 0.0, 0.0]
+    )
+    return centers
+
+
+def test_compact_zero_weight_is_plain_subcenter_ce():
+    torch.manual_seed(0)
+    x = torch.randn(2, 4)
+    labels = torch.tensor([0, 0])
+    loss_fn = SubCenterArcFaceLoss(
+        embed_dim=4, num_classes=1, k=2, compact_weight=0.0, cap=0.5
+    )
+    _set_centers(loss_fn, _two_centers(0.7))
+
+    expected = F.cross_entropy(loss_fn.head(x, labels), labels)
+    assert torch.allclose(loss_fn(x, labels), expected, atol=1e-6)
+
+
+def test_compact_hinge_is_inactive_below_cap():
+    torch.manual_seed(0)
+    x = torch.randn(2, 4)
+    labels = torch.tensor([0, 0])
+    plain = SubCenterArcFaceLoss(
+        embed_dim=4, num_classes=1, k=2, compact_weight=0.0, cap=0.5
+    )
+    _set_centers(plain, _two_centers(0.7))  # cosine distance 0.3 < cap
+    penalized = SubCenterArcFaceLoss(
+        embed_dim=4, num_classes=1, k=2, compact_weight=0.3, cap=0.5
+    )
+    _set_centers(penalized, _two_centers(0.7))
+
+    assert torch.allclose(penalized(x, labels), plain(x, labels), atol=1e-6)
+
+
+def test_compact_hinge_adds_weight_times_excess_distance():
+    torch.manual_seed(0)
+    x = torch.randn(2, 4, requires_grad=True)
+    labels = torch.tensor([0, 0])
+    plain = SubCenterArcFaceLoss(
+        embed_dim=4, num_classes=1, k=2, compact_weight=0.0, cap=0.5
+    )
+    _set_centers(plain, _two_centers(0.2))  # cosine distance 0.8 > cap
+    penalized = SubCenterArcFaceLoss(
+        embed_dim=4, num_classes=1, k=2, compact_weight=0.3, cap=0.5
+    )
+    _set_centers(penalized, _two_centers(0.2))
+
+    penalty = penalized(x, labels) - plain(x, labels)
+    assert torch.allclose(penalty, torch.tensor(0.3 * (0.8 - 0.5)), atol=1e-5)
+
+    penalized(x, labels).backward()
+    assert torch.isfinite(x.grad).all()
+    assert torch.isfinite(penalized.head.weight.grad).all()
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"k": 0},
+        {"k": -1},
+        {"compact_weight": -0.1},
+        {"compact_weight": float("nan")},
+        {"compact_weight": float("inf")},
+        {"cap": 0.0},
+        {"cap": 2.5},
+        {"cap": float("nan")},
+    ],
+)
+def test_subcenter_loss_rejects_invalid_settings(kwargs):
+    with pytest.raises(ValueError):
+        SubCenterArcFaceLoss(embed_dim=4, num_classes=2, **kwargs)
+
+
+def test_subcenter_loss_accepts_cap_two_as_noop_boundary():
+    loss_fn = SubCenterArcFaceLoss(
+        embed_dim=4, num_classes=2, k=2, compact_weight=0.5, cap=2.0
+    )
+    x = torch.randn(2, 4)
+    labels = torch.tensor([0, 1])
+    loss = loss_fn(x, labels)
+    assert torch.isfinite(loss)
+
+
+# --- Supervised contrastive -------------------------------------------------
+
+
+def _reference_supcon(z, labels, temperature):
+    zn = F.normalize(z, dim=-1)
+    logits = zn @ zn.T / temperature
+    n = z.shape[0]
+    self_mask = ~torch.eye(n, dtype=torch.bool)
+    pos_mask = labels[:, None].eq(labels[None, :]) & self_mask
+    logsumexp = torch.logsumexp(
+        logits.masked_fill(~self_mask, float("-inf")), dim=1
+    )
+    pos_counts = pos_mask.sum(dim=1)
+    pos_mean = (logits * pos_mask).sum(dim=1) / pos_counts.clamp(min=1)
+    valid = pos_counts > 0
+    return (logsumexp[valid] - pos_mean[valid]).mean()
+
+
+def test_supcon_loss_matches_reference_forward_and_backward():
+    torch.manual_seed(0)
+    labels = torch.tensor([0, 0, 1, 1])
+    z_loss = torch.randn(4, 6, requires_grad=True)
+    z_ref = z_loss.detach().clone().requires_grad_(True)
+    loss_fn = SupConLoss(temperature=0.07)
+
+    loss = loss_fn(z_loss, labels)
+    expected = _reference_supcon(z_ref, labels, 0.07)
+
+    assert loss is not None
+    assert torch.allclose(loss, expected, atol=1e-6)
+    assert loss_fn.last_valid_anchors == 4
+    loss.backward()
+    expected.backward()
+    assert torch.allclose(z_loss.grad, z_ref.grad, atol=1e-6)
+
+
+def test_supcon_skips_batches_without_positives_or_negatives():
+    loss_fn = SupConLoss(temperature=0.1)
+
+    assert loss_fn(torch.randn(3, 4), torch.tensor([0, 1, 2])) is None
+    assert loss_fn.last_valid_anchors == 0
+
+    assert loss_fn(torch.randn(3, 4), torch.tensor([0, 0, 0])) is None
+    assert loss_fn.last_valid_anchors == 0
+
+    loss = loss_fn(torch.randn(3, 4), torch.tensor([0, 0, 1]))
+    assert loss is not None
+    assert loss_fn.last_valid_anchors == 2
+
+
+@pytest.mark.parametrize("temperature", [0.0, -0.1, float("nan"), float("inf")])
+def test_supcon_rejects_invalid_temperature(temperature):
+    with pytest.raises(ValueError, match="temperature"):
+        SupConLoss(temperature=temperature)

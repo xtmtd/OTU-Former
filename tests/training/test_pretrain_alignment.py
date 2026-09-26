@@ -1,6 +1,7 @@
 import argparse
 import importlib.util
 import json
+import math
 from pathlib import Path
 
 import numpy as np
@@ -723,7 +724,7 @@ def test_historical_sft_new_run_can_resume_saved_projection_checkpoint(tmp_path)
     first_path = tmp_path / "first" / "finetune_latest.pth"
     first = torch.load(first_path, map_location="cpu", weights_only=False)
     assert first["config"]["embedding_head"] == "projection_mlp_2048"
-    assert len(first["optimizer"]["param_groups"]) == 2
+    assert len(first["optimizer"]["param_groups"]) == 3
 
     resume_args = _finetune_args(
         tmp_path,
@@ -748,7 +749,7 @@ def test_historical_sft_new_run_can_resume_saved_projection_checkpoint(tmp_path)
         weights_only=False,
     )
     assert second["config"]["embedding_head"] == "projection_mlp_2048"
-    assert len(second["optimizer"]["param_groups"]) == 2
+    assert len(second["optimizer"]["param_groups"]) == 3
 
 
 @pytest.mark.parametrize(
@@ -1754,3 +1755,1348 @@ def test_malformed_enhanced_schema_fails_without_touching_the_file(tmp_path, con
 
     assert path.read_bytes() == original
     assert list(tmp_path.glob("*.tmp")) == []
+
+
+# --- v0.8.0 loss configuration resolver -------------------------------------
+
+
+def test_resolve_finetune_loss_mode_new_run_defaults(tmp_path):
+    args = _finetune_args(tmp_path, tmp_path / "source.pth")
+
+    resolved = trainer._resolve_finetune_loss_config(args, None)
+
+    assert resolved["loss"] == "arcface"
+    assert resolved["subcenters"] is None
+    assert resolved["compact_weight"] is None
+    assert resolved["compact_cap"] is None
+    assert resolved["supcon_temperature"] is None
+
+
+def test_resolve_finetune_loss_mode_applies_only_applicable_settings(tmp_path):
+    args = _finetune_args(
+        tmp_path, tmp_path / "source.pth", loss="supcon", supcon_temperature=0.1
+    )
+    resolved = trainer._resolve_finetune_loss_config(
+        args, None, explicit_options={"loss", "supcon_temperature"}
+    )
+    assert resolved["loss"] == "supcon"
+    assert resolved["supcon_temperature"] == 0.1
+    assert resolved["subcenters"] is None
+    assert resolved["compact_weight"] is None
+    assert resolved["compact_cap"] is None
+
+    args = _finetune_args(
+        tmp_path, tmp_path / "source.pth", loss="subcenter-arcface", subcenters=3
+    )
+    resolved = trainer._resolve_finetune_loss_config(
+        args, None, explicit_options={"loss", "subcenters"}
+    )
+    assert resolved["subcenters"] == 3
+    assert resolved["compact_weight"] is None
+    assert resolved["supcon_temperature"] is None
+
+    args = _finetune_args(
+        tmp_path,
+        tmp_path / "source.pth",
+        loss="subcenter-arcface-compact",
+        compact_weight=0.25,
+    )
+    resolved = trainer._resolve_finetune_loss_config(
+        args, None, explicit_options={"loss", "compact_weight"}
+    )
+    assert resolved["compact_weight"] == 0.25
+    assert resolved["compact_cap"] == 0.5
+    assert resolved["subcenters"] == 2
+    assert resolved["supcon_temperature"] is None
+
+
+@pytest.mark.parametrize(
+    ("overrides", "explicit"),
+    [
+        ({"loss": "bogus"}, {"loss"}),
+        ({"loss": "supcon", "subcenters": 3}, {"loss", "subcenters"}),
+        (
+            {"loss": "arcface", "supcon_temperature": 0.1},
+            {"loss", "supcon_temperature"},
+        ),
+        (
+            {"loss": "subcenter-arcface", "compact_weight": 0.2},
+            {"loss", "compact_weight"},
+        ),
+        ({"loss": "subcenter-arcface", "subcenters": 9}, {"loss", "subcenters"}),
+        ({"loss": "subcenter-arcface", "subcenters": 0}, {"loss", "subcenters"}),
+        ({"loss": "supcon", "supcon_temperature": 0.0}, {"loss", "supcon_temperature"}),
+        (
+            {"loss": "subcenter-arcface-compact", "compact_weight": -0.1},
+            {"loss", "compact_weight"},
+        ),
+    ],
+)
+def test_resolve_finetune_loss_option_rejects_inapplicable_or_invalid(
+    tmp_path, overrides, explicit
+):
+    args = _finetune_args(tmp_path, tmp_path / "source.pth", **overrides)
+
+    with pytest.raises(ValueError):
+        trainer._resolve_finetune_loss_config(args, None, explicit_options=explicit)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "explicit"),
+    [
+        (
+            {"loss": "subcenter-arcface-compact", "compact_weight": float("nan")},
+            {"loss", "compact_weight"},
+        ),
+        (
+            {"loss": "subcenter-arcface-compact", "compact_weight": float("inf")},
+            {"loss", "compact_weight"},
+        ),
+        (
+            {"loss": "supcon", "supcon_temperature": float("nan")},
+            {"loss", "supcon_temperature"},
+        ),
+        (
+            {"loss": "supcon", "supcon_temperature": float("inf")},
+            {"loss", "supcon_temperature"},
+        ),
+    ],
+)
+def test_resolve_finetune_loss_option_rejects_non_finite_values(
+    tmp_path, overrides, explicit
+):
+    args = _finetune_args(tmp_path, tmp_path / "source.pth", **overrides)
+
+    with pytest.raises(ValueError):
+        trainer._resolve_finetune_loss_config(args, None, explicit_options=explicit)
+
+
+def test_resolve_finetune_loss_mode_resume_inherits_saved_mode(tmp_path):
+    checkpoint = {
+        "config": {"loss": "supcon", "supcon_temperature": 0.05},
+    }
+    # ``--loss`` omitted: the Namespace still carries the CLI default, but the
+    # option is not explicit, so the recorded mode must win.
+    args = _finetune_args(tmp_path, tmp_path / "source.pth", loss="arcface")
+
+    resolved = trainer._resolve_finetune_loss_config(args, checkpoint)
+
+    assert resolved["loss"] == "supcon"
+    assert resolved["supcon_temperature"] == 0.05
+    assert resolved["subcenters"] is None
+
+
+def test_resolve_finetune_loss_mode_resume_allows_equal_and_rejects_conflict(tmp_path):
+    checkpoint = {"config": {"loss": "supcon", "supcon_temperature": 0.07}}
+
+    args = _finetune_args(
+        tmp_path, tmp_path / "source.pth", loss="supcon", supcon_temperature=0.07
+    )
+    resolved = trainer._resolve_finetune_loss_config(
+        args, checkpoint, explicit_options={"loss", "supcon_temperature"}
+    )
+    assert resolved["loss"] == "supcon"
+    assert resolved["supcon_temperature"] == 0.07
+
+    args = _finetune_args(
+        tmp_path, tmp_path / "source.pth", loss="supcon", supcon_temperature=0.1
+    )
+    with pytest.raises(ValueError):
+        trainer._resolve_finetune_loss_config(
+            args, checkpoint, explicit_options={"loss", "supcon_temperature"}
+        )
+
+    args = _finetune_args(tmp_path, tmp_path / "source.pth", loss="arcface")
+    with pytest.raises(ValueError):
+        trainer._resolve_finetune_loss_config(
+            args, checkpoint, explicit_options={"loss"}
+        )
+
+
+def test_resolve_compact_subcenters_uses_the_requested_k(tmp_path):
+    """compact shares the plain Sub-center K range instead of fixing K=2."""
+    args = _finetune_args(
+        tmp_path,
+        tmp_path / "source.pth",
+        loss="subcenter-arcface-compact",
+        subcenters=3,
+        compact_weight=0.25,
+    )
+
+    resolved = trainer._resolve_finetune_loss_config(
+        args, None, explicit_options={"loss", "subcenters", "compact_weight"}
+    )
+
+    assert resolved["loss"] == "subcenter-arcface-compact"
+    assert resolved["subcenters"] == 3
+    assert resolved["compact_weight"] == 0.25
+    assert resolved["compact_cap"] == 0.5
+
+
+@pytest.mark.parametrize("k", [0, 1, 9, -1])
+def test_resolve_subcenters_rejects_k_outside_the_bound(tmp_path, k):
+    args = _finetune_args(
+        tmp_path, tmp_path / "source.pth", loss="subcenter-arcface", subcenters=k
+    )
+    with pytest.raises(ValueError, match="--subcenters"):
+        trainer._resolve_finetune_loss_config(
+            args, None, explicit_options={"subcenters"}
+        )
+
+
+def test_resume_rejects_explicit_k_against_a_legacy_compact_checkpoint(tmp_path):
+    """A compact checkpoint with subcenters=None was trained with the fixed K=2."""
+    checkpoint = {
+        "config": {"loss": "subcenter-arcface-compact", "compact_weight": 0.1},
+    }
+    args = _finetune_args(
+        tmp_path,
+        tmp_path / "source.pth",
+        loss="subcenter-arcface-compact",
+        subcenters=3,
+    )
+    with pytest.raises(ValueError, match="subcenters"):
+        trainer._resolve_finetune_loss_config(
+            args, checkpoint, explicit_options={"subcenters"}
+        )
+
+    # Omitting K still resolves the recorded K=2, not an arbitrary default.
+    args = _finetune_args(
+        tmp_path, tmp_path / "source.pth", loss="subcenter-arcface-compact"
+    )
+    resolved = trainer._resolve_finetune_loss_config(args, checkpoint)
+    assert resolved["subcenters"] == 2
+
+
+def test_resolve_finetune_loss_mode_rejects_new_mode_on_legacy_resume(tmp_path):
+    legacy = {"config": {}, "loss_state_dict": {"head.weight": torch.zeros(3, 4)}}
+
+    args = _finetune_args(tmp_path, tmp_path / "source.pth", loss="supcon")
+    with pytest.raises(ValueError, match="legacy"):
+        trainer._resolve_finetune_loss_config(
+            args, legacy, explicit_options={"loss"}
+        )
+
+    args = _finetune_args(tmp_path, tmp_path / "source.pth", loss="arcface")
+    resolved = trainer._resolve_finetune_loss_config(
+        args, legacy, explicit_options={"loss"}
+    )
+    assert resolved["loss"] == "arcface"
+
+
+# --- v0.8.0 checkpoint decision table ---------------------------------------
+
+
+def _ssl_like_state():
+    return {"projector.net.0.weight": torch.zeros(2048, 4)}
+
+
+def test_finetune_source_decision_table_classifies_sources():
+    ssl = {
+        "model_state_dict": _ssl_like_state(),
+        "config": {"model_name": "m", "out_dim": 16},
+    }
+    assert trainer._classify_finetune_source(ssl) == "ssl"
+    assert trainer._select_finetune_embedding_head(ssl) == "arcface_mlp_512"
+
+    v080_supcon = {
+        "model_state_dict": _ssl_like_state(),
+        "config": {"loss": "supcon", "embedding_head": "arcface_mlp_512"},
+        "loss_state_dict": {},
+    }
+    assert trainer._classify_finetune_source(v080_supcon) == "v080"
+    assert (
+        trainer._select_finetune_embedding_head(v080_supcon) == "arcface_mlp_512"
+    )
+
+    v080_arcface = {
+        "model_state_dict": _ssl_like_state(),
+        "config": {"loss": "arcface", "embedding_head": "arcface_mlp_512"},
+        "loss_state_dict": {"head.weight": torch.zeros(2, 16)},
+    }
+    assert trainer._classify_finetune_source(v080_arcface) == "v080"
+
+    legacy_with_head = {
+        "model_state_dict": _ssl_like_state(),
+        "config": {"embedding_head": "projection_mlp_2048"},
+        "loss_state_dict": {"head.weight": torch.zeros(2, 16)},
+    }
+    assert trainer._classify_finetune_source(legacy_with_head) == "legacy_arcface"
+    assert (
+        trainer._select_finetune_embedding_head(legacy_with_head)
+        == "projection_mlp_2048"
+    )
+
+    historical = {
+        "model_state_dict": _ssl_like_state(),
+        "loss_state_dict": {"head.weight": torch.zeros(2, 16)},
+    }
+    assert trainer._classify_finetune_source(historical) == "legacy_arcface"
+    assert (
+        trainer._select_finetune_embedding_head(historical) == "projection_mlp_2048"
+    )
+
+    head_only = {
+        "config": {"embedding_head": "arcface_mlp_512"},
+        "model_state_dict": _ssl_like_state(),
+    }
+    assert trainer._classify_finetune_source(head_only) == "head_only"
+    assert (
+        trainer._select_finetune_embedding_head(head_only) == "arcface_mlp_512"
+    )
+
+    # Repo SSL checkpoints also carry teacher/student and args; only `config`
+    # plus the absence of fine-tune markers makes them SSL.
+    repo_ssl = {
+        "model_state_dict": _ssl_like_state(),
+        "student": {},
+        "teacher": {},
+        "args": {"model_name": "m"},
+        "config": {"model_name": "m", "out_dim": 16},
+    }
+    assert trainer._classify_finetune_source(repo_ssl) == "ssl"
+
+
+@pytest.mark.parametrize(
+    "checkpoint",
+    [
+        # empty loss state, no head metadata: ambiguous, never ProjectionHead
+        {"loss_state_dict": {}},
+        # fine-tune marker without any classifier or head metadata
+        {"loss_state_dict": {}, "class_labels": ["classA"]},
+        # v0.8.0 loss metadata without an embedding head
+        {"config": {"loss": "arcface"}},
+        # arcface needs a classifier state; supcon must not have one
+        {
+            "config": {"loss": "arcface", "embedding_head": "arcface_mlp_512"},
+            "loss_state_dict": {},
+        },
+        {
+            "config": {"loss": "supcon", "embedding_head": "arcface_mlp_512"},
+            "loss_state_dict": {"head.weight": torch.zeros(2, 16)},
+        },
+        # prototype shape that cannot be a prototype classifier
+        {
+            "config": {
+                "loss": "subcenter-arcface",
+                "embedding_head": "arcface_mlp_512",
+            },
+            "loss_state_dict": {"head.weight": torch.zeros(2, 16)},
+        },
+        # ref-script formats are read-only for finetune
+        {"model": {}, "loss_func": {}},
+        {"config": {"loss": "arcface", "embedding_head": "arcface_mlp_512"}, "loss_func": {}},
+        # ref-script signature: args without config
+        {"model_state_dict": _ssl_like_state(), "args": {"model_name": "m"}},
+        # no encoder weights: not a valid SSL initialization source
+        {},
+        {"model_state_dict": {}},
+        # non-empty state without any recognizable encoder parameter
+        {"model_state_dict": {"nonexistent.weight": torch.zeros(1)}},
+        # a declared head with a *present* empty loss state is ambiguous, not head-only
+        {"config": {"embedding_head": "arcface_mlp_512"}, "loss_state_dict": {}},
+        # recorded K / embedding width must match the classifier state
+        {
+            "config": {
+                "loss": "subcenter-arcface",
+                "embedding_head": "arcface_mlp_512",
+                "subcenters": 3,
+            },
+            "loss_state_dict": {"head.weight": torch.zeros(2, 2, 16)},
+        },
+        {
+            "config": {
+                "loss": "arcface",
+                "embedding_head": "arcface_mlp_512",
+                "metric_embed_dim": 32,
+            },
+            "loss_state_dict": {"head.weight": torch.zeros(2, 16)},
+        },
+        # a v0.8.0 source without any model state cannot be resumed or initialized
+        {
+            "config": {"loss": "supcon", "embedding_head": "arcface_mlp_512"},
+            "loss_state_dict": {},
+        },
+        {
+            "config": {"loss": "arcface", "embedding_head": "arcface_mlp_512"},
+            "loss_state_dict": {"head.weight": torch.zeros(2, 16)},
+        },
+        # head-only without model state
+        {"config": {"embedding_head": "arcface_mlp_512"}},
+    ],
+)
+def test_finetune_source_decision_table_rejects(checkpoint):
+    with pytest.raises(ValueError):
+        trainer._classify_finetune_source(checkpoint)
+
+
+def test_finetune_legacy_inference_requires_projector_weights():
+    # No model state at all: rejected before head inference is attempted.
+    weightless = {
+        "loss_state_dict": {"head.weight": torch.zeros(2, 16)},
+        "config": {},
+    }
+    with pytest.raises(ValueError, match="encoder weights"):
+        trainer._select_finetune_embedding_head(weightless)
+
+    # Encoder weights present, but no projector weights and no declared head:
+    # there is nothing to infer the embedding head from.
+    no_projector = {
+        "model_state_dict": {"backbone.cls_token": torch.zeros(1, 1, 192)},
+        "loss_state_dict": {"head.weight": torch.zeros(2, 16)},
+        "config": {},
+    }
+    with pytest.raises(ValueError, match="projector"):
+        trainer._select_finetune_embedding_head(no_projector)
+
+
+# --- manifest hashing -------------------------------------------------------
+
+
+def test_train_manifest_hash_is_permutation_invariant_and_content_sensitive(
+    tmp_path,
+):
+    root = tmp_path / "images"
+    refs = ["b.jpg", "a.jpg", "a.jpg"]
+    labels = ["classB", "classA", "classA"]
+    baseline = trainer._train_manifest_sha256(refs, labels, root)
+
+    assert (
+        trainer._train_manifest_sha256(
+            ["a.jpg", "b.jpg", "a.jpg"], ["classA", "classB", "classA"], root
+        )
+        == baseline
+    )
+    # ``./img.jpg`` and ``img.jpg`` are the same canonical reference.
+    assert (
+        trainer._train_manifest_sha256(
+            ["./a.jpg", "a.jpg", "b.jpg"], ["classA", "classA", "classB"], root
+        )
+        == baseline
+    )
+    # Duplicate rows and label assignments are part of the manifest.
+    assert (
+        trainer._train_manifest_sha256(
+            refs + ["a.jpg"], labels + ["classA"], root
+        )
+        != baseline
+    )
+    assert (
+        trainer._train_manifest_sha256(
+            refs, ["classB", "classA", "classB"], root
+        )
+        != baseline
+    )
+
+
+def test_train_manifest_hash_ignores_the_absolute_root(tmp_path):
+    labels = ["classA", "classA"]
+    one = tmp_path / "one"
+    two = tmp_path / "two"
+
+    first = trainer._train_manifest_sha256(
+        [str(one / "a.jpg"), "b.jpg"], labels, one
+    )
+    second = trainer._train_manifest_sha256(
+        [str(two / "a.jpg"), "b.jpg"], labels, two
+    )
+
+    assert first == second
+
+
+def test_train_manifest_hash_rejects_references_outside_the_root(tmp_path):
+    with pytest.raises(ValueError, match="input-images-dir"):
+        trainer._train_manifest_sha256(
+            [str(tmp_path / "elsewhere" / "a.jpg")], ["classA"], tmp_path / "images"
+        )
+
+
+def test_metric_dataset_retains_original_image_refs(tmp_path):
+    img_dir, labels_path = _write_tiny_ft_data(tmp_path)
+    from otuformer.training.dataset import MetricDataset
+
+    ds = MetricDataset(
+        csv_path=labels_path, images_dir=img_dir, image_size=32
+    )
+
+    assert ds.image_refs == [
+        "img_0.jpg",
+        "img_1.jpg",
+        "img_2.jpg",
+        "img_3.jpg",
+    ]
+    assert ds.label_names == ["classA", "classA", "classB", "classB"]
+
+
+def test_metric_dataset_retains_recursive_csv_refs(tmp_path):
+    """A CSV ref found only by recursive lookup keeps its original form."""
+    from otuformer.training.dataset import MetricDataset
+
+    img_dir = tmp_path / "images"
+    (img_dir / "nested").mkdir(parents=True)
+    for i in range(2):
+        Image.new("RGB", (64, 64), color=(i * 40, 0, 0)).save(
+            img_dir / "nested" / f"img_{i}.jpg"
+        )
+    labels_path = tmp_path / "labels.csv"
+    pd.DataFrame(
+        {"image": ["img_0.jpg", "img_1.jpg"], "label": ["classA", "classB"]}
+    ).to_csv(labels_path, index=False)
+
+    ds = MetricDataset(csv_path=labels_path, images_dir=img_dir, image_size=32)
+
+    # The image is discovered under nested/, but the CSV reference is retained,
+    # so the manifest hash covers the reference, not the discovered path.
+    assert ds.image_refs == ["img_0.jpg", "img_1.jpg"]
+    assert trainer._train_manifest_sha256(
+        ds.image_refs, ds.label_names, img_dir
+    ) == trainer._train_manifest_sha256(
+        ["img_0.jpg", "img_1.jpg"], ["classA", "classB"], img_dir
+    )
+
+
+# --- checkpoint provenance --------------------------------------------------
+
+
+def test_sha256_file_matches_hashlib(tmp_path):
+    import hashlib
+
+    path = tmp_path / "payload.bin"
+    path.write_bytes(b"otuformer" * 5000)
+
+    assert trainer._sha256_file(path) == hashlib.sha256(
+        path.read_bytes()
+    ).hexdigest()
+
+
+def _expected_manifest(tmp_path):
+    return trainer._train_manifest_sha256(
+        [f"img_{i}.jpg" for i in range(4)],
+        ["classA", "classA", "classB", "classB"],
+        tmp_path / "images",
+    )
+
+
+def test_finetune_records_provenance_and_effective_config(tmp_path):
+    ssl = _write_pretrain_checkpoint(tmp_path / "ssl.pth", image_size=32, out_dim=16)
+
+    saved = _run_frozen_finetune(tmp_path, ssl, "provenance")
+
+    config = saved["config"]
+    ssl_sha = trainer._sha256_file(ssl)
+    assert config["loss"] == "arcface"
+    assert config["subcenters"] is None
+    assert config["compact_weight"] is None
+    assert config["compact_cap"] is None
+    assert config["supcon_temperature"] is None
+    assert config["seed"] == 42
+    assert config["optimizer_groups"] == "v080_prototype"
+    assert config["prototype_weight_decay"] == 0.0
+    assert config["initialization_checkpoint_sha256"] == ssl_sha
+    assert config["ssl_initialization_checkpoint_sha256"] == ssl_sha
+    assert config["train_manifest_sha256"] == _expected_manifest(tmp_path)
+
+    finetune_path = tmp_path / "provenance" / "finetune_latest.pth"
+    second = _run_frozen_finetune(tmp_path, finetune_path, "provenance2")
+    second_config = second["config"]
+    assert second_config["initialization_checkpoint_sha256"] == (
+        trainer._sha256_file(finetune_path)
+    )
+    assert second_config["ssl_initialization_checkpoint_sha256"] == ssl_sha
+
+
+def test_finetune_new_run_can_switch_loss_without_inheriting_classifier(tmp_path):
+    ssl = _write_pretrain_checkpoint(tmp_path / "ssl.pth", image_size=32, out_dim=16)
+
+    arcface_run = _run_frozen_finetune(tmp_path, ssl, "switch_arcface")
+    assert arcface_run["config"]["loss"] == "arcface"
+    assert "head.weight" in arcface_run["loss_state_dict"]
+    assert len(arcface_run["optimizer"]["param_groups"]) == 3
+
+    supcon_run = _run_frozen_finetune(
+        tmp_path,
+        tmp_path / "switch_arcface" / "finetune_latest.pth",
+        "switch_supcon",
+        loss="supcon",
+        supcon_temperature=0.1,
+        batch_size=4,
+    )
+
+    assert supcon_run["config"]["loss"] == "supcon"
+    # A direct Python caller has no explicit options, so the recorded value is
+    # the first-round default, not the unused argument above.
+    assert supcon_run["config"]["supcon_temperature"] == 0.07
+    assert supcon_run["config"]["subcenters"] is None
+    assert supcon_run["loss_state_dict"] == {}
+    assert len(supcon_run["optimizer"]["param_groups"]) == 2
+
+
+def test_build_finetune_loss_uses_effective_mode_kwargs():
+    from otuformer.training.loss import (
+        ArcFaceLoss,
+        SubCenterArcFaceLoss,
+        SupConLoss,
+    )
+
+    arcface = trainer._build_finetune_loss(
+        {
+            "loss": "arcface",
+            "subcenters": None,
+            "compact_weight": None,
+            "compact_cap": None,
+            "supcon_temperature": None,
+        },
+        8,
+        3,
+    )
+    assert isinstance(arcface, ArcFaceLoss)
+    assert tuple(arcface.head.weight.shape) == (3, 8)
+
+    supcon = trainer._build_finetune_loss(
+        {
+            "loss": "supcon",
+            "subcenters": None,
+            "compact_weight": None,
+            "compact_cap": None,
+            "supcon_temperature": 0.1,
+        },
+        8,
+        3,
+    )
+    assert isinstance(supcon, SupConLoss)
+    assert supcon.temperature == 0.1
+
+    subcenter = trainer._build_finetune_loss(
+        {
+            "loss": "subcenter-arcface",
+            "subcenters": 3,
+            "compact_weight": None,
+            "compact_cap": None,
+            "supcon_temperature": None,
+        },
+        8,
+        3,
+    )
+    assert isinstance(subcenter, SubCenterArcFaceLoss)
+    assert subcenter.head.k == 3
+    assert subcenter.compact_weight == 0.0
+
+    compact = trainer._build_finetune_loss(
+        {
+            "loss": "subcenter-arcface-compact",
+            "subcenters": 3,
+            "compact_weight": 0.25,
+            "compact_cap": 0.5,
+            "supcon_temperature": None,
+        },
+        8,
+        3,
+    )
+    assert isinstance(compact, SubCenterArcFaceLoss)
+    assert compact.head.k == 3
+    assert compact.compact_weight == 0.25
+    assert compact.cap == 0.5
+
+
+def test_compact_checkpoint_k_comes_from_recorded_subcenters():
+    trainer._validate_v080_loss_state(
+        {"loss": "subcenter-arcface-compact", "subcenters": 3},
+        {"head.weight": torch.zeros(4, 3, 16)},
+    )
+    with pytest.raises(ValueError, match="centers"):
+        trainer._validate_v080_loss_state(
+            {"loss": "subcenter-arcface-compact", "subcenters": 3},
+            {"head.weight": torch.zeros(4, 2, 16)},
+        )
+    # A compact checkpoint written before K was recorded still expects K=2.
+    trainer._validate_v080_loss_state(
+        {"loss": "subcenter-arcface-compact"},
+        {"head.weight": torch.zeros(4, 2, 16)},
+    )
+
+
+def test_finetune_resume_rejects_ssl_and_head_only_sources(tmp_path):
+    ssl = _write_pretrain_checkpoint(tmp_path / "ssl.pth", image_size=32, out_dim=16)
+    real_ssl = tmp_path / "SSL_latest.pth"
+    torch.save(
+        {
+            "model_state_dict": _ssl_like_state(),
+            "optimizer": {"state": {}, "param_groups": [{}]},
+            "epoch": 3,
+            "args": {"model_name": "m"},
+            "config": {"model_name": "m", "out_dim": 16},
+        },
+        real_ssl,
+    )
+    head_only = tmp_path / "head_only.pth"
+    torch.save(
+        {
+            "model_state_dict": _ssl_like_state(),
+            "config": {"embedding_head": "arcface_mlp_512", "out_dim": 16},
+        },
+        head_only,
+    )
+
+    for index, source in enumerate((ssl, real_ssl, head_only)):
+        args = _finetune_args(
+            tmp_path,
+            source,
+            resume=str(source),
+            finetune_epochs=2,
+            **_finetune_overrides(tmp_path, f"resume_{index}"),
+        )
+        with pytest.raises(ValueError, match="SSL"):
+            trainer.run_finetune(args)
+
+
+# --- one epoch per loss mode, skips, diagnostics and traces ----------------
+
+_LOSS_MODES = (
+    "arcface",
+    "supcon",
+    "subcenter-arcface",
+    "subcenter-arcface-compact",
+)
+
+
+def _run_loss_mode_epoch(tmp_path, mode, out_name, **extra):
+    ssl = _write_pretrain_checkpoint(
+        tmp_path / f"ssl_{mode}.pth", image_size=32, out_dim=16
+    )
+    args = _finetune_args(
+        tmp_path,
+        ssl,
+        finetune_epochs=1,
+        loss=mode,
+        **_finetune_overrides(
+            tmp_path,
+            out_name,
+            batch_size=4,
+            # Frozen optimizer: the saved head is exactly the head that was
+            # loaded, so the resume test can assert it was not re-initialized.
+            finetune_lr=0.0,
+            metric_head_lr=0.0,
+            weight_decay=0.0,
+            **extra,
+        ),
+    )
+    trainer.run_finetune(args)
+    return torch.load(
+        tmp_path / out_name / "finetune_latest.pth",
+        map_location="cpu",
+        weights_only=False,
+    )
+
+
+@pytest.mark.parametrize("mode", _LOSS_MODES)
+def test_finetune_one_epoch_then_resume_for_each_loss_mode(tmp_path, mode, capsys):
+    import otuformer.embedding.extractor as extractor
+
+    saved = _run_loss_mode_epoch(tmp_path, mode, f"one_{mode}")
+    expected_groups = 2 if mode == "supcon" else 3
+    assert saved["config"]["loss"] == mode
+    assert len(saved["optimizer"]["param_groups"]) == expected_groups
+    if mode == "supcon":
+        assert saved["loss_state_dict"] == {}
+    else:
+        assert "head.weight" in saved["loss_state_dict"]
+
+    out_dir = tmp_path / f"one_{mode}"
+    diagnostics = pd.read_csv(out_dir / "logs" / "loss_diagnostics.finetune.csv")
+    assert len(diagnostics) == 1
+    assert diagnostics.loc[0, "mode"] == mode
+
+    # Training-only loss state is ignored by the read-only consumer.
+    model, _ = extractor._load_model(
+        out_dir / "finetune_latest.pth", "vit_tiny_patch16_224", torch.device("cpu")
+    )
+    assert model.backbone.num_features > 0
+
+    resume_args = _finetune_args(
+        tmp_path,
+        tmp_path / f"ssl_{mode}.pth",
+        resume=str(out_dir / "finetune_latest.pth"),
+        finetune_epochs=2,
+        loss=mode,
+        **_finetune_overrides(
+            tmp_path,
+            f"two_{mode}",
+            batch_size=4,
+            finetune_lr=0.0,
+            metric_head_lr=0.0,
+            weight_decay=0.0,
+        ),
+    )
+    trainer.run_finetune(resume_args)
+    # The SupCon-only batch/anchor line must not clutter the other modes.
+    epoch_log = capsys.readouterr().out
+    if mode == "supcon":
+        assert "valid_anchors=" in epoch_log
+    else:
+        assert "valid_anchors=" not in epoch_log
+    resumed = torch.load(
+        tmp_path / f"two_{mode}" / "finetune_latest.pth",
+        map_location="cpu",
+        weights_only=False,
+    )
+
+    assert resumed["epoch"] == 1
+    assert len(resumed["optimizer"]["param_groups"]) == expected_groups
+    if mode != "supcon":
+        # Resuming never re-initializes the trained classifier.
+        assert torch.equal(
+            resumed["loss_state_dict"]["head.weight"],
+            saved["loss_state_dict"]["head.weight"],
+        )
+    resumed_diagnostics = pd.read_csv(
+        tmp_path / f"two_{mode}" / "logs" / "loss_diagnostics.finetune.csv"
+    )
+    assert len(resumed_diagnostics) == 1
+    assert resumed_diagnostics.loc[0, "mode"] == mode
+
+
+def test_finetune_supcon_epoch_without_negatives_fails_without_checkpoint(tmp_path):
+    ssl = _write_pretrain_checkpoint(tmp_path / "ssl.pth", image_size=32, out_dim=16)
+    img_dir = tmp_path / "single_images"
+    img_dir.mkdir()
+    for i in range(4):
+        Image.new("RGB", (64, 64), color=(i * 40, 0, 0)).save(
+            img_dir / f"img_{i}.jpg"
+        )
+    labels_path = tmp_path / "one_class.csv"
+    pd.DataFrame(
+        {
+            "image": [f"img_{i}.jpg" for i in range(4)],
+            "label": ["classA"] * 4,
+        }
+    ).to_csv(labels_path, index=False)
+
+    args = _finetune_args(
+        tmp_path,
+        ssl,
+        finetune_epochs=1,
+        loss="supcon",
+        out_dir=str(tmp_path / "one_class_out"),
+        train_data=str(labels_path),
+        input_images_dir=str(img_dir),
+        batch_size=4,
+        num_workers=0,
+        log_every_n_steps=100,
+        save_every_epochs=1,
+        keep_last_checkpoints=0,
+        weight_decay=1e-4,
+        metric_head_lr=None,
+    )
+
+    with pytest.raises(ValueError, match="usable"):
+        trainer.run_finetune(args)
+
+    assert not (tmp_path / "one_class_out" / "finetune_latest.pth").exists()
+
+
+def _write_legacy_finetune_checkpoint(path, *, groups: int):
+    """A pre-v0.8.0 finetune checkpoint with a historical optimizer layout.
+
+    One or two parameter groups, both with nonzero prototype decay, exactly as
+    the pre-v0.8.0 constructors produced them.
+    """
+    from otuformer.training.loss import ArcFaceLoss
+    from otuformer.training.model import OTUFormerEncoder
+
+    _write_historical_sft_checkpoint(path, image_size=32, out_dim=16)
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    checkpoint["config"]["embedding_head"] = "projection_mlp_2048"
+    encoder = OTUFormerEncoder(
+        model_name="vit_tiny_patch16_224", out_dim=16, pretrained=False, img_size=32
+    )
+    loss = ArcFaceLoss(embed_dim=16, num_classes=2)
+    trainer._freeze_backbone_blocks(encoder, 0.7)
+    if groups == 1:
+        optimizer = torch.optim.AdamW(
+            [p for p in encoder.parameters() if p.requires_grad]
+            + list(loss.parameters()),
+            lr=3e-5,
+            weight_decay=1e-4,
+        )
+    else:
+        optimizer = torch.optim.AdamW(
+            [
+                {
+                    "params": [
+                        p for p in encoder.backbone.parameters() if p.requires_grad
+                    ],
+                    "lr": 3e-5,
+                    "weight_decay": 1e-4,
+                },
+                {
+                    "params": list(encoder.projector.parameters())
+                    + list(loss.parameters()),
+                    "lr": 1e-4,
+                    "weight_decay": 1e-4,
+                },
+            ]
+        )
+    checkpoint["optimizer"] = optimizer.state_dict()
+    checkpoint["epoch"] = 0
+    torch.save(checkpoint, path)
+    return path
+
+
+@pytest.mark.parametrize(
+    ("groups", "expected_lrs", "expected_decays"),
+    [(1, [3e-5], [1e-4]), (2, [3e-5, 1e-4], [1e-4, 1e-4])],
+)
+def test_finetune_legacy_resume_keeps_historical_layout(
+    tmp_path, groups, expected_lrs, expected_decays
+):
+    """Review Focus 3: a genuine pre-v0.8.0 resume keeps its own optimizer."""
+    source = _write_legacy_finetune_checkpoint(
+        tmp_path / f"legacy_{groups}.pth", groups=groups
+    )
+    out_name = f"legacy_resume_{groups}"
+    args = _finetune_args(
+        tmp_path,
+        source,
+        resume=str(source),
+        finetune_epochs=2,
+        **_finetune_overrides(tmp_path, out_name, batch_size=4),
+    )
+
+    trainer.run_finetune(args)
+
+    resumed = torch.load(
+        tmp_path / out_name / "finetune_latest.pth",
+        map_location="cpu",
+        weights_only=False,
+    )
+    assert len(resumed["optimizer"]["param_groups"]) == groups
+    # The historical decay and learning rates survive; the v0.8.0 zero-decay
+    # prototype rule is never imposed on a legacy resume.
+    assert [g["lr"] for g in resumed["optimizer"]["param_groups"]] == expected_lrs
+    assert [
+        g["weight_decay"] for g in resumed["optimizer"]["param_groups"]
+    ] == expected_decays
+    assert resumed["config"]["loss"] == "arcface"
+
+
+def test_run_finetune_uses_a_preloaded_resume_checkpoint(tmp_path, monkeypatch):
+    """The CLI preflight's read must not be repeated inside run_finetune."""
+    source = _write_legacy_finetune_checkpoint(tmp_path / "preloaded.pth", groups=2)
+    preloaded = torch.load(source, map_location="cpu", weights_only=False)
+
+    def fail(*_args, **_kwargs):
+        raise AssertionError("resume checkpoint was loaded a second time")
+
+    monkeypatch.setattr(trainer, "load_checkpoint", fail)
+    args = _finetune_args(
+        tmp_path,
+        source,
+        resume=str(source),
+        finetune_epochs=2,
+        **_finetune_overrides(tmp_path, "preloaded_resume", batch_size=4),
+    )
+
+    trainer.run_finetune(args, source_checkpoint=preloaded)
+
+    assert (tmp_path / "preloaded_resume" / "finetune_latest.pth").exists()
+
+
+def test_center_direction_cosine_uses_post_epoch_boundaries(tmp_path):
+    """The recorded cosine must compare consecutive post-epoch snapshots."""
+    torch.manual_seed(0)
+    ssl = _write_pretrain_checkpoint(tmp_path / "ssl.pth", image_size=32, out_dim=16)
+    args = _finetune_args(
+        tmp_path,
+        ssl,
+        finetune_epochs=2,
+        loss="subcenter-arcface-compact",
+        **_finetune_overrides(tmp_path, "post_epoch", batch_size=4),
+    )
+
+    trainer.run_finetune(args)
+
+    diagnostics = pd.read_csv(
+        tmp_path / "post_epoch" / "logs" / "loss_diagnostics.finetune.csv"
+    )
+    assert pd.isna(diagnostics.loc[0, "center_direction_cosine"])
+
+    def saved_centers(name):
+        state = torch.load(
+            tmp_path / "post_epoch" / name, map_location="cpu", weights_only=False
+        )
+        return torch.nn.functional.normalize(
+            state["loss_state_dict"]["head.weight"], dim=-1
+        )
+
+    expected = trainer._center_direction_cosine(
+        saved_centers("finetune_epoch_0001.pth"),
+        saved_centers("finetune_epoch_0002.pth"),
+    )
+    recorded = json.loads(diagnostics.loc[1, "center_direction_cosine"])
+    assert [value for row in recorded for value in row] == pytest.approx(
+        [value for row in expected for value in row]
+    )
+
+
+def test_batch_id_trace_appends_on_resume_into_the_same_output_dir(tmp_path):
+    ssl = _write_pretrain_checkpoint(tmp_path / "ssl.pth", image_size=32, out_dim=16)
+    first = _finetune_args(
+        tmp_path,
+        ssl,
+        finetune_epochs=1,
+        trace_batch_ids=True,
+        **_finetune_overrides(tmp_path, "trace_resume", batch_size=4),
+    )
+    trainer.run_finetune(first)
+    trace_path = tmp_path / "trace_resume" / "logs" / "batch_ids.finetune.jsonl"
+    first_lines = trace_path.read_text(encoding="utf-8").splitlines()
+    assert first_lines
+
+    resume = _finetune_args(
+        tmp_path,
+        ssl,
+        resume=str(tmp_path / "trace_resume" / "finetune_latest.pth"),
+        finetune_epochs=2,
+        trace_batch_ids=True,
+        **_finetune_overrides(tmp_path, "trace_resume", batch_size=4),
+    )
+    trainer.run_finetune(resume)
+
+    records = [
+        json.loads(line)
+        for line in trace_path.read_text(encoding="utf-8").splitlines()
+    ]
+    # The resume appended to the existing trace instead of truncating it.
+    assert len(records) == len(first_lines) + 1
+    assert [record["epoch"] for record in records] == [0, 1]
+
+
+def test_finetune_legacy_resume_twice_keeps_the_recorded_layout(tmp_path):
+    """A legacy resume's own checkpoint stays resumable with its 2-group layout."""
+    source = _write_legacy_finetune_checkpoint(tmp_path / "legacy_twice.pth", groups=2)
+    first_args = _finetune_args(
+        tmp_path,
+        source,
+        resume=str(source),
+        finetune_epochs=2,
+        **_finetune_overrides(tmp_path, "legacy_twice_1", batch_size=4),
+    )
+    trainer.run_finetune(first_args)
+    first_path = tmp_path / "legacy_twice_1" / "finetune_latest.pth"
+    first = torch.load(first_path, map_location="cpu", weights_only=False)
+    assert first["config"]["loss"] == "arcface"
+    assert first["config"]["optimizer_groups"] == "legacy_split"
+    assert len(first["optimizer"]["param_groups"]) == 2
+
+    second_args = _finetune_args(
+        tmp_path,
+        source,
+        resume=str(first_path),
+        finetune_epochs=3,
+        **_finetune_overrides(tmp_path, "legacy_twice_2", batch_size=4),
+    )
+    trainer.run_finetune(second_args)
+    second = torch.load(
+        tmp_path / "legacy_twice_2" / "finetune_latest.pth",
+        map_location="cpu",
+        weights_only=False,
+    )
+
+    assert second["config"]["optimizer_groups"] == "legacy_split"
+    assert len(second["optimizer"]["param_groups"]) == 2
+    assert [
+        g["weight_decay"] for g in second["optimizer"]["param_groups"]
+    ] == [1e-4, 1e-4]
+
+
+def test_center_direction_cosine_continues_across_a_resume(tmp_path):
+    """The first continued epoch must compare against the checkpoint centers."""
+    out_name = "continued_cosine"
+    ssl = _write_pretrain_checkpoint(tmp_path / "ssl.pth", image_size=32, out_dim=16)
+    first = _finetune_args(
+        tmp_path,
+        ssl,
+        finetune_epochs=1,
+        loss="subcenter-arcface-compact",
+        **_finetune_overrides(tmp_path, out_name, batch_size=4),
+    )
+    trainer.run_finetune(first)
+
+    resume = _finetune_args(
+        tmp_path,
+        ssl,
+        resume=str(tmp_path / out_name / "finetune_latest.pth"),
+        finetune_epochs=2,
+        loss="subcenter-arcface-compact",
+        **_finetune_overrides(tmp_path, out_name, batch_size=4),
+    )
+    trainer.run_finetune(resume)
+
+    diagnostics = pd.read_csv(
+        tmp_path / out_name / "logs" / "loss_diagnostics.finetune.csv"
+    )
+    assert list(diagnostics["epoch"]) == [0, 1]
+    assert pd.isna(diagnostics.loc[0, "center_direction_cosine"])
+
+    def saved_centers(name):
+        state = torch.load(
+            tmp_path / out_name / name, map_location="cpu", weights_only=False
+        )
+        return torch.nn.functional.normalize(
+            state["loss_state_dict"]["head.weight"], dim=-1
+        )
+
+    expected = trainer._center_direction_cosine(
+        saved_centers("finetune_epoch_0001.pth"),
+        saved_centers("finetune_epoch_0002.pth"),
+    )
+    recorded = json.loads(diagnostics.loc[1, "center_direction_cosine"])
+    assert [value for row in recorded for value in row] == pytest.approx(
+        [value for row in expected for value in row]
+    )
+
+
+def test_finetune_rejects_a_partial_encoder_source(tmp_path):
+    """A source with only a few backbone keys must not train a random encoder."""
+    source = tmp_path / "partial.pth"
+    torch.save(
+        {
+            "model_state_dict": {"backbone.cls_token": torch.zeros(1, 1, 192)},
+            "config": {
+                "model_name": "vit_tiny_patch16_224",
+                "out_dim": 16,
+                "image_size": 32,
+            },
+        },
+        source,
+    )
+    args = _finetune_args(
+        tmp_path,
+        source,
+        finetune_epochs=1,
+        **_finetune_overrides(tmp_path, "partial_source", batch_size=4),
+    )
+
+    with pytest.raises(ValueError, match="encoder weights"):
+        trainer.run_finetune(args)
+
+
+def test_finetune_resume_rejects_a_source_without_projector_weights(tmp_path):
+    """--resume must restore the trained projector, never re-initialize it."""
+    saved = _run_loss_mode_epoch(tmp_path, "arcface", "no_projector_src")
+    source = tmp_path / "no_projector.pth"
+    saved["model_state_dict"] = {
+        key: value
+        for key, value in saved["model_state_dict"].items()
+        if not key.startswith("projector.")
+    }
+    torch.save(saved, source)
+
+    args = _finetune_args(
+        tmp_path,
+        source,
+        resume=str(source),
+        finetune_epochs=2,
+        **_finetune_overrides(tmp_path, "no_projector_resume", batch_size=4),
+    )
+
+    with pytest.raises(ValueError, match="encoder weights"):
+        trainer.run_finetune(args)
+
+
+def test_finetune_resume_rejects_a_partially_populated_backbone(tmp_path):
+    """A state dict missing backbone parameters must not train a random encoder."""
+    saved = _run_loss_mode_epoch(tmp_path, "arcface", "partial_backbone_src")
+    source = tmp_path / "partial_backbone.pth"
+    dropped = set(
+        sorted(k for k in saved["model_state_dict"] if k.startswith("backbone."))[:2]
+    )
+    saved["model_state_dict"] = {
+        key: value
+        for key, value in saved["model_state_dict"].items()
+        if key not in dropped
+    }
+    torch.save(saved, source)
+
+    args = _finetune_args(
+        tmp_path,
+        source,
+        resume=str(source),
+        finetune_epochs=2,
+        **_finetune_overrides(tmp_path, "partial_backbone_resume", batch_size=4),
+    )
+
+    with pytest.raises(ValueError, match="complete encoder weights"):
+        trainer.run_finetune(args)
+
+
+def test_finetune_rejects_a_declared_head_without_projector_weights(tmp_path):
+    """A declared matching head must still come with its trained projector."""
+    ssl = _write_pretrain_checkpoint(tmp_path / "ssl.pth", image_size=32, out_dim=16)
+    state = torch.load(ssl, map_location="cpu", weights_only=False)
+    state["model_state_dict"] = {
+        key: value
+        for key, value in state["model_state_dict"].items()
+        if not key.startswith("projector.")
+    }
+    state["config"]["embedding_head"] = "arcface_mlp_512"
+    source = tmp_path / "declared_head_no_projector.pth"
+    torch.save(state, source)
+
+    args = _finetune_args(
+        tmp_path,
+        source,
+        finetune_epochs=1,
+        **_finetune_overrides(tmp_path, "declared_head_src", batch_size=4),
+    )
+
+    with pytest.raises(ValueError, match="encoder weights"):
+        trainer.run_finetune(args)
+
+
+def test_loss_diagnostics_counts_local_and_global_winners_differently():
+    from otuformer.training.loss import SubCenterArcFaceLoss
+
+    loss = SubCenterArcFaceLoss(embed_dim=4, num_classes=2, k=2)
+    with torch.no_grad():
+        # Target-local winner is class 0 / center 0; the globally winning
+        # class-center is class 1 / center 0.
+        loss.head.weight[0, 0] = torch.tensor([0.99, 0.14, 0.0, 0.0])
+        loss.head.weight[0, 1] = torch.tensor([0.0, 1.0, 0.0, 0.0])
+        loss.head.weight[1, 0] = torch.tensor([1.0, 0.0, 0.0, 0.0])
+        loss.head.weight[1, 1] = torch.tensor([0.0, 0.0, 1.0, 0.0])
+
+    counts = trainer._empty_loss_diagnostic_counts(2, 2)
+    trainer._accumulate_loss_diagnostics(
+        counts, loss, torch.tensor([[1.0, 0.0, 0.0, 0.0]]), torch.tensor([0])
+    )
+
+    assert counts["local"] == [[1, 0], [0, 0]]
+    assert counts["global"] == [[0, 0], [1, 0]]
+    assert counts["samples"] == 1
+
+
+def test_loss_diagnostics_margin_hits_use_margin_adjusted_target_logit():
+    from otuformer.training.loss import ArcFaceLoss
+
+    loss = ArcFaceLoss(embed_dim=4, num_classes=2)
+    with torch.no_grad():
+        loss.head.weight[0] = torch.tensor([1.0, 0.0, 0.0, 0.0])
+        loss.head.weight[1] = torch.tensor([-1.0, 0.0, 0.0, 0.0])
+
+    counts = trainer._empty_loss_diagnostic_counts(2, 1)
+    trainer._accumulate_loss_diagnostics(
+        counts,
+        loss,
+        torch.tensor([[1.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]]),
+        torch.tensor([0, 1]),
+    )
+
+    # Only the sample whose margin-adjusted target logit beats the best rival.
+    assert counts["margin_hits"] == 1
+    assert counts["samples"] == 2
+
+
+def test_loss_diagnostics_compact_hinge_stats_match_prescribed_centers():
+    from otuformer.training.loss import ArcFaceLoss, SubCenterArcFaceLoss
+
+    loss = SubCenterArcFaceLoss(
+        embed_dim=4, num_classes=2, k=2, compact_weight=0.1, cap=0.5
+    )
+    with torch.no_grad():
+        loss.head.weight[0, 0] = torch.tensor([1.0, 0.0, 0.0, 0.0])
+        loss.head.weight[0, 1] = torch.tensor([0.7, math.sqrt(1 - 0.49), 0.0, 0.0])
+        loss.head.weight[1, 0] = torch.tensor([0.0, 1.0, 0.0, 0.0])
+        loss.head.weight[1, 1] = torch.tensor([math.sqrt(1 - 0.01), 0.1, 0.0, 0.0])
+
+    fraction, mean_penalty = trainer._compact_hinge_stats(loss)
+
+    assert fraction == pytest.approx(0.5)
+    assert mean_penalty == pytest.approx(0.1 * 0.4 / 2)
+    assert trainer._compact_hinge_stats(ArcFaceLoss(embed_dim=4, num_classes=2)) == (
+        None,
+        None,
+    )
+
+
+def test_center_direction_cosine_is_empty_before_the_second_epoch():
+    from otuformer.training.loss import ArcFaceLoss, SupConLoss
+
+    loss = ArcFaceLoss(embed_dim=4, num_classes=2)
+    first = trainer._prototype_centers(loss)
+    assert first is not None
+    assert trainer._center_direction_cosine(None, first) == []
+
+    with torch.no_grad():
+        loss.head.weight.mul_(2.0)
+    second = trainer._prototype_centers(loss)
+    scaled = trainer._center_direction_cosine(first, second)
+    assert scaled[0][0] == pytest.approx(1.0)
+    assert scaled[1][0] == pytest.approx(1.0)
+
+    with torch.no_grad():
+        loss.head.weight[0].neg_()
+    third = trainer._prototype_centers(loss)
+    cosines = trainer._center_direction_cosine(second, third)
+    assert cosines[0][0] == pytest.approx(-1.0)
+    assert cosines[1][0] == pytest.approx(1.0)
+
+    assert trainer._prototype_centers(SupConLoss(temperature=0.07)) is None
+
+
+def test_loss_diagnostics_logger_creates_the_file_and_rejects_unknown_schema(
+    tmp_path,
+):
+    path = tmp_path / "nested" / "loss_diagnostics.finetune.csv"
+    logger = trainer.LossDiagnosticsLogger(path)
+    logger.log(epoch=0, mode="arcface", usable_batches=2)
+
+    text = path.read_text(encoding="utf-8")
+    assert text.splitlines()[0] == ",".join(trainer._LOSS_DIAGNOSTIC_FIELDS)
+    assert "arcface" in text
+
+    broken = tmp_path / "broken.csv"
+    broken.write_text("a,b\n1,2\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="schema"):
+        trainer.LossDiagnosticsLogger(broken)
+    assert broken.read_text(encoding="utf-8") == "a,b\n1,2\n"
+
+
+def test_indexed_dataset_emits_the_actual_dataset_index(tmp_path):
+    from torch.utils.data import DataLoader
+
+    from otuformer.training.dataset import IndexedDataset, MetricDataset
+
+    img_dir, labels_path = _write_tiny_ft_data(tmp_path)
+    dataset = MetricDataset(csv_path=labels_path, images_dir=img_dir, image_size=32)
+    assert dataset.image_refs == [f"img_{i}.jpg" for i in range(4)]
+
+    loader = DataLoader(
+        IndexedDataset(dataset), batch_size=2, shuffle=True, num_workers=0
+    )
+    seen = []
+    for _images, _labels, indices in loader:
+        seen.extend(indices.tolist())
+
+    assert sorted(seen) == [0, 1, 2, 3]
+
+
+def test_batch_id_trace_is_off_by_default_and_follows_shuffled_order(tmp_path):
+    _run_loss_mode_epoch(tmp_path, "arcface", "trace_off")
+    assert not (
+        tmp_path / "trace_off" / "logs" / "batch_ids.finetune.jsonl"
+    ).exists()
+
+    _run_loss_mode_epoch(tmp_path, "arcface", "trace_on", trace_batch_ids=True)
+    lines = (
+        tmp_path / "trace_on" / "logs" / "batch_ids.finetune.jsonl"
+    ).read_text(encoding="utf-8").splitlines()
+
+    assert lines
+    for line in lines:
+        record = json.loads(line)
+        assert set(record) == {"epoch", "step", "indices", "refs"}
+        assert sorted(record["indices"]) != []
+        assert record["refs"] == [f"img_{i}.jpg" for i in record["indices"]]
+    seen = [index for line in lines for index in json.loads(line)["indices"]]
+    assert sorted(seen) == [0, 1, 2, 3]

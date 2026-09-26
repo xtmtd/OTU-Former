@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import math
+import os
 import random
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import torch
@@ -19,6 +21,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+from otuformer.constants import MAX_SUBCENTERS, MIN_SUBCENTERS
 from otuformer.embedding.evaluator import (
     compute_clustering_metrics,
     compute_knn_accuracy,
@@ -31,6 +34,7 @@ from otuformer.training.dataset import (
     FINETUNE_AUGMENTATIONS,
     ORIENTATION_POLICIES,
     PRETRAIN_AUGMENTATIONS,
+    IndexedDataset,
     MetricDataset,
     MultiCropDataset,
     _build_recursive_index,
@@ -43,6 +47,8 @@ from otuformer.training.dataset import (
 from otuformer.training.loss import (
     ArcFaceLoss,
     LOSS_REGISTRY,
+    SubCenterArcFaceLoss,
+    SupConLoss,
     ibot_patch_loss,
     masked_patch_cosine_loss,
 )
@@ -1149,7 +1155,10 @@ class InstantMetricsLogger:
                 label="Learning Rate",
                 color="tab:red",
             )
-            ax_twin.set_yscale("log")
+            # An all-zero LR (for example a frozen-optimizer test run) has no
+            # positive values, and matplotlib warns when log-scaling it.
+            if (df_instant["lr"] > 0).any():
+                ax_twin.set_yscale("log")
             ax_twin.set_ylabel("Learning Rate", color="tab:red")
             ax_twin.tick_params(axis="y", labelcolor="tab:red")
             fourth_panel_has_data = True
@@ -2539,20 +2548,342 @@ def _validate_finetune_resume(
         print("[Warning] Resume checkpoint lacks class labels; validating class count only.")
 
 
-def _select_finetune_embedding_head(checkpoint: dict[str, Any]) -> str:
-    config_head = checkpoint.get("config", {}).get("embedding_head")
-    if config_head:
-        return config_head
-    if "loss_state_dict" in checkpoint:
-        return PROJECTION_EMBEDDING_HEAD
-    if "loss_func" in checkpoint or "model" in checkpoint:
+_MISSING = object()
+_PROJECTOR_FIRST_LINEAR_KEYS = ("projector.net.0.weight", "projector.0.weight")
+_ENCODER_STATE_PREFIXES = ("backbone.", "projector.")
+
+
+def _has_encoder_weights(state: object) -> bool:
+    """True when ``state`` carries at least one recognizable encoder parameter."""
+    return isinstance(state, dict) and any(
+        str(key).startswith(_ENCODER_STATE_PREFIXES) for key in state
+    )
+
+_LOSS_DIAGNOSTIC_FIELDS = (
+    "epoch",
+    "mode",
+    "usable_batches",
+    "skipped_batches",
+    "valid_anchors",
+    "margin_satisfied_fraction",
+    "compact_hinge_fraction",
+    "compact_mean_penalty",
+    "local_assignments",
+    "argmax_hits",
+    "center_direction_cosine",
+)
+
+
+class LossDiagnosticsLogger:
+    """Append-only per-epoch v0.8.0 loss diagnostics with a fixed schema."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if self.path.exists() and self.path.stat().st_size > 0:
+            with self.path.open("r", newline="", encoding="utf-8") as handle:
+                header = next(csv.reader(handle), None)
+            if header != list(_LOSS_DIAGNOSTIC_FIELDS):
+                raise ValueError(
+                    f"Unrecognized loss-diagnostics schema in {self.path}: "
+                    f"{header}. Refusing to append. Move or remove the file to "
+                    "start a new log."
+                )
+            return
+        with self.path.open("w", newline="", encoding="utf-8") as handle:
+            csv.DictWriter(handle, fieldnames=_LOSS_DIAGNOSTIC_FIELDS).writeheader()
+
+    def log(self, **fields: object) -> None:
+        row = {name: fields.get(name, "") for name in _LOSS_DIAGNOSTIC_FIELDS}
+        with self.path.open("a", newline="", encoding="utf-8") as handle:
+            csv.DictWriter(handle, fieldnames=_LOSS_DIAGNOSTIC_FIELDS).writerow(row)
+
+
+class BatchIdTraceLogger:
+    """Opt-in JSON-lines trace of each training batch's indices and image refs."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if not self.path.exists():
+            # Appending on resume matches LossDiagnosticsLogger: an existing
+            # trace is extended, never truncated.
+            self.path.write_text("", encoding="utf-8")
+
+    def log(self, *, epoch: int, step: int, indices, refs) -> None:
+        record = {
+            "epoch": int(epoch),
+            "step": int(step),
+            "indices": [int(index) for index in indices],
+            "refs": [str(ref) for ref in refs],
+        }
+        with self.path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def _prototype_centers(loss_fn: nn.Module) -> torch.Tensor | None:
+    """Detached L2-normalized ``(C, K, D)`` prototypes, or ``None`` if none.
+
+    Ordinary ArcFace stores one center per class, so its ``(C, D)`` weight is
+    returned as ``(C, 1, D)`` to keep every consumer on one shape.
+    """
+    weight = getattr(getattr(loss_fn, "head", None), "weight", None)
+    if weight is None:
+        return None
+    centers = F.normalize(weight.detach(), dim=-1).clone()
+    return centers.unsqueeze(1) if centers.ndim == 2 else centers
+
+
+def _prototype_k(loss_fn: nn.Module) -> int:
+    """Number of centers per class, for sizing the diagnostic counters."""
+    centers = _prototype_centers(loss_fn)
+    return int(centers.shape[1]) if centers is not None else 1
+
+
+def _empty_loss_diagnostic_counts(num_classes: int, k: int) -> dict[str, object]:
+    return {
+        "local": [[0] * k for _ in range(num_classes)],
+        "global": [[0] * k for _ in range(num_classes)],
+        "margin_hits": 0,
+        "samples": 0,
+    }
+
+
+@torch.no_grad()
+def _accumulate_loss_diagnostics(
+    counts: dict[str, object],
+    loss_fn: nn.Module,
+    embeddings: torch.Tensor,
+    labels: torch.Tensor,
+) -> None:
+    """Accumulate detached assignment and margin counts for one batch.
+
+    A local winner is the closest center of the sample's own class; a global
+    winner is the closest center of any class. The two counts are separate
+    states, and the margin fraction compares the margin-adjusted target logit
+    against the best rival logit rather than the ArcFace threshold branch.
+    """
+    centers = _prototype_centers(loss_fn)
+    if centers is None:
+        return
+    num_classes, k, _ = centers.shape
+    features = F.normalize(embeddings.detach(), dim=-1)
+    cosine = (features @ centers.reshape(-1, centers.shape[-1]).T).reshape(
+        features.shape[0], num_classes, k
+    )
+    rows = torch.arange(features.shape[0], device=features.device)
+    global_winners = cosine.reshape(features.shape[0], -1).argmax(dim=1)
+    local_winners = cosine[rows, labels].argmax(dim=1)
+    for row in range(features.shape[0]):
+        winner = int(global_winners[row])
+        counts["global"][winner // k][winner % k] += 1
+        counts["local"][int(labels[row])][int(local_winners[row])] += 1
+    if num_classes >= 2:
+        logits = loss_fn.head(embeddings.detach(), labels)
+        target = logits.gather(1, labels[:, None]).squeeze(1)
+        one_hot = F.one_hot(labels, num_classes).bool()
+        rival = logits.masked_fill(one_hot, float("-inf")).max(dim=1).values
+        counts["margin_hits"] += int((target > rival).sum())
+    counts["samples"] += int(features.shape[0])
+
+
+@torch.no_grad()
+def _compact_hinge_stats(loss_fn: nn.Module) -> tuple[float | None, float | None]:
+    """Same-class center-pair hinge activation and mean weighted penalty."""
+    centers = _prototype_centers(loss_fn)
+    weight = float(getattr(loss_fn, "compact_weight", 0.0))
+    cap = getattr(loss_fn, "cap", None)
+    if centers is None or weight == 0.0 or cap is None or centers.shape[1] < 2:
+        return (None, None)
+    penalties: list[float] = []
+    for i in range(centers.shape[1]):
+        for j in range(i + 1, centers.shape[1]):
+            distance = 1.0 - (centers[:, i] * centers[:, j]).sum(dim=-1)
+            penalties.extend(F.relu(distance - float(cap)).tolist())
+    if not penalties:
+        return (None, None)
+    fraction = sum(1 for value in penalties if value > 0.0) / len(penalties)
+    return (fraction, weight * (sum(penalties) / len(penalties)))
+
+
+def _center_direction_cosine(
+    previous: torch.Tensor | None, current: torch.Tensor | None
+) -> list[list[float]]:
+    """Per-center cosine between two post-epoch normalized center snapshots."""
+    if previous is None or current is None:
+        return []
+    cosine = (previous * current).sum(dim=-1).clamp(-1.0, 1.0)
+    return [[float(value) for value in row] for row in cosine]
+
+
+def _sha256_file(path: Path) -> str:
+    """SHA-256 of a checkpoint's bytes, read in chunks."""
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _canonical_image_ref(ref: object, images_root: Path) -> str:
+    """Canonical POSIX reference relative to ``input_images_dir``.
+
+    Relative references are normalized lexically and never resolved through the
+    filesystem, so a recursively discovered image path does not change the
+    manifest hash. An absolute reference must stay inside the image root.
+    """
+    text = str(ref)
+    path = Path(text)
+    if path.is_absolute():
+        root = images_root.resolve()
+        resolved = path.resolve()
+        if resolved != root and root not in resolved.parents:
+            raise ValueError(
+                f"Manifest image reference escapes --input-images-dir: {text}"
+            )
+        return resolved.relative_to(root).as_posix()
+    return Path(os.path.normpath(text)).as_posix()
+
+
+def _train_manifest_sha256(
+    image_refs: object, label_names: object, images_root: Path
+) -> str:
+    """SHA-256 of the canonical ``[image_ref, label]`` training manifest.
+
+    Duplicate rows are preserved and rows are sorted, so the hash covers which
+    images and labels were listed rather than their CSV order.
+    """
+    rows = sorted(
+        [_canonical_image_ref(ref, images_root), str(label)]
+        for ref, label in zip(image_refs, label_names)
+    )
+    payload = json.dumps(rows, ensure_ascii=False, separators=(",", ":")).encode(
+        "utf-8"
+    )
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _classify_finetune_source(checkpoint: dict[str, Any]) -> str:
+    """Classify a finetune source per the v0.8.0 checkpoint decision table.
+
+    Loss metadata and embedding-head metadata are independent: ``config.loss``
+    selects the loss, ``config.embedding_head`` selects the head, and a
+    present-but-empty ``loss_state_dict`` is never the same as an absent one.
+    An SSL source additionally needs real encoder weights, so a checkpoint with
+    neither loss metadata nor a non-empty ``model_state_dict`` is rejected
+    instead of being mistaken for SSL initialization.
+    Returns ``ssl``, ``v080``, ``legacy_arcface`` or ``head_only``; ambiguous
+    or ref-script sources raise, because guessing a head or a loss from them is
+    exactly what the v0.8.0 contract forbids.
+    """
+    if (
+        "loss_func" in checkpoint
+        or "model" in checkpoint
+        or ("args" in checkpoint and "config" not in checkpoint)
+    ):
         raise ValueError(
             "Unsupported legacy fine-tune checkpoint format: expected "
             "'model_state_dict' and 'loss_state_dict'. Ref-script checkpoints "
-            "('model' + 'loss_func') can be read by extract/export/cam but not "
-            "resumed by finetune."
+            "('model'/'loss_func', or 'args' without 'config') can be read by "
+            "extract/export/cam but not resumed by finetune."
         )
-    return ARCFACE_EMBEDDING_HEAD
+    config = checkpoint.get("config") or {}
+    if not _has_encoder_weights(checkpoint.get("model_state_dict")):
+        raise ValueError(
+            "Cannot use this checkpoint for finetune: it has no valid encoder "
+            "weights in 'model_state_dict', so the encoder could only be "
+            "re-initialized. Refusing an empty or unrecognized state dict."
+        )
+    declared_head = config.get("embedding_head")
+    state = checkpoint.get("loss_state_dict", _MISSING)
+    classifier = isinstance(state, dict) and "head.weight" in state
+    if "loss" in config:
+        if not declared_head:
+            raise ValueError(
+                "Malformed v0.8.0 fine-tune checkpoint: config.loss without "
+                "config.embedding_head."
+            )
+        _validate_v080_loss_state(config, state)
+        return "v080"
+    if classifier:
+        return "legacy_arcface"
+    if declared_head:
+        if state is not _MISSING:
+            raise ValueError(
+                "Ambiguous fine-tune checkpoint: it declares an embedding head "
+                "but has a present loss_state_dict without a classifier, so it "
+                "is neither a head-only initialization nor a fine-tune "
+                "checkpoint."
+            )
+        # A declared head and no loss state at all: usable for a new run, but
+        # there is nothing for --resume to restore.
+        return "head_only"
+    if state is _MISSING and "class_labels" not in checkpoint:
+        return "ssl"
+    raise ValueError(
+        "Ambiguous fine-tune checkpoint: it declares neither an embedding head "
+        "nor a classifier state, so the loss and head cannot be recovered; "
+        "refusing to guess."
+    )
+
+
+def _validate_v080_loss_state(config: dict[str, Any], state: object) -> None:
+    """Reject a v0.8.0 loss state that does not match its recorded mode.
+
+    The recorded K and embedding width must agree with the classifier tensor,
+    so a corrupt resume is rejected before any output directory is created.
+    """
+    loss = str(config["loss"])
+    if loss not in LOSS_REGISTRY:
+        raise ValueError(f"Malformed v0.8.0 checkpoint: unknown loss '{loss}'.")
+    if loss == "supcon":
+        if state != {}:
+            raise ValueError(
+                "Malformed v0.8.0 checkpoint: loss 'supcon' has no classifier "
+                "and requires an empty loss_state_dict."
+            )
+        return
+    weight = state.get("head.weight") if isinstance(state, dict) else None
+    expected_ndim = 2 if loss == "arcface" else 3
+    if not isinstance(weight, torch.Tensor) or weight.ndim != expected_ndim:
+        raise ValueError(
+            f"Malformed v0.8.0 checkpoint: loss '{loss}' requires a "
+            f"{expected_ndim}-D loss_state_dict['head.weight']."
+        )
+    expected_k = config.get("subcenters")
+    if expected_k is None and loss == "subcenter-arcface-compact":
+        # Compact checkpoints written before K was recorded defaulted to 2.
+        expected_k = 2
+    if expected_ndim == 3 and expected_k is not None and int(weight.shape[1]) != int(
+        expected_k
+    ):
+        raise ValueError(
+            f"Malformed v0.8.0 checkpoint: loss '{loss}' records K={expected_k} "
+            f"but head.weight has {int(weight.shape[1])} centers."
+        )
+    recorded_embed = config.get("metric_embed_dim") or config.get("out_dim")
+    if recorded_embed is not None and int(weight.shape[-1]) != int(recorded_embed):
+        raise ValueError(
+            f"Malformed v0.8.0 checkpoint: recorded embedding dimension "
+            f"{recorded_embed} but head.weight is {int(weight.shape[-1])}-wide."
+        )
+
+
+def _select_finetune_embedding_head(checkpoint: dict[str, Any]) -> str:
+    kind = _classify_finetune_source(checkpoint)
+    declared_head = (checkpoint.get("config") or {}).get("embedding_head")
+    if declared_head:
+        return declared_head
+    if kind == "ssl":
+        # SSL initialization installs a fresh fine-tune head.
+        return ARCFACE_EMBEDDING_HEAD
+    state_dict = checkpoint.get("model_state_dict") or {}
+    if not any(key in state_dict for key in _PROJECTOR_FIRST_LINEAR_KEYS):
+        raise ValueError(
+            "Cannot determine the embedding head: the checkpoint has no "
+            "config.embedding_head and no projector weights to infer it from."
+        )
+    return resolve_checkpoint_embedding_head(checkpoint, state_dict)
 
 
 def _validate_finetune_embedding_dim(cfg: dict[str, Any], out_dim: int) -> None:
@@ -2588,13 +2919,289 @@ def _validate_finetune_freeze_ratio(checkpoint: dict[str, Any], freeze_ratio: fl
         )
 
 
-def _use_split_finetune_optimizer(
-    checkpoint: dict[str, Any], resume: bool
-) -> bool:
+_OPTIMIZER_LAYOUT_GROUPS = {
+    "legacy_single": 1,
+    "legacy_split": 2,
+    "v080_supcon": 2,
+    "v080_prototype": 3,
+}
+
+
+
+def _finetune_optimizer_layout(
+    checkpoint: dict[str, Any] | None,
+    resume: bool,
+    loss: str,
+) -> str:
+    """Decide which optimizer layout this run must build and load into.
+
+    Group count alone cannot separate a v0.8.0 two-group SupCon checkpoint from
+    a legacy two-group ArcFace one. The recorded ``config.optimizer_groups`` is
+    the authority when present (a legacy resume keeps its historical layout
+    through later resumes); otherwise the recorded ``config.loss`` policy
+    decides, and an unmarked unexpected group count is rejected rather than
+    guessed.
+    """
     if not resume:
-        return True
-    param_groups = checkpoint.get("optimizer", {}).get("param_groups")
-    return len(param_groups or []) != 1
+        return "v080_supcon" if loss == "supcon" else "v080_prototype"
+    config = (checkpoint or {}).get("config") or {}
+    groups = len(((checkpoint or {}).get("optimizer") or {}).get("param_groups") or [])
+    recorded = config.get("optimizer_groups")
+    if recorded is not None:
+        if recorded not in _OPTIMIZER_LAYOUT_GROUPS:
+            raise ValueError(
+                f"Cannot resume: unknown recorded optimizer layout '{recorded}'."
+            )
+        expected = _OPTIMIZER_LAYOUT_GROUPS[recorded]
+        if groups != expected:
+            raise ValueError(
+                f"Cannot resume: recorded optimizer layout '{recorded}' expects "
+                f"{expected} optimizer parameter groups but the checkpoint has "
+                f"{groups}."
+            )
+        return recorded
+    saved_loss = config.get("loss")
+    if saved_loss is not None:
+        layout = "v080_supcon" if saved_loss == "supcon" else "v080_prototype"
+        expected = _OPTIMIZER_LAYOUT_GROUPS[layout]
+        if groups != expected:
+            raise ValueError(
+                f"Cannot resume: recorded loss '{saved_loss}' expects {expected} "
+                f"optimizer parameter groups but the checkpoint has {groups}."
+            )
+        return layout
+    if groups == 1:
+        return "legacy_single"
+    if groups == 2:
+        return "legacy_split"
+    raise ValueError(
+        f"Cannot resume: unexpected optimizer parameter-group count {groups}."
+    )
+
+
+def _validate_finetune_resume_source(
+    checkpoint: dict[str, Any], loss: str | None = None
+) -> None:
+    """Reject a resume whose source cannot restore a fine-tune run.
+
+    The CLI preflight passes the resolved loss so the optimizer layout is also
+    checked before any output exists; ``run_finetune`` uses it for the source
+    check and relies on its own layout decision later.
+    """
+    kind = _classify_finetune_source(checkpoint)
+    if kind in ("ssl", "head_only"):
+        raise ValueError(
+            "Cannot resume: the checkpoint is an SSL/initialization checkpoint "
+            "with no fine-tune loss state; pass it as --checkpoint to start a "
+            "new run."
+        )
+    if loss is not None:
+        _finetune_optimizer_layout(checkpoint, True, loss)
+
+
+def _build_finetune_optimizer_for_layout(
+    layout: str,
+    model: OTUFormerEncoder,
+    loss_fn: nn.Module,
+    backbone_lr: float,
+    metric_head_lr: float | None,
+    weight_decay: float,
+) -> torch.optim.Optimizer:
+    """Build the optimizer for a resolved layout, by Parameter identity.
+
+    Legacy layouts reproduce their historical grouping and decay exactly;
+    only ``v080_*`` layouts use the zero-decay prototype group.
+    """
+    head_lr = backbone_lr if metric_head_lr is None else metric_head_lr
+    backbone_params = [p for p in model.backbone.parameters() if p.requires_grad]
+    projector_params = list(model.projector.parameters())
+    prototype_params = list(loss_fn.parameters())
+    if layout == "v080_prototype":
+        return _build_finetune_optimizer(
+            model, loss_fn, backbone_lr, metric_head_lr, weight_decay
+        )
+    if layout == "legacy_single":
+        return torch.optim.AdamW(
+            [p for p in model.parameters() if p.requires_grad] + prototype_params,
+            lr=backbone_lr,
+            weight_decay=weight_decay,
+        )
+    group_specs = {
+        "legacy_split": [
+            {"params": backbone_params, "lr": backbone_lr, "weight_decay": weight_decay},
+            {
+                "params": projector_params + prototype_params,
+                "lr": head_lr,
+                "weight_decay": weight_decay,
+            },
+        ],
+        "v080_supcon": [
+            {"params": backbone_params, "lr": backbone_lr, "weight_decay": weight_decay},
+            {"params": projector_params, "lr": head_lr, "weight_decay": weight_decay},
+        ],
+    }
+    if layout not in group_specs:
+        raise ValueError(f"Unsupported optimizer layout: {layout}")
+    return torch.optim.AdamW(group_specs[layout])
+
+
+def _resolve_finetune_loss_config(
+    args: argparse.Namespace,
+    checkpoint: dict[str, Any] | None,
+    *,
+    explicit_options: frozenset[str] | set[str] = frozenset(),
+) -> dict[str, object]:
+    """Resolve the effective loss mode and only its applicable settings.
+
+    ``checkpoint`` is the saved fine-tune checkpoint on ``--resume`` and
+    ``None`` for a new run, so an omitted ``--loss`` is ArcFace on a new run
+    but inherits the recorded mode on resume. Only options the caller marked
+    explicit may conflict with saved settings or be rejected as inapplicable;
+    a CLI default value is not an explicit choice. Direct Python callers that
+    omit ``explicit_options`` therefore get new-run defaults, not validation
+    errors.
+    """
+    explicit = set(explicit_options)
+    saved = (checkpoint or {}).get("config") or {}
+    saved_loss = saved.get("loss")
+    requested = getattr(args, "loss", None) or "arcface"
+
+    if saved_loss is None:
+        if checkpoint is not None and "loss" in explicit and requested != "arcface":
+            raise ValueError(
+                f"Cannot resume: legacy checkpoint has no recorded loss, so only "
+                f"--loss arcface can be resumed, not '{requested}'."
+            )
+        loss = requested
+    else:
+        if "loss" in explicit and requested != saved_loss:
+            raise ValueError(
+                f"Cannot resume: checkpoint loss is '{saved_loss}' but --loss "
+                f"is '{requested}'."
+            )
+        loss = saved_loss
+    if loss not in LOSS_REGISTRY:
+        raise ValueError(
+            f"Unknown --loss '{loss}'; choose from {sorted(LOSS_REGISTRY)}."
+        )
+
+    # A compact checkpoint written before K was recorded stored
+    # ``subcenters: None`` while training with the then-fixed K=2. Treat that as
+    # a recorded 2 so an explicit conflicting --subcenters is rejected here
+    # instead of later by a head-size mismatch. Copy rather than mutate the
+    # checkpoint's own config dict.
+    if (
+        checkpoint is not None
+        and loss == "subcenter-arcface-compact"
+        and saved.get("subcenters") is None
+    ):
+        saved = {**saved, "subcenters": 2}
+
+    def _effective(
+        name: str,
+        saved_key: str,
+        default: object,
+        applicable: bool,
+        validate: Callable[[object], None],
+    ) -> object:
+        option = f"--{name.replace('_', '-')}"
+        if name in explicit:
+            if not applicable:
+                raise ValueError(f"{option} does not apply to --loss {loss}.")
+            value = getattr(args, name, None)
+            validate(value)
+            if saved.get(saved_key) is not None and saved[saved_key] != value:
+                raise ValueError(
+                    f"Cannot resume: checkpoint {name} is {saved[saved_key]} but "
+                    f"{option} is {value}."
+                )
+            return value
+        # A recorded ``None`` means the setting did not apply to the saved mode.
+        if saved.get(saved_key) is not None:
+            validate(saved[saved_key])
+            return saved[saved_key]
+        return default if applicable else None
+
+    def _validate_subcenters(value: object) -> None:
+        number = float(value)
+        if not math.isfinite(number) or not number.is_integer():
+            raise ValueError(f"--subcenters must be an integer, got {value}.")
+        if not MIN_SUBCENTERS <= int(number) <= MAX_SUBCENTERS:
+            raise ValueError(
+                f"--subcenters must be between {MIN_SUBCENTERS} and "
+                f"{MAX_SUBCENTERS}, got {value}."
+            )
+
+    def _validate_weight(value: object) -> None:
+        number = float(value)
+        if not math.isfinite(number) or number < 0.0:
+            raise ValueError(
+                f"--compact-weight must be a finite value >= 0, got {value}."
+            )
+
+    def _validate_temperature(value: object) -> None:
+        number = float(value)
+        if not math.isfinite(number) or number <= 0.0:
+            raise ValueError(
+                f"--supcon-temperature must be a finite value > 0, got {value}."
+            )
+
+    is_compact = loss == "subcenter-arcface-compact"
+    # Both Sub-center modes share the K setting; compact no longer fixes K=2.
+    subcenters = _effective(
+        "subcenters",
+        "subcenters",
+        2,
+        loss == "subcenter-arcface" or is_compact,
+        _validate_subcenters,
+    )
+
+    return {
+        "loss": loss,
+        "subcenters": subcenters,
+        "compact_weight": _effective(
+            "compact_weight", "compact_weight", 0.1, is_compact, _validate_weight
+        ),
+        "compact_cap": 0.5 if is_compact else None,
+        "supcon_temperature": _effective(
+            "supcon_temperature",
+            "supcon_temperature",
+            0.07,
+            loss == "supcon",
+            _validate_temperature,
+        ),
+    }
+
+
+def _build_finetune_loss(
+    loss_config: dict[str, object], embed_dim: int, num_classes: int
+) -> nn.Module:
+    """Instantiate the resolved loss by explicit mode dispatch.
+
+    The four modes do not share a constructor signature, so each is built with
+    only its applicable settings.
+    """
+    mode = loss_config["loss"]
+    if mode == "arcface":
+        return ArcFaceLoss(embed_dim, num_classes)
+    if mode == "supcon":
+        return SupConLoss(temperature=loss_config["supcon_temperature"])
+    if mode == "subcenter-arcface":
+        return SubCenterArcFaceLoss(
+            embed_dim,
+            num_classes,
+            k=loss_config["subcenters"],
+            compact_weight=0.0,
+        )
+    if mode == "subcenter-arcface-compact":
+        return SubCenterArcFaceLoss(
+            embed_dim,
+            num_classes,
+            k=loss_config["subcenters"],
+            compact_weight=loss_config["compact_weight"],
+            cap=loss_config["compact_cap"],
+        )
+    raise ValueError(f"Unsupported loss mode: {mode}")
 
 
 def _build_finetune_optimizer(
@@ -2604,18 +3211,39 @@ def _build_finetune_optimizer(
     metric_head_lr: float | None,
     weight_decay: float,
 ) -> torch.optim.Optimizer:
-    effective_head_lr = backbone_lr if metric_head_lr is None else metric_head_lr
-    backbone_params = [p for p in model.backbone.parameters() if p.requires_grad]
-    metric_head_params = list(model.projector.parameters()) + list(loss_fn.parameters())
+    """v0.8.0 prototype layout: backbone, projector, zero-decay prototype.
+
+    Only normalized class prototypes drop weight decay; every other parameter
+    keeps the requested policy.
+    """
+    head_lr = backbone_lr if metric_head_lr is None else metric_head_lr
     return torch.optim.AdamW(
         [
-            {"params": backbone_params, "lr": backbone_lr, "weight_decay": weight_decay},
-            {"params": metric_head_params, "lr": effective_head_lr, "weight_decay": weight_decay},
+            {
+                "params": [p for p in model.backbone.parameters() if p.requires_grad],
+                "lr": backbone_lr,
+                "weight_decay": weight_decay,
+            },
+            {
+                "params": list(model.projector.parameters()),
+                "lr": head_lr,
+                "weight_decay": weight_decay,
+            },
+            {
+                "params": list(loss_fn.parameters()),
+                "lr": head_lr,
+                "weight_decay": 0.0,
+            },
         ]
     )
 
 
-def run_finetune(args: argparse.Namespace) -> None:
+def run_finetune(
+    args: argparse.Namespace,
+    *,
+    explicit_options: frozenset[str] | set[str] = frozenset(),
+    source_checkpoint: dict[str, Any] | None = None,
+) -> None:
     _set_seed(args.seed)
     _set_cpus(args.cpus)
     device = _resolve_device(args.device)
@@ -2626,12 +3254,22 @@ def run_finetune(args: argparse.Namespace) -> None:
     resume_path = (
         Path(getattr(args, "resume", "")) if getattr(args, "resume", "") else None
     )
+    trace_batch_ids = bool(getattr(args, "trace_batch_ids", False))
     if resume_path is not None:
         ckpt_path = resume_path
     else:
         ckpt_path = Path(args.checkpoint)
-    ckpt = load_checkpoint(ckpt_path)
+    if source_checkpoint is not None:
+        # The CLI preflight already read this checkpoint; reusing it keeps the
+        # validation read and the training read from diverging.
+        ckpt = source_checkpoint
+    else:
+        ckpt = load_checkpoint(ckpt_path)
     cfg = ckpt.get("config", {})
+    source_kind = _classify_finetune_source(ckpt)
+    previous_centers: torch.Tensor | None = None
+    if resume_path is not None:
+        _validate_finetune_resume_source(ckpt)
     model_name = cfg.get("model_name", args.model_name)
     # ``encoder_out_dim`` sizes the pretrained projector; the fine-tune
     # embedding width (``out_dim``) is resolved separately below so
@@ -2716,13 +3354,33 @@ def run_finetune(args: argparse.Namespace) -> None:
     # Reuse the saved projector only when it matches the head being trained.
     source_head = resolve_checkpoint_embedding_head(ckpt, state_dict)
     source_dim = resolve_projector_out_dim(state_dict)
-    if source_head != embedding_head or (
+    projector_replaced = source_head != embedding_head or (
         source_dim is not None and source_dim != out_dim
-    ):
+    )
+    if projector_replaced:
         state_dict = {
             key: value for key, value in state_dict.items() if not key.startswith("projector.")
         }
-    model.load_state_dict(state_dict, strict=False)
+    load_result = model.load_state_dict(state_dict, strict=False)
+    # Only a deliberate head replacement (a new run whose source head or width
+    # does not match) may leave the projector uninitialized; every other case,
+    # and every resume, must load the trained projector instead of silently
+    # re-initializing it underneath a restored optimizer state.
+    needs_projector = resume_path is not None or not projector_replaced
+    missing_encoder = [
+        key
+        for key in load_result.missing_keys
+        if key.startswith("backbone.")
+        or (needs_projector and key.startswith("projector."))
+    ]
+    if missing_encoder:
+        raise ValueError(
+            "Checkpoint does not provide complete encoder weights: "
+            f"{len(missing_encoder)} parameter(s) are missing (for example "
+            f"'{missing_encoder[0]}'). Refusing to train from a partially "
+            "loaded model; the trained projector is required unless the head "
+            "is deliberately replaced."
+        )
 
     _freeze_backbone_blocks(model, args.freeze_ratio)
 
@@ -2734,35 +3392,51 @@ def run_finetune(args: argparse.Namespace) -> None:
         orientation_policy=policy,
     )
     loader = DataLoader(
-        ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers
+        IndexedDataset(ds) if trace_batch_ids else ds,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+    )
+    initialization_sha = _sha256_file(ckpt_path)
+    ssl_initialization_sha = (
+        initialization_sha
+        if source_kind == "ssl"
+        else cfg.get("ssl_initialization_checkpoint_sha256")
+    )
+    manifest_sha = _train_manifest_sha256(
+        ds.image_refs, ds.label_names, Path(args.input_images_dir)
     )
 
     n_classes = len(ds.class_to_idx)
-    loss_cls = LOSS_REGISTRY.get(args.loss, ArcFaceLoss)
-    loss_fn = loss_cls(embed_dim=out_dim, num_classes=n_classes).to(device)
+    loss_config = _resolve_finetune_loss_config(
+        args,
+        ckpt if resume_path is not None else None,
+        explicit_options=explicit_options,
+    )
+    loss_fn = _build_finetune_loss(loss_config, out_dim, n_classes).to(device)
+    print(
+        "[Info] Effective loss config: "
+        + json.dumps(loss_config, sort_keys=True)
+    )
+    optimizer_layout = _finetune_optimizer_layout(
+        ckpt, resume_path is not None, str(loss_config["loss"])
+    )
 
-    if not _use_split_finetune_optimizer(ckpt, resume_path is not None):
-        # Keep the single-group optimizer layout used by historical fine-tune checkpoints.
-        optimizer = torch.optim.AdamW(
-            [p for p in model.parameters() if p.requires_grad] + list(loss_fn.parameters()),
-            lr=args.finetune_lr,
-            weight_decay=getattr(args, "weight_decay", 1e-4),
-        )
-    else:
-        optimizer = _build_finetune_optimizer(
-            model,
-            loss_fn,
-            args.finetune_lr,
-            getattr(args, "metric_head_lr", None),
-            getattr(args, "weight_decay", 1e-4),
-        )
+    optimizer = _build_finetune_optimizer_for_layout(
+        optimizer_layout,
+        model,
+        loss_fn,
+        args.finetune_lr,
+        getattr(args, "metric_head_lr", None),
+        getattr(args, "weight_decay", 1e-4),
+    )
     start_epoch = 0
     if resume_path is not None:
         class_labels = sorted(str(label) for label in ds.class_to_idx)
         _validate_finetune_resume(ckpt, class_labels, args.finetune_epochs)
         _validate_finetune_freeze_ratio(ckpt, args.freeze_ratio)
         saved_loss = ckpt.get("loss_state_dict")
-        if saved_loss is not None:
+        if isinstance(saved_loss, dict) and "head.weight" in saved_loss:
             saved_classes = saved_loss["head.weight"].shape[0]
             if saved_classes != n_classes:
                 raise ValueError(
@@ -2770,9 +3444,13 @@ def run_finetune(args: argparse.Namespace) -> None:
                 )
         if "optimizer" in ckpt:
             optimizer.load_state_dict(ckpt["optimizer"])
-        if saved_loss is not None:
+        if isinstance(saved_loss, dict):
             loss_fn.load_state_dict(saved_loss, strict=False)
         start_epoch = int(ckpt.get("epoch", -1)) + 1
+        if start_epoch > 0:
+            # Continue the center-direction chain from the checkpoint's
+            # post-epoch centers instead of restarting it.
+            previous_centers = _prototype_centers(loss_fn)
         print(
             f"[Info] Resume from {resume_path} at epoch {start_epoch}, iteration {int(ckpt.get('iteration', 0))}"
         )
@@ -2781,6 +3459,14 @@ def run_finetune(args: argparse.Namespace) -> None:
     logs_dir.mkdir(parents=True, exist_ok=True)
     instant_logger = InstantMetricsLogger(
         logs_dir / "instant_metrics.finetune.csv", mode="finetune"
+    )
+    diagnostics_logger = LossDiagnosticsLogger(
+        logs_dir / "loss_diagnostics.finetune.csv"
+    )
+    trace_logger = (
+        BatchIdTraceLogger(logs_dir / "batch_ids.finetune.jsonl")
+        if trace_batch_ids
+        else None
     )
 
     compute_embedding_metrics = bool(getattr(args, "compute_embedding_metrics", True))
@@ -2807,26 +3493,49 @@ def run_finetune(args: argparse.Namespace) -> None:
         loss_fn.train()
         running = 0.0
         batches = 0
+        usable = 0
+        skipped = 0
+        valid_anchors = 0
+        counts = _empty_loss_diagnostic_counts(n_classes, _prototype_k(loss_fn))
 
         pbar = tqdm(
             loader,
             desc=f"Finetune Epoch {epoch + 1}/{args.finetune_epochs}",
             ncols=120,
         )
-        for step, (imgs, labels) in enumerate(pbar):
+        for step, batch in enumerate(pbar):
             batches += 1
+            if trace_logger is not None:
+                imgs, labels, dataset_indices = batch
+                indices = [int(index) for index in dataset_indices.tolist()]
+                trace_logger.log(
+                    epoch=epoch,
+                    step=step,
+                    indices=indices,
+                    refs=[ds.image_refs[index] for index in indices],
+                )
+            else:
+                imgs, labels = batch
             imgs = imgs.to(device)
             labels = labels.to(device)
 
             emb = model(imgs)
             loss = loss_fn(emb, labels)
+            if loss is None:
+                # SupCon: no valid positive anchor, or no different-species
+                # pair. Nothing to backpropagate; count it and move on.
+                skipped += 1
+                continue
 
             optimizer.zero_grad()
             loss.backward()
             grad_norm = _compute_grad_norm(model)
             optimizer.step()
 
+            usable += 1
             running += float(loss.item())
+            valid_anchors += int(getattr(loss_fn, "last_valid_anchors", 0))
+            _accumulate_loss_diagnostics(counts, loss_fn, emb, labels)
 
             pbar.set_postfix(
                 loss=f"{loss.item():.4f}",
@@ -2849,10 +3558,56 @@ def run_finetune(args: argparse.Namespace) -> None:
 
             global_step += 1
 
-        avg_loss = running / max(batches, 1)
+        if usable == 0:
+            raise ValueError(
+                f"No usable batches in epoch {epoch + 1} for loss "
+                f"'{loss_config['loss']}': every batch had no valid positive "
+                "anchor or no different-species pair. Refusing to save a "
+                "checkpoint trained on an empty signal."
+            )
+        avg_loss = running / usable
         print(
-            f"[Finetune] Epoch {epoch + 1}/{args.finetune_epochs} - Avg Loss: {avg_loss:.4f}"
+            f"[Finetune] Epoch {epoch + 1}/{args.finetune_epochs} - Avg Loss: "
+            f"{avg_loss:.4f}"
         )
+        if loss_config["loss"] == "supcon":
+            # Only SupCon can skip a batch; every other mode has usable == batches
+            # with skipped/valid_anchors always 0, so this line would be noise.
+            print(
+                f"[Finetune] Epoch {epoch + 1} batches: {batches} "
+                f"usable={usable} skipped={skipped} valid_anchors={valid_anchors}"
+            )
+        # Snapshot the prototypes at the post-epoch boundary, after every
+        # optimizer step, so this row describes the epoch that just finished.
+        centers = _prototype_centers(loss_fn)
+        compact_fraction, compact_penalty = _compact_hinge_stats(loss_fn)
+        center_cosines = _center_direction_cosine(previous_centers, centers)
+        diagnostics_logger.log(
+            epoch=epoch,
+            mode=loss_config["loss"],
+            usable_batches=usable,
+            skipped_batches=skipped,
+            valid_anchors=valid_anchors,
+            margin_satisfied_fraction=(
+                counts["margin_hits"] / counts["samples"]
+                if n_classes >= 2 and counts["samples"]
+                else ""
+            ),
+            compact_hinge_fraction=(
+                "" if compact_fraction is None else compact_fraction
+            ),
+            compact_mean_penalty=(
+                "" if compact_penalty is None else compact_penalty
+            ),
+            local_assignments=(
+                json.dumps(counts["local"]) if centers is not None else ""
+            ),
+            argmax_hits=json.dumps(counts["global"]) if centers is not None else "",
+            center_direction_cosine=(
+                json.dumps(center_cosines) if center_cosines else ""
+            ),
+        )
+        previous_centers = centers
 
         # Save checkpoint per --save-every-epochs (mirrors ref arcface_epoch_XXXX.pth)
         should_save = (epoch + 1) % max(1, args.save_every_epochs) == 0 or (
@@ -2870,6 +3625,27 @@ def run_finetune(args: argparse.Namespace) -> None:
                     "metric_embed_dim": out_dim,
                     "out_dim": out_dim,
                     "embedding_head": embedding_head,
+                    # Recorded optimizer policy: required to tell a v0.8.0
+                    # two-group SupCon checkpoint from a legacy two-group one.
+                    "loss": loss_config["loss"],
+                    "subcenters": loss_config["subcenters"],
+                    "compact_weight": loss_config["compact_weight"],
+                    "compact_cap": loss_config["compact_cap"],
+                    "supcon_temperature": loss_config["supcon_temperature"],
+                    "seed": int(args.seed),
+                    "initialization_checkpoint_sha256": initialization_sha,
+                    "train_manifest_sha256": manifest_sha,
+                    "optimizer_groups": optimizer_layout,
+                    "prototype_weight_decay": (
+                        0.0 if optimizer_layout == "v080_prototype" else None
+                    ),
+                    **(
+                        {
+                            "ssl_initialization_checkpoint_sha256": ssl_initialization_sha
+                        }
+                        if ssl_initialization_sha
+                        else {}
+                    ),
                     "freeze_ratio": args.freeze_ratio,
                     "image_size": finetune_image_size,
                     "augmentation_profile": profile,

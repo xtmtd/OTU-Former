@@ -82,3 +82,36 @@ def _validate_orientation_policy(value: str | None) -> None:
             f"{', '.join(ORIENTATION_POLICIES)}.",
             param_hint="--orientation-policy",
         )
+
+
+def source_is_commandline(source: object) -> bool:
+    """True when a parameter came from the command line.
+
+    Compares by name so both external Click and Typer's vendored Click
+    ``ParameterSource`` enums are accepted.
+    """
+    return getattr(source, "name", None) == "COMMANDLINE"
+
+
+def format_user_command(
+    ctx: typer.Context, params: dict[str, object], command: str
+) -> str:
+    """Rebuild the invocation that was actually typed, for the run log.
+
+    Only command-line-sourced parameters are echoed, so a copied line reruns
+    the same command instead of its defaults. A boolean flag is written as
+    ``--flag`` (never ``--flag true``), matching how Typer parses it.
+    """
+    parts = ["otuformer", command]
+    for key, value in params.items():
+        if not source_is_commandline(ctx.get_parameter_source(key)):
+            continue
+        option = f"--{key.replace('_', '-')}"
+        if isinstance(value, bool):
+            if value:
+                parts.append(option)
+            continue
+        if value in (None, ""):
+            continue
+        parts.extend([option, str(value)])
+    return " ".join(parts)

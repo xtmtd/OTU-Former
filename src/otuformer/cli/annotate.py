@@ -10,6 +10,8 @@ from pathlib import Path
 
 import typer
 
+from otuformer.cli import format_user_command
+
 app = typer.Typer(
     help=(
         "Apply expert corrections to cluster assignments.\n\n"
@@ -21,19 +23,6 @@ app = typer.Typer(
         "  otuformer annotate --raw-assignments partition_0.30_assignments.csv --corrections corrections.csv --embeddings runs/extract/embeddings.csv --show-annotation-bar\n"
     )
 )
-
-
-def _format_user_command(ctx: typer.Context, params: dict[str, object]) -> str:
-    parts = ["otuformer", "annotate"]
-    for key, value in params.items():
-        source = ctx.get_parameter_source(key)
-        if getattr(source, "name", None) != "COMMANDLINE":
-            continue
-        option = f"--{key.replace('_', '-')}"
-        if value in (None, ""):
-            continue
-        parts.extend([option, str(value)])
-    return " ".join(parts)
 
 
 @app.callback(invoke_without_command=True)
@@ -142,7 +131,7 @@ def annotate(
             "out_dir": str(out_dir),
             "overwrite": overwrite,
         }
-        print(f"Command: {_format_user_command(ctx, params)}")
+        print(f"Command: {format_user_command(ctx, params, 'annotate')}")
         print("Parameters:")
         print(json.dumps(params, ensure_ascii=False, indent=2, sort_keys=True))
         print("-" * 80)

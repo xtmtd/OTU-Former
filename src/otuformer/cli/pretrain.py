@@ -16,8 +16,10 @@ from otuformer.cli import (
     _parse_size,
     _validate_augmentation,
     _validate_orientation_policy,
+    format_user_command,
     orientation_policy_choices,
     pretrain_augmentation_choices,
+    source_is_commandline as _source_is_commandline,
 )
 
 app = typer.Typer(
@@ -100,32 +102,6 @@ def _validate_patch_options(
             f"--ibot-prototypes must be an integer >= {IBOT_PROTOTYPES_MIN}, "
             f"got '{ibot_prototypes}'"
         )
-
-
-def _source_is_commandline(source: object) -> bool:
-    """True when a parameter came from the command line.
-
-    Compares by name so both external Click and Typer's vendored Click
-    ``ParameterSource`` enums are accepted.
-    """
-    return getattr(source, "name", None) == "COMMANDLINE"
-
-
-def _format_user_command(ctx: typer.Context, params: dict[str, object]) -> str:
-    parts = ["otuformer", "pretrain"]
-    for key, value in params.items():
-        source = ctx.get_parameter_source(key)
-        if not _source_is_commandline(source):
-            continue
-        option = f"--{key.replace('_', '-')}"
-        if isinstance(value, bool):
-            if value:
-                parts.append(option)
-            continue
-        if value in (None, ""):
-            continue
-        parts.extend([option, str(value)])
-    return " ".join(parts)
 
 
 @app.callback(invoke_without_command=True)
@@ -475,7 +451,7 @@ def pretrain(
             seed=seed,
         )
         params = vars(ns)
-        cli_command = _format_user_command(ctx, params)
+        cli_command = format_user_command(ctx, params, "pretrain")
         print(f"Command: {cli_command}")
         print("Parameters:")
         print(json.dumps(params, ensure_ascii=False, indent=2, sort_keys=True))

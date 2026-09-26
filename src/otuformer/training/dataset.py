@@ -890,6 +890,10 @@ class MetricDataset(Dataset):
         classes = sorted(df["label"].unique())
         self.class_to_idx = {c: i for i, c in enumerate(classes)}
         self.labels = [self.class_to_idx[l] for l in df["label"]]
+        # Original CSV references and label names, kept for the training
+        # manifest hash and the optional batch-ID trace.
+        self.image_refs = refs
+        self.label_names = [str(label) for label in df["label"]]
         self.image_size = int(image_size)
         self.augmentation_profile = augmentation_profile
         self.orientation_policy = orientation_policy
@@ -915,3 +919,22 @@ class MetricDataset(Dataset):
             image = self.transform(img, fill)
         _validate_view_shape(image, self.image_size, "finetune view")
         return image, self.labels[idx]
+
+
+class IndexedDataset(Dataset):
+    """Training-only wrapper that also returns the dataset index.
+
+    Used by the opt-in batch-ID trace so recorded IDs come from the actual
+    shuffled sampling order rather than the DataLoader step position. The
+    default ``(image, label)`` contract is unchanged for non-trace callers.
+    """
+
+    def __init__(self, dataset: Dataset) -> None:
+        self.dataset = dataset
+
+    def __len__(self) -> int:
+        return len(self.dataset)  # type: ignore[arg-type]
+
+    def __getitem__(self, index: int):
+        image, label = self.dataset[index]
+        return image, label, index

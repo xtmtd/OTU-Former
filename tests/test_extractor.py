@@ -84,6 +84,42 @@ def test_load_model_keeps_historical_projection_head_metadata(monkeypatch, tmp_p
     assert isinstance(model.projector, torch.nn.Identity)
 
 
+def test_load_model_ignores_parameter_free_supcon_loss_state(tmp_path):
+    """A v0.8.0 SupCon checkpoint has an empty loss state and no classifier."""
+    from otuformer.training.model import ArcFaceEmbeddingHead, OTUFormerEncoder
+
+    encoder = OTUFormerEncoder(
+        model_name="vit_tiny_patch16_224", out_dim=16, pretrained=False, img_size=32
+    )
+    encoder.projector = ArcFaceEmbeddingHead(encoder.backbone.num_features, 16)
+    checkpoint = tmp_path / "supcon.pth"
+    torch.save(
+        {
+            "model_state_dict": encoder.state_dict(),
+            "loss_state_dict": {},
+            "config": {
+                "model_name": "vit_tiny_patch16_224",
+                "out_dim": 16,
+                "metric_embed_dim": 16,
+                "image_size": 32,
+                "embedding_head": "arcface_mlp_512",
+                "loss": "supcon",
+                "supcon_temperature": 0.07,
+            },
+        },
+        checkpoint,
+    )
+
+    model, size = _load_model(
+        checkpoint, "vit_tiny_patch16_224", torch.device("cpu")
+    )
+
+    assert isinstance(model.projector, ArcFaceEmbeddingHead)
+    assert size == 32
+    # Default extraction vector stays the raw CLS feature.
+    assert model.backbone.num_features == encoder.backbone.num_features
+
+
 def test_load_model_rebuilds_arcface_embedding_head(monkeypatch, tmp_path):
     import otuformer.embedding.extractor as extractor_module
     from otuformer.training.model import ArcFaceEmbeddingHead

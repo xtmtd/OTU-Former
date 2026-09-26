@@ -389,3 +389,54 @@ class ArcFaceHead(nn.Module):
         one_hot = F.one_hot(labels, num_classes=self.weight.shape[0]).float()
         output = (one_hot * phi) + ((1.0 - one_hot) * cosine)
         return output * self.s
+
+
+class SubCenterArcFaceHead(nn.Module):
+    """Sub-center ArcFace head: ``k`` normalized centers per class.
+
+    Image-to-class similarity is the maximum cosine similarity over that
+    class's centers; the ArcFace angular margin is applied to the resulting
+    target-class logit. ``k=1`` is numerically identical to ``ArcFaceHead``.
+    Centers are training-only state and are never used by ``extract``.
+    """
+
+    def __init__(
+        self,
+        embed_dim: int,
+        num_classes: int,
+        k: int = 2,
+        s: float = 64.0,
+        m: float = 0.5,
+    ) -> None:
+        super().__init__()
+        if k < 1:
+            raise ValueError(f"k must be >= 1, got {k}.")
+        self.s = s
+        self.m = m
+        self.k = int(k)
+        self.weight = nn.Parameter(
+            torch.FloatTensor(num_classes, self.k, embed_dim)
+        )
+        # Per-center initialization matching ArcFaceHead's (C, D) layout.
+        nn.init.xavier_uniform_(self.weight.view(-1, embed_dim))
+        self.cos_m = math.cos(m)
+        self.sin_m = math.sin(m)
+        self.th = math.cos(math.pi - m)
+        self.mm = math.sin(math.pi - m) * m
+
+    def forward(
+        self, x: torch.Tensor, labels: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        weight = F.normalize(self.weight, dim=-1)
+        cosine = F.linear(F.normalize(x), weight.reshape(-1, weight.shape[-1]))
+        cosine = cosine.reshape(
+            x.shape[0], weight.shape[0], self.k
+        ).max(dim=-1).values
+        if labels is None:
+            return cosine * self.s
+        sine = torch.sqrt(1.0 - cosine.pow(2).clamp(0, 1))
+        phi = cosine * self.cos_m - sine * self.sin_m
+        phi = torch.where(cosine > self.th, phi, cosine - self.mm)
+        one_hot = F.one_hot(labels, num_classes=weight.shape[0]).float()
+        output = (one_hot * phi) + ((1.0 - one_hot) * cosine)
+        return output * self.s

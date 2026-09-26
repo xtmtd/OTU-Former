@@ -2,7 +2,7 @@
 
 [中文文档](README.cn.md) | **English**
 
-An image-based morphological OTU (Operational Taxonomic Unit) delineation toolkit. Provides a unified `otuformer` CLI with commands for self-supervised pretraining, ArcFace metric learning finetuning, embedding extraction (including quality metrics/UMAP when labels are provided), UPGMA hierarchical clustering, expert-corrected annotation, community diversity analysis, CAM visualization, and ONNX model export.
+An image-based morphological OTU (Operational Taxonomic Unit) delineation toolkit. Provides a unified `otuformer` CLI with commands for self-supervised pretraining, supervised metric-learning finetuning (`--loss` selects `arcface`, `supcon`, `subcenter-arcface`, or `subcenter-arcface-compact`), embedding extraction (including quality metrics/UMAP when labels are provided), UPGMA hierarchical clustering, expert-corrected annotation, community diversity analysis, CAM visualization, and ONNX model export.
 
 ## Overview
 
@@ -16,7 +16,7 @@ otuformer <command> [options]
 |---------|-------------|
 | `doctor` | Diagnose environment and dependency status |
 | `pretrain` | Self-supervised contrastive pretraining (DINO/iBOT style) |
-| `finetune` | ArcFace metric learning finetuning |
+| `finetune` | Supervised metric-learning finetuning (`--loss` selects the objective) |
 | `extract` | Extract image embeddings (ONNX-accelerated) |
 | `cluster` | UPGMA hierarchical clustering into morphological OTUs |
 | `annotate` | Apply expert corrections to produce refined OTU annotations |
@@ -29,7 +29,7 @@ otuformer <command> [options]
 
 - **Unified CLI**: Single `otuformer` entry point — covers the complete pipeline from pretraining to diversity analysis
 - **Self-Supervised Pretraining**: DINO/iBOT-style teacher-student ViT contrastive learning with global/local crops and masked-token consistency
-- **ArcFace Metric Learning Finetuning**: Optimize model with labelled data to produce discriminative embeddings for OTU clustering
+- **Supervised Metric-Learning Finetuning**: Optimize the model with labelled data and a selectable supervised objective (`arcface` by default, or `supcon`, `subcenter-arcface`, `subcenter-arcface-compact`) to produce discriminative embeddings for OTU clustering
 - **Multi-Mode Embedding Extraction**: CLS token, patch-topk, and attention-pool modes; optional ONNX acceleration
 - **Embedding Quality Evaluation**: NMI, ARI, Recall@K, kNN accuracy, mAP@R, Silhouette Score, Linear Probing Accuracy, and more
 - **UPGMA Hierarchical Clustering**: Build distance matrix and phylogenetic tree, auto-partition OTUs at multiple distance cutoffs
@@ -95,7 +95,7 @@ Recommended workflow command order:
 
 1. `doctor` — Check environment
 2. `pretrain` — Self-supervised pretraining
-3. `finetune` — ArcFace finetuning
+3. `finetune` — supervised metric-learning finetuning
 4. `extract` — Extract embeddings
 5. `cluster` — UPGMA clustering into OTUs
 6. `annotate` — Apply expert corrections
@@ -303,15 +303,18 @@ otuformer pretrain \
 
 **Output**:
 - `logs/pretrain.log` — Run log
-- `checkpoints/` — Model checkpoints (`SSL_latest.pth`, `SSL_best.pth`)
+- `SSL_latest.pth`, `SSL_epoch_*.pth` — Model checkpoints, written to `--out-dir` (there is no `checkpoints/` subdirectory and no `SSL_best.pth`)
 - `logs/metrics.pretrain.csv` — Periodic embedding metrics
-- `umap.pdf` — UMAP visualization (when not disabled)
+- `logs/instant_metrics.pretrain.csv` — Per-iteration training metrics
+- `logs/training_curves_pretrain.pdf` — Training-curve plot
+- `logs/umap.train.epoch_<N>.pdf` — Periodic UMAP plots (when not disabled)
 
 ---
 
 ### Finetune Command
 
-ArcFace metric learning finetuning with labelled data.
+Supervised metric-learning finetuning with labelled data; `--loss` selects the
+objective (see "Metric-loss modes (v0.8.0)").
 
 A separate image-only `--visualize-data` CSV may be used for UMAP; supervised metrics require at least two label classes.
 
@@ -365,13 +368,17 @@ otuformer finetune \
 | `--input-images-dir` | Root image directory | Required |
 | `--out-dir` | Output directory | `runs/finetune` |
 | `--model-name` | timm backbone name | `vit_tiny_patch16_224` |
-| `--metric-embed-dim` | Fine-tune embedding dimension (ArcFace head output, not raw CLS). An explicit value resizes the head; it is rejected for a historical `ProjectionHead` checkpoint, whose width is fixed by the pretrained projector | inherit the checkpoint's metric dimension |
+| `--metric-embed-dim` | Fine-tune embedding dimension (metric-embedding head output, not raw CLS). An explicit value resizes the head; it is rejected for a historical `ProjectionHead` checkpoint, whose width is fixed by the pretrained projector | inherit the checkpoint's metric dimension |
 | `--finetune-epochs` | Finetuning epochs | 20 |
 | `--finetune-lr` | Backbone learning rate | 1e-4 |
-| `--metric-head-lr` | ArcFace embedding head and classifier learning rate; omitted inherits `--finetune-lr` | `--finetune-lr` |
+| `--metric-head-lr` | Embedding head and, for prototype losses, classifier learning rate; omitted inherits `--finetune-lr` | `--finetune-lr` |
 | `--weight-decay` | Fine-tune AdamW weight decay; default `1e-4` is a conservative supervised choice, while `0.05` reproduces the legacy script's setting | 1e-4 |
 | `--freeze-ratio` | Fraction of backbone blocks to freeze (0.0=none, 1.0=all) | 0.7 |
-| `--loss` | Metric-learning loss name | `arcface` |
+| `--loss` | Metric-learning loss: `arcface` (default), `supcon`, `subcenter-arcface`, or `subcenter-arcface-compact`; see "Metric-loss modes (v0.8.0)" | `arcface` |
+| `--subcenters` | Centers per class (K) for `--loss subcenter-arcface` or `subcenter-arcface-compact`: an integer from 2 to 8; `arcface` and `supcon` reject the flag | 2 |
+| `--compact-weight` | Same-class center-distance hinge weight for `--loss subcenter-arcface-compact` (cap is fixed at 0.5) | 0.1 |
+| `--supcon-temperature` | Temperature for `--loss supcon`; must be greater than 0 | 0.07 |
+| `--trace-batch-ids` | Write the ordered image IDs of every training batch to `logs/batch_ids.finetune.jsonl` (opt-in, can be large) | No |
 | `--augmentation` | Fine-tuning augmentation profile: `none` (new-run default) or `conservative` (experimental); omit to inherit the saved profile on `--resume` | `none` |
 | `--orientation-policy` | Orientation policy: `sensitive` (new-run default) or `invariant`; affects `conservative` only. Omit on `--checkpoint` initialization to inherit the pretraining checkpoint's saved policy; omit on `--resume` to inherit the saved policy | `sensitive` |
 | `--batch-size` | Batch size | 32 |
@@ -393,15 +400,68 @@ otuformer finetune \
 
 **Output**:
 - `logs/finetune.log` — Run log
-- `checkpoints/` — Model checkpoints (`finetune_latest.pth`, `finetune_best.pth`)
+- `finetune_latest.pth`, `finetune_epoch_*.pth` — Model checkpoints, written to `--out-dir` (there is no `checkpoints/` subdirectory and no `finetune_best.pth`)
 - `logs/metrics.finetune.csv` — Periodic embedding metrics
-- `umap.pdf` — UMAP visualization (when not disabled)
+- `logs/instant_metrics.finetune.csv` — Per-iteration training metrics
+- `logs/loss_diagnostics.finetune.csv` — Per-epoch v0.8.0 loss diagnostics
+- `logs/batch_ids.finetune.jsonl` — Training-batch ID trace (only with `--trace-batch-ids`)
+- `logs/training_curves_finetune.pdf` — Training-curve plot
+- `logs/umap.train.epoch_<N>.pdf` — Periodic UMAP plots (when not disabled)
 
 **Checkpoint handling**:
 
-- `--checkpoint` starts a new run. An SSL pretrain checkpoint installs a fresh ArcFace embedding head; a fine-tune checkpoint whose head and width match keeps its trained projector. A historical `ProjectionHead` checkpoint keeps its projector, which fixes the embedding width.
+- `--checkpoint` starts a new run. An SSL pretrain checkpoint installs a fresh embedding head; a fine-tune checkpoint whose head and width match keeps its trained projector. A historical `ProjectionHead` checkpoint keeps its projector, which fixes the embedding width.
 - `--resume` restores the saved optimizer state, so `--finetune-lr`, `--metric-head-lr`, and `--weight-decay` have no effect. `--freeze-ratio` must match the saved value.
 - Ref-script checkpoints (`ref/ibot20260115.py`) can be read by `extract`, `export`, and `cam`, but cannot be resumed by `finetune`.
+
+**Metric-loss modes (v0.8.0).** `--loss` accepts four explicit supervised
+targets, and rejects an unknown name or a setting that does not apply to the
+resolved mode before creating any output. ArcFace stays the default and the
+v0.8.0 reference loss.
+
+| Mode | Objective |
+|------|-----------|
+| `arcface` | One angular-margin classifier center per labelled species (default) |
+| `supcon` | Single-view supervised contrastive loss over batch-wise image pairs |
+| `subcenter-arcface` | K centers per species; a sample approaches its closest center |
+| `subcenter-arcface-compact` | Sub-center ArcFace plus a bounded same-class center-distance penalty |
+
+- Classifier centers are **training-only** state: `extract`, `cluster`, and the
+  default downstream workflow never read them, and morphology metadata never
+  enters training.
+- **Raw CLS stays the comparison target.** The loss acts on the fine-tune head
+  while the default `extract` vector is the backbone's raw CLS embedding, so a
+  lower training loss does not by itself prove better distances. Hold
+  `--freeze-ratio`, the backbone and metric-head learning rates, the epoch
+  budget, augmentation, the training manifest, batch size, and seed fixed
+  across modes. An **open-set** comparison calibrates each loss on held-out
+  known species and applies it without retuning to unseen species.
+- First-round exploratory settings are SupCon temperature `0.07`, K `2`,
+  cosine-distance cap `0.5`, and compact weight `0.1`. They are starting values,
+  not validated optima; there is no first-round parameter grid or benchmark
+  runner.
+- `supcon` skips a batch with no valid positive anchor or no different-species
+  pair, reports the skipped batches, and fails the run when a whole epoch is
+  unusable instead of saving a checkpoint trained on an empty signal.
+- New v0.8.0 checkpoints record the loss name and its effective settings, the
+  seed, the source-checkpoint SHA-256 values, `train_manifest_sha256`, the
+  optimizer layout, and the prototype weight-decay rule. New v0.8.0 ArcFace
+  runs set zero weight decay on the L2-normalized prototypes where v0.7.x
+  applied the requested decay (default `1e-4`). Because the forward pass
+  normalizes the prototypes, that decay only rescaled their norm, which the
+  loss never observes; at the default `--finetune-lr 1e-4` and
+  `--weight-decay 1e-4` it is below float32 resolution, so results are
+  numerically identical to v0.7.x. A larger learning-rate x weight-decay
+  product does change the raw prototype norm, so cross-version checkpoints are
+  not guaranteed to be loss-only controlled comparisons. A legacy `--resume`
+  keeps its saved optimizer semantics, and resuming an SSL or classifier-free
+  initialization checkpoint is rejected.
+- `logs/loss_diagnostics.finetune.csv` holds one row per completed epoch
+  (usable and skipped batches, valid anchors, margin-satisfied fraction, compact
+  hinge activation and penalty, per-class/per-center assignment counts, and
+  center-direction cosine). `logs/batch_ids.finetune.jsonl` is written only
+  with `--trace-batch-ids`. The existing `logs/metrics.finetune.csv` and
+  `logs/instant_metrics.finetune.csv` schemas are unchanged.
 
 ---
 
@@ -506,7 +566,7 @@ otuformer extract \
 | `--model-name` | timm backbone name | `vit_tiny_patch16_224` |
 | `--extract-size` | Resize/crop size for extraction; `auto` uses the checkpoint's recorded training size | auto |
 | `--eval-transform` | Evaluation preprocessing protocol: `center-crop` (default) or `whole-specimen-pad` (aspect-preserving square padding, reserved) | `center-crop` |
-| `--use-projector-output` | Use SSL projector output, or the ArcFace task embedding for fine-tune checkpoints | No |
+| `--use-projector-output` | Use SSL projector output, or the fine-tune task embedding for fine-tune checkpoints | No |
 | `--use-student` | Load student weights instead of teacher (EMA) | No |
 | `--token-mode` | `cls`/`patch-topk`/`attention-pool` | `cls` |
 | `--topk-patches` | Top-K patch tokens for patch-topk mode | 20 |
