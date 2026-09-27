@@ -21,7 +21,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from otuformer.constants import MAX_SUBCENTERS, MIN_SUBCENTERS
+from otuformer.constants import ARCFACE_FAMILY_LOSSES, MAX_SUBCENTERS, MIN_SUBCENTERS
 from otuformer.embedding.evaluator import (
     compute_clustering_metrics,
     compute_knn_accuracy,
@@ -66,6 +66,7 @@ from otuformer.utils.checkpoint import (
     resolve_projector_out_dim,
     save_checkpoint,
 )
+from otuformer.utils.paths import canonical_image_ref, path_identity
 from otuformer.utils.size import (
     _positive_int,
     resolve_backbone_native_size,
@@ -2728,21 +2729,10 @@ def _sha256_file(path: Path) -> str:
 def _canonical_image_ref(ref: object, images_root: Path) -> str:
     """Canonical POSIX reference relative to ``input_images_dir``.
 
-    Relative references are normalized lexically and never resolved through the
-    filesystem, so a recursively discovered image path does not change the
-    manifest hash. An absolute reference must stay inside the image root.
+    Shared with pseudo-label discovery so both use one definition; see
+    :func:`otuformer.utils.paths.canonical_image_ref`.
     """
-    text = str(ref)
-    path = Path(text)
-    if path.is_absolute():
-        root = images_root.resolve()
-        resolved = path.resolve()
-        if resolved != root and root not in resolved.parents:
-            raise ValueError(
-                f"Manifest image reference escapes --input-images-dir: {text}"
-            )
-        return resolved.relative_to(root).as_posix()
-    return Path(os.path.normpath(text)).as_posix()
+    return canonical_image_ref(ref, images_root)
 
 
 def _train_manifest_sha256(
@@ -2761,6 +2751,597 @@ def _train_manifest_sha256(
         "utf-8"
     )
     return hashlib.sha256(payload).hexdigest()
+
+
+def _path_identity(resolved: Path) -> object:
+    """Per-scan file identity; see :func:`otuformer.utils.paths.path_identity`."""
+    return path_identity(resolved)
+
+
+def _expert_path_identity(
+    image_refs: object, images_root: Path
+) -> tuple[bool, str | None]:
+    """Expert-only path-identity check used for pseudo-source eligibility.
+
+    Ordinary manifest validation runs first and keeps its hard failures; this
+    check only answers whether the expert rows can seed one pseudo round. A
+    duplicate resolved identity (alias) or a reference escaping the image root
+    makes the checkpoint ineligible rather than failing ordinary training.
+    """
+    root = Path(images_root).resolve()
+    seen: set[object] = set()
+    for ref in image_refs:
+        text = str(ref)
+        path = Path(text)
+        target = path if path.is_absolute() else root / path
+        try:
+            resolved = target.resolve()
+        except OSError as exc:
+            return False, f"unresolvable expert reference {text!r}: {exc}"
+        if resolved != root and root not in resolved.parents:
+            return False, f"expert reference escapes the image root: {text!r}"
+        try:
+            identity = _path_identity(resolved)
+        except OSError as exc:
+            return False, f"missing expert image {text!r}: {exc}"
+        if identity in seen:
+            return False, f"duplicate expert path identity: {text!r}"
+        seen.add(identity)
+    return True, None
+
+
+def _pseudo_source_status(
+    *, loss: str, ssl_initialization_sha256: str | None, expert_reason: str | None
+) -> tuple[bool, str | None]:
+    """Decide whether a completed finetune#1 checkpoint may seed a pseudo round."""
+    if loss not in ARCFACE_FAMILY_LOSSES:
+        return False, f"loss {loss!r} is not ArcFace-family"
+    if not ssl_initialization_sha256:
+        return False, "missing SSL initialization file SHA-256"
+    if expert_reason:
+        return False, expert_reason
+    return True, None
+
+
+def _resolved_finetune_identity(
+    *,
+    optimizer_layout: str,
+    finetune_lr: float,
+    metric_head_lr: float | None,
+    weight_decay: float,
+    orientation_policy: str,
+    batch_size: int,
+    finetune_epochs: int,
+    long_tail: str,
+) -> dict[str, object]:
+    """Resolved experiment-identity keys the existing config block lacks.
+
+    The other identity keys (loss settings, dimensions, freeze ratio, seed,
+    augmentation, image size) are already written by the caller; this returns
+    only the additive ones so the checkpoint keeps a single identity record.
+    """
+    return {
+        "finetune_lr": float(finetune_lr),
+        "effective_metric_head_lr": float(
+            finetune_lr if metric_head_lr is None else metric_head_lr
+        ),
+        "weight_decay": float(weight_decay),
+        "orientation_policy": orientation_policy,
+        "batch_size": int(batch_size),
+        "finetune_epochs": int(finetune_epochs),
+        "optimizer_name": "adamw",
+        "optimizer_groups": optimizer_layout,
+        "arcface_scale": 64.0,
+        "arcface_margin": 0.5,
+        "long_tail": long_tail,
+    }
+
+
+CB_DRW_BETA = 0.99
+CB_DRW_MAX_CLASS_WEIGHT = 3.0
+CB_DRW_START_FRACTION = 0.5
+CB_DRW_RAMP_FRACTION = 0.1
+
+
+def _effective_number_class_weights(
+    expert_counts, *, beta: float = CB_DRW_BETA, cap: float = CB_DRW_MAX_CLASS_WEIGHT
+) -> torch.Tensor:
+    """Class-Balanced effective-number weights, sample-mean normalized then capped.
+
+    Normalization uses expert training rows, and the cap applies to the target
+    class weight before the manifest-wide denominator, so the final effective
+    coefficient can exceed ``cap``.
+    """
+    # Compute in CPU float64: MPS has no float64, and the tiny class-weight
+    # vector never needs to live on the accelerator.
+    counts = torch.as_tensor(expert_counts).cpu().to(torch.float64)
+    raw = (1.0 - beta) / (1.0 - torch.pow(beta, counts))
+    row_mean = float((raw * counts).sum() / counts.sum())
+    return torch.clamp(raw / row_mean, max=cap)
+
+
+def _drw_lambda(completed_steps: int, total_steps: int) -> float:
+    """Deferred-reweighting interpolation: 0 before start, 1 after the ramp."""
+    start = int(total_steps * CB_DRW_START_FRACTION)
+    ramp = int(total_steps * CB_DRW_RAMP_FRACTION)
+    if ramp <= 0:
+        return 1.0 if completed_steps >= start else 0.0
+    return min(max((completed_steps - start) / ramp, 0.0), 1.0)
+
+
+def _cb_drw_class_weights(
+    target: torch.Tensor, completed_steps: int, total_steps: int
+) -> torch.Tensor:
+    lam = _drw_lambda(completed_steps, total_steps)
+    return 1.0 + lam * (target - 1.0)
+
+
+def _cb_drw_r_bar(class_weights: torch.Tensor, training_counts) -> float:
+    """Manifest-wide mean row weight; never depends on the current batch."""
+    counts = torch.as_tensor(
+        training_counts, dtype=class_weights.dtype, device=class_weights.device
+    )
+    return float((class_weights * counts).sum() / counts.sum())
+
+
+def _weighted_ce(
+    per_row: torch.Tensor, labels: torch.Tensor, class_weights: torch.Tensor, r_bar: float
+) -> torch.Tensor:
+    """``sum_i(w[label_i] * CE_i) / (actual_batch_size * r_bar)``."""
+    return (class_weights[labels] * per_row).sum() / (per_row.numel() * r_bar)
+
+
+# Every resolved experiment setting a v0.9.0 finetune#1 must carry before it
+# can seed a pseudo round. A checkpoint missing any of these cannot be a pseudo
+# source (design sections 3.2 and 7): the design forbids guessing defaults for
+# them, so an old or hand-crafted "eligible" checkpoint fails loudly instead of
+# silently inheriting finetune#2 CLI defaults.
+REQUIRED_PSEUDO_SOURCE_KEYS = (
+    "model_name",
+    "metric_embed_dim",
+    "embedding_head",
+    "loss",
+    "subcenters",
+    "compact_weight",
+    "compact_cap",
+    "supcon_temperature",
+    "freeze_ratio",
+    "finetune_lr",
+    "effective_metric_head_lr",
+    "weight_decay",
+    "batch_size",
+    "seed",
+    "finetune_epochs",
+    "image_size",
+    "augmentation_profile",
+    "augmentation_config",
+    "orientation_policy",
+    "long_tail",
+    "optimizer_name",
+    "optimizer_groups",
+    "arcface_scale",
+    "arcface_margin",
+    "train_manifest_sha256",
+    "ssl_initialization_checkpoint_sha256",
+)
+
+
+def _assert_pseudo_source_identity(
+    source_cfg: dict, resolved: dict, *, ignore: frozenset[str] = frozenset()
+) -> None:
+    """Reject any resolved experiment difference from the finetune#1 source.
+
+    Omitted options are inherited before this check, so a difference here is a
+    genuine mismatch (or an explicit conflict), never a default. ``ignore``
+    covers keys governed by another check (for example ``--finetune-epochs``,
+    which legitimately grows on resume).
+    """
+    for key, value in resolved.items():
+        if key in ignore:
+            continue
+        if key in source_cfg and source_cfg[key] != value:
+            raise ValueError(
+                "pseudo mode requires the finetune#2 experiment identity to "
+                f"match finetune#1: {key} is {value!r}, source has "
+                f"{source_cfg[key]!r}."
+            )
+
+
+def _rows_sha256(rows: list[dict]) -> str:
+    """Canonical hash of ``[image, label]`` rows, independent of row order."""
+    payload = json.dumps(
+        sorted([[str(row["image"]), str(row["label"])] for row in rows]),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _expert_rows_from_csv(path: Path) -> list[dict]:
+    from otuformer.utils.io import read_csv
+
+    frame = read_csv(path)
+    return [
+        {"image": str(row["image"]), "label": str(row["label"]), "source": "expert"}
+        for _index, row in frame.iterrows()
+    ]
+
+
+def _class_row_counts(
+    rows: list[dict] | None, class_to_idx: dict, source: str
+) -> dict[str, int]:
+    """Per-class training-row counts for one row source (record-keeping only)."""
+    counts = {str(label): 0 for label in class_to_idx}
+    for row in rows or []:
+        if row.get("source") != source:
+            continue
+        label = str(row.get("label"))
+        if label in counts:
+            counts[label] += 1
+    return counts
+
+
+def _warn_pseudo_resume_drift(
+    cfg: dict[str, Any], args: Any, out_dir: Path
+) -> None:
+    """Warning-only finetune#2 resume checks (design section 7).
+
+    None of these block: the checkpointed accepted rows are authoritative. A
+    moved root, a changed non-accepted candidate pool, or a missing/edited
+    ``pseudo_labels.csv`` only warns and logs the current state.
+    """
+    recorded_root = cfg.get("input_images_dir")
+    current_root = str(Path(args.input_images_dir).resolve())
+    if recorded_root and str(recorded_root) != current_root:
+        print(
+            "[Warning] Resuming finetune#2 with a different image root: "
+            f"recorded {recorded_root}, current {current_root}."
+        )
+
+    from otuformer.embedding.pseudo_label import discover_candidates
+
+    try:
+        expert_rows = _expert_rows_from_csv(Path(args.train_data))
+        _candidates, _rejections, discovery = discover_candidates(
+            expert_rows, Path(args.input_images_dir)
+        )
+    except Exception as exc:  # noqa: BLE001 - warning only, never blocking
+        print(f"[Warning] Cannot rescan the pseudo candidate pool: {exc}")
+    else:
+        recorded_pool = cfg.get("pseudo_candidate_pool_sha256")
+        current_pool = discovery.get("candidate_pool_sha256")
+        if recorded_pool and current_pool and recorded_pool != current_pool:
+            print(
+                "[Warning] Pseudo candidate pool changed since finetune#2 was "
+                "checkpointed; checkpointed accepted rows still apply."
+            )
+
+    labels_path = Path(out_dir) / "pseudo_labels.csv"
+    if not labels_path.is_file():
+        print(
+            "[Warning] pseudo_labels.csv is missing; checkpointed accepted rows "
+            "remain authoritative."
+        )
+        return
+    current_hash = _sha256_file(labels_path)
+    recorded_csv = cfg.get("pseudo_labels_sha256")
+    if recorded_csv and recorded_csv != current_hash:
+        print(
+            "[Warning] pseudo_labels.csv changed since checkpointing; current "
+            f"sha256 {current_hash[:12]}."
+        )
+    else:
+        print(f"[Info] pseudo_labels.csv sha256 {current_hash[:12]}")
+
+
+def _write_pseudo_outputs(out_dir: Path, diagnostics: list[dict], summary: dict) -> None:
+    import pandas as pd
+
+    from otuformer.utils.io import write_json
+
+    logs_dir = Path(out_dir) / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(diagnostics).to_csv(
+        Path(out_dir) / "pseudo_labels.csv", index=False
+    )
+    write_json(summary, Path(out_dir) / "pseudo_summary.json")
+
+
+def _assert_pseudo_paths(out_dir: Path, image_root: Path, inputs: list[Path]) -> None:
+    """Reject output/root overlap and any file-valued input inside ``out_dir``."""
+    out = Path(out_dir).resolve()
+    root = Path(image_root).resolve()
+    if out == root or out in root.parents or root in out.parents:
+        raise ValueError(
+            "pseudo out_dir must not overlap the biological image root: "
+            f"out_dir={out} root={root}"
+        )
+    for path in inputs:
+        resolved = Path(path).resolve()
+        if resolved == out or out in resolved.parents:
+            raise ValueError(f"input file is inside out_dir: {path}")
+
+
+def _resolve_pseudo_ssl_path(cfg: dict, checkpoint: Path | None) -> Path:
+    """Locate the recorded SSL initialization, verifying its file SHA-256."""
+    recorded_sha = cfg.get("ssl_initialization_checkpoint_sha256")
+    if not recorded_sha:
+        raise ValueError("pseudo source records no SSL initialization file SHA-256")
+    if checkpoint is not None:
+        if not Path(checkpoint).is_file():
+            raise ValueError(f"relocated SSL checkpoint not found: {checkpoint}")
+        if _sha256_file(checkpoint) != recorded_sha:
+            raise ValueError("relocated SSL checkpoint file SHA-256 does not match")
+        return Path(checkpoint)
+    recorded = cfg.get("ssl_initialization_checkpoint_path")
+    if not recorded:
+        raise ValueError(
+            "pseudo source records no SSL checkpoint path; pass --checkpoint to locate it"
+        )
+    path = Path(recorded)
+    if not path.is_file():
+        raise ValueError(f"recorded SSL checkpoint is missing: {path}; pass --checkpoint")
+    if _sha256_file(path) != recorded_sha:
+        raise ValueError("recorded SSL checkpoint file SHA-256 does not match")
+    return path
+
+
+def pseudo_cli_identity(
+    *,
+    ssl_checkpoint: dict,
+    source_cfg: dict,
+    resolved_loss: dict,
+    model_name: str,
+    metric_embed_dim: int | None,
+    finetune_epochs: int,
+    finetune_lr: float,
+    metric_head_lr: float | None,
+    weight_decay: float,
+    freeze_ratio: float,
+    augmentation: str | None,
+    orientation_policy: str | None,
+    batch_size: int,
+    seed: int,
+    long_tail: str,
+    source_class_labels: list[str] | None = None,
+) -> dict:
+    """Resolve the finetune#2 experiment identity from CLI inputs alone.
+
+    Used by the CLI preflight so an identity conflict is reported before any
+    output directory is created or cleared; ``run_finetune`` re-checks the same
+    keys against its fully resolved values as a backstop.
+    """
+    profile = _select_augmentation_profile(augmentation, None, stage="finetune")
+    policy = _select_orientation_policy(
+        orientation_policy, ssl_checkpoint, stage="finetune", resume=False
+    )
+    image_size = resolve_training_image_size(ssl_checkpoint)
+    ssl_cfg = ssl_checkpoint.get("config") or {}
+    out_dim = metric_embed_dim
+    if out_dim is None:
+        out_dim = ssl_cfg.get("metric_embed_dim") or ssl_cfg.get("out_dim") or 256
+    return {
+        "model_name": model_name,
+        "metric_embed_dim": int(out_dim),
+        "embedding_head": _select_finetune_embedding_head(ssl_checkpoint),
+        "loss": str(resolved_loss["loss"]),
+        "subcenters": resolved_loss["subcenters"],
+        "compact_weight": resolved_loss["compact_weight"],
+        "compact_cap": resolved_loss["compact_cap"],
+        "supcon_temperature": resolved_loss["supcon_temperature"],
+        "freeze_ratio": float(freeze_ratio),
+        "finetune_lr": float(finetune_lr),
+        "effective_metric_head_lr": float(
+            finetune_lr if metric_head_lr is None else metric_head_lr
+        ),
+        "weight_decay": float(weight_decay),
+        "batch_size": int(batch_size),
+        "seed": int(seed),
+        "finetune_epochs": int(finetune_epochs),
+        "image_size": int(image_size),
+        "augmentation_profile": profile,
+        "augmentation_config": build_finetune_augmentation_config(
+            profile, image_size, orientation_policy=policy
+        ),
+        "orientation_policy": policy,
+        "long_tail": long_tail,
+        "class_labels": [
+            str(label)
+            for label in (
+                source_class_labels
+                if source_class_labels is not None
+                else source_cfg.get("class_labels", [])
+            )
+        ],
+        "optimizer_name": "adamw",
+        "optimizer_groups": _finetune_optimizer_layout(
+            ssl_checkpoint, False, str(resolved_loss["loss"])
+        ),
+        "arcface_scale": 64.0,
+        "arcface_margin": 0.5,
+    }
+
+
+def _load_pseudo_source(path: Path) -> dict[str, Any]:
+    """Load a pseudo-source checkpoint as one lightweight error type."""
+    from otuformer.embedding.pseudo_label import PseudoLabelError
+
+    try:
+        return load_checkpoint(Path(path))
+    except PseudoLabelError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - surfaced as one lightweight error
+        raise PseudoLabelError(
+            f"cannot read pseudo source checkpoint: {exc}"
+        ) from exc
+
+
+def prepare_pseudo_round(
+    *,
+    pseudo_label_from: Path,
+    train_data: Path,
+    input_images_dir: Path,
+    out_dir: Path,
+    similarity_floor: float,
+    min_gap: float,
+    neighbors: int,
+    long_tail: str,
+    loss: str | None,
+    checkpoint: Path | None,
+    device: str,
+    batch_size: int,
+    num_workers: int,
+    cap_multiplier: int | None = None,
+    absolute_cap: int | None = None,
+    visualize_data: Path | None = None,
+    progress=None,
+) -> dict:
+    """Validate the pseudo source, generate one round in memory, and return it.
+
+    Runs entirely before ``prepare_output_dir``: an empty or invalid round
+    leaves no output directory or file behind.
+    """
+    from otuformer.embedding.pseudo_label import (
+        ABSOLUTE_CAP,
+        CAP_MULTIPLIER,
+        PseudoLabelError,
+        generate_pseudo_rows,
+    )
+    from otuformer.utils.io import read_csv
+
+    if cap_multiplier is None:
+        cap_multiplier = CAP_MULTIPLIER
+    if absolute_cap is None:
+        absolute_cap = ABSOLUTE_CAP
+
+    source = _load_pseudo_source(pseudo_label_from)
+    cfg = source.get("config") or {}
+    if int(cfg.get("pseudo_round", 0)) != 0:
+        raise ValueError("--pseudo-label-from cannot be a finetune#2 checkpoint")
+    if not cfg.get("pseudo_source_eligible"):
+        raise ValueError(
+            "pseudo source is ineligible: "
+            f"{cfg.get('pseudo_source_ineligible_reason') or 'unknown reason'}"
+        )
+    missing = [key for key in REQUIRED_PSEUDO_SOURCE_KEYS if key not in cfg]
+    if missing:
+        raise ValueError(
+            "pseudo source checkpoint is missing required provenance/resolved "
+            f"settings: {', '.join(sorted(missing))}"
+        )
+    if str(cfg.get("loss")) not in ARCFACE_FAMILY_LOSSES:
+        raise ValueError("pseudo feedback supports only ArcFace-family losses")
+    if loss is not None and str(cfg.get("loss")) != loss:
+        raise ValueError(
+            f"--loss must match the pseudo source ({cfg.get('loss')!r})"
+        )
+    if cfg.get("long_tail") != long_tail:
+        raise ValueError(
+            f"--long-tail must match the pseudo source ({cfg.get('long_tail')!r})"
+        )
+
+    frame = read_csv(train_data)
+    expert_rows = [
+        {"image": str(row["image"]), "label": str(row["label"])}
+        for _index, row in frame.iterrows()
+    ]
+    expert_hash = _train_manifest_sha256(
+        [row["image"] for row in expert_rows],
+        [row["label"] for row in expert_rows],
+        Path(input_images_dir),
+    )
+    if cfg.get("train_manifest_sha256") != expert_hash:
+        raise ValueError(
+            "--train-data does not match the pseudo source expert manifest"
+        )
+
+    # ``class_order`` is the actual classifier row order of the source run;
+    # ``class_labels`` is the historical sorted-string metadata and can differ
+    # for numeric labels. A missing table is rejected, never guessed, and these
+    # checks run before the expensive candidate generation.
+    class_labels = [str(label) for label in (source.get("class_order") or [])]
+    if not class_labels:
+        raise ValueError("pseudo source checkpoint has no recorded class order")
+    recorded_labels = [str(label) for label in (source.get("class_labels") or [])]
+    if not recorded_labels:
+        raise ValueError("pseudo source checkpoint has no recorded class labels")
+    if set(recorded_labels) != set(class_labels):
+        raise ValueError(
+            "pseudo source class order and historical class labels disagree"
+        )
+    if set(class_labels) != {row["label"] for row in expert_rows}:
+        raise ValueError(
+            "expert CSV labels do not match the pseudo source class table"
+        )
+    planned_epochs = int(cfg.get("finetune_epochs") or 0)
+    completed_epochs = int(source.get("epoch", -1)) + 1
+    if planned_epochs and completed_epochs < planned_epochs:
+        raise ValueError(
+            "pseudo source run is incomplete: "
+            f"epoch {completed_epochs} of {planned_epochs}"
+        )
+
+    ssl_path = _resolve_pseudo_ssl_path(cfg, checkpoint)
+    protected = [Path(pseudo_label_from), ssl_path, Path(train_data)]
+    if visualize_data is not None:
+        protected.append(Path(visualize_data))
+    if checkpoint is not None:
+        protected.append(Path(checkpoint))
+    _assert_pseudo_paths(Path(out_dir), Path(input_images_dir), protected)
+
+    accepted, diagnostics, summary = generate_pseudo_rows(
+        expert_rows=expert_rows,
+        image_root=Path(input_images_dir),
+        pseudo_checkpoint=Path(pseudo_label_from),
+        similarity_floor=similarity_floor,
+        min_gap=min_gap,
+        neighbors=neighbors,
+        cap_multiplier=cap_multiplier,
+        absolute_cap=absolute_cap,
+        model_name=str(cfg.get("model_name") or "vit_tiny_patch16_224"),
+        device=device,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        progress=progress,
+    )
+    if not accepted:
+        raise PseudoLabelError(
+            "no candidate accepted; candidate count: "
+            + str(summary.get("candidate_count"))
+            + "; accepted count: "
+            + str(summary.get("accepted_count"))
+            + "; acceptance rate: "
+            + json.dumps(summary.get("acceptance_rate"))
+            + "; rejection counts: "
+            + json.dumps(summary.get("rejection_reason_counts", {}), sort_keys=True)
+            + "; score quantiles: "
+            + json.dumps(summary.get("score_quantiles", {}), sort_keys=True)
+            + "; counterfactual pass counts: "
+            + json.dumps(
+                summary.get("counterfactual_pass_counts", {}), sort_keys=True
+            )
+            + "; seed-count bins: "
+            + json.dumps(summary.get("seed_count_bins", {}), sort_keys=True)
+        )
+
+    rows = [
+        {"image": row["image"], "label": row["label"], "source": "expert"}
+        for row in expert_rows
+    ] + [
+        {"image": row["image"], "label": row["label"], "source": "known-pseudo"}
+        for row in accepted
+    ]
+    return {
+        "rows": rows,
+        "accepted": accepted,
+        "diagnostics": diagnostics,
+        "summary": summary,
+        "class_labels": class_labels,
+        "source_class_labels": class_labels,
+        "ssl_checkpoint": str(ssl_path),
+        "source_checkpoint": str(pseudo_label_from),
+        "source_config": cfg,
+    }
 
 
 def _classify_finetune_source(checkpoint: dict[str, Any]) -> str:
@@ -3255,8 +3836,11 @@ def run_finetune(
         Path(getattr(args, "resume", "")) if getattr(args, "resume", "") else None
     )
     trace_batch_ids = bool(getattr(args, "trace_batch_ids", False))
+    pseudo_data = getattr(args, "pseudo_round_data", None)
     if resume_path is not None:
         ckpt_path = resume_path
+    elif pseudo_data is not None:
+        ckpt_path = Path(pseudo_data["ssl_checkpoint"])
     else:
         ckpt_path = Path(args.checkpoint)
     if source_checkpoint is not None:
@@ -3384,13 +3968,104 @@ def run_finetune(
 
     _freeze_backbone_blocks(model, args.freeze_ratio)
 
-    ds = MetricDataset(
-        csv_path=Path(args.train_data),
-        images_dir=Path(args.input_images_dir),
-        image_size=finetune_image_size,
-        augmentation_profile=profile,
-        orientation_policy=policy,
+    pseudo_rows = None
+    pseudo_class_labels = None
+    if pseudo_data is not None:
+        pseudo_rows = pseudo_data["rows"]
+        pseudo_class_labels = pseudo_data["class_labels"]
+    elif resume_path is not None and int(cfg.get("pseudo_round", 0)) == 1:
+        pseudo_rows = _expert_rows_from_csv(Path(args.train_data)) + [
+            {"image": row["image"], "label": row["label"], "source": "known-pseudo"}
+            for row in cfg.get("accepted_pseudo_rows", [])
+        ]
+        # ``class_order`` (actual row order) is preferred over the historical
+        # sorted-string ``class_labels``; both are top-level checkpoint fields.
+        pseudo_class_labels = [
+            str(label)
+            for label in (
+                ckpt.get("class_order") or ckpt.get("class_labels") or []
+            )
+        ]
+    if pseudo_rows is not None:
+        ds = MetricDataset(
+            images_dir=Path(args.input_images_dir),
+            image_size=finetune_image_size,
+            augmentation_profile=profile,
+            orientation_policy=policy,
+            rows=pseudo_rows,
+            class_labels=pseudo_class_labels,
+        )
+    else:
+        ds = MetricDataset(
+            csv_path=Path(args.train_data),
+            images_dir=Path(args.input_images_dir),
+            image_size=finetune_image_size,
+            augmentation_profile=profile,
+            orientation_policy=policy,
+        )
+    expert_label_indices = (
+        [
+            ds.class_to_idx[row["label"]]
+            for row in pseudo_rows
+            if row.get("source") == "expert"
+        ]
+        if pseudo_rows is not None
+        else None
     )
+    # Pseudo rounds save the class table in its actual insertion order so the
+    # numeric-label order (2 before 10) survives save -> resume; ordinary
+    # finetune keeps the historical sorted-string behaviour.
+    saved_class_labels = (
+        [str(label) for label in ds.class_to_idx]
+        if pseudo_rows is not None
+        else sorted(str(label) for label in ds.class_to_idx)
+    )
+    pseudo_config: dict[str, object] = {}
+    if pseudo_data is not None:
+        accepted_rows = [
+            {"image": row["image"], "label": row["label"]}
+            for row in pseudo_data["rows"]
+            if row.get("source") == "known-pseudo"
+        ]
+        pseudo_config = {
+            "pseudo_round": 1,
+            "pseudo_source_checkpoint_sha256": _sha256_file(
+                Path(pseudo_data["source_checkpoint"])
+            ),
+            "accepted_pseudo_rows": accepted_rows,
+            "accepted_pseudo_rows_sha256": _rows_sha256(accepted_rows),
+            "pseudo_rule": pseudo_data["summary"].get("thresholds"),
+            "pseudo_candidate_pool_sha256": pseudo_data["summary"].get(
+                "candidate_pool_sha256"
+            ),
+            "preprocessing": {
+                "eval_transform": "center-crop",
+                "image_size": int(finetune_image_size),
+            },
+        }
+        _write_pseudo_outputs(
+            out_dir, pseudo_data["diagnostics"], pseudo_data["summary"]
+        )
+        pseudo_config["pseudo_labels_sha256"] = _sha256_file(
+            Path(out_dir) / "pseudo_labels.csv"
+        )
+    elif resume_path is not None and int(cfg.get("pseudo_round", 0)) == 1:
+        pseudo_config = {
+            "pseudo_round": 1,
+            **{
+                key: cfg[key]
+                for key in (
+                    "pseudo_source_checkpoint_sha256",
+                    "accepted_pseudo_rows",
+                    "accepted_pseudo_rows_sha256",
+                    "pseudo_rule",
+                    "pseudo_candidate_pool_sha256",
+                    "pseudo_labels_sha256",
+                    "preprocessing",
+                )
+                if key in cfg
+            },
+        }
     loader = DataLoader(
         IndexedDataset(ds) if trace_batch_ids else ds,
         batch_size=args.batch_size,
@@ -3398,6 +4073,18 @@ def run_finetune(
         num_workers=args.num_workers,
     )
     initialization_sha = _sha256_file(ckpt_path)
+    if resume_path is None:
+        # State the initialization source explicitly: pseudo mode starts from
+        # the original SSL checkpoint, never from finetune#1.
+        origin = (
+            "the original SSL checkpoint"
+            if pseudo_data is not None
+            else "checkpoint"
+        )
+        print(
+            f"[Info] Initializing from {origin}: "
+            f"{Path(ckpt_path).resolve()} (sha256 {initialization_sha[:12]})"
+        )
     ssl_initialization_sha = (
         initialization_sha
         if source_kind == "ssl"
@@ -3406,6 +4093,26 @@ def run_finetune(
     manifest_sha = _train_manifest_sha256(
         ds.image_refs, ds.label_names, Path(args.input_images_dir)
     )
+    if resume_path is not None and int(cfg.get("pseudo_round", 0)) == 1:
+        # Finetune#2 resume gates: the expert+accepted training rows must be the
+        # recorded ones, and the checkpointed accepted rows must be unaltered.
+        if cfg.get("train_manifest_sha256") != manifest_sha:
+            raise ValueError(
+                "Cannot resume finetune#2: expert/accepted training rows changed "
+                "(training manifest hash mismatch)."
+            )
+        recorded_hash = cfg.get("accepted_pseudo_rows_sha256")
+        if not recorded_hash:
+            raise ValueError(
+                "Cannot resume finetune#2: checkpoint lacks the accepted "
+                "pseudo-row hash."
+            )
+        if _rows_sha256(cfg.get("accepted_pseudo_rows", [])) != recorded_hash:
+            raise ValueError(
+                "Cannot resume finetune#2: checkpointed accepted pseudo rows were "
+                "altered."
+            )
+        _warn_pseudo_resume_drift(cfg, args, out_dir)
 
     n_classes = len(ds.class_to_idx)
     loss_config = _resolve_finetune_loss_config(
@@ -3422,6 +4129,107 @@ def run_finetune(
         ckpt, resume_path is not None, str(loss_config["loss"])
     )
 
+    # Pseudo-source provenance: resolved identity plus an expert-only path
+    # check. Ordinary manifest validation already ran (and keeps its hard
+    # failures); this only records whether the checkpoint can seed one round.
+    requested_long_tail = str(getattr(args, "long_tail", "none"))
+    if resume_path is not None and "long_tail" in cfg:
+        if (
+            "long_tail" in set(explicit_options)
+            and requested_long_tail != str(cfg["long_tail"])
+        ):
+            raise ValueError(
+                "Cannot resume: --long-tail differs from the recorded strategy "
+                f"{cfg['long_tail']!r}."
+            )
+        long_tail = str(cfg["long_tail"])
+    else:
+        long_tail = requested_long_tail
+    if long_tail == "cb-drw" and str(loss_config["loss"]) == "supcon":
+        raise ValueError(
+            "--long-tail cb-drw is rejected for SupCon: it has no class-level "
+            "cross-entropy term."
+        )
+    identity_extras = _resolved_finetune_identity(
+        optimizer_layout=optimizer_layout,
+        finetune_lr=float(args.finetune_lr),
+        metric_head_lr=getattr(args, "metric_head_lr", None),
+        weight_decay=float(getattr(args, "weight_decay", 1e-4)),
+        orientation_policy=policy,
+        batch_size=int(args.batch_size),
+        finetune_epochs=int(args.finetune_epochs),
+        long_tail=long_tail,
+    )
+    if resume_path is not None:
+        # A resume must not rewrite recorded identity with inert CLI values; old
+        # checkpoints that lack a key stay incomplete rather than looking fresh.
+        identity_extras = {
+            key: value for key, value in identity_extras.items() if key in cfg
+        }
+    expert_ok, expert_reason = _expert_path_identity(
+        ds.image_refs, Path(args.input_images_dir)
+    )
+    pseudo_round = int(cfg.get("pseudo_round", 0)) if resume_path is not None else 0
+    eligible, ineligible_reason = _pseudo_source_status(
+        loss=str(loss_config["loss"]),
+        ssl_initialization_sha256=ssl_initialization_sha,
+        expert_reason=expert_reason,
+    )
+    if resume_path is not None and "pseudo_source_eligible" in cfg:
+        eligible = bool(cfg["pseudo_source_eligible"])
+        ineligible_reason = cfg.get("pseudo_source_ineligible_reason")
+    ssl_source_path = (
+        str(Path(ckpt_path).resolve())
+        if source_kind == "ssl"
+        else str(cfg.get("ssl_initialization_checkpoint_path") or "")
+    )
+    print(
+        "[Info] Pseudo-source eligibility: "
+        + ("eligible" if eligible else f"ineligible ({ineligible_reason})")
+    )
+    pseudo_identity_cfg = None
+    if pseudo_data is not None:
+        pseudo_identity_cfg = pseudo_data.get("source_config") or {}
+    elif resume_path is not None and int(cfg.get("pseudo_round", 0)) == 1:
+        # A finetune#2 resume must also fix every experiment key, not only the
+        # training rows; operational keys stay free.
+        pseudo_identity_cfg = cfg
+    if pseudo_identity_cfg is not None:
+        _assert_pseudo_source_identity(
+            pseudo_identity_cfg,
+            {
+                "model_name": model_name,
+                "metric_embed_dim": int(out_dim),
+                "embedding_head": embedding_head,
+                "loss": str(loss_config["loss"]),
+                "subcenters": loss_config["subcenters"],
+                "compact_weight": loss_config["compact_weight"],
+                "compact_cap": loss_config["compact_cap"],
+                "supcon_temperature": loss_config["supcon_temperature"],
+                "freeze_ratio": float(args.freeze_ratio),
+                "weight_decay": float(getattr(args, "weight_decay", 1e-4)),
+                "batch_size": int(args.batch_size),
+                "seed": int(args.seed),
+                "finetune_epochs": int(args.finetune_epochs),
+                "image_size": int(finetune_image_size),
+                "augmentation_profile": profile,
+                "augmentation_config": augmentation_config,
+                "orientation_policy": policy,
+                "long_tail": long_tail,
+                "class_labels": saved_class_labels,
+                **identity_extras,
+                # These are genuinely CLI-driven on resume, so compare the actual
+                # values rather than the preserved checkpoint copies.
+                "batch_size": int(args.batch_size),
+                "seed": int(args.seed),
+            },
+            # Resume may extend the epoch budget; _validate_finetune_resume
+            # owns that rule, so it is not an identity mismatch here.
+            ignore=(
+                frozenset({"finetune_epochs"}) if pseudo_data is None else frozenset()
+            ),
+        )
+
     optimizer = _build_finetune_optimizer_for_layout(
         optimizer_layout,
         model,
@@ -3430,10 +4238,69 @@ def run_finetune(
         getattr(args, "metric_head_lr", None),
         getattr(args, "weight_decay", 1e-4),
     )
+
+    use_cb_drw = long_tail == "cb-drw"
+    cb_drw_record: dict[str, object] | None = None
+    if use_cb_drw:
+        training_counts = torch.bincount(
+            torch.as_tensor(ds.labels, dtype=torch.long), minlength=n_classes
+        ).double()
+        # Class weights come from expert rows only; pseudo rows still change the
+        # manifest-wide denominator (r_bar) through training_counts.
+        expert_counts = (
+            torch.bincount(
+                torch.as_tensor(expert_label_indices, dtype=torch.long),
+                minlength=n_classes,
+            ).double()
+            if expert_label_indices is not None
+            else training_counts
+        )
+        # Keep the target weights on CPU in float64 (device-agnostic); the
+        # per-step loss reduction casts the small (C,) vector to the batch
+        # device/dtype, so MPS never sees float64.
+        target_weights = _effective_number_class_weights(expert_counts)
+        recorded = (cfg.get("cb_drw") or {}) if resume_path is not None else {}
+        if recorded.get("total_steps"):
+            # Resume restores the original horizon T (design: restore t and T).
+            # Extra epochs continue at the target weights, since lambda is
+            # clamped to 1 past the original ramp end.
+            total_steps = int(recorded["total_steps"])
+        else:
+            total_steps = max(1, len(loader) * int(args.finetune_epochs))
+        # start/ramp must come from the final T, so the recorded schedule and
+        # the schedule the training loop actually applies cannot diverge.
+        start_step = int(total_steps * CB_DRW_START_FRACTION)
+        ramp_steps = int(total_steps * CB_DRW_RAMP_FRACTION)
+        r_bar_points = {
+            name: _cb_drw_r_bar(
+                _cb_drw_class_weights(target_weights, step, total_steps),
+                training_counts,
+            )
+            for name, step in (
+                ("r_bar_step0", 0),
+                ("r_bar_ramp_start", start_step),
+                ("r_bar_ramp_end", start_step + ramp_steps),
+            )
+        }
+        cb_drw_record = {
+            "beta": CB_DRW_BETA,
+            "max_class_weight": CB_DRW_MAX_CLASS_WEIGHT,
+            "start_step": start_step,
+            "ramp_steps": ramp_steps,
+            "total_steps": total_steps,
+            "expert_counts": [int(v) for v in expert_counts.tolist()],
+            "target_weights": [round(float(v), 6) for v in target_weights.tolist()],
+            **{name: round(value, 6) for name, value in r_bar_points.items()},
+            "effective_max_step0": round(
+                float(target_weights.max())
+                / max(r_bar_points["r_bar_step0"], 1e-12),
+                6,
+            ),
+        }
+        print("[Info] CB-DRW: " + json.dumps(cb_drw_record, sort_keys=True))
     start_epoch = 0
     if resume_path is not None:
-        class_labels = sorted(str(label) for label in ds.class_to_idx)
-        _validate_finetune_resume(ckpt, class_labels, args.finetune_epochs)
+        _validate_finetune_resume(ckpt, saved_class_labels, args.finetune_epochs)
         _validate_finetune_freeze_ratio(ckpt, args.freeze_ratio)
         saved_loss = ckpt.get("loss_state_dict")
         if isinstance(saved_loss, dict) and "head.weight" in saved_loss:
@@ -3520,7 +4387,22 @@ def run_finetune(
             labels = labels.to(device)
 
             emb = model(imgs)
-            loss = loss_fn(emb, labels)
+            if use_cb_drw:
+                class_weights_t = _cb_drw_class_weights(
+                    target_weights, global_step, total_steps
+                )
+                r_bar = _cb_drw_r_bar(class_weights_t, training_counts)
+                per_row = loss_fn.unreduced(emb, labels)
+                loss = _weighted_ce(
+                    per_row,
+                    labels,
+                    class_weights_t.to(device=per_row.device, dtype=per_row.dtype),
+                    r_bar,
+                )
+                if hasattr(loss_fn, "compact_penalty"):
+                    loss = loss + loss_fn.compact_penalty()
+            else:
+                loss = loss_fn(emb, labels)
             if loss is None:
                 # SupCon: no valid positive anchor, or no different-species
                 # pair. Nothing to backpropagate; count it and move on.
@@ -3648,10 +4530,40 @@ def run_finetune(
                     ),
                     "freeze_ratio": args.freeze_ratio,
                     "image_size": finetune_image_size,
+                    "input_images_dir": str(Path(args.input_images_dir).resolve()),
                     "augmentation_profile": profile,
                     "augmentation_config": augmentation_config,
+                    "pseudo_round": pseudo_round,
+                    **pseudo_config,
+                    **(
+                        {
+                            "pseudo_training_summary": {
+                                "epochs": int(args.finetune_epochs),
+                                "training_rows": len(ds),
+                                "batches_per_epoch": len(loader),
+                                "completed_optimizer_steps": int(global_step),
+                                "expert_counts_by_class": _class_row_counts(
+                                    pseudo_rows, ds.class_to_idx, "expert"
+                                ),
+                                "pseudo_counts_by_class": _class_row_counts(
+                                    pseudo_rows, ds.class_to_idx, "known-pseudo"
+                                ),
+                            }
+                        }
+                        if pseudo_rows is not None
+                        else {}
+                    ),
+                    "pseudo_source_eligible": bool(eligible),
+                    "pseudo_source_ineligible_reason": ineligible_reason,
+                    "ssl_initialization_checkpoint_path": ssl_source_path,
+                    **({"cb_drw": cb_drw_record} if cb_drw_record else {}),
+                    **identity_extras,
                 },
-                "class_labels": sorted(str(label) for label in ds.class_to_idx),
+                "class_labels": saved_class_labels,
+                # The actual classifier row order used by this run. ``class_labels``
+                # keeps its historical sorted-string value; for numeric labels the
+                # two differ, and pseudo rounds must inherit the real order.
+                "class_order": [str(label) for label in ds.class_to_idx],
             }
             save_path = out_dir / f"finetune_epoch_{epoch + 1:04d}.pth"
             save_checkpoint(ckpt_payload, save_path)

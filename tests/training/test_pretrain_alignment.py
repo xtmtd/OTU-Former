@@ -2,6 +2,7 @@ import argparse
 import importlib.util
 import json
 import math
+import os
 from pathlib import Path
 
 import numpy as np
@@ -562,7 +563,7 @@ def test_finetune_resolves_and_persists_checkpoint_size(tmp_path):
     assert saved["config"]["augmentation_profile"] == "none"
     assert saved["config"]["augmentation_config"]["image_size"] == 32
     assert saved["config"]["augmentation_config"]["orientation_policy"] == "sensitive"
-    assert "orientation_policy" not in saved["config"]
+    assert saved["config"]["orientation_policy"] == "sensitive"
     # and a finetune checkpoint resolves back to 32 (not 224)
     assert resolve_training_image_size(saved) == 32
 
@@ -3100,3 +3101,457 @@ def test_batch_id_trace_is_off_by_default_and_follows_shuffled_order(tmp_path):
         assert record["refs"] == [f"img_{i}.jpg" for i in record["indices"]]
     seen = [index for line in lines for index in json.loads(line)["indices"]]
     assert sorted(seen) == [0, 1, 2, 3]
+
+
+def test_cb_drw_resume_restores_the_original_horizon(tmp_path):
+    img_dir, labels_path = _write_tiny_ft_data(tmp_path)
+    checkpoint = _write_pretrain_checkpoint(tmp_path / "ssl.pth")
+    args = _finetune_args(
+        tmp_path,
+        checkpoint,
+        out_dir=str(tmp_path / "ft_cbdrw"),
+        train_data=str(labels_path),
+        input_images_dir=str(img_dir),
+        finetune_epochs=1,
+        batch_size=4,
+        num_workers=0,
+        log_every_n_steps=100,
+        save_every_epochs=1,
+        keep_last_checkpoints=0,
+        long_tail="cb-drw",
+    )
+    trainer.run_finetune(args)
+    saved = torch.load(
+        tmp_path / "ft_cbdrw" / "finetune_latest.pth",
+        map_location="cpu",
+        weights_only=False,
+    )
+
+    assert saved["config"]["long_tail"] == "cb-drw"
+    record = saved["config"]["cb_drw"]
+    assert record["total_steps"] == 1  # one batch per epoch, one epoch
+    assert record["start_step"] == 0
+    assert record["ramp_steps"] == 0  # T=1 applies the target from the first step
+    assert record["expert_counts"] == [2, 2]
+    assert record["target_weights"] == [1.0, 1.0]
+    assert record["r_bar_step0"] == 1.0
+
+    resume_args = _finetune_args(
+        tmp_path,
+        checkpoint,
+        out_dir=str(tmp_path / "ft_cbdrw_resume"),
+        resume=str(tmp_path / "ft_cbdrw" / "finetune_latest.pth"),
+        train_data=str(labels_path),
+        input_images_dir=str(img_dir),
+        finetune_epochs=2,
+        batch_size=4,
+        num_workers=0,
+        log_every_n_steps=100,
+        save_every_epochs=1,
+        keep_last_checkpoints=0,
+        long_tail="cb-drw",
+    )
+    # Resume restores the original horizon T; extra epochs keep the target
+    # weights instead of being rejected.
+    trainer.run_finetune(resume_args)
+    resumed = torch.load(
+        tmp_path / "ft_cbdrw_resume" / "finetune_latest.pth",
+        map_location="cpu",
+        weights_only=False,
+    )
+    record = resumed["config"]["cb_drw"]
+    assert record["total_steps"] == 1
+    # The recorded schedule must match the schedule actually applied: both come
+    # from the restored T, not from the extended epoch count.
+    assert record["start_step"] == int(1 * 0.5)
+    assert record["ramp_steps"] == int(1 * 0.1)
+
+
+def test_cb_drw_is_rejected_for_supcon(tmp_path):
+    img_dir, labels_path = _write_tiny_ft_data(tmp_path)
+    checkpoint = _write_pretrain_checkpoint(tmp_path / "ssl.pth")
+    args = _finetune_args(
+        tmp_path,
+        checkpoint,
+        out_dir=str(tmp_path / "ft_supcon"),
+        train_data=str(labels_path),
+        input_images_dir=str(img_dir),
+        finetune_epochs=1,
+        batch_size=2,
+        num_workers=0,
+        log_every_n_steps=100,
+        save_every_epochs=1,
+        keep_last_checkpoints=0,
+        loss="supcon",
+        long_tail="cb-drw",
+    )
+    with pytest.raises(ValueError, match="SupCon"):
+        trainer.run_finetune(args)
+
+
+def _write_pseudo_ft_data(tmp_path, *, per_class=5):
+    """Dedicated fixture with >=3 expert seeds per class, as the rule requires."""
+    img_dir = tmp_path / "pseudo_images"
+    img_dir.mkdir()
+    rows = []
+    for index in range(per_class * 2):
+        label = "classA" if index < per_class else "classB"
+        color = (index * 20 % 256, 40, 160) if label == "classA" else (30, index * 20 % 256, 90)
+        Image.new("RGB", (64, 64), color=color).save(img_dir / f"img_{index}.jpg")
+        rows.append({"image": f"img_{index}.jpg", "label": label})
+    labels_path = tmp_path / "pseudo_labels.csv"
+    pd.DataFrame(rows).to_csv(labels_path, index=False)
+    return img_dir, labels_path
+
+
+def test_pseudo_round_end_to_end_and_third_round_rejected(tmp_path):
+    img_dir, labels_path = _write_pseudo_ft_data(tmp_path)
+    # Candidates are classA-like images with one changed pixel, so their bytes
+    # differ from every expert seed while the raw-CLS features stay close.
+    for index in range(2):
+        image = Image.new("RGB", (64, 64), color=(index * 20 % 256, 40, 160))
+        image.putpixel((0, 0), (1, 1, 1))
+        image.save(img_dir / f"cand_{index}.jpg")
+    # A hard-linked duplicate candidate exercises pre-scan rejection counting.
+    os.link(img_dir / "cand_0.jpg", img_dir / "cand_2.jpg")
+    ssl = _write_pretrain_checkpoint(tmp_path / "ssl.pth")
+    trainer.run_finetune(
+        _finetune_args(
+            tmp_path,
+            ssl,
+            out_dir=str(tmp_path / "ft1"),
+            train_data=str(labels_path),
+            input_images_dir=str(img_dir),
+            finetune_epochs=1,
+            batch_size=4,
+            num_workers=0,
+            log_every_n_steps=100,
+            save_every_epochs=1,
+            keep_last_checkpoints=0,
+        )
+    )
+    ft1 = tmp_path / "ft1" / "finetune_latest.pth"
+
+    pseudo = trainer.prepare_pseudo_round(
+        pseudo_label_from=ft1,
+        train_data=labels_path,
+        input_images_dir=img_dir,
+        out_dir=tmp_path / "ft2",
+        similarity_floor=-1.0,
+        min_gap=0.0,
+        neighbors=3,
+        long_tail="none",
+        loss=None,
+        checkpoint=None,
+        device="cpu",
+        batch_size=2,
+        num_workers=0,
+    )
+    assert any(row["source"] == "known-pseudo" for row in pseudo["rows"])
+    assert not (tmp_path / "ft2").exists()
+    assert pseudo["summary"]["candidate_count"] == len(pseudo["diagnostics"])
+    assert (
+        pseudo["summary"]["rejection_reason_counts"].get("duplicate_file_identity")
+        == 1
+    )
+
+    trainer.run_finetune(
+        _finetune_args(
+            tmp_path,
+            ssl,
+            out_dir=str(tmp_path / "ft2"),
+            train_data=str(labels_path),
+            input_images_dir=str(img_dir),
+            finetune_epochs=1,
+            batch_size=4,
+            num_workers=0,
+            log_every_n_steps=100,
+            save_every_epochs=1,
+            keep_last_checkpoints=0,
+            pseudo_round_data=pseudo,
+        )
+    )
+    saved = torch.load(
+        tmp_path / "ft2" / "finetune_latest.pth", map_location="cpu", weights_only=False
+    )
+    assert saved["config"]["pseudo_round"] == 1
+    assert saved["config"]["accepted_pseudo_rows"]
+    assert saved["config"]["pseudo_source_checkpoint_sha256"]
+    assert (tmp_path / "ft2" / "pseudo_labels.csv").exists()
+    assert (tmp_path / "ft2" / "pseudo_summary.json").exists()
+    assert saved["config"]["accepted_pseudo_rows_sha256"]
+    assert saved["config"]["pseudo_rule"]["eval_transform"] == "center-crop"
+    assert saved["config"]["input_images_dir"] == str(img_dir.resolve())
+    assert saved["config"]["pseudo_labels_sha256"]
+    training = saved["config"]["pseudo_training_summary"]
+    assert training["epochs"] == 1
+    assert training["training_rows"] == (
+        sum(training["expert_counts_by_class"].values())
+        + sum(training["pseudo_counts_by_class"].values())
+    )
+    assert training["batches_per_epoch"] >= 1
+    assert training["completed_optimizer_steps"] >= 1
+    assert set(training["expert_counts_by_class"]) == {"classA", "classB"}
+    assert saved["config"]["preprocessing"]["eval_transform"] == "center-crop"
+
+    # A finetune#2 resume must also fix the experiment identity: an explicit
+    # batch-size change is rejected even with unchanged training rows.
+    with pytest.raises(ValueError, match="batch_size"):
+        trainer.run_finetune(
+            _finetune_args(
+                tmp_path,
+                ssl,
+                out_dir=str(tmp_path / "ft2_resume_bs"),
+                resume=str(tmp_path / "ft2" / "finetune_latest.pth"),
+                train_data=str(labels_path),
+                input_images_dir=str(img_dir),
+                finetune_epochs=1,
+                batch_size=2,
+                num_workers=0,
+                log_every_n_steps=100,
+                save_every_epochs=1,
+                keep_last_checkpoints=0,
+            )
+        )
+
+    # Resume rejects a changed expert manifest instead of silently continuing.
+    changed = tmp_path / "changed_labels.csv"
+    changed_frame = pd.read_csv(labels_path)
+    changed_frame.loc[0, "label"] = "classB"
+    changed_frame.to_csv(changed, index=False)
+    with pytest.raises(ValueError, match="manifest hash mismatch"):
+        trainer.run_finetune(
+            _finetune_args(
+                tmp_path,
+                ssl,
+                out_dir=str(tmp_path / "ft2_resume"),
+                resume=str(tmp_path / "ft2" / "finetune_latest.pth"),
+                train_data=str(changed),
+                input_images_dir=str(img_dir),
+                finetune_epochs=1,
+                batch_size=4,
+                num_workers=0,
+                log_every_n_steps=100,
+                save_every_epochs=1,
+                keep_last_checkpoints=0,
+            )
+        )
+
+    with pytest.raises(ValueError, match="finetune#2"):
+        trainer.prepare_pseudo_round(
+            pseudo_label_from=tmp_path / "ft2" / "finetune_latest.pth",
+            train_data=labels_path,
+            input_images_dir=img_dir,
+            out_dir=tmp_path / "ft3",
+            similarity_floor=-1.0,
+            min_gap=0.0,
+            neighbors=3,
+            long_tail="none",
+            loss=None,
+            checkpoint=None,
+            device="cpu",
+            batch_size=2,
+            num_workers=0,
+        )
+
+
+def test_pseudo_mode_rejects_experiment_identity_mismatch(tmp_path):
+    img_dir, labels_path = _write_pseudo_ft_data(tmp_path)
+    image = Image.new("RGB", (64, 64), color=(5, 40, 160))
+    image.putpixel((0, 0), (1, 1, 1))
+    image.save(img_dir / "cand_0.jpg")
+    ssl = _write_pretrain_checkpoint(tmp_path / "ssl.pth")
+    trainer.run_finetune(
+        _finetune_args(
+            tmp_path,
+            ssl,
+            out_dir=str(tmp_path / "ft1"),
+            train_data=str(labels_path),
+            input_images_dir=str(img_dir),
+            finetune_epochs=1,
+            batch_size=4,
+            num_workers=0,
+            log_every_n_steps=100,
+            save_every_epochs=1,
+            keep_last_checkpoints=0,
+        )
+    )
+    pseudo = trainer.prepare_pseudo_round(
+        pseudo_label_from=tmp_path / "ft1" / "finetune_latest.pth",
+        train_data=labels_path,
+        input_images_dir=img_dir,
+        out_dir=tmp_path / "ft2",
+        similarity_floor=-1.0,
+        min_gap=0.0,
+        neighbors=3,
+        long_tail="none",
+        loss=None,
+        checkpoint=None,
+        device="cpu",
+        batch_size=2,
+        num_workers=0,
+    )
+
+    with pytest.raises(ValueError, match="freeze_ratio"):
+        trainer.run_finetune(
+            _finetune_args(
+                tmp_path,
+                ssl,
+                out_dir=str(tmp_path / "ft2"),
+                train_data=str(labels_path),
+                input_images_dir=str(img_dir),
+                finetune_epochs=1,
+                batch_size=4,
+                num_workers=0,
+                log_every_n_steps=100,
+                save_every_epochs=1,
+                keep_last_checkpoints=0,
+                freeze_ratio=0.5,
+                pseudo_round_data=pseudo,
+            )
+        )
+
+
+def test_pseudo_round_preserves_numeric_class_order_across_resume(tmp_path):
+    img_dir = tmp_path / "num_images"
+    img_dir.mkdir()
+    rows = []
+    for index in range(10):
+        label = 2 if index < 5 else 10
+        color = (index * 20 % 256, 40, 160) if label == 2 else (30, index * 20 % 256, 90)
+        Image.new("RGB", (64, 64), color=color).save(img_dir / f"img_{index}.jpg")
+        rows.append({"image": f"img_{index}.jpg", "label": label})
+    labels_path = tmp_path / "num_labels.csv"
+    pd.DataFrame(rows).to_csv(labels_path, index=False)
+    for index in range(2):
+        image = Image.new("RGB", (64, 64), color=(index * 20 % 256, 40, 160))
+        image.putpixel((0, 0), (1, 1, 1))
+        image.save(img_dir / f"cand_{index}.jpg")
+
+    ssl = _write_pretrain_checkpoint(tmp_path / "ssl.pth")
+    trainer.run_finetune(
+        _finetune_args(
+            tmp_path, ssl, out_dir=str(tmp_path / "num_ft1"),
+            train_data=str(labels_path), input_images_dir=str(img_dir),
+            finetune_epochs=1, batch_size=4, num_workers=0,
+            log_every_n_steps=100, save_every_epochs=1, keep_last_checkpoints=0,
+        )
+    )
+    ft1 = tmp_path / "num_ft1" / "finetune_latest.pth"
+    # The real ft1 checkpoint records class_order ["2", "10"] (numeric) while
+    # class_labels keeps the historical sorted-string ["10", "2"].
+    source = torch.load(ft1, map_location="cpu", weights_only=False)
+    assert source["class_order"] == ["2", "10"]
+    assert source["class_labels"] == ["10", "2"]
+
+    pseudo = trainer.prepare_pseudo_round(
+        pseudo_label_from=ft1, train_data=labels_path, input_images_dir=img_dir,
+        out_dir=tmp_path / "num_ft2", similarity_floor=-1.0, min_gap=0.0,
+        neighbors=3, long_tail="none", loss=None, checkpoint=None,
+        device="cpu", batch_size=2, num_workers=0,
+    )
+    assert pseudo["class_labels"] == ["2", "10"]
+
+    trainer.run_finetune(
+        _finetune_args(
+            tmp_path, ssl, out_dir=str(tmp_path / "num_ft2"),
+            train_data=str(labels_path), input_images_dir=str(img_dir),
+            finetune_epochs=1, batch_size=4, num_workers=0,
+            log_every_n_steps=100, save_every_epochs=1, keep_last_checkpoints=0,
+            pseudo_round_data=pseudo,
+        )
+    )
+    ft2 = tmp_path / "num_ft2" / "finetune_latest.pth"
+    saved = torch.load(ft2, map_location="cpu", weights_only=False)
+    # Save must not re-sort the numeric class table into ["10", "2"].
+    assert saved["class_labels"] == ["2", "10"]
+    assert saved["class_order"] == ["2", "10"]
+
+    trainer.run_finetune(
+        _finetune_args(
+            tmp_path, ssl, out_dir=str(tmp_path / "num_ft2_resume"),
+            resume=str(ft2), train_data=str(labels_path),
+            input_images_dir=str(img_dir), finetune_epochs=2, batch_size=4,
+            num_workers=0, log_every_n_steps=100, save_every_epochs=1,
+            keep_last_checkpoints=0,
+        )
+    )
+    resumed = torch.load(
+        tmp_path / "num_ft2_resume" / "finetune_latest.pth",
+        map_location="cpu",
+        weights_only=False,
+    )
+    assert resumed["class_labels"] == ["2", "10"]
+
+
+def test_pseudo_cli_preflight_accepts_numeric_class_order(tmp_path, monkeypatch):
+    """The public CLI preflight must accept labels whose sorted string order
+    differs from the classifier row order (2 before 10)."""
+    from typer.testing import CliRunner
+
+    from otuformer.cli.main import app
+    from otuformer.embedding import pseudo_label as pl_module
+
+    img_dir = tmp_path / "num_cli_images"
+    img_dir.mkdir()
+    rows = []
+    for index in range(10):
+        label = 2 if index < 5 else 10
+        Image.new("RGB", (64, 64), color=(index * 20 % 256, 40, 160)).save(
+            img_dir / f"img_{index}.jpg"
+        )
+        rows.append({"image": f"img_{index}.jpg", "label": label})
+    for index in range(2):
+        image = Image.new("RGB", (64, 64), color=(index * 20 % 256, 40, 160))
+        image.putpixel((0, 0), (1, 1, 1))
+        image.save(img_dir / f"cand_{index}.jpg")
+    labels_path = tmp_path / "num_cli_labels.csv"
+    pd.DataFrame(rows).to_csv(labels_path, index=False)
+
+    ssl = _write_pretrain_checkpoint(tmp_path / "num_cli_ssl.pth")
+    trainer.run_finetune(
+        _finetune_args(
+            tmp_path, ssl, out_dir=str(tmp_path / "num_cli_ft1"),
+            train_data=str(labels_path), input_images_dir=str(img_dir),
+            finetune_epochs=1, batch_size=4, num_workers=0,
+            log_every_n_steps=100, save_every_epochs=1, keep_last_checkpoints=0,
+        )
+    )
+    ft1 = tmp_path / "num_cli_ft1" / "finetune_latest.pth"
+
+    monkeypatch.setattr(
+        pl_module,
+        "generate_pseudo_rows",
+        lambda **kwargs: (
+            [{"image": "cand_0.jpg", "label": "2"}],
+            [{"image": "cand_0.jpg", "accepted": True, "rejection_reasons": []}],
+            {
+                "thresholds": {"similarity_floor": 0.0, "min_gap": 0.0, "neighbors": 3},
+                "candidate_count": 1,
+                "accepted_count": 1,
+                "acceptance_rate": 1.0,
+                "rejection_reason_counts": {},
+                "seed_count_bins": {},
+            },
+        ),
+    )
+    monkeypatch.setattr(trainer, "run_finetune", lambda args, **kwargs: None)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "finetune",
+            "--train-data", str(labels_path),
+            "--input-images-dir", str(img_dir),
+            "--out-dir", str(tmp_path / "num_cli_ft2"),
+            "--pseudo-label-from", str(ft1),
+            "--device", "cpu",
+            "--batch-size", "4",
+            "--num-workers", "0",
+            "--save-every-epochs", "1",
+            "--log-every-n-steps", "100",
+            "--keep-last-checkpoints", "0",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output

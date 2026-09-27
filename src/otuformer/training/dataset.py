@@ -866,13 +866,29 @@ class MetricDataset(Dataset):
 
     def __init__(
         self,
-        csv_path: Path,
-        images_dir: Path,
+        csv_path: Path | None = None,
+        images_dir: Path = Path("."),
         image_size: int = 224,
         augmentation_profile: str = "none",
         orientation_policy: str = "sensitive",
+        *,
+        rows: list[dict] | None = None,
+        class_labels: list[str] | None = None,
     ) -> None:
-        df = pd.read_csv(csv_path)
+        # ``rows`` is the opt-in pseudo-mode path: already-validated in-memory
+        # expert+accepted rows with an explicit ordered class table. The default
+        # CSV path is unchanged and keeps ``csv_path`` required.
+        if rows is None:
+            if csv_path is None:
+                raise ValueError("MetricDataset requires csv_path or rows")
+            df = pd.read_csv(csv_path)
+        else:
+            df = pd.DataFrame(
+                {
+                    "image": [str(row["image"]) for row in rows],
+                    "label": [str(row["label"]) for row in rows],
+                }
+            )
         images_root = Path(images_dir)
         refs = [str(row) for row in df["image"]]
         missing_direct = [
@@ -887,9 +903,14 @@ class MetricDataset(Dataset):
         self.image_paths = [
             _resolve_image_path(images_root, ref, by_relative, by_name) for ref in refs
         ]
-        classes = sorted(df["label"].unique())
-        self.class_to_idx = {c: i for i, c in enumerate(classes)}
-        self.labels = [self.class_to_idx[l] for l in df["label"]]
+        if class_labels is None:
+            classes = sorted(df["label"].unique())
+            self.class_to_idx = {c: i for i, c in enumerate(classes)}
+            self.labels = [self.class_to_idx[l] for l in df["label"]]
+        else:
+            classes = list(class_labels)
+            self.class_to_idx = {c: i for i, c in enumerate(classes)}
+            self.labels = [self.class_to_idx[str(l)] for l in df["label"]]
         # Original CSV references and label names, kept for the training
         # manifest hash and the optional batch-ID trace.
         self.image_refs = refs

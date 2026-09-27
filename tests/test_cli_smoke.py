@@ -447,7 +447,21 @@ def test_finetune_runs_one_epoch(tmp_path):
     assert saved["config"]["embedding_head"] == "arcface_mlp_512"
     assert saved["config"]["augmentation_config"]["profile"] == "none"
     assert saved["config"]["augmentation_config"]["orientation_policy"] == "sensitive"
-    assert "orientation_policy" not in saved["config"]
+    # Additive experiment identity recorded for later cross-run comparison.
+    assert saved["config"]["orientation_policy"] == "sensitive"
+    assert saved["config"]["pseudo_round"] == 0
+    assert saved["config"]["pseudo_source_eligible"] is True
+    assert saved["config"]["pseudo_source_ineligible_reason"] is None
+    assert saved["config"]["finetune_lr"] == 1e-4
+    assert saved["config"]["effective_metric_head_lr"] == 1e-4
+    assert saved["config"]["weight_decay"] == 1e-4
+    assert saved["config"]["finetune_epochs"] == 1
+    assert saved["config"]["long_tail"] == "none"
+    assert saved["config"]["arcface_scale"] == 64.0
+    assert saved["config"]["arcface_margin"] == 0.5
+    assert saved["config"]["optimizer_name"] == "adamw"
+    assert saved["config"]["ssl_initialization_checkpoint_path"] == str(ckpt)
+    assert saved["config"]["ssl_initialization_checkpoint_sha256"]
 
 
 def _make_ckpt(tmp_path, out_dim=64):
@@ -3693,3 +3707,426 @@ def test_finetune_help_names_loss_modes_and_flag_applicability():
     assert "Supervised metric-learning fine-tuning" in normalized
     assert "ArcFace metric learning fine-tuning" not in normalized
     assert "benchmark" not in output.lower()
+
+
+def _finetune_param_names() -> set[str]:
+    import inspect
+
+    from otuformer.cli import finetune as finetune_module
+
+    callback = finetune_module.app.registered_callback.callback
+    return {
+        name for name in inspect.signature(callback).parameters if name != "ctx"
+    }
+
+
+def test_finetune_help_documents_pseudo_and_long_tail_options():
+    result = runner.invoke(app, ["finetune", "--help"])
+    assert result.exit_code == 0
+    for flag in (
+        "--long-tail",
+        "--pseudo-label-from",
+        "--pseudo-similarity-floor",
+        "--pseudo-min-gap",
+        "--pseudo-neighbors",
+        "--pseudo-cap-multiplier",
+        "--pseudo-absolute-cap",
+    ):
+        assert flag in result.output
+    assert "[default: 0.75]" in result.output
+    assert "[default: 15]" in result.output
+    assert "[default: 50]" in result.output
+    # Typer/rich hard-wraps help text with panel borders; normalize before matching.
+    normalized = " ".join(result.output.replace("│", " ").split())
+    assert "not a probability" in normalized
+    assert "Higher rejects more" in normalized
+    assert "asymmetric own-class-excluded mutual-kNN" in normalized
+    assert "omitted experiment options inherit finetune#1" in normalized
+
+def test_finetune_param_classification_is_complete():
+    from otuformer.cli.finetune import (
+        DERIVED_IDENTITY_KEYS,
+        EXPERIMENT_IDENTITY_KEYS,
+        PARAM_CLASSIFICATION,
+    )
+
+    names = _finetune_param_names()
+    assert names == set(PARAM_CLASSIFICATION)
+    assert set(PARAM_CLASSIFICATION.values()) <= {
+        "experiment",
+        "operational",
+        "control",
+    }
+    experiment = {n for n, kind in PARAM_CLASSIFICATION.items() if kind == "experiment"}
+    assert experiment == set(EXPERIMENT_IDENTITY_KEYS)
+    mapped = {k for keys in EXPERIMENT_IDENTITY_KEYS.values() for k in keys}
+    assert mapped.isdisjoint(DERIVED_IDENTITY_KEYS)
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ["--long-tail", "bogus"],
+        ["--pseudo-similarity-floor", "1.5"],
+        ["--pseudo-similarity-floor", "nan"],
+        ["--pseudo-min-gap", "-0.1"],
+        ["--pseudo-min-gap", "2.5"],
+        ["--pseudo-neighbors", "0"],
+        ["--pseudo-cap-multiplier", "0"],
+        ["--pseudo-absolute-cap", "0"],
+        ["--pseudo-similarity-floor", "0.5"],
+        ["--loss", "supcon", "--long-tail", "cb-drw"],
+        ["--loss", "supcon", "--pseudo-label-from", "ft1.pth"],
+    ],
+)
+def test_finetune_rejects_invalid_pseudo_options(tmp_path, extra):
+    out_dir = tmp_path / "out"
+    result = runner.invoke(
+        app,
+        [
+            "finetune",
+            "--checkpoint", str(tmp_path / "source.pth"),
+            "--train-data", str(tmp_path / "labels.csv"),
+            "--input-images-dir", str(tmp_path),
+            "--out-dir", str(out_dir),
+            *extra,
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert not out_dir.exists()
+
+
+def test_readmes_document_sparse_label_workflow():
+    for path in ["README.md", "README.cn.md"]:
+        text = Path(path).read_text(encoding="utf-8")
+        assert "--pseudo-label-from" in text
+        assert "--long-tail" in text
+        assert "--pseudo-cap-multiplier" in text
+        assert "--pseudo-absolute-cap" in text
+        assert "HELDOUT_ROOT" in text
+        assert "center-crop" in text
+        assert "pseudo_labels.csv" in text
+        # Options removed from the final design must not be documented.
+        assert "--on-empty-pseudo" not in text
+        assert "--allow-config-diff" not in text
+        assert "--pseudo-weight" not in text
+
+
+def test_finetune_pseudo_overwrite_is_allowed(monkeypatch, tmp_path):
+    from otuformer.training import trainer as trainer_module
+
+    ft1 = _write_init_checkpoint(tmp_path / "ft1.pth")
+    ssl = _write_init_checkpoint(tmp_path / "ssl.pth")
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    stale = out_dir / "stale.txt"
+    stale.write_text("old", encoding="utf-8")
+
+    monkeypatch.setattr(
+        trainer_module,
+        "prepare_pseudo_round",
+        lambda **kwargs: {
+            "source_config": {"loss": "arcface", "long_tail": "none"},
+            "source_class_labels": ["classA"],
+            "ssl_checkpoint": str(ssl),
+            "rows": [],
+            "accepted": [],
+            "diagnostics": [],
+            "summary": {},
+            "class_labels": ["classA"],
+            "source_checkpoint": str(ft1),
+        },
+    )
+    monkeypatch.setattr(trainer_module, "run_finetune", lambda args, **kwargs: None)
+
+    result = runner.invoke(
+        app,
+        [
+            "finetune",
+            "--train-data", str(tmp_path / "labels.csv"),
+            "--input-images-dir", str(tmp_path),
+            "--out-dir", str(out_dir),
+            "--pseudo-label-from", str(ft1),
+            "--overwrite",
+        ],
+    )
+
+    # Overwrite is allowed; a required input inside out_dir would still be
+    # rejected by the input-protection check before anything is cleared.
+    assert result.exit_code == 0, result.output
+    assert not stale.exists()
+
+
+def test_finetune_pseudo_identity_conflict_fails_before_output(monkeypatch, tmp_path):
+    from otuformer.training import trainer as trainer_module
+
+    ft1 = _write_init_checkpoint(tmp_path / "ft1.pth")
+    ssl = _write_init_checkpoint(tmp_path / "ssl.pth")
+    monkeypatch.setattr(
+        trainer_module,
+        "prepare_pseudo_round",
+        lambda **kwargs: {
+            "source_config": {
+                "loss": "arcface",
+                "freeze_ratio": 0.7,
+                "long_tail": "none",
+                "class_labels": ["classA", "classB"],
+            },
+            "ssl_checkpoint": str(ssl),
+            "rows": [],
+            "diagnostics": [],
+            "summary": {},
+            "class_labels": ["classA", "classB"],
+            "source_checkpoint": str(ft1),
+        },
+    )
+    out_dir = tmp_path / "out"
+
+    result = runner.invoke(
+        app,
+        [
+            "finetune",
+            "--train-data", str(tmp_path / "labels.csv"),
+            "--input-images-dir", str(tmp_path),
+            "--out-dir", str(out_dir),
+            "--pseudo-label-from", str(ft1),
+            "--freeze-ratio", "0.5",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "freeze_ratio" in result.output
+    assert not out_dir.exists()
+
+
+def test_finetune_pseudo_inherits_nondefault_loss_params(monkeypatch, tmp_path):
+    from otuformer.training import trainer as trainer_module
+
+    ft1 = tmp_path / "ft1.pth"
+    torch.save(
+        {
+            "model_state_dict": _init_checkpoint_state(),
+            "config": {
+                "model_name": "vit_tiny_patch16_224",
+                "out_dim": 16,
+                "metric_embed_dim": 16,
+                "image_size": 32,
+                "loss": "subcenter-arcface",
+                "subcenters": 3,
+                "compact_weight": None,
+                "compact_cap": None,
+                "supcon_temperature": None,
+                "freeze_ratio": 0.7,
+                "long_tail": "none",
+                "pseudo_round": 0,
+                "pseudo_source_eligible": True,
+            },
+        },
+        ft1,
+    )
+    ssl = _write_init_checkpoint(tmp_path / "ssl.pth")
+    source_cfg = torch.load(ft1, map_location="cpu", weights_only=False)["config"]
+    monkeypatch.setattr(
+        trainer_module,
+        "prepare_pseudo_round",
+        lambda **kwargs: {
+            "source_config": source_cfg,
+            "source_class_labels": ["classA", "classB"],
+            "ssl_checkpoint": str(ssl),
+            "rows": [],
+            "diagnostics": [],
+            "summary": {},
+            "class_labels": ["classA", "classB"],
+            "source_checkpoint": str(ft1),
+        },
+    )
+    seen = {}
+    monkeypatch.setattr(
+        trainer_module,
+        "run_finetune",
+        lambda args, **kwargs: seen.update(vars(args)),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "finetune",
+            "--train-data", str(tmp_path / "labels.csv"),
+            "--input-images-dir", str(tmp_path),
+            "--out-dir", str(tmp_path / "out"),
+            "--pseudo-label-from", str(ft1),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert seen["loss"] == "subcenter-arcface"
+    assert seen["subcenters"] == 3
+
+
+def test_finetune_pseudo_resume_requires_recorded_source_sha(tmp_path):
+    resume = _write_init_checkpoint(tmp_path / "resume.pth")
+    other = _write_init_checkpoint(tmp_path / "other.pth")
+
+    result = runner.invoke(
+        app,
+        [
+            "finetune",
+            "--resume", str(resume),
+            "--train-data", str(tmp_path / "labels.csv"),
+            "--input-images-dir", str(tmp_path),
+            "--out-dir", str(tmp_path / "out"),
+            "--pseudo-label-from", str(other),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "records no pseudo-source SHA-256" in result.output
+
+
+def test_finetune_resume_rejects_explicit_pseudo_rule_options(tmp_path):
+    resume = _write_init_checkpoint(tmp_path / "resume.pth")
+
+    result = runner.invoke(
+        app,
+        [
+            "finetune",
+            "--resume", str(resume),
+            "--train-data", str(tmp_path / "labels.csv"),
+            "--input-images-dir", str(tmp_path),
+            "--out-dir", str(tmp_path / "out"),
+            "--pseudo-neighbors", "5",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "do not resupply" in result.output
+
+
+def test_finetune_pseudo_log_is_concise_per_class_summary(monkeypatch, tmp_path):
+    from otuformer.training import trainer as trainer_module
+
+    ft1 = _write_init_checkpoint(tmp_path / "ft1.pth")
+    ssl = _write_init_checkpoint(tmp_path / "ssl.pth")
+    rows = [
+        {"image": "a1.jpg", "label": "classA", "source": "expert"},
+        {"image": "a2.jpg", "label": "classA", "source": "expert"},
+        {"image": "a3.jpg", "label": "classA", "source": "expert"},
+        {"image": "b1.jpg", "label": "classB", "source": "expert"},
+        {"image": "b2.jpg", "label": "classB", "source": "expert"},
+        {"image": "b3.jpg", "label": "classB", "source": "expert"},
+        {"image": "c1.jpg", "label": "classA", "source": "known-pseudo"},
+        {"image": "c2.jpg", "label": "classA", "source": "known-pseudo"},
+    ]
+    diagnostics = [
+        {
+            "image": "c1.jpg",
+            "accepted": True,
+            "candidate_neighbor_refs": ["a1.jpg", "a2.jpg"],
+            "rejection_reasons": [],
+        },
+        {
+            "image": "c2.jpg",
+            "accepted": True,
+            "candidate_neighbor_refs": ["a2.jpg", "a3.jpg"],
+            "rejection_reasons": [],
+        },
+    ]
+    def fake_prepare(**kwargs):
+        progress = kwargs.get("progress")
+        if progress is not None:
+            progress("[Info] Pseudo round: 4 candidates discovered; extracting raw CLS ...")
+        return {
+            "source_config": {
+                "loss": "arcface",
+                "long_tail": "none",
+                "class_labels": ["classA", "classB"],
+            },
+            "source_class_labels": ["classA", "classB"],
+            "ssl_checkpoint": str(ssl),
+            "rows": rows,
+            "accepted": [
+                {"image": "c1.jpg", "label": "classA"},
+                {"image": "c2.jpg", "label": "classA"},
+            ],
+            "diagnostics": diagnostics,
+            "summary": {
+                "candidate_count": 4,
+                "accepted_count": 2,
+                "acceptance_rate": 0.5,
+                "rejection_reason_counts": {"floor": 2},
+            },
+            "class_labels": ["classA", "classB"],
+            "source_checkpoint": str(ft1),
+        }
+
+    monkeypatch.setattr(trainer_module, "prepare_pseudo_round", fake_prepare)
+    monkeypatch.setattr(trainer_module, "run_finetune", lambda args, **kwargs: None)
+
+    result = runner.invoke(
+        app,
+        [
+            "finetune",
+            "--train-data", str(tmp_path / "labels.csv"),
+            "--input-images-dir", str(tmp_path),
+            "--out-dir", str(tmp_path / "out"),
+            "--pseudo-label-from", str(ft1),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    output = result.output
+    assert "Pseudo round: 2 accepted from 4 candidates (50.0%)" in output
+    assert "classA" in output and "classB" in output
+    assert "rejections: floor=2" in output
+    # The large diagnostics payload must not be dumped into the log.
+    assert "candidate_neighbor_refs" not in output
+    assert "pseudo_round_data" not in output
+    # Progress is echoed live so the run does not look stuck.
+    assert "4 candidates discovered; extracting raw CLS" in output
+
+
+def test_finetune_pseudo_cap_options_are_forwarded(monkeypatch, tmp_path):
+    from otuformer.training import trainer as trainer_module
+
+    ft1 = _write_init_checkpoint(tmp_path / "ft1.pth")
+    ssl = _write_init_checkpoint(tmp_path / "ssl.pth")
+    seen = {}
+
+    def fake_prepare(**kwargs):
+        seen.update(kwargs)
+        return {
+            "source_config": {"loss": "arcface", "long_tail": "none"},
+            "source_class_labels": ["classA"],
+            "ssl_checkpoint": str(ssl),
+            "rows": [],
+            "accepted": [],
+            "diagnostics": [],
+            "summary": {},
+            "class_labels": ["classA"],
+            "source_checkpoint": str(ft1),
+        }
+
+    monkeypatch.setattr(trainer_module, "prepare_pseudo_round", fake_prepare)
+    monkeypatch.setattr(trainer_module, "run_finetune", lambda args, **kwargs: None)
+
+    result = runner.invoke(
+        app,
+        [
+            "finetune",
+            "--train-data", str(tmp_path / "labels.csv"),
+            "--input-images-dir", str(tmp_path),
+            "--out-dir", str(tmp_path / "out"),
+            "--pseudo-label-from", str(ft1),
+            "--pseudo-cap-multiplier", "5",
+            "--pseudo-absolute-cap", "80",
+            "--pseudo-similarity-floor", "0.7",
+            "--pseudo-neighbors", "20",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert seen["cap_multiplier"] == 5
+    assert seen["absolute_cap"] == 80
+    assert seen["similarity_floor"] == 0.7
+    assert seen["neighbors"] == 20

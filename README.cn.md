@@ -340,9 +340,32 @@ otuformer finetune \
     --out-dir runs/finetune
 ```
 
+**稀疏标签伪标签反馈。** 可选一轮，自动回收已知物种的未标注图像，无需候选清单输入：候选图是 `--input-images-dir` 下受支持图像减去专家 CSV 引用后的集合。请使用与 run 树分离的专用数据根（`DATA_ROOT/dorsal/` 与 `RUN_ROOT/finetune1/`）；`--out-dir` 不得与图像根重叠，所有文件型输入都必须位于 `--out-dir` 之外。
+
+```bash
+# finetune#1 记录专家清单与 SSL 身份，供后续复用
+otuformer finetune --checkpoint runs/pretrain/SSL_latest.pth \
+    --train-data labels.csv --input-images-dir DATA_ROOT/dorsal \
+    --out-dir RUN_ROOT/finetune1 --finetune-epochs 20
+
+# finetune#2：从同一原始 SSL 检查点出发的一轮自动伪标签
+otuformer finetune --train-data labels.csv --input-images-dir DATA_ROOT/dorsal \
+    --pseudo-label-from RUN_ROOT/finetune1/finetune_latest.pth \
+    --out-dir RUN_ROOT/finetune2 --finetune-epochs 20
+```
+
+- 伪标签仅支持 ArcFace 家族损失且仅一轮；finetune#2 检查点不能再作为伪标签来源。
+- 省略的实验类选项继承 finetune#1 的解析值，显式冲突会报错。finetune#2 始终从同一原始 SSL 检查点初始化；伪标签模式下 `--checkpoint` 仅用于 SSL 文件迁移后的定位（文件 SHA-256 必须一致）。
+- 预处理固定为 `center-crop`；输出 `pseudo_labels.csv`（每个候选一行诊断）与 `pseudo_summary.json`。
+- `--pseudo-similarity-floor`（默认 0.75）是未经校准的 raw-CLS 前三均值余弦类别分数，不是概率；floor 与 gap 越大越严格，`--pseudo-neighbors`（默认 15）越小通常越局部、越严格。每个类在三关之后最多接受 `min(--pseudo-cap-multiplier * 专家种子数, --pseudo-absolute-cap)` 行（默认 3 与 50）。
+- 诊断 CSV 不是人工审批环节；接受集为空时会在创建输出目录前失败。
+- `--long-tail cb-drw` 是独立的长尾选项（仅 ArcFace 家族，beta 0.99、cap 3.0、50% 起、10% 斜坡），两轮之间必须一致。
+- `--input-images-dir` 必须是真实目录树（不遍历目录符号链接，并在 summary 中报告）；显式 `--visualize-data` 仍可用于任意 UMAP/指标诊断。
+- RUN1/RUN2 对比请使用独立 `HELDOUT_ROOT`：`otuformer extract --input-images-dir HELDOUT_ROOT --label-csv HELDOUT.csv`；留在训练根内的留出图像会成为伪标签候选。
+
 | 参数 | 描述 | 默认值 |
 |-----------|-------------|---------|
-| `--checkpoint` | 预训练检查点路径（通常为 `runs/pretrain/SSL_latest.pth`） | 必填 |
+| `--checkpoint` | 预训练检查点路径（通常为 `runs/pretrain/SSL_latest.pth`）；在 `--pseudo-label-from` 模式（仅用于定位已记录的 SSL 文件）与 `--resume` 下均可省略 | 必填（伪标签模式或 `--resume` 除外） |
 | `--resume` | 恢复微调检查点路径 | 无 |
 | `--train-data` | 训练数据 CSV（含 `image` 和 `label` 列） | 必填 |
 | `--input-images-dir` | 图像根目录 | 必填 |
@@ -358,6 +381,13 @@ otuformer finetune \
 | `--subcenters` | `--loss subcenter-arcface` 或 `subcenter-arcface-compact` 的每类中心数（K）：2 到 8 的整数；`arcface` 与 `supcon` 会拒绝该参数 | 2 |
 | `--compact-weight` | `--loss subcenter-arcface-compact` 的同类别中心距离 hinge 权重（cap 固定为 0.5） | 0.1 |
 | `--supcon-temperature` | `--loss supcon` 的温度；必须大于 0 | 0.07 |
+| `--long-tail` | 长尾策略：`none` 或 `cb-drw`（仅 ArcFace 家族；beta 0.99、cap 3.0、50% 起 10% 斜坡） | `none` |
+| `--pseudo-label-from` | 用于一轮自动伪标签的已完成 finetune#1 ArcFace 家族检查点 | 无 |
+| `--pseudo-similarity-floor` | 未经校准的 raw-CLS 前三均值余弦类别分数下限，取值 [-1, 1] | 0.75 |
+| `--pseudo-min-gap` | 获胜分数与次高分数之差，取值 [0, 2] | 0.10 |
+| `--pseudo-neighbors` | 非对称、排除同类 mutual-kNN 的邻居数 | 15 |
+| `--pseudo-cap-multiplier` | 每类接受上限乘数：`min(multiplier * 专家种子数, absolute_cap)` | 3 |
+| `--pseudo-absolute-cap` | 每类绝对接受上限 | 50 |
 | `--trace-batch-ids` | 将每个训练批次的图像 ID 按顺序写入 `logs/batch_ids.finetune.jsonl`（需显式开启，文件可能较大） | 否 |
 | `--augmentation` | 微调数据增强配置：`none`（新运行默认）或 `conservative`（实验性）；`--resume` 时省略则继承已保存配置 | `none` |
 | `--orientation-policy` | 方向策略：`sensitive`（新运行默认）或 `invariant`；仅影响 `conservative`。`--checkpoint` 初始化时省略则继承预训练 checkpoint 的策略；`--resume` 时省略则继承已保存策略 | `sensitive` |

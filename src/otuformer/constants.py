@@ -9,3 +9,11 @@ Kept import-light so the CLI stays torch-free at import time.
 # numerically ArcFace, which already has its own mode.
 MIN_SUBCENTERS = 2
 MAX_SUBCENTERS = 8
+
+# Supervised losses with a class-level cross-entropy term. CB-DRW and pseudo
+# feedback apply only to these; SupCon rejects both.
+ARCFACE_FAMILY_LOSSES = (
+    "arcface",
+    "subcenter-arcface",
+    "subcenter-arcface-compact",
+)

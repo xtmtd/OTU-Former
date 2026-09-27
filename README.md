@@ -360,9 +360,54 @@ otuformer finetune \
     --out-dir runs/finetune
 ```
 
+**Sparse-label pseudo-label feedback.** One optional round recovers unlabeled
+images of known species without a candidate-list input: candidates are discovered
+automatically as supported images under `--input-images-dir` minus the expert CSV
+references. Use a dedicated data root separate from the run tree
+(`DATA_ROOT/dorsal/` vs `RUN_ROOT/finetune1/`); `--out-dir` must not overlap the
+image root, and every file-valued input must stay outside `--out-dir`.
+
+```bash
+# finetune#1 records its expert-manifest and SSL identity for later reuse
+otuformer finetune --checkpoint runs/pretrain/SSL_latest.pth \
+    --train-data labels.csv --input-images-dir DATA_ROOT/dorsal \
+    --out-dir RUN_ROOT/finetune1 --finetune-epochs 20
+
+# finetune#2: one automatic pseudo round from the same original SSL checkpoint
+otuformer finetune --train-data labels.csv --input-images-dir DATA_ROOT/dorsal \
+    --pseudo-label-from RUN_ROOT/finetune1/finetune_latest.pth \
+    --out-dir RUN_ROOT/finetune2 --finetune-epochs 20
+```
+
+- Pseudo mode is ArcFace-family only and one round only; a finetune#2 checkpoint
+  cannot seed another round.
+- Omitted experiment options inherit finetune#1 resolved values; explicit
+  conflicts fail. Finetune#2 always initializes from the same original SSL
+  checkpoint; `--checkpoint` in pseudo mode only locates that SSL file after it
+  moved (its file SHA-256 must still match).
+- Preprocessing is fixed to `center-crop`. Outputs are `pseudo_labels.csv` (one
+  diagnostic row per candidate) and `pseudo_summary.json`.
+- `--pseudo-similarity-floor` (default 0.75) is an uncalibrated raw-CLS
+  top-three-mean cosine class score, not a probability. Higher floor and gap
+  reject more; smaller `--pseudo-neighbors` (default 15) is usually more local
+  and stricter. Each class additionally accepts at most
+  `min(--pseudo-cap-multiplier * expert_seed_count, --pseudo-absolute-cap)`
+  rows (defaults 3 and 50) after the three feature rules.
+- The diagnostic CSV is not an approval gate; an empty accepted set fails before
+  creating the output directory.
+- `--long-tail cb-drw` is an independent conventional long-tail option for
+  ArcFace-family losses (fixed beta 0.99, cap 3.0, deferred 50%/50%..10%); it must
+  match between pseudo rounds.
+- `--input-images-dir` must be a real directory tree (directory symlinks are
+  not traversed and are reported); explicit `--visualize-data` still works for
+  arbitrary UMAP/metric diagnostics.
+- Evaluate RUN1 vs RUN2 on held-out images under a separate `HELDOUT_ROOT`:
+  `otuformer extract --input-images-dir HELDOUT_ROOT --label-csv HELDOUT.csv`.
+  Held-out images left inside the training root would become pseudo candidates.
+
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `--checkpoint` | Pretrained checkpoint path (typically `runs/pretrain/SSL_latest.pth`) | Required |
+| `--checkpoint` | Pretrained checkpoint path (typically `runs/pretrain/SSL_latest.pth`); optional in `--pseudo-label-from` mode (where it only relocates the recorded SSL file) and on `--resume` | Required (except pseudo mode or `--resume`) |
 | `--resume` | Finetune checkpoint path to resume from | None |
 | `--train-data` | Training data CSV (with `image` and `label` columns) | Required |
 | `--input-images-dir` | Root image directory | Required |
@@ -378,6 +423,13 @@ otuformer finetune \
 | `--subcenters` | Centers per class (K) for `--loss subcenter-arcface` or `subcenter-arcface-compact`: an integer from 2 to 8; `arcface` and `supcon` reject the flag | 2 |
 | `--compact-weight` | Same-class center-distance hinge weight for `--loss subcenter-arcface-compact` (cap is fixed at 0.5) | 0.1 |
 | `--supcon-temperature` | Temperature for `--loss supcon`; must be greater than 0 | 0.07 |
+| `--long-tail` | Long-tail strategy: `none` or `cb-drw` (ArcFace-family only; fixed beta 0.99, cap 3.0, deferred 50%/10%) | `none` |
+| `--pseudo-label-from` | Completed finetune#1 ArcFace-family checkpoint for one automatic pseudo round | None |
+| `--pseudo-similarity-floor` | Uncalibrated raw-CLS top-three-mean cosine class-score floor in [-1, 1] | 0.75 |
+| `--pseudo-min-gap` | Winning-score minus runner-up-score gap in [0, 2] | 0.10 |
+| `--pseudo-neighbors` | Neighbor count for the asymmetric own-class-excluded mutual-kNN check | 15 |
+| `--pseudo-cap-multiplier` | Per-class acceptance cap multiplier: `min(multiplier * expert_seed_count, absolute_cap)` | 3 |
+| `--pseudo-absolute-cap` | Absolute per-class acceptance cap | 50 |
 | `--trace-batch-ids` | Write the ordered image IDs of every training batch to `logs/batch_ids.finetune.jsonl` (opt-in, can be large) | No |
 | `--augmentation` | Fine-tuning augmentation profile: `none` (new-run default) or `conservative` (experimental); omit to inherit the saved profile on `--resume` | `none` |
 | `--orientation-policy` | Orientation policy: `sensitive` (new-run default) or `invariant`; affects `conservative` only. Omit on `--checkpoint` initialization to inherit the pretraining checkpoint's saved policy; omit on `--resume` to inherit the saved policy | `sensitive` |

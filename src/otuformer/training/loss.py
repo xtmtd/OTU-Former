@@ -127,9 +127,14 @@ class ArcFaceLoss(nn.Module):
         self.head = ArcFaceHead(embed_dim, num_classes, s=s, m=m)
         self.ce = nn.CrossEntropyLoss()
 
+    def unreduced(
+        self, embeddings: torch.Tensor, labels: torch.Tensor
+    ) -> torch.Tensor:
+        """Per-row cross-entropy, for class/source-weighted reduction."""
+        return F.cross_entropy(self.head(embeddings, labels), labels, reduction="none")
+
     def forward(self, embeddings: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-        logits = self.head(embeddings, labels)
-        return self.ce(logits, labels)
+        return self.unreduced(embeddings, labels).mean()
 
 
 class SubCenterArcFaceLoss(nn.Module):
@@ -164,19 +169,33 @@ class SubCenterArcFaceLoss(nn.Module):
         self.cap = float(cap)
         self.ce = nn.CrossEntropyLoss()
 
-    def forward(self, embeddings: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-        loss = self.ce(self.head(embeddings, labels), labels)
+    def unreduced(
+        self, embeddings: torch.Tensor, labels: torch.Tensor
+    ) -> torch.Tensor:
+        """Per-row cross-entropy only; the center penalty is added separately."""
+        return F.cross_entropy(self.head(embeddings, labels), labels, reduction="none")
+
+    def compact_penalty(self) -> torch.Tensor:
+        """Weighted same-class center-distance hinge (zero for plain Sub-center).
+
+        Averaged over every distinct same-class center pair, exactly as the
+        original inline term, so ``unreduced(...).mean() + compact_penalty()``
+        reproduces the previous scalar ``forward``.
+        """
         if self.compact_weight == 0.0 or self.head.k < 2:
-            return loss
+            return self.head.weight.new_zeros(())
         centers = F.normalize(self.head.weight, dim=-1)
-        total = embeddings.new_zeros(())
+        total = self.head.weight.new_zeros(())
         pairs = 0
         for i in range(self.head.k):
             for j in range(i + 1, self.head.k):
                 distance = 1.0 - (centers[:, i] * centers[:, j]).sum(dim=-1)
                 total = total + F.relu(distance - self.cap).sum()
                 pairs += centers.shape[0]
-        return loss + self.compact_weight * total / pairs
+        return self.compact_weight * total / pairs
+
+    def forward(self, embeddings: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        return self.unreduced(embeddings, labels).mean() + self.compact_penalty()
 
 
 class SupConLoss(nn.Module):

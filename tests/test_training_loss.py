@@ -354,3 +354,131 @@ def test_supcon_skips_batches_without_positives_or_negatives():
 def test_supcon_rejects_invalid_temperature(temperature):
     with pytest.raises(ValueError, match="temperature"):
         SupConLoss(temperature=temperature)
+
+
+def test_arcface_unreduced_mean_matches_forward():
+    loss = ArcFaceLoss(embed_dim=8, num_classes=3)
+    embeddings = torch.randn(5, 8)
+    labels = torch.tensor([0, 1, 2, 0, 1])
+
+    assert torch.allclose(loss.unreduced(embeddings, labels).mean(), loss(embeddings, labels))
+
+
+def test_compact_penalty_equivalence_preserves_pair_normalization():
+    loss = SubCenterArcFaceLoss(
+        embed_dim=8, num_classes=4, k=3, compact_weight=0.1, cap=0.5
+    )
+    embeddings = torch.randn(6, 8)
+    labels = torch.tensor([0, 1, 2, 3, 0, 1])
+
+    expected = loss.unreduced(embeddings, labels).mean() + loss.compact_penalty()
+
+    assert torch.allclose(loss(embeddings, labels), expected)
+
+
+def test_plain_subcenter_compact_penalty_is_zero():
+    loss = SubCenterArcFaceLoss(embed_dim=8, num_classes=3, k=2, compact_weight=0.0)
+
+    assert loss.compact_penalty().item() == 0.0
+
+
+def test_effective_number_weights_reference_example_and_r_bar():
+    from otuformer.training.trainer import (
+        _cb_drw_class_weights,
+        _cb_drw_r_bar,
+        _effective_number_class_weights,
+    )
+
+    counts = torch.tensor([10.0, 128.0])
+    target = _effective_number_class_weights(counts)
+
+    assert target[0].item() == pytest.approx(3.0, abs=1e-6)
+    assert target[1].item() == pytest.approx(0.677499, abs=1e-4)
+
+    final = _cb_drw_class_weights(target, completed_steps=1000, total_steps=1000)
+    r_bar = _cb_drw_r_bar(final, counts)
+
+    assert r_bar == pytest.approx(0.845792, abs=1e-5)
+    assert final[0].item() / r_bar == pytest.approx(3.546971, abs=1e-4)
+
+
+def test_drw_lambda_boundaries_and_zero_ramp():
+    from otuformer.training.trainer import _drw_lambda
+
+    assert _drw_lambda(0, 1) == 1.0  # T=1 applies the target from the first step
+    assert _drw_lambda(50, 100) == 0.0
+    assert _drw_lambda(55, 100) == 0.5
+    assert _drw_lambda(60, 100) == 1.0
+    assert _drw_lambda(3, 9) == 0.0  # start=4, ramp=0 -> step switch
+    assert _drw_lambda(4, 9) == 1.0
+
+
+def test_weighted_ce_all_ones_is_ordinary_mean_and_uses_batch_size():
+    from otuformer.training.trainer import _weighted_ce
+
+    per_row = torch.tensor([1.0, 2.0, 3.0])
+    labels = torch.tensor([0, 1, 2])
+    assert _weighted_ce(per_row, labels, torch.ones(3), 1.0).item() == pytest.approx(2.0)
+
+    partial = torch.tensor([1.0, 3.0])
+    partial_labels = torch.tensor([0, 1])
+    weights = torch.tensor([2.0, 4.0])
+    # (2*1 + 4*3) / (2 rows * r_bar 1) = 7
+    assert _weighted_ce(partial, partial_labels, weights, 1.0).item() == pytest.approx(7.0)
+
+
+def test_prefilled_loss_params_need_the_explicit_marker():
+    """A pre-filled arg is only honoured when marked explicit (pseudo mode)."""
+    import argparse
+
+    from otuformer.training.trainer import _resolve_finetune_loss_config
+
+    args = argparse.Namespace(
+        loss="subcenter-arcface",
+        subcenters=3,
+        compact_weight=None,
+        supcon_temperature=None,
+    )
+
+    # Documented direct-caller semantics: a pre-filled value is not a choice.
+    defaulted = _resolve_finetune_loss_config(args, None, explicit_options=frozenset())
+    assert defaulted["subcenters"] == 2
+
+    # Pseudo-mode inheritance marks the applicable inherited keys explicit.
+    inherited = _resolve_finetune_loss_config(
+        args, None, explicit_options=frozenset({"subcenters"})
+    )
+    assert inherited["loss"] == "subcenter-arcface"
+    assert inherited["subcenters"] == 3
+
+
+def test_effective_number_class_weights_stay_on_cpu_float64():
+    """MPS has no float64, so the class-weight vector must stay on the CPU."""
+    from otuformer.training.trainer import _effective_number_class_weights
+
+    weights = _effective_number_class_weights(torch.tensor([10.0, 128.0]))
+
+    assert weights.device.type == "cpu"
+    assert weights.dtype == torch.float64
+
+
+@pytest.mark.skipif(
+    not torch.backends.mps.is_available(), reason="MPS not available"
+)
+def test_cb_drw_r_bar_moves_counts_to_the_weights_device():
+    from otuformer.training.trainer import (
+        _cb_drw_r_bar,
+        _effective_number_class_weights,
+    )
+
+    weights = _effective_number_class_weights(
+        torch.tensor([10.0, 128.0], device="mps")
+    )
+    assert weights.device.type == "cpu"
+
+    # The only accelerator hop is the per-step float32 cast; r_bar must move
+    # its counts tensor to the same device instead of mixing MPS and CPU.
+    mps_weights = weights.to("mps", dtype=torch.float32)
+    r_bar = _cb_drw_r_bar(mps_weights, torch.tensor([10.0, 128.0]))
+
+    assert r_bar == pytest.approx(0.845792, abs=1e-4)

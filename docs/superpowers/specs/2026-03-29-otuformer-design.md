@@ -8,8 +8,10 @@ OTU-Former is a Python CLI toolbox for image-based biodiversity analysis. It con
 
 The toolbox packages an existing research workflow (ref/ibot20260115.py, ref/embeddings_tree20260206.py, ref/GradCam_heatmap.py, ref/diversity_index.txt) into a single installable Python package with a unified CLI.
 
-**Version:** 0.1.0  
-**Python:** ≥ 3.11  
+**Version:** 0.1.0
+
+**Python:** ≥ 3.11
+
 **CLI framework:** Typer (with `--install-completion` built-in)
 
 ---
@@ -45,7 +47,8 @@ otuformer/
 │       │   └── scheduler.py     # LR cosine schedule, EMA momentum, teacher temperature warmup
 │       ├── embedding/
 │       │   ├── extractor.py     # checkpoint → embeddings CSV
-│       │   └── evaluator.py     # kNN, linear probe, Recall@K, mAP, NMI/ARI/AMI, UMAP
+│       │   ├── evaluator.py     # kNN, linear probe, Recall@K, mAP, NMI/ARI/AMI, UMAP
+│       │   └── pseudo_label.py  # planned: in-memory sparse-label scoring + diagnostics
 │       ├── delineation/
 │       │   ├── distance.py      # Cosine + Euclidean distance, PCA whitening, local scaling
 │       │   ├── tree.py          # UPGMA construction, bootstrap support
@@ -127,7 +130,7 @@ Transform-level profile definitions live in [`2026-09-07-otuformer-training-augm
 ---
 
 ### 3.2 `finetune`
-ArcFace metric learning supervised fine-tuning on top of a pretrained checkpoint. New fine-tune runs replace the SSL projector with a compact, unnormalized `backbone_dim -> 512 -> metric_embed_dim` embedding head; ArcFace owns feature and classifier normalization. Fine-tuning uses separate backbone and metric-head learning rates, defaults to AdamW `weight_decay=1e-4` as a conservative supervised-training choice rather than a full legacy-script reproduction, and does not apply gradient clipping.
+Supervised metric-learning fine-tuning on top of a pretrained checkpoint. ArcFace remains the default; v0.8.0 also implements SupCon, Sub-center ArcFace, and compact Sub-center ArcFace. New runs initialized from SSL checkpoints replace the SSL projector with a compact, unnormalized `backbone_dim -> 512 -> metric_embed_dim` embedding head; the selected loss handles its required normalization. Fine-tuning uses separate backbone and metric-head learning rates, defaults to AdamW `weight_decay=1e-4` as a conservative supervised-training choice rather than a full legacy-script reproduction, and does not apply gradient clipping.
 
 Initialization semantics for `--checkpoint`: an SSL pretrain checkpoint installs a fresh `ArcFaceEmbeddingHead`; a fine-tune checkpoint whose head and width match the head being trained keeps its trained projector; a `ProjectionHead` checkpoint (OTU historical SFT, or `projection_mlp_2048` metadata) keeps its projector and therefore fixes the embedding width.
 
@@ -147,14 +150,28 @@ All parameters migrated from `ref/ibot20260115.py` `get_parser()`, mode=finetune
 - `--metric-head-lr` : learning rate for the ArcFace embedding head and classifier; omitted means inherit `--finetune-lr`. On `--resume`, saved optimizer state takes precedence.
 - `--weight-decay` : AdamW weight decay [default: 1e-4, a conservative supervised SFT choice; pass 0.05 for the legacy script's setting]
 - `--freeze-ratio` : fraction of transformer blocks to freeze [default: 0.7]; recorded in `config.freeze_ratio` and required to match on `--resume`, because the optimizer only holds `requires_grad` backbone parameters
-- `--loss` : loss function [default: arcface]; the proposed v0.8.0 extension and its compatibility contract are specified in [the metric-loss design](2026-09-24-otuformer-metric-loss-v080-design.md)
+- `--loss` : `arcface` | `supcon` | `subcenter-arcface` | `subcenter-arcface-compact` [default: arcface]; implementation and compatibility are specified in [the metric-loss design](2026-09-24-otuformer-metric-loss-v080-design.md)
 - `--augmentation` : fine-tuning augmentation profile — `none` (new-run default) or `conservative` (experimental)
 - `--orientation-policy` : orientation policy — `sensitive` (new-run default) or `invariant` (opt-in broad rotation and reflection); when initializing from `--checkpoint`, an omitted value inherits the pretraining checkpoint's saved policy
 - `--batch-size`, `--num-workers`, `--cpus`, `--device`, `--seed`
 - `--log-every-n-steps`, `--save-every-epochs`, `--keep-last-checkpoints`
 - `--visualize-data` : CSV with `image` and optional `label` columns for periodic evaluation; without labels, only UMAP is generated
 
-**Outputs:** `finetune_latest.pth` (and epoch checkpoints `finetune_epoch_*.pth`), `metrics.finetune.csv`, `instant_metrics.csv`, training curves PDF, log file. When labels are absent or contain fewer than two classes, supervised metric fields remain empty while the epoch row is retained; an image-only visualization CSV still produces UMAP. `--metrics-sample-size` limits both supervised metric and UMAP inputs when positive.
+The following sparse-label extension is implemented (v0.9.0):
+
+- `--long-tail` : `none` | `cb-drw` [default: none]; CB-DRW applies only to ArcFace-family cross-entropy and must match between pseudo rounds
+- `--pseudo-label-from` : completed finetune#1 ArcFace-family checkpoint used to generate one automatic pseudo-feedback round
+- `--pseudo-similarity-floor` : winning top-three-mean raw-CLS cosine floor in `[-1,1]` [default: 0.75]
+- `--pseudo-min-gap` : winning score minus runner-up gap in `[0,2]` [default: 0.10]
+- `--pseudo-neighbors` : positive neighbor count for asymmetric own-class-excluded mutual-kNN [default: 15]
+- `--pseudo-cap-multiplier` : per-class acceptance cap multiplier, `min(multiplier * expert_seed_count, absolute_cap)`, integer >= 1 [default: 3]
+- `--pseudo-absolute-cap` : absolute per-class acceptance cap, integer >= 1 [default: 50]
+
+Without `--pseudo-label-from`, ordinary fine-tune semantics are unchanged. Pseudo mode uses two explicit finetune commands. Omitted experiment options inherit finetune#1 resolved values rather than new-run defaults; explicit conflicts fail. Finetune#2 always initializes from the same original SSL checkpoint, never finetune#1. In pseudo mode the existing `--checkpoint` only locates that SSL file after it has moved, and its file SHA-256 must match. Full rules are specified in [the sparse-label pseudo-feedback design](2026-09-26-otuformer-sparse-label-pseudolabel-design.md).
+
+**Outputs:** `finetune_latest.pth` (and epoch checkpoints `finetune_epoch_*.pth`), `metrics.finetune.csv`, `instant_metrics.csv`, training curves PDF, log file. Pseudo mode additionally writes `pseudo_labels.csv` and `pseudo_summary.json` in the finetune#2 directory. When labels are absent or contain fewer than two classes, supervised metric fields remain empty while the epoch row is retained; an image-only visualization CSV still produces UMAP. `--metrics-sample-size` limits both supervised metric and UMAP inputs when positive.
+
+New ordinary fine-tune checkpoints add `pseudo_round=0`, the existing expert-manifest hash, original SSL resolved path and file SHA-256, resolved experiment identity, and `pseudo_source_eligible` plus an optional reason. Finetune#2 adds `pseudo_round=1`, pseudo-source SHA-256, authoritative accepted pseudo rows and their hash, rule/preprocessing metadata, counts, and long-tail schedule. These fields are additive; existing model/config keys remain authoritative.
 
 ---
 
@@ -249,18 +266,20 @@ Parameters migrated from `ref/embeddings_tree20260206.py`:
 ### 3.6 `annotate`
 Write expert taxonomic corrections back into partition assignments.
 
-- `--assignments` : `partition_{cutoff}_assignments.csv` (columns: `id, cluster`)
-- `--corrections` : CSV with columns `id, corrected_cluster`
+- `--raw-assignments` : cluster-run `partition_{cutoff}_assignments.csv` (columns: `id, cluster`)
+- `--corrections` : CSV with `id` (or `image`) and `cluster` (or `corrected_cluster`)
+- `--embeddings` : optional embeddings CSV for distance recomputation and annotated UPGMA PDF
 - `--out-dir`
 
 **Logic:**
-- IDs present in `corrections` override the cluster assignment in `assignments`
+- IDs present in `corrections` override the cluster assignment in `raw_assignments`
 - IDs absent from `corrections` are kept unchanged
-- Output filename: `{original_stem}_annotated.csv`
 
 **Outputs:**
-- `partition_{cutoff}_assignments_annotated.csv`
-- `annotation_summary.csv` : number of corrections, clusters affected, before/after distribution
+- `partition_{cutoff}_assignments.csv` and `partition_{cutoff}_assignments_changed_only.csv`
+- `otu_table.csv`
+- `annotation_summary.json` : number of corrections, clusters affected, before/after distribution
+- `pairwise_distance_summary_intra-class.csv` and `UPGMA_tree_partitions_annotated.pdf` (only with `--embeddings`)
 
 ---
 
@@ -352,9 +371,9 @@ Both cosine and Euclidean distances support: PCA whitening, k-NN based local sca
 ```python
 LOSS_REGISTRY = {"arcface": ArcFaceLoss, ...}
 ```
-The original registry contains only ArcFace. The proposed v0.8.0 SupCon and
-Sub-center variants require loss-aware CLI validation, batch handling, and
-checkpoint/resume compatibility; see [the metric-loss design](2026-09-24-otuformer-metric-loss-v080-design.md).
+The v0.8.0 registry implements ArcFace, SupCon, Sub-center ArcFace, and compact
+Sub-center ArcFace with loss-aware CLI validation, batch handling, and
+checkpoint/resume compatibility; see [the implemented metric-loss design](2026-09-24-otuformer-metric-loss-v080-design.md). CB-DRW is a later opt-in training strategy over existing ArcFace-family per-row cross-entropy; it is not another registered loss.
 
 ### 4.3 Batch extract
 Auto-detection logic in `extractor.py`: if `--input-images-dir` contains at least one subdirectory with images, batch mode is activated. All batches share the same checkpoint and `--prefix`, ensuring consistent OTU naming.
@@ -384,6 +403,8 @@ The three read-only consumers (`extract`, `export`, `cam`) share one resolver, `
 The embedding head is taken from `config.embedding_head` when present, otherwise inferred from the projector's first linear width (512 → `arcface_mlp_512`, 2048 → `projection_mlp_2048`); any other width is rejected rather than silently mis-loaded. Buffers that do not fit the rebuilt model (the SSL-only `center`) are dropped, and a backbone whose tensors do not fit the resolved model name is rejected with a message that distinguishes a conflict inside the checkpoint metadata (which outranks `--model-name`) from a missing recorded name that `--model-name` must supply.
 
 Resuming a ref-script checkpoint in `finetune` stays unsupported: its classifier is `loss_func.W`, which is embedding-major and not interchangeable with `ArcFaceLoss.head.weight`. Ref-script **SSL** checkpoints are self-describing (they record `args` with `model_name`/`out_dim`); ref-script **SFT** checkpoints record neither `config` nor `args`, so they require an explicit `--model-name` (`extract`, `export`, and `cam` all expose it).
+
+Finetune#2's accepted pseudo rows and provenance are additive top-level/config payload fields used only by training resume. The shared read-only consumers ignore them and continue to resolve architecture and weights from the existing keys, so `extract`, `export`, and `cam` load finetune#2 checkpoints without schema-specific handling.
 
 ---
 

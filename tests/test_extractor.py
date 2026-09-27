@@ -681,3 +681,36 @@ def test_load_model_reads_ref_script_ssl_checkpoint_metadata(tmp_path: Path):
     assert loaded.backbone.num_features == model.backbone.num_features
     assert size == 224
     assert torch.equal(loaded.projector.net[0].weight, model.projector.net[0].weight)
+
+
+def test_pseudo_payload_fields_do_not_affect_readonly_consumers(tmp_path):
+    from otuformer.embedding.extractor import _load_model
+    from otuformer.training.model import ArcFaceEmbeddingHead, OTUFormerEncoder
+    from otuformer.utils.device import resolve_device
+
+    encoder = OTUFormerEncoder(
+        model_name="vit_tiny_patch16_224", out_dim=8, pretrained=False, img_size=32
+    )
+    encoder.projector = ArcFaceEmbeddingHead(encoder.backbone.num_features, 8)
+    checkpoint = tmp_path / "ft2.pth"
+    torch.save(
+        {
+            "model_state_dict": encoder.state_dict(),
+            "config": {
+                "model_name": "vit_tiny_patch16_224",
+                "out_dim": 8,
+                "metric_embed_dim": 8,
+                "embedding_head": "arcface_mlp_512",
+                "image_size": 32,
+                "pseudo_round": 1,
+            },
+            "accepted_pseudo_rows": [{"image": "a.jpg", "label": "A"}],
+            "pseudo_source_checkpoint_sha256": "deadbeef",
+        },
+        checkpoint,
+    )
+
+    model, size = _load_model(checkpoint, "vit_tiny_patch16_224", resolve_device("cpu"))
+
+    assert size == 32
+    assert model.projector is not None
