@@ -272,8 +272,7 @@ def test_training_rejects_resume_with_overwrite(tmp_path, command):
 
 
 def test_pretrain_resume_allows_existing_output_and_appends_log(tmp_path, monkeypatch):
-    checkpoint = tmp_path / "resume.pth"
-    torch.save({}, checkpoint)
+    checkpoint = _make_ckpt(tmp_path)
     out_dir = tmp_path / "pretrain_out"
     log_path = out_dir / "logs" / "pretrain.log"
     log_path.parent.mkdir(parents=True)
@@ -290,6 +289,164 @@ def test_pretrain_resume_allows_existing_output_and_appends_log(tmp_path, monkey
 
     assert result.exit_code == 0
     assert log_path.read_text(encoding="utf-8").startswith("old run\n")
+
+
+def test_pretrain_register_tokens_rejects_invalid_value(tmp_path):
+    out_dir = tmp_path / "pretrain_out"
+    result = runner.invoke(
+        app,
+        [
+            "pretrain", "--input-images-dir", str(tmp_path),
+            "--out-dir", str(out_dir), "--register-tokens", "2",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "none, 0, 4" in result.output
+    assert not out_dir.exists()
+
+
+def test_pretrain_register_tokens_none_matches_omission(tmp_path, monkeypatch):
+    seen: dict = {}
+    monkeypatch.setattr(
+        "otuformer.training.trainer.run_pretrain", lambda args: seen.update(vars(args))
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "pretrain", "--input-images-dir", str(tmp_path),
+            "--out-dir", str(tmp_path / "out_none"), "--register-tokens", "none",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert seen["register_tokens"] is None
+
+
+def test_pretrain_register_option_provenance_reaches_the_trainer(tmp_path, monkeypatch):
+    seen: dict = {}
+    monkeypatch.setattr(
+        "otuformer.training.trainer.run_pretrain", lambda args: seen.update(vars(args))
+    )
+    out_dir = tmp_path / "pretrain_out"
+
+    omitted = runner.invoke(
+        app,
+        ["pretrain", "--input-images-dir", str(tmp_path), "--out-dir", str(out_dir)],
+    )
+    assert omitted.exit_code == 0
+    assert seen["register_tokens"] is None
+    assert seen["model_name_explicit"] is False
+
+    explicit_zero = runner.invoke(
+        app,
+        [
+            "pretrain", "--input-images-dir", str(tmp_path),
+            "--out-dir", str(tmp_path / "pretrain_out_zero"),
+            "--register-tokens", "0",
+            "--model-name", "vit_tiny_patch16_224",
+        ],
+    )
+    assert explicit_zero.exit_code == 0
+    assert seen["register_tokens"] == 0
+    assert seen["model_name_explicit"] is True
+
+
+def test_pretrain_new_run_rejects_an_impossible_register_option_before_overwrite(
+    tmp_path, monkeypatch
+):
+    """--overwrite must not clear an existing output before rejecting the flag."""
+    import timm as timm_module
+    from timm.models.vision_transformer import VisionTransformer
+
+    def factory(_model_name, **kwargs):
+        return VisionTransformer(
+            img_size=32, patch_size=16, in_chans=3, embed_dim=16, depth=2,
+            num_heads=2, num_classes=0, global_pool="", class_token=False,
+            reg_tokens=4, dynamic_img_size=True,
+        )
+
+    monkeypatch.setattr(timm_module, "create_model", factory)
+    out_dir = tmp_path / "pretrain_out"
+    out_dir.mkdir()
+    sentinel = out_dir / "keep.txt"
+    sentinel.write_text("keep", encoding="utf-8")
+    monkeypatch.setattr("otuformer.training.trainer.run_pretrain", lambda _args: None)
+
+    result = runner.invoke(
+        app,
+        [
+            "pretrain", "--input-images-dir", str(tmp_path),
+            "--out-dir", str(out_dir), "--overwrite",
+            "--model-name", "tiny-gap-reg4",
+        ],
+    )
+
+    assert result.exit_code != 0
+    # Rich wraps the message, so match a substring that survives rendering.
+    assert "CLS token" in result.output
+    assert sentinel.read_text(encoding="utf-8") == "keep"
+
+
+def test_pretrain_registered_resume_preflight_preserves_existing_output(tmp_path, monkeypatch):
+    from otuformer.training.model import OTUFormerEncoder
+
+    source = OTUFormerEncoder(
+        model_name="vit_tiny_patch16_224", out_dim=8, pretrained=False
+    )
+    checkpoint = tmp_path / "registered.pth"
+    torch.save(
+        {
+            "model_state_dict": {
+                "backbone.reg_token": torch.zeros(
+                    1, 4, source.backbone.num_features
+                )
+            },
+            "config": {
+                "model_name": "vit_tiny_patch16_224",
+                "out_dim": 8,
+                "register_tokens": 4,
+            },
+        },
+        checkpoint,
+    )
+    out_dir = tmp_path / "pretrain_out"
+    (out_dir / "logs").mkdir(parents=True)
+    sentinel = out_dir / "keep.txt"
+    sentinel.write_text("keep", encoding="utf-8")
+    monkeypatch.setattr("otuformer.training.trainer.run_pretrain", lambda _args: None)
+
+    result = runner.invoke(
+        app,
+        [
+            "pretrain", "--resume", str(checkpoint),
+            "--input-images-dir", str(tmp_path), "--out-dir", str(out_dir),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "Registered resume requires explicit 'student'" in result.output
+    assert sentinel.read_text(encoding="utf-8") == "keep"
+    assert not (out_dir / "logs" / "pretrain.log").exists()
+
+
+def test_pretrain_resume_cannot_add_registers_to_a_zero_register_checkpoint(tmp_path):
+    checkpoint = _make_ckpt(tmp_path)
+    out_dir = tmp_path / "pretrain_out"
+
+    result = runner.invoke(
+        app,
+        [
+            "pretrain", "--resume", str(checkpoint),
+            "--input-images-dir", str(tmp_path), "--out-dir", str(out_dir),
+            "--register-tokens", "4",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "start a new run" in result.output
+    assert not out_dir.exists()
 
 
 def test_finetune_checkpoint_initialization_requires_empty_or_overwrite(tmp_path, monkeypatch):
@@ -311,6 +468,49 @@ def test_finetune_checkpoint_initialization_requires_empty_or_overwrite(tmp_path
     overwritten = runner.invoke(app, [*args, "--overwrite"])
     assert overwritten.exit_code == 0
     assert not stale.exists()
+
+
+def test_finetune_registered_source_preflight_precedes_overwrite(tmp_path, monkeypatch):
+    from otuformer.training.model import OTUFormerEncoder
+
+    source = OTUFormerEncoder(
+        model_name="vit_tiny_patch16_224", out_dim=8, pretrained=False
+    )
+    state = dict(source.state_dict())
+    state["backbone.reg_token"] = torch.zeros(1, 3, source.backbone.num_features)
+    checkpoint = tmp_path / "broken_register.pth"
+    torch.save(
+        {
+            "model_state_dict": state,
+            "config": {
+                "model_name": "vit_tiny_patch16_224",
+                "out_dim": 8,
+                "register_tokens": 4,
+            },
+        },
+        checkpoint,
+    )
+    out_dir = tmp_path / "finetune_out"
+    out_dir.mkdir()
+    sentinel = out_dir / "keep.txt"
+    sentinel.write_text("keep", encoding="utf-8")
+    monkeypatch.setattr(
+        "otuformer.training.trainer.run_finetune", lambda _args, **_kw: None
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "finetune", "--checkpoint", str(checkpoint),
+            "--train-data", str(tmp_path / "labels.csv"),
+            "--input-images-dir", str(tmp_path), "--out-dir", str(out_dir),
+            "--overwrite",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "reg_token" in result.output
+    assert sentinel.read_text(encoding="utf-8") == "keep"
 
 
 def test_readmes_document_update_and_continued_training():
@@ -467,7 +667,9 @@ def test_finetune_runs_one_epoch(tmp_path):
 def _make_ckpt(tmp_path, out_dim=64):
     from otuformer.training.model import OTUFormerEncoder
 
-    m = OTUFormerEncoder(model_name="vit_tiny_patch16_224", out_dim=out_dim)
+    m = OTUFormerEncoder(
+        model_name="vit_tiny_patch16_224", out_dim=out_dim, pretrained=False, img_size=224
+    )
     ckpt = {
         "model_state_dict": m.state_dict(),
         "config": {"model_name": "vit_tiny_patch16_224", "out_dim": out_dim},

@@ -58,6 +58,43 @@ class ArcFaceEmbeddingHead(nn.Module):
         return self.net(x)
 
 
+def is_standard_vision_transformer(backbone: nn.Module) -> bool:
+    """True when the backbone is a timm ``VisionTransformer`` instance.
+
+    Checked by type rather than by a ``vit_`` model-name prefix so Eva-style
+    models (DINOv3) are never mistaken for the standard ViT contract.
+    """
+    try:
+        from timm.models.vision_transformer import VisionTransformer
+    except Exception:  # pragma: no cover - timm layout changed
+        return False
+    return isinstance(backbone, VisionTransformer)
+
+
+def native_register_count(backbone: nn.Module) -> int:
+    """Register tokens the backbone itself declares, independent of any option.
+
+    Standard timm ViTs report ``num_reg_tokens``; Eva-style models only expose
+    ``reg_token``. Both are read so a non-``VisionTransformer`` with native
+    registers can be rejected instead of silently treated as unregistered.
+    """
+    count = getattr(backbone, "num_reg_tokens", None)
+    if isinstance(count, int):
+        return count
+    token = getattr(backbone, "reg_token", None)
+    if token is not None and hasattr(token, "shape") and len(token.shape) == 3:
+        return int(token.shape[1])
+    return 0
+
+
+def has_class_token(backbone: nn.Module) -> bool:
+    """True when the backbone carries a CLS token (timm ViT or Eva-style)."""
+    flag = getattr(backbone, "has_class_token", None)
+    if isinstance(flag, bool):
+        return flag
+    return getattr(backbone, "cls_token", None) is not None
+
+
 class OTUFormerEncoder(nn.Module):
     """ViT backbone plus projection head."""
 
@@ -68,56 +105,263 @@ class OTUFormerEncoder(nn.Module):
         return_patch_tokens: bool = False,
         img_size: int = 224,
         pretrained: bool = True,
+        reg_tokens: int | None = None,
     ) -> None:
+        """Build the encoder.
+
+        ``reg_tokens=None`` keeps the model's own architecture (omitted flag).
+        ``0`` keeps the native zero-register construction on an eligible
+        single-CLS ViT; ``4`` adds four registers, migrating the one-CLS
+        pretrained backbone when ``pretrained`` is set. Any other value, an
+        explicit option on a model that already has registers, and a
+        register-bearing model that is not a supported CLS ViT are rejected.
+        """
         super().__init__()
+        if reg_tokens not in (None, 0, 4):
+            raise ValueError(
+                f"reg_tokens must be None, 0 or 4 (got {reg_tokens!r})."
+            )
         self.return_patch_tokens = return_patch_tokens
         self.model_name = model_name
+        self.reg_tokens = reg_tokens
+
+        native = self._build_backbone(model_name, img_size, pretrained)
+        self._check_register_support(native, requested=reg_tokens)
+        if reg_tokens == 4:
+            registered = self._build_backbone(
+                model_name, img_size, False, reg_tokens=4
+            )
+            if pretrained:
+                self._migrate_pretrained_weights(native, registered)
+            self._assert_register_capability(registered)
+            self.backbone = registered
+        else:
+            if native_register_count(native) > 0:
+                self._assert_register_capability(native)
+            self.backbone = native
+
+        hidden_dim = self.backbone.num_features
+        proj_hidden_dim = 2048
+        self.projector = ProjectionHead(hidden_dim, proj_hidden_dim, out_dim)
+        self.register_buffer("center", torch.zeros(1, out_dim))
+
+    def _build_backbone(
+        self,
+        model_name: str,
+        img_size: int,
+        pretrained: bool,
+        reg_tokens: int | None = None,
+    ) -> nn.Module:
+        """Build the timm backbone, preserving the legacy CNN error boundary."""
+        extra = {} if reg_tokens is None else {"reg_tokens": reg_tokens}
         try:
-            self.backbone = timm.create_model(
+            return timm.create_model(
                 model_name,
                 img_size=img_size,
                 num_classes=0,
                 global_pool="",
                 pretrained=pretrained,
                 dynamic_img_size=True,
+                **extra,
             )
-        except Exception:
-            try:
-                self.backbone = timm.create_model(
-                    model_name,
-                    img_size=img_size,
-                    pretrained=pretrained,
-                    dynamic_img_size=True,
-                )
-                if hasattr(self.backbone, "head"):
-                    self.backbone.head = nn.Identity()
-                if hasattr(self.backbone, "fc_norm"):
-                    self.backbone.fc_norm = nn.Identity()
-            except TypeError as exc:
-                if "unexpected keyword argument" in str(exc):
-                    raise RuntimeError(
-                        f"Backbone '{model_name}' is not supported: it rejects the "
-                        "ViT-only options (img_size / dynamic_img_size), i.e. it is "
-                        "a CNN-style model. The OTU-Former pipeline is built around "
-                        "ViT patch tokens; CNN backbones are not supported."
-                    ) from exc
-                raise
-            except Exception as exc:
+        except TypeError as exc:
+            if reg_tokens is not None and "reg_tokens" in str(exc):
                 raise RuntimeError(
-                    f"Could not load pretrained backbone weights for '{model_name}'. "
-                    "Repair or remove the corrupted timm/Hugging Face cache, then retry."
+                    f"Installed timm does not support the 'reg_tokens' option "
+                    f"needed to build '{model_name}' as a registered backbone; "
+                    "upgrade timm."
                 ) from exc
-        hidden_dim = self.backbone.num_features
-        proj_hidden_dim = 2048
-        self.projector = ProjectionHead(hidden_dim, proj_hidden_dim, out_dim)
-        self.register_buffer("center", torch.zeros(1, out_dim))
+        except Exception:
+            pass
+        try:
+            backbone = timm.create_model(
+                model_name,
+                img_size=img_size,
+                pretrained=pretrained,
+                dynamic_img_size=True,
+                **extra,
+            )
+            if hasattr(backbone, "head"):
+                backbone.head = nn.Identity()
+            if hasattr(backbone, "fc_norm"):
+                backbone.fc_norm = nn.Identity()
+            return backbone
+        except TypeError as exc:
+            if "unexpected keyword argument" in str(exc):
+                raise RuntimeError(
+                    f"Backbone '{model_name}' is not supported: it rejects the "
+                    "ViT-only options (img_size / dynamic_img_size), i.e. it is "
+                    "a CNN-style model. The OTU-Former pipeline is built around "
+                    "ViT patch tokens; CNN backbones are not supported."
+                ) from exc
+            raise
+        except Exception as exc:
+            raise RuntimeError(
+                f"Could not load pretrained backbone weights for '{model_name}'. "
+                "Repair or remove the corrupted timm/Hugging Face cache, then retry."
+            ) from exc
+
+    def _check_register_support(
+        self, backbone: nn.Module, *, requested: int | None
+    ) -> None:
+        """Reject the register layouts this pipeline cannot honour.
+
+        Runs after ``timm.create_model`` succeeded and outside its broad
+        weight-loading error boundary, so every message reaches the caller.
+        """
+        native = native_register_count(backbone)
+        is_vi = is_standard_vision_transformer(backbone)
+        if requested is None:
+            if native == 0:
+                return
+            if not is_vi:
+                raise ValueError(
+                    f"Backbone '{self.model_name}' has {native} native register "
+                    "tokens but is not a standard timm VisionTransformer. "
+                    "Register-aware paths (including DINOv3/Eva models) are not "
+                    "supported by this pipeline."
+                )
+            if not has_class_token(backbone):
+                raise ValueError(
+                    f"Backbone '{self.model_name}' has {native} native register "
+                    "tokens but no CLS token; OTU-Former's register-aware paths "
+                    "require a CLS token."
+                )
+            return
+        if native > 0:
+            raise ValueError(
+                f"Backbone '{self.model_name}' already has {native} native "
+                "register tokens; an explicit --register-tokens 0 or 4 cannot "
+                "add or replace them. Omit the option to keep them."
+            )
+        if not has_class_token(backbone):
+            raise ValueError(
+                f"Backbone '{self.model_name}' has no CLS token; an explicit "
+                "--register-tokens requires a single-CLS VisionTransformer."
+            )
+        if not is_vi:
+            raise ValueError(
+                f"Backbone '{self.model_name}' is not a standard timm "
+                "VisionTransformer; --register-tokens supports only those."
+            )
+        prefix = int(getattr(backbone, "num_prefix_tokens", 1))
+        if prefix != 1:
+            raise ValueError(
+                f"Backbone '{self.model_name}' reports {prefix} prefix tokens "
+                "without registers; --register-tokens needs a single CLS token."
+            )
+        pos_embed = getattr(backbone, "pos_embed", None)
+        if requested == 4 and not isinstance(pos_embed, nn.Parameter):
+            raise ValueError(
+                f"Backbone '{self.model_name}' has no learned pos_embed tensor; "
+                "the register migration needs one to preserve patch positions."
+            )
+
+    def _migrate_pretrained_weights(
+        self, source: nn.Module, target: nn.Module
+    ) -> None:
+        """Copy every pretrained tensor into the registered backbone.
+
+        The target must differ from the source by exactly ``reg_token`` plus
+        four prefix positional entries. The register token keeps its own
+        native initialization; every other tensor is copied verbatim.
+        """
+        source_state = source.state_dict()
+        target_state = target.state_dict()
+        extra = set(target_state) - set(source_state)
+        if extra != {"reg_token"}:
+            raise ValueError(
+                "Cannot migrate pretrained weights into the registered "
+                f"backbone: expected only 'reg_token' to be added, got "
+                f"{sorted(extra)}."
+            )
+        missing = set(source_state) - set(target_state)
+        if missing:
+            raise ValueError(
+                "Cannot migrate pretrained weights into the registered "
+                f"backbone: {sorted(missing)} exist only in the pretrained one."
+            )
+        for key, tensor in source_state.items():
+            if key == "pos_embed":
+                continue
+            if tensor.shape != target_state[key].shape:
+                raise ValueError(
+                    "Cannot migrate pretrained weights into the registered "
+                    f"backbone: '{key}' has shape {tuple(tensor.shape)} in the "
+                    f"pretrained backbone but {tuple(target_state[key].shape)} "
+                    "in the registered one."
+                )
+        migrated = dict(source_state)
+        if "pos_embed" in source_state:
+            source_pos = source_state["pos_embed"]
+            target_pos = target_state["pos_embed"]
+            if source_pos.shape == target_pos.shape:
+                # no_embed_class=True keeps a patch-only positional embedding.
+                migrated["pos_embed"] = source_pos
+            elif (
+                source_pos.shape[1] + 4 == target_pos.shape[1]
+                and source_pos.shape[2] == target_pos.shape[2]
+            ):
+                migrated["pos_embed"] = torch.cat(
+                    [
+                        source_pos[:, :1],
+                        target_pos[:, 1:5],
+                        source_pos[:, 1:],
+                    ],
+                    dim=1,
+                )
+            else:
+                raise ValueError(
+                    "Cannot migrate pretrained weights into the registered "
+                    f"backbone: pos_embed has shape {tuple(source_pos.shape)} in "
+                    f"the pretrained backbone but {tuple(target_pos.shape)} in "
+                    "the registered one."
+                )
+        for key in extra:
+            migrated[key] = target_state[key]
+        target.load_state_dict(migrated, strict=True)
+
+    def _assert_register_capability(self, backbone: nn.Module) -> None:
+        """Verify by real forward shape that timm inserts the registers.
+
+        A constructor signature check cannot prove the installed timm actually
+        routes registers through ``_pos_embed``; this runs the private hook.
+        """
+        count = native_register_count(backbone)
+        prefix = int(getattr(backbone, "num_prefix_tokens", 0))
+        if prefix != 1 + count:
+            raise ValueError(
+                f"Backbone '{self.model_name}' reports {prefix} prefix tokens "
+                f"for {count} register tokens; the installed timm inserts "
+                "registers differently than this pipeline expects. Upgrade timm."
+            )
+        patch_embed = backbone.patch_embed
+        patch_size = patch_embed.patch_size
+        if isinstance(patch_size, (tuple, list)):
+            patch_size = patch_size[0]
+        with torch.no_grad():
+            patches = patch_embed(torch.zeros(1, 3, int(patch_size) * 2, int(patch_size) * 2))
+            grid = (
+                patches.shape[1] * patches.shape[2]
+                if patches.dim() == 4
+                else patches.shape[1]
+            )
+            tokens = backbone._pos_embed(patches)
+        if int(tokens.shape[1]) != int(grid) + prefix:
+            raise ValueError(
+                f"Backbone '{self.model_name}' _pos_embed produced "
+                f"{tokens.shape[1]} tokens for {grid} patches and {prefix} "
+                "prefix tokens; the installed timm does not insert registers "
+                "into the token sequence as expected. Upgrade timm."
+            )
 
     def forward(self, x: torch.Tensor):
         features = self.backbone.forward_features(x)
         cls_token = features[:, 0]
         cls_emb = self.projector(cls_token)
         if self.return_patch_tokens:
-            patch_tokens = features[:, 1:]
+            prefix = int(getattr(self.backbone, "num_prefix_tokens", 1))
+            patch_tokens = features[:, prefix:]
             return cls_emb, patch_tokens
         return cls_emb
 

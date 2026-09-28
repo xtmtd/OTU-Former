@@ -415,3 +415,388 @@ def test_subcenter_head_without_labels_returns_scaled_cosine():
     cosine = F.normalize(x) @ F.normalize(head.weight.reshape(-1, 6)).T
     cosine = cosine.reshape(5, 3, 2).max(dim=2).values
     assert torch.allclose(head(x), cosine * 8.0, atol=1e-6)
+
+
+# --- v0.10.0 optional register tokens -----------------------------------------
+
+_FACTORY_SEED = 0
+
+_TINY_SPECS = {
+    "tiny_onecls": {"regs": 0, "cls": True},
+    "tiny_native_reg4": {"regs": 4, "cls": True},
+    "tiny_native_reg2": {"regs": 2, "cls": True},
+    "tiny_gap": {"regs": 0, "cls": False},
+    "tiny_gap_reg4": {"regs": 4, "cls": False},
+    "tiny_onecls_noembed": {"regs": 0, "cls": True, "no_embed_class": True},
+}
+
+
+def _tensor_hash(tensor: torch.Tensor) -> str:
+    import hashlib
+
+    payload = tensor.detach().to(torch.float32).contiguous().numpy().tobytes()
+    return hashlib.sha256(payload).hexdigest()[:16]
+
+
+class _VitNamedButNotAVit(torch.nn.Module):
+    """Reports native registers without being a timm VisionTransformer."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.reg_token = torch.nn.Parameter(torch.zeros(1, 4, 32))
+        self.num_reg_tokens = 4
+        self.num_prefix_tokens = 5
+        self.has_class_token = False
+        self.num_features = 32
+
+
+def tiny_vit(name="tiny_onecls", pretrained=False, regs=None, embed_dim=32,
+             img_size=32, patch_size=16, depth=2, num_heads=2):
+    """Build a real tiny timm VisionTransformer, optionally with synthetic weights.
+
+    ``pretrained=True`` fills every tensor with a name-derived constant and makes
+    ``pos_embed`` carry its position index, so tests assert exact values and
+    positions without any network download.
+    """
+    from timm.models.vision_transformer import VisionTransformer
+
+    spec = _TINY_SPECS[name]
+    torch.manual_seed(_FACTORY_SEED)
+    model = VisionTransformer(
+        img_size=img_size,
+        patch_size=patch_size,
+        in_chans=3,
+        embed_dim=embed_dim,
+        depth=depth,
+        num_heads=num_heads,
+        mlp_ratio=2.0,
+        num_classes=0,
+        global_pool="",
+        class_token=spec["cls"],
+        reg_tokens=spec["regs"] if regs is None else int(regs),
+        no_embed_class=bool(spec.get("no_embed_class", False)),
+        dynamic_img_size=True,
+    )
+    if pretrained:
+        for tensor_name, tensor in model.state_dict().items():
+            if tensor_name == "pos_embed":
+                tensor.copy_(
+                    torch.arange(tensor.shape[1], dtype=tensor.dtype)
+                    .view(1, -1, 1)
+                    .expand_as(tensor)
+                )
+            else:
+                tensor.fill_(float(len(tensor_name) % 9) + 1.0)
+    return model
+
+
+def install_tiny_factory(monkeypatch, register_embed_dim=None, calls=None):
+    """Route ``timm.create_model`` to :func:`tiny_vit` and record the kwargs."""
+    import otuformer.training.model as model_module
+
+    calls = [] if calls is None else calls
+
+    def factory(model_name, **kwargs):
+        calls.append(dict(kwargs))
+        if model_name not in _TINY_SPECS:
+            return _VitNamedButNotAVit()
+        spec = _TINY_SPECS[model_name]
+        requested = kwargs.get("reg_tokens")
+        embed_dim = 32
+        if requested is not None and register_embed_dim is not None:
+            embed_dim = register_embed_dim
+        return tiny_vit(
+            model_name,
+            pretrained=bool(kwargs.get("pretrained", False)),
+            regs=spec["regs"] if requested is None else int(requested),
+            embed_dim=embed_dim,
+            img_size=int(kwargs.get("img_size", 32)),
+        )
+
+    monkeypatch.setattr(model_module.timm, "create_model", factory)
+    return calls
+
+
+def build_tiny_encoder(monkeypatch, model_name="tiny_onecls", **kwargs):
+    install_tiny_factory(monkeypatch)
+    kwargs.setdefault("out_dim", 8)
+    kwargs.setdefault("return_patch_tokens", True)
+    kwargs.setdefault("img_size", 32)
+    return OTUFormerEncoder(model_name=model_name, **kwargs)
+
+
+def test_omitted_register_option_preserves_pre_change_construction():
+    """Guards the zero-register path against extra construction or RNG use.
+
+    Baseline captured from the unmodified code before this feature
+    (workspace ``baseline.json``): with seed S the student projector and with
+    seed S+1 the teacher projector initialize to these exact tensors, and the
+    two are independently initialized. The projector stream is identical for
+    ``pretrained=True`` and ``pretrained=False``, so this offline recipe
+    represents the real trainer path.
+    """
+    from otuformer.training.trainer import _set_seed
+
+    _set_seed(1234)
+    student = OTUFormerEncoder(
+        model_name="vit_tiny_patch16_224", out_dim=64,
+        return_patch_tokens=True, img_size=32, pretrained=False,
+    )
+    rng_state = torch.get_rng_state()
+    _set_seed(1235)
+    teacher = OTUFormerEncoder(
+        model_name="vit_tiny_patch16_224", out_dim=64,
+        return_patch_tokens=True, img_size=32, pretrained=False,
+    )
+    torch.set_rng_state(rng_state)
+
+    assert _tensor_hash(student.projector.net[0].weight) == "25a3dddafffdaaab"
+    assert _tensor_hash(student.projector.net[2].weight) == "fd71bf8c97fea6d8"
+    assert _tensor_hash(student.projector.net[4].weight) == "e0bbcff873a45e07"
+    assert _tensor_hash(teacher.projector.net[0].weight) == "86651199182904cb"
+    assert _tensor_hash(teacher.projector.net[2].weight) == "c3168ca1fdad0fd2"
+    assert _tensor_hash(teacher.projector.net[4].weight) == "90aef90fe9a5f239"
+
+    _set_seed(1234)
+    finetune = OTUFormerEncoder(
+        model_name="vit_tiny_patch16_224", out_dim=64, img_size=32, pretrained=False
+    )
+    head = ArcFaceEmbeddingHead(finetune.backbone.num_features, 64)
+    assert _tensor_hash(finetune.projector.net[0].weight) == "25a3dddafffdaaab"
+    assert _tensor_hash(head.net[0].weight) == "f0692685b48e8447"
+    assert _tensor_hash(head.net[2].weight) == "7c6eb2860dfa6f9e"
+
+
+def test_register_option_four_migrates_pretrained_weights_exactly(monkeypatch):
+    calls = install_tiny_factory(monkeypatch)
+    source = tiny_vit("tiny_onecls", pretrained=True)
+    encoder = OTUFormerEncoder(
+        model_name="tiny_onecls", out_dim=8, img_size=32,
+        reg_tokens=4, pretrained=True,
+    )
+    target = encoder.backbone
+    source_state = source.state_dict()
+    target_state = target.state_dict()
+
+    assert set(target_state) - set(source_state) == {"reg_token"}
+    assert set(source_state) - set(target_state) == set()
+    for key, tensor in source_state.items():
+        if key == "pos_embed":
+            continue
+        assert tensor.shape == target_state[key].shape
+        assert torch.equal(tensor, target_state[key])
+    assert source_state["pos_embed"].shape[1] + 4 == target_state["pos_embed"].shape[1]
+    assert target.num_prefix_tokens == 5
+    assert target.num_reg_tokens == 4
+    # Native one-CLS construction first, then the registered target without a
+    # second pretrained load.
+    assert [call["pretrained"] for call in calls] == [True, False]
+    assert "reg_tokens" not in calls[0]
+    assert calls[1]["reg_tokens"] == 4
+
+
+def test_register_positions_keep_cls_patches_and_native_register_entries(monkeypatch):
+    install_tiny_factory(monkeypatch)
+    source = tiny_vit("tiny_onecls", pretrained=True)
+    native_registered = tiny_vit("tiny_onecls", regs=4)
+    encoder = OTUFormerEncoder(
+        model_name="tiny_onecls", out_dim=8, img_size=32,
+        reg_tokens=4, pretrained=True,
+    )
+    pos = encoder.backbone.pos_embed
+    assert torch.equal(pos[0, 0], source.pos_embed[0, 0])
+    assert torch.equal(pos[0, 5:], source.pos_embed[0, 1:])
+    assert torch.equal(pos[0, 1:5], native_registered.pos_embed[0, 1:5])
+    assert not torch.equal(pos[0, 1:5], source.pos_embed[0, 1:5])
+
+
+def test_register_option_four_without_embed_class_keeps_patch_only_pos_embed(monkeypatch):
+    install_tiny_factory(monkeypatch)
+    source = tiny_vit("tiny_onecls_noembed", pretrained=True)
+    encoder = OTUFormerEncoder(
+        model_name="tiny_onecls_noembed", out_dim=8, img_size=32,
+        reg_tokens=4, pretrained=True,
+    )
+    target = encoder.backbone
+    assert source.pos_embed.shape == target.pos_embed.shape
+    assert torch.equal(source.pos_embed, target.pos_embed)
+    assert target.pos_embed.shape[1] == 4
+    assert target.num_prefix_tokens == 5
+    assert target.reg_token is not None
+
+
+def test_register_option_four_without_pretrained_builds_registered_architecture(monkeypatch):
+    calls = install_tiny_factory(monkeypatch)
+    encoder = OTUFormerEncoder(
+        model_name="tiny_onecls", out_dim=8, img_size=32,
+        reg_tokens=4, pretrained=False,
+    )
+    assert calls and all(call["pretrained"] is False for call in calls)
+    assert "reg_tokens" not in calls[0]
+    assert calls[-1]["reg_tokens"] == 4
+    assert encoder.backbone.num_prefix_tokens == 5
+    assert encoder.backbone.reg_token is not None
+
+
+def test_register_option_zero_preserves_zero_register_construction(monkeypatch):
+    calls = install_tiny_factory(monkeypatch)
+    encoder = OTUFormerEncoder(
+        model_name="tiny_onecls", out_dim=8, img_size=32,
+        reg_tokens=0, pretrained=True,
+    )
+    assert len(calls) == 1
+    assert "reg_tokens" not in calls[0]
+    assert encoder.backbone.num_prefix_tokens == 1
+    assert encoder.backbone.reg_token is None
+
+
+def test_invalid_register_option_is_rejected(monkeypatch):
+    install_tiny_factory(monkeypatch)
+    with pytest.raises(ValueError, match="0 or 4"):
+        OTUFormerEncoder(
+            model_name="tiny_onecls", out_dim=8, img_size=32,
+            reg_tokens=2, pretrained=False,
+        )
+
+
+def test_explicit_register_option_rejected_on_native_register_model(monkeypatch):
+    install_tiny_factory(monkeypatch)
+    for value in (0, 4):
+        with pytest.raises(ValueError, match="native register tokens"):
+            OTUFormerEncoder(
+                model_name="tiny_native_reg4", out_dim=8, img_size=32,
+                reg_tokens=value, pretrained=False,
+            )
+
+
+def test_explicit_register_option_rejected_on_no_cls_model(monkeypatch):
+    install_tiny_factory(monkeypatch)
+    for value in (0, 4):
+        with pytest.raises(ValueError, match="no CLS token"):
+            OTUFormerEncoder(
+                model_name="tiny_gap", out_dim=8, img_size=32,
+                reg_tokens=value, pretrained=False,
+            )
+
+
+def test_native_register_model_without_cls_rejected_even_when_omitted(monkeypatch):
+    install_tiny_factory(monkeypatch)
+    with pytest.raises(ValueError, match="no CLS token"):
+        OTUFormerEncoder(
+            model_name="tiny_gap_reg4", out_dim=8, img_size=32,
+            reg_tokens=None, pretrained=False,
+        )
+
+
+def test_vit_named_non_vision_transformer_with_registers_is_rejected(monkeypatch):
+    install_tiny_factory(monkeypatch)
+    with pytest.raises(ValueError, match="standard timm VisionTransformer"):
+        OTUFormerEncoder(
+            model_name="vit_small_patch16_dinov3.lvd1689m", out_dim=8,
+            img_size=32, reg_tokens=None, pretrained=False,
+        )
+
+
+def test_migration_rejects_incompatible_target_weights(monkeypatch):
+    install_tiny_factory(monkeypatch, register_embed_dim=64)
+    with pytest.raises(ValueError, match="migrat"):
+        OTUFormerEncoder(
+            model_name="tiny_onecls", out_dim=8, img_size=32,
+            reg_tokens=4, pretrained=True,
+        )
+
+
+def test_forward_excludes_every_prefix_token(monkeypatch):
+    install_tiny_factory(monkeypatch)
+    plain = OTUFormerEncoder(
+        model_name="tiny_onecls", out_dim=8, return_patch_tokens=True,
+        img_size=32, pretrained=False,
+    )
+    registered = OTUFormerEncoder(
+        model_name="tiny_onecls", out_dim=8, return_patch_tokens=True,
+        img_size=32, reg_tokens=4, pretrained=False,
+    )
+    x = torch.randn(2, 3, 32, 32)
+    with torch.no_grad():
+        _, plain_patches = plain(x)
+        _, registered_patches = registered(x)
+    assert plain_patches.shape == (2, 4, 32)
+    assert registered_patches.shape == (2, 4, 32)
+    assert registered.backbone.num_prefix_tokens == 5
+
+
+def test_pretrain_final_norm_binds_the_migrated_backbone(monkeypatch):
+    install_tiny_factory(monkeypatch)
+    encoder = OTUFormerEncoder(
+        model_name="tiny_onecls", out_dim=8, return_patch_tokens=True,
+        img_size=32, reg_tokens=4, pretrained=True,
+    )
+    encoder.validate_pretrain_backbone()
+    assert encoder._pretrain_final_norm is encoder.backbone.norm
+    assert encoder.backbone.num_prefix_tokens == 5
+
+
+def test_timm_without_reg_tokens_support_raises_a_capability_error(monkeypatch):
+    """An older timm must fail with a clear capability error, not a CNN error."""
+    import otuformer.training.model as model_module
+
+    def factory(model_name, **kwargs):
+        if "reg_tokens" in kwargs:
+            raise TypeError(
+                "create_model() got an unexpected keyword argument 'reg_tokens'"
+            )
+        return tiny_vit(model_name)
+
+    monkeypatch.setattr(model_module.timm, "create_model", factory)
+    with pytest.raises(RuntimeError, match="upgrade timm"):
+        OTUFormerEncoder(
+            model_name="tiny_onecls", out_dim=8, img_size=32,
+            reg_tokens=4, pretrained=False,
+        )
+
+
+def test_capability_guard_rejects_a_backbone_that_omits_the_registers(monkeypatch):
+    """A timm that ignores reg_tokens must be caught, not silently accepted."""
+    import otuformer.training.model as model_module
+
+    def factory(model_name, **kwargs):
+        requested = kwargs.get("reg_tokens")
+        model = tiny_vit(
+            model_name,
+            pretrained=bool(kwargs.get("pretrained", False)),
+            regs=0 if requested is None else int(requested),
+        )
+        if requested is not None:
+            model.num_prefix_tokens = 1
+        return model
+
+    monkeypatch.setattr(model_module.timm, "create_model", factory)
+    with pytest.raises(ValueError, match="prefix tokens"):
+        OTUFormerEncoder(
+            model_name="tiny_onecls", out_dim=8, img_size=32,
+            reg_tokens=4, pretrained=False,
+        )
+
+
+def test_capability_guard_checks_the_pos_embed_forward_shape(monkeypatch):
+    """The guard must probe ``_pos_embed``, not just trust constructor kwargs."""
+    import otuformer.training.model as model_module
+
+    def factory(model_name, **kwargs):
+        requested = kwargs.get("reg_tokens")
+        model = tiny_vit(
+            model_name,
+            pretrained=bool(kwargs.get("pretrained", False)),
+            regs=0 if requested is None else int(requested),
+        )
+        if requested is not None:
+            original = model._pos_embed
+            model._pos_embed = lambda patches: original(patches)[:, :1]
+        return model
+
+    monkeypatch.setattr(model_module.timm, "create_model", factory)
+    with pytest.raises(ValueError, match="_pos_embed"):
+        OTUFormerEncoder(
+            model_name="tiny_onecls", out_dim=8, img_size=32,
+            reg_tokens=4, pretrained=False,
+        )

@@ -57,11 +57,14 @@ from otuformer.training.model import (
     ArcFaceEmbeddingHead,
     OTUFormerEncoder,
     PatchObjective,
+    native_register_count,
 )
 from otuformer.utils.checkpoint import (
     ARCFACE_EMBEDDING_HEAD,
     PROJECTION_EMBEDDING_HEAD,
     load_checkpoint,
+    recorded_register_count,
+    resolve_checkpoint,
     resolve_checkpoint_embedding_head,
     resolve_projector_out_dim,
     save_checkpoint,
@@ -1969,7 +1972,303 @@ def _validate_augmentation_config(
     return current_config
 
 
+_REGISTER_RESUME_KEYS = ("student", "teacher", "model_state_dict")
+
+
+def _assert_encoder_state_matches(
+    state_dict: dict, model: OTUFormerEncoder, label: str
+) -> None:
+    """Require every ``backbone.*`` key and shape of a resume state to fit.
+
+    Only the backbone is compared, so ``center`` and the ``_pretrain_final_norm.*``
+    alias remain allowed inside an encoder state dict.
+    """
+    expected = {
+        key: value
+        for key, value in model.state_dict().items()
+        if key.startswith("backbone.")
+    }
+    provided = {
+        key: value for key, value in state_dict.items() if key.startswith("backbone.")
+    }
+    missing = sorted(set(expected) - set(provided))
+    unexpected = sorted(set(provided) - set(expected))
+    mismatched = sorted(
+        key
+        for key in set(expected) & set(provided)
+        if expected[key].shape != provided[key].shape
+    )
+    if missing or unexpected or mismatched:
+        raise ValueError(
+            f"Resume checkpoint '{label}' does not fit '{model.model_name}': "
+            f"{len(missing)} missing, {len(unexpected)} unexpected, "
+            f"{len(mismatched)} shape-mismatched backbone tensor(s) "
+            f"(e.g. {(missing + unexpected + mismatched)[0]})."
+        )
+
+
+def _resume_register_plan(
+    resume_ckpt: dict[str, Any], model_name: str, image_size: int, out_dim: int
+) -> tuple[str, int]:
+    """Resolve ``(mode, actual_count)`` for a pretraining resume.
+
+    ``mode`` is ``"legacy"`` (no registers), ``"added"`` (four added registers)
+    or ``"native"`` (the model's own registers). A registered resume requires
+    explicit ``student`` and ``teacher`` states that agree on the layout, and
+    every present encoder state is checked against the rebuilt backbone before
+    any training encoder exists. Probes are RNG-isolated and never download
+    pretrained weights.
+    """
+    from otuformer.utils.checkpoint import (
+        preserved_rng,
+        reject_noncanonical_register_keys,
+        resolve_register_layout,
+    )
+
+    present = {
+        key: resume_ckpt[key]
+        for key in _REGISTER_RESUME_KEYS
+        if isinstance(resume_ckpt.get(key), dict)
+    }
+    for state in present.values():
+        reject_noncanonical_register_keys(state)
+
+    with preserved_rng():
+        probe = OTUFormerEncoder(
+            model_name=model_name,
+            out_dim=out_dim,
+            return_patch_tokens=True,
+            img_size=image_size,
+            pretrained=False,
+        )
+    native = native_register_count(probe.backbone)
+    recorded = recorded_register_count(resume_ckpt)
+    registered = (
+        (recorded is not None and recorded > 0)
+        or native > 0
+        or any("backbone.reg_token" in state for state in present.values())
+    )
+    if not registered:
+        # Legacy zero-register resume keeps its historical permissive partial
+        # load: the design explicitly excludes this path from the registered
+        # complete-backbone requirement.
+        return "legacy", 0
+
+    missing = [key for key in ("student", "teacher") if key not in present]
+    if missing:
+        raise ValueError(
+            "Registered resume requires explicit "
+            + " and ".join(f"'{key}'" for key in missing)
+            + " encoder state(s): the legacy model_state_dict fallback is a "
+            "teacher copy, not a student replacement."
+        )
+    layouts = {
+        key: resolve_register_layout(resume_ckpt, state, probe.backbone)
+        for key, state in present.items()
+    }
+    if len(set(layouts.values())) != 1:
+        raise ValueError(
+            "Registered resume encoder states disagree on the register layout: "
+            + json.dumps({key: list(value) for key, value in layouts.items()})
+            + "."
+        )
+    actual, added = layouts["student"]
+    mode = "added" if added == 4 else "native"
+
+    with preserved_rng():
+        expected = OTUFormerEncoder(
+            model_name=model_name,
+            out_dim=out_dim,
+            return_patch_tokens=True,
+            img_size=image_size,
+            pretrained=False,
+            **({"reg_tokens": 4} if mode == "added" else {}),
+        )
+    for key, state in present.items():
+        _assert_encoder_state_matches(state, expected, key)
+    return mode, actual
+
+
+def _check_register_option_against_resume(
+    mode: str, actual: int, register_tokens: int | None
+) -> None:
+    """Reject an explicit option that conflicts with the saved architecture."""
+    if register_tokens is None:
+        return
+    if mode == "native":
+        raise ValueError(
+            "Cannot resume with --register-tokens: the checkpoint natively has "
+            f"{actual} register tokens, which the option cannot add or replace."
+        )
+    if mode == "added" and register_tokens != 4:
+        raise ValueError(
+            "Cannot resume a four-register checkpoint with --register-tokens "
+            f"{register_tokens}; resume with 4 or omit the option."
+        )
+    if mode == "legacy" and register_tokens != 0:
+        raise ValueError(
+            "Cannot add registers while resuming a zero-register checkpoint; "
+            "start a new run with --register-tokens 4."
+        )
+
+
+def _finetune_register_plan(
+    checkpoint: dict[str, Any], model_name: str, image_size: int, out_dim: int
+) -> tuple[str, int]:
+    """Resolve ``(mode, actual_count)`` for a fine-tune source.
+
+    Fine-tuning always reads the ``model_state_dict`` source. A legacy
+    zero-register checkpoint keeps its existing ``pretrained=True``
+    construction; a registered source rebuilds without a download and must
+    match every ``backbone.*`` key and shape, including under the head
+    replacement's ``strict=False`` load.
+    """
+    from otuformer.utils.checkpoint import (
+        preserved_rng,
+        reject_noncanonical_register_keys,
+        resolve_register_layout,
+    )
+
+    state = checkpoint.get("model_state_dict")
+    if not isinstance(state, dict):
+        # The trainer reports the missing-source error in its own words.
+        return "legacy", 0
+    reject_noncanonical_register_keys(state)
+    with preserved_rng():
+        probe = OTUFormerEncoder(
+            model_name=model_name,
+            out_dim=out_dim,
+            return_patch_tokens=True,
+            img_size=image_size,
+            pretrained=False,
+        )
+    native = native_register_count(probe.backbone)
+    recorded = recorded_register_count(checkpoint)
+    registered = (
+        (recorded is not None and recorded > 0)
+        or native > 0
+        or "backbone.reg_token" in state
+    )
+    if not registered:
+        return "legacy", 0
+    actual, added = resolve_register_layout(checkpoint, state, probe.backbone)
+    mode = "added" if added == 4 else "native"
+    with preserved_rng():
+        expected = OTUFormerEncoder(
+            model_name=model_name,
+            out_dim=out_dim,
+            return_patch_tokens=True,
+            img_size=image_size,
+            pretrained=False,
+            **({"reg_tokens": 4} if mode == "added" else {}),
+        )
+    _assert_encoder_state_matches(state, expected, "model_state_dict")
+    return mode, actual
+
+
+def preflight_finetune_source(
+    checkpoint: dict[str, Any], model_name: str
+) -> tuple[str, int]:
+    """Validate a fine-tune source before the CLI creates or clears output."""
+    cfg = checkpoint.get("config") or {}
+    resolved = cfg.get("model_name") or model_name
+    out_dim = int(cfg.get("out_dim") or cfg.get("metric_embed_dim") or 256)
+    return _finetune_register_plan(
+        checkpoint, resolved, resolve_training_image_size(checkpoint), out_dim
+    )
+
+
+def preflight_pretrain_new_run(
+    model_name: str, register_tokens: int | None, image_size: int | None
+) -> None:
+    """Reject an impossible register/model combination before output setup.
+
+    Builds one RNG-isolated ``pretrained=False`` architecture probe, so the
+    caller's RNG streams are untouched and no pretrained weights are downloaded;
+    ``--overwrite`` therefore cannot clear an existing output directory for a
+    combination that is rejected anyway.
+    """
+    from otuformer.utils.checkpoint import preserved_rng
+
+    size = 224 if image_size is None else int(image_size)
+    with preserved_rng():
+        OTUFormerEncoder(
+            model_name=model_name,
+            out_dim=256,
+            return_patch_tokens=True,
+            img_size=size,
+            pretrained=False,
+            reg_tokens=register_tokens,
+        )
+
+
+def preflight_pretrain_resume(
+    resume_ckpt: dict[str, Any],
+    model_name: str,
+    register_tokens: int | None,
+    model_name_explicit: bool,
+) -> tuple[str, int]:
+    """Validate a pretraining resume before the CLI creates any output file.
+
+    Returns ``(mode, actual_count)``. Raises ``ValueError``/``KeyError`` so the
+    caller can map it onto a clean CLI error.
+    """
+    architecture = resolve_checkpoint(resume_ckpt, model_name)
+    if (
+        architecture.model_name_from_metadata
+        and model_name_explicit
+        and architecture.model_name != model_name
+    ):
+        raise ValueError(
+            "The resume checkpoint records model_name="
+            f"{architecture.model_name!r}, which conflicts with the explicit "
+            f"--model-name {model_name!r}."
+        )
+    image_size = resolve_training_image_size(resume_ckpt)
+    mode, actual = _resume_register_plan(
+        resume_ckpt, architecture.model_name, image_size, architecture.embedding_dim
+    )
+    _check_register_option_against_resume(mode, actual, register_tokens)
+    return mode, actual
+
+
+def _new_register_position_tensor(model: OTUFormerEncoder) -> torch.Tensor | None:
+    """The four registered prefix positional entries, or ``None`` if patch-only."""
+    backbone = model.backbone
+    prefix = int(getattr(backbone, "num_prefix_tokens", 1))
+    pos = getattr(backbone, "pos_embed", None)
+    if pos is None or pos.shape[1] <= prefix:
+        return None
+    if pos.shape[1] - prefix != int(getattr(backbone.patch_embed, "num_patches", -1)):
+        return None
+    return pos[:, 1:prefix]
+
+
+def _synchronize_new_registers(
+    student: OTUFormerEncoder, teacher: OTUFormerEncoder
+) -> None:
+    """Copy the student's freshly initialized registers into the teacher.
+
+    The teacher is initialized independently under a different seed, so the new
+    register parameters (and their positional entries) would otherwise disagree
+    before the first EMA update. Existing independent projector initialization
+    is left untouched.
+    """
+    with torch.no_grad():
+        teacher.backbone.reg_token.copy_(student.backbone.reg_token)
+        student_positions = _new_register_position_tensor(student)
+        if student_positions is not None:
+            teacher_positions = _new_register_position_tensor(teacher)
+            if teacher_positions is not None:
+                teacher_positions.copy_(student_positions)
+
+
 def run_pretrain(args: argparse.Namespace) -> None:
+    register_option = getattr(args, "register_tokens", None)
+    if register_option not in (None, 0, 4):
+        raise ValueError(
+            f"--register-tokens must be 0 or 4 (got {register_option!r})."
+        )
     _set_seed(args.seed)
     _set_cpus(args.cpus)
     device = _resolve_device(args.device)
@@ -1980,11 +2279,19 @@ def run_pretrain(args: argparse.Namespace) -> None:
     # Resolve the global crop size before dataset/model construction.
     # ``args.global_crop_size`` is None (auto) or an explicit resolved int.
     resume_ckpt: dict[str, Any] | None = None
+    resume_path: Path | None = None
+    resume_register_mode = "new"
+    actual_register_tokens = 0
     start_epoch = 0
     global_step = 0
+    model_name = args.model_name
     if getattr(args, "resume", ""):
         resume_path = Path(args.resume)
-        resume_ckpt = torch.load(resume_path, map_location="cpu", weights_only=False)
+        # The CLI preloads and validates the checkpoint before creating any
+        # output file; direct callers still load it from the recorded path.
+        resume_ckpt = getattr(args, "resume_state", None)
+        if resume_ckpt is None:
+            resume_ckpt = load_checkpoint(resume_path)
         checkpoint_size = resolve_training_image_size(resume_ckpt)
         if (
             args.global_crop_size is not None
@@ -2003,7 +2310,16 @@ def run_pretrain(args: argparse.Namespace) -> None:
             else resolve_backbone_native_size(args.model_name)
         )
     args.global_crop_size = global_crop_size
-    validate_model_name_size(args.model_name, global_crop_size)
+    if resume_ckpt is not None:
+        architecture = resolve_checkpoint(resume_ckpt, args.model_name)
+        model_name = architecture.model_name
+        resume_register_mode, actual_register_tokens = _resume_register_plan(
+            resume_ckpt, model_name, global_crop_size, architecture.embedding_dim
+        )
+        _check_register_option_against_resume(
+            resume_register_mode, actual_register_tokens, register_option
+        )
+    validate_model_name_size(model_name, global_crop_size)
 
     patch_config = _resolve_patch_config(args, resume_ckpt)
     patch_mode = str(patch_config["patch_loss"])
@@ -2071,25 +2387,39 @@ def run_pretrain(args: argparse.Namespace) -> None:
         persistent_workers=args.num_workers > 0,
     )
 
-    student = OTUFormerEncoder(
-        model_name=args.model_name,
-        out_dim=args.out_dim,
-        return_patch_tokens=True,
-        img_size=global_crop_size,
-    ).to(device)
+    student_kwargs: dict[str, Any] = {
+        "model_name": model_name,
+        "out_dim": args.out_dim,
+        "return_patch_tokens": True,
+        "img_size": global_crop_size,
+    }
+    if resume_register_mode == "added":
+        # Registered resume rebuilds without a pretrained download and loads the
+        # saved registers instead of migrating from timm weights.
+        student_kwargs.update(pretrained=False, reg_tokens=4)
+    elif resume_register_mode == "native":
+        student_kwargs.update(pretrained=False)
+    elif register_option is not None:
+        # ``0`` must stay distinct from omission: only the explicit option
+        # rejects a CLS-free backbone.
+        student_kwargs["reg_tokens"] = register_option
+
+    student = OTUFormerEncoder(**student_kwargs).to(device)
 
     rng_state = torch.get_rng_state()
     cuda_rng_state = torch.cuda.get_rng_state() if torch.cuda.is_available() else None
     _set_seed(args.seed + 1)
-    teacher = OTUFormerEncoder(
-        model_name=args.model_name,
-        out_dim=args.out_dim,
-        return_patch_tokens=True,
-        img_size=global_crop_size,
-    ).to(device)
+    teacher = OTUFormerEncoder(**student_kwargs).to(device)
     torch.set_rng_state(rng_state)
     if cuda_rng_state is not None:
         torch.cuda.set_rng_state(cuda_rng_state)
+
+    if resume_register_mode == "new" and register_option == 4:
+        # The teacher's independently seeded register init must match the
+        # student's before the first forward/EMA update.
+        _synchronize_new_registers(student, teacher)
+    if resume_ckpt is None:
+        actual_register_tokens = native_register_count(student.backbone)
 
     for p in teacher.parameters():
         p.requires_grad = False
@@ -2491,11 +2821,16 @@ def run_pretrain(args: argparse.Namespace) -> None:
                 "center": teacher.center.detach().cpu(),
                 "patch_objective": objective.state_dict(),
                 "rng_state": _capture_rng_state(),
-                "args": vars(args),
+                "args": {
+                    key: value
+                    for key, value in vars(args).items()
+                    if key != "resume_state"
+                },
                 "config": {
-                    "model_name": args.model_name,
+                    "model_name": model_name,
                     "out_dim": args.out_dim,
                     "image_size": global_crop_size,
+                    "register_tokens": actual_register_tokens,
                     "augmentation_profile": profile,
                     "augmentation_config": augmentation_config,
                     **patch_config,
@@ -3120,6 +3455,12 @@ def pseudo_cli_identity(
     out_dim = metric_embed_dim
     if out_dim is None:
         out_dim = ssl_cfg.get("metric_embed_dim") or ssl_cfg.get("out_dim") or 256
+    # The patch set of the initialized backbone is part of the experiment
+    # identity: the same model name can train on different token sets (zero
+    # versus four registers, or a CLS-free backbone).
+    _register_mode, register_tokens = _finetune_register_plan(
+        ssl_checkpoint, model_name, image_size, int(out_dim)
+    )
     return {
         "model_name": model_name,
         "metric_embed_dim": int(out_dim),
@@ -3159,6 +3500,7 @@ def pseudo_cli_identity(
         ),
         "arcface_scale": 64.0,
         "arcface_margin": 0.5,
+        "register_tokens": int(register_tokens),
     }
 
 
@@ -3898,11 +4240,19 @@ def run_finetune(
         + json.dumps(augmentation_config, indent=2, sort_keys=True)
     )
 
-    model = OTUFormerEncoder(
-        model_name=model_name,
-        out_dim=encoder_out_dim,
-        img_size=finetune_image_size,
-    ).to(device)
+    finetune_register_mode, fine_tune_register_tokens = _finetune_register_plan(
+        ckpt, model_name, finetune_image_size, encoder_out_dim
+    )
+    model_kwargs: dict[str, Any] = {
+        "model_name": model_name,
+        "out_dim": encoder_out_dim,
+        "img_size": finetune_image_size,
+    }
+    if finetune_register_mode == "added":
+        model_kwargs.update(pretrained=False, reg_tokens=4)
+    elif finetune_register_mode == "native":
+        model_kwargs.update(pretrained=False)
+    model = OTUFormerEncoder(**model_kwargs).to(device)
     validate_input_size(finetune_image_size, model, model_name)
     embedding_head = _select_finetune_embedding_head(ckpt)
     used_arcface_head = embedding_head == ARCFACE_EMBEDDING_HEAD
@@ -4217,6 +4567,7 @@ def run_finetune(
                 "orientation_policy": policy,
                 "long_tail": long_tail,
                 "class_labels": saved_class_labels,
+                "register_tokens": int(fine_tune_register_tokens),
                 **identity_extras,
                 # These are genuinely CLI-driven on resume, so compare the actual
                 # values rather than the preserved checkpoint copies.
@@ -4507,6 +4858,7 @@ def run_finetune(
                     "metric_embed_dim": out_dim,
                     "out_dim": out_dim,
                     "embedding_head": embedding_head,
+                    "register_tokens": fine_tune_register_tokens,
                     # Recorded optimizer policy: required to tell a v0.8.0
                     # two-group SupCon checkpoint from a legacy two-group one.
                     "loss": loss_config["loss"],

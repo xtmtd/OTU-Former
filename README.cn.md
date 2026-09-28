@@ -188,6 +188,19 @@ teacher 目标是 teacher 最后四个 block 输出的 L2 归一化均值。iBOT
 比例；对 `masked-feature`/`ibot`，它是被替换为 mask token 的 student patch 比例。
 显式传入当前模式不使用的选项会被拒绝，而不是静默忽略。
 
+**可选 register token（v0.10.0）。** `--register-tokens` 对合格的单 CLS timm
+`VisionTransformer` 接受 `none`（默认）、`0` 或 `4`。`4` 会新增四个可训练 register，并迁移单 CLS
+的预训练骨干：register token 保留其原生初始化，而所有 CLS/patch/block 权重与位置
+保持不变。`none` 保留骨干网络自身结构，原生 register 模型会保留自身数量；对原生
+register 或无 CLS 的骨干传入显式值会被拒绝，DINOv3/Eva 骨干不被该选项支持。
+register 永远不是图像 patch：`patch-topk`、`attention-pool` 提取、CAM reshape 与
+patch 目标都会跳过所有前缀 token（`backbone.num_prefix_tokens`）。新的 attention-pool
+checkpoint 会记录其 patch 策略（`num_prefix_tokens`、`register_tokens`、
+`prefix_excluded`、`attention_pooling_type`）并保存到带策略标签的同级文件，因此
+在不同 patch 集上训练的 pool 不会被静默复用。ONNX 导出还会在同一输入上比对 CPU
+FP32 PyTorch 与 CPU ONNX Runtime（`atol=1e-4`、`rtol=1e-3`），并在
+`export_report.json` 中记录 `validation_status`、`max_abs_diff` 与 register 数量。微调运行的 register 布局属于 v0.9.0 伪标签实验同一性的一部分，因此 finetune#2 必须从具有相同 patch 集合的源初始化。
+
 `masked-feature` 与 iBOT 会为每个 global view 增加一次 masked student 前向，在默认
 的两 global / 六 local 裁剪布局下，student 编码器计算量约增至 1.65 倍。
 extract、finetune、CAM、export 均未改变：默认仍使用原始 CLS token，它们从不加载
@@ -253,6 +266,7 @@ otuformer pretrain \
 | `--augmentation` | 预训练数据增强配置：`global-barcode`（新运行默认）、`color-robust` 或 `legacy`；`--resume` 时省略则继承已保存配置 | `global-barcode` |
 | `--orientation-policy` | 所有全局与局部视图的方向策略（对 `legacy` 无变换效果）：`sensitive`（新运行默认；旋转 `[-15°, 15°]`，不做水平翻转）或 `invariant`（可选加入的宽角度旋转与翻转）；`--resume` 时省略则继承已保存策略 | `sensitive` |
 | `--patch-loss` | patch 级目标：`none`、`consistency`（默认；可见同位余弦一致性，不是输入遮挡）、`masked-feature`（连续掩码特征预测）或 `ibot`（实验性原型预测） | `consistency` |
+| `--register-tokens` | 仅适用于合格的单 CLS ViT 的 register token：`none`、`0` 或 `4`。`none` 保留骨干网络自身结构（无 register，或原生 register 模型的自身数量）；显式 `0` 在无 CLS 骨干上会被拒绝 | `none` |
 | `--masking-strategy` | `masked-feature`/`ibot` 的真实遮挡几何：`random`、`blockwise` 或 `hybrid` | `random` |
 | `--mask-ratio` | `auto` 或 (0, 1) 内的浮点数。新运行 `auto` 解析为 0.30（v0.6.x 为 0.50）；旧检查点续训保留其记录值（缺失时为 0.50） | auto |
 | `--ibot-prototypes` | `ibot` 的原型字典大小；任意 >= 2 的整数，默认 512，数据集越大可越大 | 512 |

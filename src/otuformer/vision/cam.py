@@ -19,8 +19,8 @@ from otuformer.training.dataset import (
 )
 from otuformer.training.model import OTUFormerEncoder
 from otuformer.utils.checkpoint import (
-    apply_checkpoint_weights,
     load_checkpoint,
+    load_checkpoint_encoder,
     resolve_checkpoint,
 )
 from otuformer.utils.device import resolve_device
@@ -179,14 +179,10 @@ def load_model_from_checkpoint(
     ckpt = load_checkpoint(checkpoint_path)
     architecture = resolve_checkpoint(ckpt, model_name)
     checkpoint_size = resolve_training_image_size(ckpt)
-    encoder = OTUFormerEncoder(
-        model_name=architecture.model_name,
-        out_dim=architecture.embedding_dim,
-        pretrained=False,
-        img_size=checkpoint_size,
+    encoder, architecture = load_checkpoint_encoder(
+        ckpt, architecture, image_size=checkpoint_size
     )
     validate_input_size(checkpoint_size, encoder, architecture.model_name)
-    apply_checkpoint_weights(encoder, architecture)
     backbone = encoder.backbone
     backbone.eval().to(device)
 
@@ -260,15 +256,34 @@ def infer_architecture(base_model_name: str, model: torch.nn.Module) -> str:
     return "cnn"
 
 
-def vit_reshape_transform(tensor: torch.Tensor) -> torch.Tensor:
+def vit_reshape_transform(
+    tensor: torch.Tensor, prefix_tokens: int = 1
+) -> torch.Tensor:
+    """Reshape ViT tokens into a square grid, dropping every prefix token.
+
+    ``prefix_tokens`` is the loaded backbone's ``num_prefix_tokens`` so CLS and
+    register tokens never become image pixels; the default keeps the historical
+    one-prefix behaviour for direct callers.
+    """
     if tensor.ndim != 3:
         raise ValueError(f"Expected (B, N, C), got {tensor.shape}")
-    tensor = tensor[:, 1:, :]
+    tensor = tensor[:, int(prefix_tokens):, :]
     batch, tokens, channels = tensor.shape
     spatial_dim = int(tokens**0.5)
     if spatial_dim * spatial_dim != tokens:
         raise ValueError("Token count cannot form a square grid.")
     return tensor.permute(0, 2, 1).reshape(batch, channels, spatial_dim, spatial_dim)
+
+
+def _bind_reshape_transform(model: torch.nn.Module):
+    """Bind the loaded backbone's prefix-token count into the ViT reshape."""
+    backbone = getattr(model, "backbone", model)
+    prefix_tokens = int(getattr(backbone, "num_prefix_tokens", 1))
+
+    def reshape(tensor: torch.Tensor) -> torch.Tensor:
+        return vit_reshape_transform(tensor, prefix_tokens=prefix_tokens)
+
+    return reshape
 
 
 def build_display_transform(name: str, size: int) -> transforms.Compose:
@@ -376,7 +391,7 @@ def prepare_cam(
             else [default_vit_target(model)]
         )
 
-    reshape_transform = vit_reshape_transform if arch == "vit" else None
+    reshape_transform = _bind_reshape_transform(model) if arch == "vit" else None
     cam_kwargs = {
         "model": model,
         "target_layers": target_layers,

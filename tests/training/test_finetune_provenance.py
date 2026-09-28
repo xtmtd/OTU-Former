@@ -184,6 +184,130 @@ def test_identity_key_maps_are_consistent():
     mapped = {key for keys in EXPERIMENT_IDENTITY_KEYS.values() for key in keys}
     assert mapped.isdisjoint(derived)
     assert set(FIXED_IDENTITY_VALUES) <= derived
+    # The patch set is a derived (not CLI) identity attribute.
+    assert "register_tokens" in derived
+    assert "register_tokens" not in mapped
+
+
+def _minimal_ssl_checkpoint(path: Path, **config) -> Path:
+    """A readable SSL source for pseudo-identity resolution (no real weights)."""
+    import torch
+
+    payload = {
+        "model_state_dict": {"backbone.cls_token": torch.zeros(1, 1, 192)},
+        "config": {
+            "model_name": "vit_tiny_patch16_224",
+            "out_dim": 16,
+            "metric_embed_dim": 16,
+            "embedding_head": "arcface_mlp_512",
+            "image_size": 32,
+            **config,
+        },
+    }
+    torch.save(payload, path)
+    return path
+
+
+def _pseudo_identity_for(ssl_checkpoint: Path, **overrides):
+    resolved_loss = {
+        "loss": "arcface",
+        "subcenters": None,
+        "compact_weight": None,
+        "compact_cap": None,
+        "supcon_temperature": None,
+    }
+    kwargs = dict(
+        ssl_checkpoint=trainer._load_pseudo_source(ssl_checkpoint),
+        source_cfg={"class_labels": ["a", "b"]},
+        resolved_loss=resolved_loss,
+        model_name="vit_tiny_patch16_224",
+        metric_embed_dim=16,
+        finetune_epochs=1,
+        finetune_lr=1e-4,
+        metric_head_lr=None,
+        weight_decay=1e-4,
+        freeze_ratio=0.0,
+        augmentation="none",
+        orientation_policy="sensitive",
+        batch_size=2,
+        seed=42,
+        long_tail="none",
+    )
+    kwargs.update(overrides)
+    return trainer.pseudo_cli_identity(**kwargs)
+
+
+def test_pseudo_identity_carries_the_resolved_register_count(tmp_path: Path):
+    """A zero-register source resolves to zero (the producer, not just the map)."""
+    ssl = _minimal_ssl_checkpoint(tmp_path / "ssl.pth")
+
+    identity = _pseudo_identity_for(ssl)
+
+    assert identity["register_tokens"] == 0
+
+
+def test_pseudo_identity_sees_a_four_register_source(tmp_path: Path, monkeypatch):
+    """The count comes from the source's backbone layout, not a constant."""
+    import timm as timm_module
+    import torch
+    from timm.models.vision_transformer import VisionTransformer
+
+    import otuformer.training.model as model_module
+
+    def factory(_model_name, **kwargs):
+        requested = kwargs.get("reg_tokens")
+        return VisionTransformer(
+            img_size=32, patch_size=16, in_chans=3, embed_dim=16, depth=2,
+            num_heads=2, num_classes=0, global_pool="",
+            reg_tokens=0 if requested is None else int(requested),
+            dynamic_img_size=True,
+        )
+
+    monkeypatch.setattr(timm_module, "create_model", factory)
+    encoder = model_module.OTUFormerEncoder(
+        model_name="tiny-vit", out_dim=8, pretrained=False, reg_tokens=4, img_size=32
+    )
+    ssl = _minimal_ssl_checkpoint(
+        tmp_path / "registered.pth",
+        model_name="tiny-vit",
+        out_dim=8,
+        metric_embed_dim=8,
+        register_tokens=4,
+    )
+    torch.save(
+        {
+            "model_state_dict": encoder.state_dict(),
+            "config": {
+                "model_name": "tiny-vit",
+                "out_dim": 8,
+                "metric_embed_dim": 8,
+                "embedding_head": "arcface_mlp_512",
+                "image_size": 32,
+                "register_tokens": 4,
+            },
+        },
+        ssl,
+    )
+
+    identity = _pseudo_identity_for(
+        ssl, model_name="tiny-vit", metric_embed_dim=8
+    )
+
+    assert identity["register_tokens"] == 4
+
+
+def test_pseudo_identity_rejects_a_register_layout_mismatch():
+    """finetune#2 must not mix patch sets with finetune#1's pseudo labels."""
+    with pytest.raises(ValueError, match="register_tokens"):
+        trainer._assert_pseudo_source_identity(
+            {"register_tokens": 4}, {"register_tokens": 0}
+        )
+    with pytest.raises(ValueError, match="register_tokens"):
+        trainer._assert_pseudo_source_identity(
+            {"register_tokens": 0}, {"register_tokens": 4}
+        )
+    # A pre-v0.10.0 source without the key stays comparable.
+    trainer._assert_pseudo_source_identity({}, {"register_tokens": 4})
 
 
 def _label_fixture(tmp_path, name, labels):
@@ -578,3 +702,127 @@ def test_resume_drift_warns_on_missing_labels_csv(tmp_path, capsys):
     trainer._warn_pseudo_resume_drift({}, args, tmp_path / "out")
 
     assert "pseudo_labels.csv is missing" in capsys.readouterr().out
+
+
+# --- v0.10.0 fine-tune register layout ---------------------------------------
+
+
+def _tiny_backbone_state(native_regs=0, register_count=None, class_token=True):
+    """A full ``backbone.*`` state dict from a tiny timm VisionTransformer."""
+    import torch
+    from timm.models.vision_transformer import VisionTransformer
+
+    torch.manual_seed(0)
+    model = VisionTransformer(
+        img_size=32, patch_size=16, in_chans=3, embed_dim=16, depth=2,
+        num_heads=2, mlp_ratio=2.0, num_classes=0, global_pool="",
+        class_token=class_token,
+        reg_tokens=native_regs if register_count is None else register_count,
+        dynamic_img_size=True,
+    )
+    return {f"backbone.{key}": value for key, value in model.state_dict().items()}
+
+
+def _install_tiny_factory(monkeypatch, native_regs=0, class_token=True):
+    import torch
+    import timm as timm_module
+    from timm.models.vision_transformer import VisionTransformer
+
+    def factory(_model_name, **kwargs):
+        requested = kwargs.get("reg_tokens")
+        count = native_regs if requested is None else int(requested)
+        torch.manual_seed(0)
+        return VisionTransformer(
+            img_size=32, patch_size=16, in_chans=3, embed_dim=16, depth=2,
+            num_heads=2, mlp_ratio=2.0, num_classes=0, global_pool="",
+            class_token=class_token, reg_tokens=count, dynamic_img_size=True,
+        )
+
+    monkeypatch.setattr(timm_module, "create_model", factory)
+
+
+def test_finetune_register_plan_detects_added_four(monkeypatch):
+    _install_tiny_factory(monkeypatch)
+    checkpoint = {
+        "model_state_dict": _tiny_backbone_state(register_count=4),
+        "config": {"register_tokens": 4},
+    }
+    assert trainer._finetune_register_plan(checkpoint, "tiny", 32, 8) == ("added", 4)
+
+
+def test_finetune_register_plan_detects_native_registers(monkeypatch):
+    _install_tiny_factory(monkeypatch, native_regs=2)
+    checkpoint = {"model_state_dict": _tiny_backbone_state(native_regs=2)}
+    assert trainer._finetune_register_plan(checkpoint, "tiny", 32, 8) == ("native", 2)
+
+
+def test_finetune_register_plan_keeps_the_legacy_zero_register_path(monkeypatch):
+    """A legacy source keeps its permissive ``pretrained=True`` construction."""
+    import torch
+
+    _install_tiny_factory(monkeypatch)
+    checkpoint = {"model_state_dict": _tiny_backbone_state()}
+    assert trainer._finetune_register_plan(checkpoint, "tiny", 32, 8) == ("legacy", 0)
+
+    # Missing backbone keys and a missing source are never tightened here.
+    incomplete = _tiny_backbone_state()
+    incomplete.pop("backbone.blocks.0.attn.qkv.weight")
+    assert trainer._finetune_register_plan(
+        {"model_state_dict": incomplete}, "tiny", 32, 8
+    ) == ("legacy", 0)
+    assert trainer._finetune_register_plan({}, "tiny", 32, 8) == ("legacy", 0)
+
+    # A wrongly sized register tensor is still not legacy.
+    checkpoint = {
+        "model_state_dict": {
+            "backbone.reg_token": torch.zeros(1, 3, 16),
+            "backbone.cls_token": torch.zeros(1, 1, 16),
+        }
+    }
+    with pytest.raises(ValueError, match="reg_token"):
+        trainer._finetune_register_plan(checkpoint, "tiny", 32, 8)
+
+
+def test_finetune_register_plan_rejects_incomplete_registered_backbone(monkeypatch):
+    _install_tiny_factory(monkeypatch)
+    state = _tiny_backbone_state(register_count=4)
+    state.pop("backbone.blocks.0.attn.qkv.weight")
+    checkpoint = {"model_state_dict": state, "config": {"register_tokens": 4}}
+
+    with pytest.raises(ValueError, match="attn.qkv.weight"):
+        trainer._finetune_register_plan(checkpoint, "tiny", 32, 8)
+
+
+def test_finetune_register_plan_rejects_a_prefixed_register_key(monkeypatch):
+    import torch
+
+    _install_tiny_factory(monkeypatch)
+    checkpoint = {
+        "model_state_dict": {"_orig_mod.backbone.reg_token": torch.zeros(1, 4, 16)},
+        "config": {"register_tokens": 4},
+    }
+
+    with pytest.raises(ValueError, match="backbone.reg_token"):
+        trainer._finetune_register_plan(checkpoint, "tiny", 32, 8)
+
+
+def test_finetune_register_plan_rejects_no_cls_native_registers(monkeypatch):
+    _install_tiny_factory(monkeypatch, native_regs=4, class_token=False)
+    checkpoint = {
+        "model_state_dict": _tiny_backbone_state(native_regs=4, class_token=False)
+    }
+
+    with pytest.raises(ValueError, match="no CLS token"):
+        trainer._finetune_register_plan(checkpoint, "tiny", 32, 8)
+
+
+def test_preflight_finetune_source_uses_recorded_model_name(monkeypatch):
+    _install_tiny_factory(monkeypatch)
+    checkpoint = {
+        "model_state_dict": _tiny_backbone_state(),
+        "config": {"model_name": "tiny", "out_dim": 8},
+    }
+    assert trainer.preflight_finetune_source(checkpoint, "vit_tiny_patch16_224") == (
+        "legacy",
+        0,
+    )

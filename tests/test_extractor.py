@@ -67,6 +67,10 @@ def test_load_model_keeps_historical_projection_head_metadata(monkeypatch, tmp_p
             self.projector = torch.nn.Identity()
 
     monkeypatch.setattr(extractor_module, "OTUFormerEncoder", FakeEncoder)
+    # The shared read-only loader owns the construction site now.
+    import otuformer.utils.checkpoint as checkpoint_module
+
+    monkeypatch.setattr(checkpoint_module, "OTUFormerEncoder", FakeEncoder)
     checkpoint = tmp_path / "historical-sft.pth"
     torch.save(
         {
@@ -131,6 +135,10 @@ def test_load_model_rebuilds_arcface_embedding_head(monkeypatch, tmp_path):
             self.projector = torch.nn.Identity()
 
     monkeypatch.setattr(extractor_module, "OTUFormerEncoder", FakeEncoder)
+    # The shared read-only loader owns the construction site now.
+    import otuformer.utils.checkpoint as checkpoint_module
+
+    monkeypatch.setattr(checkpoint_module, "OTUFormerEncoder", FakeEncoder)
     source = ArcFaceEmbeddingHead(192, 64)
     checkpoint = tmp_path / "arcface.pth"
     torch.save(
@@ -163,6 +171,7 @@ def test_load_model_constructs_at_recorded_checkpoint_size(monkeypatch, tmp_path
         def __init__(self, **kwargs):
             super().__init__()
             seen.update(kwargs)
+            self.backbone = torch.nn.Identity()
 
         def load_state_dict(self, *_args, **_kwargs):
             return None
@@ -173,6 +182,10 @@ def test_load_model_constructs_at_recorded_checkpoint_size(monkeypatch, tmp_path
         lambda _path: {"model_state_dict": {}, "args": {"global_crop_size": 32}},
     )
     monkeypatch.setattr(extractor_module, "OTUFormerEncoder", FakeEncoder)
+    # The shared read-only loader owns the construction site now.
+    import otuformer.utils.checkpoint as checkpoint_module
+
+    monkeypatch.setattr(checkpoint_module, "OTUFormerEncoder", FakeEncoder)
 
     model, size = extractor_module._load_model(
         tmp_path / "model.pth", "vit_tiny_patch16_224", torch.device("cpu")
@@ -326,12 +339,17 @@ def test_extractor_checkpoint_loader_disables_pretrained_weights(monkeypatch, tm
         def __init__(self, **kwargs):
             super().__init__()
             seen.update(kwargs)
+            self.backbone = torch.nn.Identity()
 
         def load_state_dict(self, *_args, **_kwargs):
             return None
 
     monkeypatch.setattr(extractor_module, "load_checkpoint", lambda _path: {"model_state_dict": {}})
     monkeypatch.setattr(extractor_module, "OTUFormerEncoder", FakeEncoder)
+    # The shared read-only loader owns the construction site now.
+    import otuformer.utils.checkpoint as checkpoint_module
+
+    monkeypatch.setattr(checkpoint_module, "OTUFormerEncoder", FakeEncoder)
 
     _load_model(tmp_path / "model.pth", "vit_tiny_patch16_224", torch.device("cpu"))
 
@@ -472,6 +490,318 @@ def test_extract_attention_pool_validates_csv_before_start_message(
         )
 
     assert "Starting query finetuning" not in capsys.readouterr().out
+
+
+# --- v0.10.0 patch boundaries and attention-pool policy -----------------------
+
+
+def _prefix_backbone(prefix_tokens, dim=16, registers=None):
+    backbone = torch.nn.Identity()
+    backbone.num_prefix_tokens = prefix_tokens
+    backbone.num_features = dim
+    backbone.num_reg_tokens = (
+        max(0, prefix_tokens - 1) if registers is None else registers
+    )
+    backbone.reg_token = None
+    return backbone
+
+
+def test_patch_features_excludes_registers_and_keeps_the_first_patch_when_cls_free():
+    import otuformer.embedding.extractor as extractor_module
+
+    feats = torch.arange(2 * 7 * 3, dtype=torch.float32).reshape(2, 7, 3)
+
+    registered = extractor_module._patch_features(_prefix_backbone(5), feats)
+    assert torch.equal(registered, feats[:, 5:])
+
+    cls_only = extractor_module._patch_features(_prefix_backbone(1), feats)
+    assert torch.equal(cls_only, feats[:, 1:])
+
+    # A CLS-free/no-register backbone keeps its first patch.
+    cls_free = extractor_module._patch_features(_prefix_backbone(0), feats)
+    assert cls_free.shape == (2, 7, 3)
+    assert torch.equal(cls_free[:, 0], feats[:, 0])
+
+
+def test_pool_policy_and_tagged_sibling_filename():
+    import otuformer.embedding.extractor as extractor_module
+
+    model = type("Model", (), {"backbone": _prefix_backbone(5, 32, registers=4)})()
+    policy = extractor_module._attention_pool_policy(model, "gated")
+
+    assert policy == {
+        "num_prefix_tokens": 5,
+        "register_tokens": 4,
+        "prefix_excluded": True,
+        "attention_pooling_type": "gated",
+    }
+    assert extractor_module._tagged_pooling_checkpoint_path(
+        Path("runs/pretrain/SSL_latest.gated_pooling.pth"), policy
+    ) == Path("runs/pretrain/SSL_latest.prefix5-reg4-gated_pooling.pth")
+
+
+def test_pool_candidates_search_the_tagged_sibling_first():
+    import otuformer.embedding.extractor as extractor_module
+
+    policy = {
+        "num_prefix_tokens": 5,
+        "register_tokens": 4,
+        "prefix_excluded": True,
+        "attention_pooling_type": "lightweight",
+    }
+    default = Path("d/SSL.pth")
+
+    assert extractor_module._attention_pooling_checkpoint_candidates(
+        default, "lightweight", None, policy=policy
+    ) == [
+        Path("d/SSL.prefix5-reg4-lightweight_pooling.pth"),
+        Path("d/SSL.lightweight_pooling.pth"),
+    ]
+
+    requested = Path("d/stale_pool.pth")
+    assert extractor_module._attention_pooling_checkpoint_candidates(
+        default, "lightweight", requested, policy=policy
+    ) == [
+        Path("d/stale_pool.prefix5-reg4-lightweight_pooling.pth"),
+        Path("d/stale_pool.pth"),
+        Path("d/SSL.prefix5-reg4-lightweight_pooling.pth"),
+        Path("d/SSL.lightweight_pooling.pth"),
+    ]
+
+    # Without a policy the historical path order is unchanged.
+    assert extractor_module._attention_pooling_checkpoint_candidates(
+        default, "gated", None
+    ) == [Path("d/SSL.gated_pooling.pth")]
+    assert extractor_module._attention_pooling_checkpoint_candidates(
+        default, "gated", requested
+    ) == [requested, Path("d/SSL.gated_pooling.pth")]
+
+
+def test_pool_policy_compatibility_table():
+    import otuformer.embedding.extractor as extractor_module
+
+    policy = {
+        "num_prefix_tokens": 5,
+        "register_tokens": 4,
+        "prefix_excluded": True,
+        "attention_pooling_type": "lightweight",
+    }
+    assert extractor_module._pool_policy_compatible({"args": dict(policy)}, policy)[0]
+
+    for key, value in (
+        ("num_prefix_tokens", 1),
+        ("register_tokens", 0),
+        ("prefix_excluded", False),
+        ("attention_pooling_type", "gated"),
+    ):
+        broken = dict(policy)
+        broken[key] = value
+        compatible, reason = extractor_module._pool_policy_compatible(
+            {"args": broken}, policy
+        )
+        assert not compatible and key in reason
+
+    # A policy-less pool is reusable only for one prefix and zero registers.
+    legacy_policy = dict(policy, num_prefix_tokens=1, register_tokens=0)
+    assert extractor_module._pool_policy_compatible({"args": {}}, legacy_policy)[0]
+    assert extractor_module._pool_policy_compatible({"teacher": {}}, legacy_policy)[0]
+    assert not extractor_module._pool_policy_compatible({"args": {}}, policy)[0]
+    assert not extractor_module._pool_policy_compatible({}, policy)[0]
+
+
+def test_partially_recorded_pool_policy_is_never_reused():
+    import otuformer.embedding.extractor as extractor_module
+
+    policy = {
+        "num_prefix_tokens": 1,
+        "register_tokens": 0,
+        "prefix_excluded": True,
+        "attention_pooling_type": "lightweight",
+    }
+    # A pre-policy file whose recorded pooling type differs must not be reused.
+    ok, reason = extractor_module._pool_policy_compatible(
+        {"args": {"attention_pooling_type": "gated"}}, policy
+    )
+    assert not ok and "attention_pooling_type" in reason
+    # A pre-policy file with the matching type stays readable.
+    assert extractor_module._pool_policy_compatible(
+        {"args": {"attention_pooling_type": "lightweight"}}, policy
+    )[0]
+    # A half-written patch policy is rejected even when the fields it has match.
+    ok, reason = extractor_module._pool_policy_compatible(
+        {"args": {"num_prefix_tokens": 1, "register_tokens": 0}}, policy
+    )
+    assert not ok and "prefix_excluded" in reason
+    # A complete patch trio without the pooling type cannot be verified either,
+    # including for a registered backbone (prefix 5 / 4 registers).
+    registered_policy = {
+        "num_prefix_tokens": 5,
+        "register_tokens": 4,
+        "prefix_excluded": True,
+        "attention_pooling_type": "gated",
+    }
+    ok, reason = extractor_module._pool_policy_compatible(
+        {
+            "args": {
+                "num_prefix_tokens": 5,
+                "register_tokens": 4,
+                "prefix_excluded": True,
+            }
+        },
+        registered_policy,
+    )
+    assert not ok and "attention_pooling_type" in reason
+
+
+def test_attention_pool_tagged_checkpoint_is_written_and_discovered(tmp_path: Path):
+    import otuformer.embedding.extractor as extractor_module
+
+    ckpt = make_checkpoint(tmp_path)
+    img_dir = tmp_path / "images"
+    make_images(img_dir, n=2)
+    csv_path = tmp_path / "labels.csv"
+    pd.DataFrame(
+        {"image": ["img_0.jpg", "img_1.jpg"], "label": [0, 1]}
+    ).to_csv(csv_path, index=False)
+
+    extract_embeddings(
+        checkpoint_path=ckpt,
+        images_dir=img_dir,
+        device="cpu",
+        batch_size=1,
+        token_mode="attention-pool",
+        attention_train_csv=csv_path,
+        attention_pooling_epochs=1,
+        seed=1,
+    )
+
+    legacy = extractor_module._attention_pooling_checkpoint_path(ckpt, "lightweight")
+    policy = {
+        "num_prefix_tokens": 1,
+        "register_tokens": 0,
+        "prefix_excluded": True,
+        "attention_pooling_type": "lightweight",
+    }
+    tagged = extractor_module._tagged_pooling_checkpoint_path(legacy, policy)
+    assert tagged.exists()
+    assert not legacy.exists()
+    payload = torch.load(tagged, map_location="cpu", weights_only=False)
+    assert payload["args"]["num_prefix_tokens"] == 1
+    assert payload["args"]["register_tokens"] == 0
+    assert payload["args"]["prefix_excluded"] is True
+
+    # A later extraction with no training CSV must discover the tagged sibling.
+    reloaded = extract_embeddings(
+        checkpoint_path=ckpt,
+        images_dir=img_dir,
+        device="cpu",
+        batch_size=1,
+        token_mode="attention-pool",
+    )
+    assert len(reloaded) > 0
+
+
+def test_tagged_sibling_with_a_mismatched_policy_is_rejected_and_preserved(
+    tmp_path: Path,
+):
+    import otuformer.embedding.extractor as extractor_module
+
+    ckpt = make_checkpoint(tmp_path)
+    img_dir = tmp_path / "images"
+    make_images(img_dir, n=2)
+    policy = {
+        "num_prefix_tokens": 1,
+        "register_tokens": 0,
+        "prefix_excluded": True,
+        "attention_pooling_type": "lightweight",
+    }
+    legacy = extractor_module._attention_pooling_checkpoint_path(ckpt, "lightweight")
+    tagged = extractor_module._tagged_pooling_checkpoint_path(legacy, policy)
+    pool = extractor_module._build_attention_pooling(
+        "lightweight", ckpt and 192
+    )
+    torch.save(
+        {
+            "attention_pool_state_dict": pool.state_dict(),
+            "args": dict(policy, num_prefix_tokens=5),
+        },
+        tagged,
+    )
+    before = tagged.read_bytes()
+
+    with pytest.raises(ValueError, match="different patch set"):
+        extract_embeddings(
+            checkpoint_path=ckpt,
+            images_dir=img_dir,
+            device="cpu",
+            batch_size=1,
+            token_mode="attention-pool",
+        )
+
+    assert tagged.read_bytes() == before
+
+
+def test_incompatible_tagged_sibling_is_fatal_even_with_a_compatible_legacy_file(
+    tmp_path: Path,
+):
+    """The plan requires failing with the sibling's path, not falling through.
+
+    A compatible policy-less legacy pool is present, so the only reason to raise
+    is the policy-tagged sibling itself: choosing the legacy file instead would
+    silently answer the same request from a different artifact.
+    """
+    import otuformer.embedding.extractor as extractor_module
+
+    ckpt = make_checkpoint(tmp_path)
+    img_dir = tmp_path / "images"
+    make_images(img_dir, n=2)
+    policy = {
+        "num_prefix_tokens": 1,
+        "register_tokens": 0,
+        "prefix_excluded": True,
+        "attention_pooling_type": "lightweight",
+    }
+    legacy = extractor_module._attention_pooling_checkpoint_path(ckpt, "lightweight")
+    tagged = extractor_module._tagged_pooling_checkpoint_path(legacy, policy)
+    pool = extractor_module._build_attention_pooling("lightweight", 192)
+    torch.save({"attention_pool_state_dict": pool.state_dict()}, legacy)
+    torch.save(
+        {
+            "attention_pool_state_dict": pool.state_dict(),
+            "args": dict(policy, num_prefix_tokens=5),
+        },
+        tagged,
+    )
+
+    with pytest.raises(ValueError, match="prefix1-reg0-lightweight_pooling"):
+        extract_embeddings(
+            checkpoint_path=ckpt,
+            images_dir=img_dir,
+            device="cpu",
+            batch_size=1,
+            token_mode="attention-pool",
+        )
+
+
+def test_legacy_pool_without_policy_stays_readable(tmp_path: Path):
+    import otuformer.embedding.extractor as extractor_module
+
+    ckpt = make_checkpoint(tmp_path)
+    img_dir = tmp_path / "images"
+    make_images(img_dir, n=2)
+    legacy = extractor_module._attention_pooling_checkpoint_path(ckpt, "lightweight")
+    pool = extractor_module._build_attention_pooling("lightweight", 192)
+    torch.save({"attention_pool_state_dict": pool.state_dict()}, legacy)
+
+    result = extract_embeddings(
+        checkpoint_path=ckpt,
+        images_dir=img_dir,
+        device="cpu",
+        batch_size=1,
+        token_mode="attention-pool",
+    )
+
+    assert len(result) > 0
 
 
 def test_extract_csv_preserves_csv_order(tmp_path: Path):

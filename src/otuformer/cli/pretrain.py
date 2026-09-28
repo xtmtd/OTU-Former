@@ -80,6 +80,7 @@ def _parse_mask_ratio(value: object) -> object:
 
 PATCH_LOSS_CHOICES = ("none", "consistency", "masked-feature", "ibot")
 MASKING_STRATEGY_CHOICES = ("random", "blockwise", "hybrid")
+REGISTER_TOKEN_CHOICES = ("none", "0", "4")
 IBOT_PROTOTYPES_MIN = 2
 
 
@@ -125,6 +126,19 @@ def pretrain(
         "vit_tiny_patch16_224",
         "--model-name",
         help="timm backbone name used for student/teacher encoders.",
+    ),
+    register_tokens: str = typer.Option(
+        "none",
+        "--register-tokens",
+        help=(
+            "Register tokens for an eligible single-CLS timm VisionTransformer: "
+            "'none' (default), '0' or '4'. 'none' keeps the backbone's own "
+            "architecture (no registers on a plain ViT, or a native-register "
+            "model's own count) and is recorded as null in the saved args. An "
+            "explicit '0' is not the same as 'none': it is rejected on a "
+            "CLS-free backbone. Explicit values are rejected on native-register "
+            "backbones."
+        ),
     ),
     out_dim: int = typer.Option(
         256, "--out-dim", help="SSL projector output dimension."
@@ -358,6 +372,19 @@ def pretrain(
     _validate_augmentation(augmentation, stage="pretrain")
     _validate_orientation_policy(orientation_policy)
     _validate_patch_options(patch_loss, masking_strategy, ibot_prototypes)
+    if register_tokens not in REGISTER_TOKEN_CHOICES:
+        raise typer.BadParameter(
+            "--register-tokens must be one of "
+            f"{', '.join(REGISTER_TOKEN_CHOICES)}, got '{register_tokens}'"
+        )
+    # 'none' is the user-facing spelling of the internal ``None``: it keeps the
+    # backbone's own architecture and is recorded as null in the saved args.
+    requested_register_tokens = (
+        None if register_tokens == "none" else int(register_tokens)
+    )
+    model_name_explicit = _source_is_commandline(
+        ctx.get_parameter_source("model_name")
+    )
     requested_mask_ratio = _parse_mask_ratio(mask_ratio)
     explicit_sources = {
         name: _source_is_commandline(ctx.get_parameter_source(name))
@@ -390,6 +417,42 @@ def pretrain(
             ),
             None,
         )
+    requested_global_crop_size = _parse_size(
+        global_crop_size, stage="--global-crop-size"
+    )
+    if not resume:
+        # Reject an impossible register/model combination before --overwrite can
+        # clear an existing output directory.
+        from otuformer.training.trainer import preflight_pretrain_new_run
+
+        try:
+            preflight_pretrain_new_run(
+                model_name, requested_register_tokens, requested_global_crop_size
+            )
+        except (ValueError, OSError) as exc:
+            raise typer.BadParameter(str(exc)) from exc
+    # Load the resume checkpoint once, before any output file exists, so a
+    # broken or registered-beyond-this-option source is rejected without
+    # creating or truncating logs. The object is handed to run_pretrain through
+    # ``resume_state`` after the parameter JSON has been printed, because
+    # json.dumps cannot serialise tensors.
+    resume_state: dict | None = None
+    if resume:
+        from otuformer.training.trainer import preflight_pretrain_resume
+        from otuformer.utils.checkpoint import load_checkpoint
+
+        try:
+            resume_state = load_checkpoint(Path(resume))
+        except Exception as exc:
+            raise typer.BadParameter(
+                f"Could not read resume checkpoint {resume}: {exc}"
+            ) from exc
+        try:
+            preflight_pretrain_resume(
+                resume_state, model_name, requested_register_tokens, model_name_explicit
+            )
+        except (ValueError, KeyError, OSError) as exc:
+            raise typer.BadParameter(str(exc)) from exc
     prepare_output_dir(out_dir, overwrite=overwrite, allow_existing=bool(resume))
     tee = TeeLogger(
         out_dir / "logs" / "pretrain.log",
@@ -405,6 +468,8 @@ def pretrain(
             out_dir=str(out_dir),
             overwrite=overwrite,
             model_name=model_name,
+            register_tokens=requested_register_tokens,
+            model_name_explicit=model_name_explicit,
             out_dim=out_dim,
             max_epochs=max_epochs,
             lr=lr,
@@ -412,7 +477,7 @@ def pretrain(
             warmup_epochs=warmup_epochs,
             augmentation=augmentation,
             orientation_policy=orientation_policy,
-            global_crop_size=_parse_size(global_crop_size, stage="--global-crop-size"),
+            global_crop_size=requested_global_crop_size,
             local_crop_size=local_crop_size,
             local_crops=local_crops,
             mask_ratio=requested_mask_ratio,
@@ -459,6 +524,8 @@ def pretrain(
 
         from otuformer.training.trainer import run_pretrain
 
+        if resume_state is not None:
+            ns.resume_state = resume_state
         run_pretrain(ns)
     except Exception:
         traceback.print_exc(file=tee)

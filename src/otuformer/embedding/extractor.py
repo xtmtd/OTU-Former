@@ -20,10 +20,10 @@ from otuformer.training.dataset import (
     _supports_recursive_lookup,
     build_eval_transform,
 )
-from otuformer.training.model import OTUFormerEncoder
+from otuformer.training.model import OTUFormerEncoder, native_register_count
 from otuformer.utils.checkpoint import (
-    apply_checkpoint_weights,
     load_checkpoint,
+    load_checkpoint_encoder,
     resolve_checkpoint,
 )
 from otuformer.utils.device import resolve_device
@@ -249,18 +249,118 @@ def _attention_pooling_checkpoint_path(
     return checkpoint_path.parent / f"{checkpoint_path.stem}.{pooling_type}_pooling.pth"
 
 
+# Patch policy recorded in every newly trained attention-pool checkpoint. An
+# older pool that records none of the patch keys predates the policy, so its
+# patch set is unknown and it is reusable only for a one-prefix, zero-register
+# backbone (the legacy one-CLS/no-register pool).
+_POOL_POLICY_KEYS = (
+    "num_prefix_tokens",
+    "register_tokens",
+    "prefix_excluded",
+    "attention_pooling_type",
+)
+_PATCH_POLICY_KEYS = ("num_prefix_tokens", "register_tokens", "prefix_excluded")
+
+
+def _attention_pool_policy(model: OTUFormerEncoder, pooling_type: str) -> dict:
+    """The patch set an attention pool was trained on."""
+    backbone = model.backbone
+    return {
+        "num_prefix_tokens": int(getattr(backbone, "num_prefix_tokens", 1)),
+        "register_tokens": native_register_count(backbone),
+        "prefix_excluded": True,
+        "attention_pooling_type": pooling_type,
+    }
+
+
+def _tagged_pooling_checkpoint_path(path: Path, policy: dict) -> Path:
+    """Policy-specific sibling, e.g. ``<stem>.prefix5-reg4-lightweight_pooling.pth``.
+
+    A pool path already ends in ``.<type>_pooling.pth``; that suffix is replaced
+    so the tag stays directly attached to the checkpoint stem.
+    """
+    pooling_type = policy["attention_pooling_type"]
+    suffix = f".{pooling_type}_pooling.pth"
+    stem = path.name[: -len(suffix)] if path.name.endswith(suffix) else path.stem
+    tag = f"prefix{policy['num_prefix_tokens']}-reg{policy['register_tokens']}"
+    return path.parent / f"{stem}.{tag}-{pooling_type}_pooling.pth"
+
+
 def _attention_pooling_checkpoint_candidates(
     checkpoint_path: Path,
     pooling_type: str,
     target_checkpoint_path: Path | None,
+    policy: dict | None = None,
 ) -> list[Path]:
+    """Tagged sibling first, then the requested/default legacy path."""
     legacy = _attention_pooling_checkpoint_path(checkpoint_path, pooling_type)
-    if target_checkpoint_path is None:
-        return [legacy]
-    target = Path(target_checkpoint_path)
-    if target == legacy:
-        return [target]
-    return [target, legacy]
+    if policy is None:
+        if target_checkpoint_path is None:
+            return [legacy]
+        target = Path(target_checkpoint_path)
+        if target == legacy:
+            return [target]
+        return [target, legacy]
+    bases: list[Path] = []
+    if target_checkpoint_path is not None:
+        bases.append(Path(target_checkpoint_path))
+    if legacy not in bases:
+        bases.append(legacy)
+    ordered: list[Path] = []
+    for base in bases:
+        for candidate in (_tagged_pooling_checkpoint_path(base, policy), base):
+            if candidate not in ordered:
+                ordered.append(candidate)
+    return ordered
+
+
+def _pool_policy_compatible(payload: object, policy: dict) -> tuple[bool, str]:
+    """Whether a stored attention-pool checkpoint matches this patch set.
+
+    A file that records none of the patch keys predates the policy, so its
+    patch set is unknown and it is reusable only for the legacy one-prefix,
+    zero-register backbone. Any policy field that *is* recorded must match --
+    including ``attention_pooling_type`` and a half-written patch policy -- so a
+    renamed or partially recorded file is never silently reused just because its
+    filename matches.
+    """
+    args = payload.get("args") if isinstance(payload, dict) else None
+    if not isinstance(args, dict):
+        args = {}
+    differs = [
+        key
+        for key in _POOL_POLICY_KEYS
+        if key in args and args.get(key) != policy[key]
+    ]
+    if differs:
+        return False, "records a different " + ", ".join(sorted(differs))
+    missing = [key for key in _POOL_POLICY_KEYS if key not in args]
+    if not missing:
+        return True, ""
+    if not any(key in args for key in _PATCH_POLICY_KEYS):
+        # Pre-v0.10.0 format: no patch policy at all. Its patch set is unknown,
+        # so it is reusable only for the one-prefix, zero-register backbone.
+        if policy["num_prefix_tokens"] == 1 and policy["register_tokens"] == 0:
+            return True, ""
+        return False, "has no recorded patch policy"
+    # A partially recorded policy cannot be verified -- e.g. the patch keys are
+    # present but the pooling type is not -- so reject it instead of trusting a
+    # matching filename. Otherwise a ``teacher``-format payload would load with
+    # ``strict=False`` and leave the pool randomly initialized.
+    return False, (
+        "has an incomplete patch policy (missing " + ", ".join(sorted(missing)) + ")"
+    )
+
+
+def _patch_features(backbone: torch.nn.Module, feats: torch.Tensor) -> torch.Tensor:
+    """Drop every prefix token (CLS and registers) from backbone features.
+
+    Registers are never image patches, so every patch consumer starts at the
+    backbone's own ``num_prefix_tokens``; a CLS-free backbone keeps its first
+    patch.
+    """
+    prefix = int(getattr(backbone, "num_prefix_tokens", 1))
+    return feats[:, prefix:, :]
 
 
 def _iter_trainable_params(attention_pool: nn.Module) -> Iterable[nn.Parameter]:
@@ -328,7 +428,7 @@ def _finetune_attention_query(
                 feats = model.backbone.forward_features(imgs)
                 if isinstance(feats, dict):
                     feats = feats["x"]
-                patch_tokens = feats[:, 1:, :]
+                patch_tokens = _patch_features(model.backbone, feats)
 
             pooled, _ = attention_pool(patch_tokens)
             pooled = F.normalize(pooled, dim=-1)
@@ -448,14 +548,10 @@ def _load_model(
     ckpt = load_checkpoint(checkpoint_path)
     architecture = resolve_checkpoint(ckpt, model_name, prefer_student=use_student)
     checkpoint_size = resolve_training_image_size(ckpt)
-    model = OTUFormerEncoder(
-        model_name=architecture.model_name,
-        out_dim=architecture.embedding_dim,
-        pretrained=False,
-        img_size=checkpoint_size,
+    model, architecture = load_checkpoint_encoder(
+        ckpt, architecture, image_size=checkpoint_size
     )
     validate_input_size(checkpoint_size, model, architecture.model_name)
-    apply_checkpoint_weights(model, architecture)
     model.eval().to(device)
     print(f"[Info] Loaded weights from checkpoint key: '{architecture.source_key}'")
     return model, checkpoint_size
@@ -498,7 +594,7 @@ def _extract_one_dir(
                     raise ValueError(
                         "token-mode 'patch-topk' requires OTUFormerEncoder backbone features"
                     )
-                patch_tokens = feats[:, 1:, :]
+                patch_tokens = _patch_features(model.backbone, feats)
                 num_patches = patch_tokens.shape[1]
                 k = min(topk_patches, num_patches)
                 if k <= 0:
@@ -515,7 +611,7 @@ def _extract_one_dir(
                     raise ValueError(
                         "token-mode 'attention-pool' requires OTUFormerEncoder backbone features"
                     )
-                patch_tokens = feats[:, 1:, :]
+                patch_tokens = _patch_features(model.backbone, feats)
                 if not hasattr(model, "attention_pool"):
                     raise ValueError(
                         "attention-pool is not initialized; provide --label-csv so query can be trained"
@@ -597,7 +693,7 @@ def _extract_one_csv(
                     raise ValueError(
                         "token-mode 'patch-topk' requires OTUFormerEncoder backbone features"
                     )
-                patch_tokens = feats[:, 1:, :]
+                patch_tokens = _patch_features(model.backbone, feats)
                 num_patches = patch_tokens.shape[1]
                 k = min(topk_patches, num_patches)
                 patch_norms = patch_tokens.norm(dim=-1)
@@ -610,7 +706,7 @@ def _extract_one_csv(
             elif token_mode == "attention-pool":
                 if feats is None or not hasattr(model, "attention_pool"):
                     raise ValueError("attention-pool is not initialized")
-                patch_tokens = feats[:, 1:, :]
+                patch_tokens = _patch_features(model.backbone, feats)
                 pooled, _ = model.attention_pool(patch_tokens)
                 embs = pooled
             elif use_projector_output:
@@ -867,26 +963,38 @@ def extract_embeddings(
     )
 
     if token_mode == "attention-pool":
+        policy = _attention_pool_policy(model, attention_pooling_type)
         ckpt_candidates = _attention_pooling_checkpoint_candidates(
             checkpoint_path=checkpoint_path,
             pooling_type=attention_pooling_type,
             target_checkpoint_path=attention_pooling_checkpoint_path,
+            policy=policy,
         )
-        ckpt_path = next((p for p in ckpt_candidates if p.exists()), None)
-        save_ckpt_path = (
-            Path(attention_pooling_checkpoint_path)
-            if attention_pooling_checkpoint_path is not None
-            else _attention_pooling_checkpoint_path(
-                checkpoint_path, attention_pooling_type
-            )
-        )
+        save_ckpt_path = ckpt_candidates[0]
         attention_pool = _build_attention_pooling(
             pooling_type=attention_pooling_type,
             dim=model.backbone.num_features,
         ).to(dev)
 
-        if ckpt_path is not None:
-            payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        ckpt_path: Path | None = None
+        for candidate in ckpt_candidates:
+            if not candidate.exists():
+                continue
+            payload = torch.load(candidate, map_location="cpu", weights_only=False)
+            compatible, reason = _pool_policy_compatible(payload, policy)
+            if not compatible:
+                if candidate == save_ckpt_path:
+                    # The policy-specific sibling is the canonical file for this
+                    # request. Fail with its path instead of silently loading a
+                    # different artifact for the same request.
+                    raise ValueError(
+                        f"Attention pooling checkpoint {candidate} {reason}; it "
+                        "was trained on a different patch set than this backbone. "
+                        "Remove it or point --attention-pooling-checkpoint at a "
+                        "compatible file."
+                    )
+                # An incompatible legacy fallback is simply not reusable.
+                continue
             if isinstance(payload, dict) and "teacher" in payload:
                 model.attention_pool = attention_pool
                 msg = model.load_state_dict(payload["teacher"], strict=False)
@@ -903,15 +1011,23 @@ def extract_embeddings(
                 )
                 if state is None:
                     raise ValueError(
-                        f"Invalid attention pooling checkpoint: {ckpt_path}, expected 'teacher' or 'attention_pool_state_dict'"
+                        f"Invalid attention pooling checkpoint: {candidate}, expected 'teacher' or 'attention_pool_state_dict'"
                     )
                 attention_pool.load_state_dict(state, strict=True)
                 model.attention_pool = attention_pool
+            ckpt_path = candidate
             print(f"[Info] Loaded finetuned attention pooling from: {ckpt_path}")
-        else:
+            break
+        if ckpt_path is None:
             if attention_train_csv is None:
                 raise ValueError(
-                    "attention-pool requires training a query vector. Please provide --label-csv for training data."
+                    "attention-pool needs a compatible attention-pool checkpoint. "
+                    "None was found for num_prefix_tokens="
+                    f"{policy['num_prefix_tokens']}, register_tokens="
+                    f"{policy['register_tokens']}, attention_pooling_type="
+                    f"{policy['attention_pooling_type']} at {save_ckpt_path}; "
+                    "provide --label-csv with 'image' and 'label' columns to "
+                    "train one."
                 )
             columns = set(pd.read_csv(attention_train_csv, nrows=0).columns)
             if "image" not in columns or "label" not in columns:
@@ -934,6 +1050,11 @@ def extract_embeddings(
                 num_epochs=attention_pooling_epochs,
                 eval_transform=eval_transform,
             )
+            if save_ckpt_path.exists():
+                raise ValueError(
+                    "Refusing to overwrite the existing attention pooling "
+                    f"checkpoint: {save_ckpt_path}"
+                )
             save_ckpt_path.parent.mkdir(parents=True, exist_ok=True)
             torch.save(
                 {
@@ -941,7 +1062,7 @@ def extract_embeddings(
                     "args": {
                         "model_name": model_name,
                         "token_mode": token_mode,
-                        "attention_pooling_type": attention_pooling_type,
+                        **policy,
                         "attention_pooling_epochs": attention_pooling_epochs,
                         "source_checkpoint": str(checkpoint_path),
                         "seed": seed,

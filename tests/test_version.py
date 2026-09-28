@@ -7,7 +7,7 @@ from otuformer import __version__
 def test_package_and_project_versions_match():
     root = Path(__file__).resolve().parents[1]
     project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
-    assert __version__ == "0.9.0"
+    assert __version__ == "0.10.0"
     assert project["project"]["version"] == __version__
 
 
@@ -51,6 +51,16 @@ def test_v080_readmes_document_the_metric_loss_modes():
             assert flag in text, f"{name} is missing {flag}"
         for token in ("0.8.0", "loss_diagnostics.finetune.csv", "weight decay"):
             assert token in text, f"{name} is missing {token}"
+
+
+def test_v100_readmes_document_optional_registers():
+    root = Path(__file__).resolve().parents[1]
+
+    for name in ("README.md", "README.cn.md"):
+        text = (root / name).read_text(encoding="utf-8")
+        assert "0.10.0" in text, f"{name} is missing the v0.10.0 note"
+        assert "--register-tokens" in text, f"{name} is missing --register-tokens"
+        assert "num_prefix_tokens" in text, f"{name} is missing the patch policy"
 
 
 def test_v080_readmes_state_raw_cls_open_set_and_training_only_centers():

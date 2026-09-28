@@ -522,6 +522,318 @@ def test_unmasked_pretrain_forward_matches_backbone_forward_features():
     assert torch.allclose(tokens, reference, atol=1e-6)
 
 
+# --- v0.10.0 optional register tokens -----------------------------------------
+
+
+def _real_tiny_encoder(monkeypatch, native_regs=0, class_token=True,
+                       no_embed_class=False, reg_tokens=None):
+    """Build an encoder over a real tiny timm VisionTransformer.
+
+    ``native_regs`` is the count the stand-in pretrained model natively has; a
+    ``reg_tokens`` kwarg on the create_model call selects the requested count,
+    exactly as timm would receive it.
+    """
+    import otuformer.training.model as model_module
+    from timm.models.vision_transformer import VisionTransformer
+
+    def factory(_model_name, **kwargs):
+        requested = kwargs.get("reg_tokens")
+        count = native_regs if requested is None else int(requested)
+        torch.manual_seed(0)
+        return VisionTransformer(
+            img_size=32, patch_size=16, in_chans=3, embed_dim=32, depth=2,
+            num_heads=2, mlp_ratio=2.0, num_classes=0, global_pool="",
+            class_token=class_token, reg_tokens=count,
+            no_embed_class=no_embed_class, dynamic_img_size=True,
+        )
+
+    monkeypatch.setattr(model_module.timm, "create_model", factory)
+    encoder = model_module.OTUFormerEncoder(
+        model_name="tiny-real", out_dim=8, return_patch_tokens=True,
+        img_size=32, pretrained=False, reg_tokens=reg_tokens,
+    )
+    return encoder, encoder.backbone
+
+
+@pytest.mark.parametrize("size,grid", [(32, 2), (224, 14)])
+def test_registered_unmasked_pretrain_matches_backbone_at_two_sizes(
+    monkeypatch, size, grid
+):
+    for native_regs, reg_tokens, prefix in ((0, 4, 5), (4, None, 5), (0, None, 1)):
+        encoder, backbone = _real_tiny_encoder(
+            monkeypatch, native_regs=native_regs, reg_tokens=reg_tokens
+        )
+        encoder.eval()
+        encoder.validate_pretrain_backbone()
+        x = torch.randn(2, 3, size, size)
+        with torch.no_grad():
+            tokens = encoder.forward_pretrain(x).tokens
+            reference = backbone.forward_features(x)
+
+        assert backbone.num_prefix_tokens == prefix
+        assert tokens.shape == (2, grid * grid + prefix, 32)
+        assert reference.shape == tokens.shape
+        assert torch.allclose(tokens, reference, atol=1e-6)
+
+
+def test_registered_masked_forward_masks_only_image_patches(monkeypatch):
+    encoder, backbone = _real_tiny_encoder(monkeypatch, reg_tokens=4)
+    encoder.validate_pretrain_backbone()
+    x = torch.randn(2, 3, 32, 32)
+    mask = torch.zeros(2, 4, dtype=torch.bool)
+    mask[0, 0] = True
+    replacement = torch.zeros(1, 1, 32)
+
+    seen = {}
+    original = encoder._replace_patches
+
+    def spy(tokens, patch_mask, mask_token, patch_count):
+        seen["patch_count"] = patch_count
+        seen["shape"] = tuple(tokens.shape)
+        return original(tokens, patch_mask, mask_token, patch_count)
+
+    monkeypatch.setattr(encoder, "_replace_patches", spy)
+    out = encoder.forward_pretrain(x, mask=mask, mask_token=replacement)
+
+    assert seen == {"patch_count": 4, "shape": (2, 4, 32)}
+    assert out.tokens.shape == (2, 4 + backbone.num_prefix_tokens, 32)
+    assert out.grid_size == (2, 2)
+
+    # A patch-output loss must reach the registers through self-attention.
+    out.tokens[:, backbone.num_prefix_tokens:].square().sum().backward()
+    assert backbone.reg_token.grad is not None
+    assert backbone.reg_token.grad.abs().sum() > 0
+
+
+def _encoder(**kwargs):
+    import otuformer.training.model as model_module
+
+    kwargs.setdefault("out_dim", 8)
+    kwargs.setdefault("return_patch_tokens", True)
+    kwargs.setdefault("img_size", 64)
+    kwargs.setdefault("pretrained", False)
+    return model_module.OTUFormerEncoder(model_name=kwargs.pop("model_name", "tiny-vit"), **kwargs)
+
+
+def test_new_register_parameters_and_positions_are_synchronized(monkeypatch):
+    import timm as timm_module
+
+    monkeypatch.setattr(timm_module, "create_model", _tiny_vit_factory)
+    student = _encoder(reg_tokens=4)
+    trainer._set_seed(99)
+    teacher = _encoder(reg_tokens=4)
+    assert not torch.equal(student.backbone.reg_token, teacher.backbone.reg_token)
+
+    trainer._synchronize_new_registers(student, teacher)
+
+    assert torch.equal(student.backbone.reg_token, teacher.backbone.reg_token)
+    assert torch.equal(
+        student.backbone.pos_embed[:, 1:5], teacher.backbone.pos_embed[:, 1:5]
+    )
+    # The independently initialized projectors must stay independent.
+    assert not torch.equal(
+        student.projector.net[0].weight, teacher.projector.net[0].weight
+    )
+
+
+def _record_encoder_constructions(monkeypatch, calls):
+    """Record every encoder construction, including the helper's TaggedEncoder.
+
+    ``_run_tiny_pretrain`` replaces ``trainer.OTUFormerEncoder`` with a subclass
+    of ``model_module.OTUFormerEncoder``, so subclassing that attribute records
+    both the resume probes and the training encoders.
+    """
+    import otuformer.training.model as model_module
+
+    class RecordingEncoder(model_module.OTUFormerEncoder):
+        def __init__(self, *args, **kwargs):
+            calls.append(dict(kwargs))
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(model_module, "OTUFormerEncoder", RecordingEncoder)
+    return RecordingEncoder
+
+
+def test_registered_new_run_records_the_added_registers(tmp_path, monkeypatch):
+    calls: list[dict] = []
+    _record_encoder_constructions(monkeypatch, calls)
+    observations = _run_tiny_pretrain(
+        tmp_path, monkeypatch, label="reg4", register_tokens=4
+    )
+    saved = torch.load(
+        observations["out_dir"] / "SSL_latest.pth", map_location="cpu", weights_only=False
+    )
+
+    assert saved["config"]["register_tokens"] == 4
+    assert saved["args"]["register_tokens"] == 4
+    assert saved["model_state_dict"]["backbone.reg_token"].shape == (1, 4, 16)
+    assert "resume_state" not in saved["args"]
+    registered = [call for call in calls if call.get("reg_tokens") == 4]
+    assert len(registered) == 2
+    assert all(call.get("pretrained", True) is True for call in registered)
+    # Pre-training equality is asserted by the dedicated synchronization test;
+    # after one optimizer step plus EMA the two copies legitimately differ a
+    # little, so only closeness is required here.
+    assert torch.allclose(
+        saved["student"]["backbone.reg_token"],
+        saved["teacher"]["backbone.reg_token"],
+        atol=5e-3,
+    )
+
+
+def test_registered_resume_rebuilds_without_pretrained_weights(tmp_path, monkeypatch):
+    observations = _run_tiny_pretrain(
+        tmp_path, monkeypatch, label="reg4src", register_tokens=4
+    )
+    saved = torch.load(
+        observations["out_dir"] / "SSL_latest.pth", map_location="cpu", weights_only=False
+    )
+    resume_path = tmp_path / "registered_resume.pth"
+    torch.save(saved, resume_path)
+
+    calls: list[dict] = []
+    _record_encoder_constructions(monkeypatch, calls)
+    _run_tiny_pretrain(
+        tmp_path, monkeypatch, label="reg4resume", register_tokens=4,
+        resume=str(resume_path), max_epochs=2,
+    )
+
+    registered = [call for call in calls if call.get("reg_tokens") == 4]
+    assert len(registered) >= 2
+    assert all(call["pretrained"] is False for call in registered)
+    assert all(call["pretrained"] is False for call in calls)
+
+
+def test_registered_resume_rejects_a_conflicting_register_option(tmp_path, monkeypatch):
+    observations = _run_tiny_pretrain(
+        tmp_path, monkeypatch, label="reg4src2", register_tokens=4
+    )
+    saved = torch.load(
+        observations["out_dir"] / "SSL_latest.pth", map_location="cpu", weights_only=False
+    )
+    resume_path = tmp_path / "registered_resume2.pth"
+    torch.save(saved, resume_path)
+
+    with pytest.raises(ValueError, match="Cannot resume a four-register checkpoint"):
+        _run_tiny_pretrain(
+            tmp_path, monkeypatch, label="reg4bad", register_tokens=0,
+            resume=str(resume_path), max_epochs=2,
+        )
+
+
+def test_legacy_pretrain_resume_keeps_its_permissive_partial_load(monkeypatch):
+    """The design excludes legacy zero-register resume from the new check.
+
+    Design section 3: "Do not apply this new complete-backbone requirement to
+    legacy zero-register resume." The registered paths carry the check; this
+    path keeps its historical ``strict=False`` behaviour so an older checkpoint
+    with deliberately tolerated missing keys still resumes.
+    """
+    import timm as timm_module
+
+    monkeypatch.setattr(timm_module, "create_model", _tiny_vit_factory)
+    state = {
+        f"backbone.{key}": value
+        for key, value in timm_module.create_model("tiny-vit").state_dict().items()
+    }
+    state.pop("backbone.blocks.0.attn.qkv.weight")
+    state.pop("backbone.cls_token")
+
+    assert trainer._resume_register_plan(
+        {"model_state_dict": state}, "tiny-vit", 64, 8
+    ) == ("legacy", 0)
+
+
+def test_malformed_recorded_register_count_is_rejected_by_every_entry_point(
+    monkeypatch,
+):
+    """config.register_tokens is validated before any layout decision."""
+    import timm as timm_module
+    from timm.models.vision_transformer import VisionTransformer
+
+    import otuformer.utils.checkpoint as checkpoint_module
+
+    monkeypatch.setattr(timm_module, "create_model", _tiny_vit_factory)
+    for recorded in (-1, False, "4"):
+        checkpoint = {"model_state_dict": {}, "config": {"register_tokens": recorded}}
+        with pytest.raises(ValueError, match="register_tokens"):
+            trainer._resume_register_plan(checkpoint, "tiny-vit", 64, 8)
+        with pytest.raises(ValueError, match="register_tokens"):
+            trainer._finetune_register_plan(checkpoint, "tiny-vit", 64, 8)
+
+    backbone = VisionTransformer(
+        img_size=32, patch_size=16, in_chans=3, embed_dim=16, depth=2,
+        num_heads=2, num_classes=0, global_pool="", dynamic_img_size=True,
+    )
+    with pytest.raises(ValueError, match="register_tokens"):
+        checkpoint_module.resolve_register_layout(
+            {"config": {"register_tokens": False}}, {}, backbone
+        )
+    # A legitimate zero count still reads as zero.
+    assert checkpoint_module.recorded_register_count({"config": {}}) is None
+    assert checkpoint_module.recorded_register_count(
+        {"config": {"register_tokens": 0}}
+    ) == 0
+
+
+def test_registered_resume_requires_student_and_teacher(tmp_path, monkeypatch):
+    observations = _run_tiny_pretrain(
+        tmp_path, monkeypatch, label="reg4src3", register_tokens=4
+    )
+    saved = torch.load(
+        observations["out_dir"] / "SSL_latest.pth", map_location="cpu", weights_only=False
+    )
+    del saved["student"]
+    resume_path = tmp_path / "registered_no_student.pth"
+    torch.save(saved, resume_path)
+
+    with pytest.raises(ValueError, match="Registered resume requires explicit 'student'"):
+        _run_tiny_pretrain(
+            tmp_path, monkeypatch, label="reg4nostudent", register_tokens=None,
+            resume=str(resume_path), max_epochs=2,
+        )
+
+
+def test_omitted_option_on_native_register_model_keeps_its_own_registers(
+    tmp_path, monkeypatch
+):
+    observations = _run_tiny_pretrain(
+        tmp_path, monkeypatch, label="native4", model_name="tiny-vit-native-reg4",
+        register_tokens=None,
+    )
+    saved = torch.load(
+        observations["out_dir"] / "SSL_latest.pth", map_location="cpu", weights_only=False
+    )
+
+    assert saved["config"]["register_tokens"] == 4
+    assert saved["args"]["register_tokens"] is None
+    assert saved["model_state_dict"]["backbone.reg_token"].shape == (1, 4, 16)
+
+
+def test_explicit_register_option_rejected_on_no_cls_pretrain(tmp_path, monkeypatch):
+    with pytest.raises(ValueError, match="no CLS token"):
+        _run_tiny_pretrain(
+            tmp_path, monkeypatch, label="gap", model_name="tiny-vit-gap",
+            register_tokens=0,
+        )
+
+
+def test_native_register_no_cls_pretrain_rejected_even_when_omitted(tmp_path, monkeypatch):
+    with pytest.raises(ValueError, match="no CLS token"):
+        _run_tiny_pretrain(
+            tmp_path, monkeypatch, label="gapreg", model_name="tiny-vit-gap-reg4",
+            register_tokens=None,
+        )
+
+
+def test_unsupported_registered_model_rejected_without_a_download(tmp_path, monkeypatch):
+    with pytest.raises(ValueError, match="standard timm VisionTransformer"):
+        _run_tiny_pretrain(
+            tmp_path, monkeypatch, label="eva",
+            model_name="vit_small_patch16_dinov3.lvd1689m", register_tokens=None,
+        )
+
+
 def test_validate_pretrain_backbone_requires_four_blocks_for_intermediates(
     monkeypatch,
 ):
@@ -743,10 +1055,39 @@ def test_optimizer_membership_accepts_an_absent_objective():
 
 # --- Task 6: patch-mode integration ------------------------------------------
 
+# Native register/CLS profile per tiny stand-in model name. ``reg_tokens`` in
+# the create_model kwargs always wins, so an explicit option is observable.
+_TINY_NATIVE_REGISTERS = {
+    "tiny-vit": 0,
+    "tiny-vit-native-reg4": 4,
+    "tiny-vit-native-reg2": 2,
+    "tiny-vit-gap": 0,
+    "tiny-vit-gap-reg4": 4,
+}
+_TINY_CLASS_TOKEN = {"tiny-vit-gap": False, "tiny-vit-gap-reg4": False}
+
+
+class _VitNamedButNotAVit(nn.Module):
+    """Reports native registers without being a timm VisionTransformer."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.reg_token = nn.Parameter(torch.zeros(1, 4, 16))
+        self.num_reg_tokens = 4
+        self.num_prefix_tokens = 5
+        self.num_features = 16
+
 
 def _tiny_vit_factory(*args, **kwargs):
     from timm.models.vision_transformer import VisionTransformer
 
+    model_name = args[0] if args else kwargs.pop("model_name", "tiny-vit")
+    if model_name == "vit_small_patch16_dinov3.lvd1689m":
+        return _VitNamedButNotAVit()
+
+    requested = kwargs.get("reg_tokens")
+    native = _TINY_NATIVE_REGISTERS.get(model_name, 0)
+    count = native if requested is None else int(requested)
     return VisionTransformer(
         img_size=64,
         patch_size=8,
@@ -755,6 +1096,8 @@ def _tiny_vit_factory(*args, **kwargs):
         num_heads=2,
         num_classes=0,
         global_pool="",
+        class_token=_TINY_CLASS_TOKEN.get(model_name, True),
+        reg_tokens=count,
         dynamic_img_size=True,
     )
 
@@ -908,7 +1251,7 @@ def _run_tiny_pretrain(tmp_path, monkeypatch, label="", **overrides):
         input_images_dir=str(tmp_path),
         out_dir=str(out_dir),
         overwrite=False,
-        model_name="tiny-vit",
+        model_name=settings.pop("model_name", "tiny-vit"),
         out_dim=8,
         lr=1e-3,
         weight_decay=0.0,

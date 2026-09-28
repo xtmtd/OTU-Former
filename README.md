@@ -199,6 +199,25 @@ same-position share; for `masked-feature`/`ibot` it is the masked student-input
 fraction. Explicitly passing an option that the selected mode does not use is
 rejected rather than ignored.
 
+**Optional register tokens (v0.10.0).** `--register-tokens` accepts `none` (the default), `0` or `4`
+for an eligible single-CLS timm `VisionTransformer`. `4` adds four trainable
+registers and migrates the one-CLS pretrained backbone: the register token keeps
+its native initialization while every CLS/patch/block weight and position is
+preserved. `none` keeps the backbone's own architecture, so a native-register
+model keeps its own count; an explicit value on a native-register or CLS-free
+backbone is rejected, and DINOv3/Eva backbones are not supported by this option.
+Registers are never image patches: `patch-topk`, `attention-pool` extraction,
+CAM reshape, and the patch objective all skip every prefix token
+(`backbone.num_prefix_tokens`). New attention-pool checkpoints record their patch
+policy (`num_prefix_tokens`, `register_tokens`, `prefix_excluded`,
+`attention_pooling_type`) and are saved to a policy-tagged sibling, so a pool
+trained on a different patch set is never silently reused. ONNX export also
+compares CPU FP32 PyTorch against CPU ONNX Runtime on the same input
+(`atol=1e-4`, `rtol=1e-3`) and records `validation_status`, `max_abs_diff`, and
+the register count in `export_report.json`. A fine-tune run's register layout
+is part of the v0.9.0 pseudo-label experiment identity, so finetune#2 must
+initialize from a source with the same patch set.
+
 Masked-feature and iBOT add one masked student forward per global view, so
 student encoder work grows by roughly 1.65x at the default two-global/six-local
 crop layout. Extraction, fine-tuning, CAM, and export are unchanged: the default
@@ -259,6 +278,7 @@ otuformer pretrain \
 | `--input-images-dir` | Root image directory | Required |
 | `--out-dir` | Output directory | `runs/pretrain` |
 | `--model-name` | timm backbone name | `vit_tiny_patch16_224` |
+| `--register-tokens` | Register tokens for an eligible single-CLS ViT: `none`, `0` or `4`. `none` keeps the backbone's own architecture (no registers, or a native-register model's own count); explicit `0` is rejected on a CLS-free backbone | `none` |
 | `--out-dim` | SSL projector output dimension | 256 |
 | `--max-epochs` | Pretraining epochs | 50 |
 | `--lr` | Base learning rate | 5e-4 |

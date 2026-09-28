@@ -104,6 +104,14 @@ DERIVED_IDENTITY_KEYS: tuple[str, ...] = (
     "arcface_scale",
     "arcface_margin",
     "compact_cap",
+    # The patch set of the initialized backbone. Two runs can agree on every
+    # other identity value and still train on different tokens (zero versus four
+    # registers, or a CLS-free backbone), which would make finetune#1's pseudo
+    # labels meaningless for finetune#2. For every supported model the prefix
+    # count follows from ``(model_name, register_tokens)``, so this one key pins
+    # the patch set without a second field. A pre-v0.10.0 source records no such
+    # key and is therefore not compared.
+    "register_tokens",
 )
 
 FIXED_IDENTITY_VALUES: dict[str, object] = {
@@ -610,6 +618,7 @@ def finetune(
         _resolve_finetune_loss_config,
         _sha256_file,
         _validate_finetune_resume_source,
+        preflight_finetune_source,
         prepare_pseudo_round,
         pseudo_cli_identity,
     )
@@ -801,6 +810,9 @@ def finetune(
                 )
             else:
                 _classify_finetune_source(source_checkpoint)
+            # Register-layout preflight before --overwrite can clear an existing
+            # output directory.
+            preflight_finetune_source(source_checkpoint, model_name)
     except (ValueError, OSError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     prepare_output_dir(out_dir, overwrite=overwrite, allow_existing=bool(resume))

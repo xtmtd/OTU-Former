@@ -83,7 +83,7 @@ All parameters migrated from `ref/ibot20260115.py` `get_parser()`, mode=pretrain
 - `--train-data` : CSV with `image` column (no label required for SSL)
 - `--input-images-dir` : root image directory
 - `--out-dir` : output directory for checkpoints and logs
-- `--model-name` : timm backbone [default: vit_small_patch16_224]
+- `--model-name` : supported timm VisionTransformer backbone [default: vit_small_patch16_224]; a `vit_*` name alone does not establish compatibility (see Section 4.9)
 - `--out-dim` : SSL projector output dimension [default: 256]
 - `--max-epochs` [default: 50]
 - `--lr` [default: 5e-4], `--weight-decay` [default: 0.05], `--warmup-epochs` [default: 3]
@@ -405,6 +405,9 @@ The embedding head is taken from `config.embedding_head` when present, otherwise
 Resuming a ref-script checkpoint in `finetune` stays unsupported: its classifier is `loss_func.W`, which is embedding-major and not interchangeable with `ArcFaceLoss.head.weight`. Ref-script **SSL** checkpoints are self-describing (they record `args` with `model_name`/`out_dim`); ref-script **SFT** checkpoints record neither `config` nor `args`, so they require an explicit `--model-name` (`extract`, `export`, and `cam` all expose it).
 
 Finetune#2's accepted pseudo rows and provenance are additive top-level/config payload fields used only by training resume. The shared read-only consumers ignore them and continue to resolve architecture and weights from the existing keys, so `extract`, `export`, and `cam` load finetune#2 checkpoints without schema-specific handling.
+
+### 4.9 Backbone compatibility boundary
+OTU-Former does not promise support for every timm backbone or every model whose name starts with `vit_`. Pretraining's masked/student-teacher forward follows timm's standard `VisionTransformer` token and block interfaces; compatibility is determined by the actual implementation and required capabilities, not the model-name prefix. The cached `vit_tiny_patch16_224.augreg_in21k_ft_in1k` is a standard `VisionTransformer` in timm 1.0.27. In the same version, `vit_small_patch16_dinov3.lvd1689m` is implemented as `Eva`, with four native registers and a different positional-embedding/rotary-block interface; it is **not** supported by the current pretraining forward or by the [optional-register design](2026-09-28-otuformer-optional-registers-design.md). Supporting that model requires a separately reviewed Eva/DINOv3 adaptation and end-to-end tests, not a broadened `vit_*` name check. The two cached models do not imply that all models in either family are tested or supported.
 
 ---
 

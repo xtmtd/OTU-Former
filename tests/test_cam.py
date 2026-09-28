@@ -35,6 +35,10 @@ def test_cam_checkpoint_loader_accepts_legacy_arcface_model_key(monkeypatch, tmp
     legacy_weights = {"backbone.cls_token": torch.zeros(1, 1, 1)}
     monkeypatch.setattr(cam_module, "load_checkpoint", lambda _path: {"model": legacy_weights})
     monkeypatch.setattr(cam_module, "OTUFormerEncoder", FakeEncoder)
+    # The shared read-only loader owns the construction site now.
+    import otuformer.utils.checkpoint as checkpoint_module
+
+    monkeypatch.setattr(checkpoint_module, "OTUFormerEncoder", FakeEncoder)
 
     cam_module.load_model_from_checkpoint(
         tmp_path / "arcface_epoch_0020.pth", "vit_tiny_patch16_224", torch.device("cpu")
@@ -68,6 +72,10 @@ def test_cam_checkpoint_loader_prefers_legacy_ssl_teacher_key(monkeypatch, tmp_p
         lambda _path: {"teacher": teacher_weights, "student": student_weights},
     )
     monkeypatch.setattr(cam_module, "OTUFormerEncoder", FakeEncoder)
+    # The shared read-only loader owns the construction site now.
+    import otuformer.utils.checkpoint as checkpoint_module
+
+    monkeypatch.setattr(checkpoint_module, "OTUFormerEncoder", FakeEncoder)
 
     cam_module.load_model_from_checkpoint(
         tmp_path / "SSL_epoch_0020.pth", "vit_tiny_patch16_224", torch.device("cpu")
@@ -96,10 +104,42 @@ def test_cam_checkpoint_loader_disables_pretrained_weights(monkeypatch, tmp_path
 
     monkeypatch.setattr(cam_module, "load_checkpoint", lambda _path: {"model_state_dict": {}})
     monkeypatch.setattr(cam_module, "OTUFormerEncoder", FakeEncoder)
+    # The shared read-only loader owns the construction site now.
+    import otuformer.utils.checkpoint as checkpoint_module
+
+    monkeypatch.setattr(checkpoint_module, "OTUFormerEncoder", FakeEncoder)
 
     cam_module.load_model_from_checkpoint(tmp_path / "model.pth", "vit_tiny_patch16_224", torch.device("cpu"))
 
     assert seen["pretrained"] is False
+
+
+def _registered_reshape_model(prefix_tokens):
+    import otuformer.vision.cam as cam_module
+
+    backbone = type("Backbone", (), {"num_prefix_tokens": prefix_tokens})()
+    model = type("Model", (), {"backbone": backbone})()
+    return cam_module._bind_reshape_transform(model)
+
+
+def test_vit_reshape_transform_binds_the_backbone_prefix_count():
+    import otuformer.vision.cam as cam_module
+
+    registered = _registered_reshape_model(5)
+    tokens = torch.arange(2 * (5 + 9) * 4, dtype=torch.float32).reshape(2, 14, 4)
+    grid = registered(tokens)
+
+    assert grid.shape == (2, 4, 3, 3)
+    assert torch.equal(grid.flatten(2), tokens[:, 5:].permute(0, 2, 1))
+
+    # A CLS-free/no-register backbone reshapes the full square grid.
+    cls_free = _registered_reshape_model(0)
+    assert cls_free(tokens[:, :4]).shape == (2, 4, 2, 2)
+
+    # The helper keeps its historical one-prefix default for direct callers.
+    assert cam_module.vit_reshape_transform(tokens[:, :10]).shape == (2, 4, 3, 3)
+    with pytest.raises(ValueError, match="square grid"):
+        cam_module.vit_reshape_transform(tokens[:, :4])
 
 
 def make_tiny_vit():
@@ -255,6 +295,132 @@ def test_every_cam_method_returns_unnormalized_map(name):
     # scale_cam_image sentinel, and the test-owned save-path array.
 
 
+# --- v0.10.0 register-aware CAM grids -----------------------------------------
+
+# (label, factory class_token, encoder kwargs, expected prefix count)
+_CAM_BACKBONES = (
+    ("one_cls", True, {}, 1),
+    ("added_four", True, {"reg_tokens": 4}, 5),
+    ("no_cls_no_registers", False, {}, 0),
+)
+
+
+def _install_vit_factory(monkeypatch, class_token=True, img_size=48):
+    import timm as timm_module
+    from timm.models.vision_transformer import VisionTransformer
+
+    def factory(_model_name, **kwargs):
+        requested = kwargs.get("reg_tokens")
+        return VisionTransformer(
+            img_size=img_size, patch_size=16, in_chans=3, embed_dim=16, depth=2,
+            num_heads=2, num_classes=0, global_pool="", class_token=class_token,
+            reg_tokens=0 if requested is None else int(requested),
+            dynamic_img_size=True,
+        )
+
+    monkeypatch.setattr(timm_module, "create_model", factory)
+
+
+def _tiny_vit_encoder(monkeypatch, class_token=True, img_size=48, **kwargs):
+    import otuformer.training.model as model_module
+
+    _install_vit_factory(monkeypatch, class_token=class_token, img_size=img_size)
+    return model_module.OTUFormerEncoder(
+        model_name="tiny-vit", out_dim=8, pretrained=False, img_size=img_size, **kwargs
+    ).eval()
+
+
+@pytest.mark.parametrize("name", CAM_METHOD_NAMES)
+@pytest.mark.parametrize("label,class_token,kwargs,prefix", _CAM_BACKBONES)
+def test_every_cam_method_uses_a_patch_only_grid(
+    monkeypatch, name, label, class_token, kwargs, prefix
+):
+    """Every CAM method must see only patch tokens, registers included.
+
+    48 px with a 16 px patch is a 3x3 patch grid. A reshape that kept any prefix
+    token would see 10, 13 or 14 tokens, which cannot form a square grid and
+    would raise, so passing here is real evidence rather than a shape assertion.
+    """
+    pytest.importorskip("pytorch_grad_cam")
+    from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
+
+    import otuformer.vision.cam as cam_module
+    from otuformer.vision.cam import prepare_cam
+
+    encoder = _tiny_vit_encoder(monkeypatch, class_token=class_token, **kwargs)
+    assert encoder.backbone.num_prefix_tokens == prefix
+
+    seen = []
+    real_reshape = cam_module.vit_reshape_transform
+
+    def spy(tensor, prefix_tokens=1):
+        result = real_reshape(tensor, prefix_tokens=prefix_tokens)
+        seen.append((tuple(tensor.shape), int(prefix_tokens), tuple(result.shape)))
+        return result
+
+    monkeypatch.setattr(cam_module, "vit_reshape_transform", spy)
+    cam, _layers, _reshape = prepare_cam(encoder, "vit", None, name, 1)
+
+    with torch.enable_grad():
+        raw = cam(
+            input_tensor=torch.rand(1, 3, 48, 48),
+            targets=[ClassifierOutputTarget(1)],
+        )
+
+    assert np.isfinite(raw).all()
+    assert seen, "reshape_transform was never called"
+    for input_shape, seen_prefix, output_shape in seen:
+        assert seen_prefix == prefix
+        assert input_shape[1] == prefix + 9
+        assert output_shape[-2:] == (3, 3)
+
+
+def test_run_cam_end_to_end_on_a_registered_backbone(tmp_path, monkeypatch):
+    """A full run_cam pass on a four-register checkpoint, including AblationCAM.
+
+    ``run_cam`` logs and skips a failing image instead of raising, so the
+    assertion is the produced artifacts: a summary row, a figure, and an array.
+    """
+    pytest.importorskip("pytorch_grad_cam")
+    import pandas as pd
+
+    import otuformer.vision.cam as cam_module
+
+    encoder = _tiny_vit_encoder(monkeypatch, reg_tokens=4)
+    checkpoint = tmp_path / "registered.pth"
+    torch.save(
+        {
+            "model_state_dict": encoder.state_dict(),
+            "config": {
+                "model_name": "tiny-vit",
+                "out_dim": 8,
+                "image_size": 48,
+                "register_tokens": 4,
+            },
+        },
+        checkpoint,
+    )
+    images_dir = tmp_path / "images"
+    images_dir.mkdir()
+    Image.new("RGB", (48, 48), color=(10, 20, 30)).save(images_dir / "img_0.jpg")
+    out_dir = tmp_path / "cam_out"
+
+    cam_module.run_cam(
+        checkpoint=checkpoint,
+        images_dir=images_dir,
+        out_dir=out_dir,
+        model_name="tiny-vit",
+        cam_method="ablationcam",
+        save_npy="normalized",
+        device="cpu",
+    )
+
+    summary = pd.read_csv(out_dir / "cam_summary.csv")
+    assert len(summary) == 1
+    assert list((out_dir / "figures").glob("*.png"))
+    assert list((out_dir / "arrays").glob("*.npy"))
+
+
 def test_infer_architecture_vit():
     model = make_tiny_vit()
     arch = infer_architecture("vit_tiny_patch16_224", model)
@@ -315,6 +481,10 @@ def test_cam_load_model_constructs_at_checkpoint_size(monkeypatch, tmp_path):
         },
     )
     monkeypatch.setattr(cam_module, "OTUFormerEncoder", FakeEncoder)
+    # The shared read-only loader owns the construction site now.
+    import otuformer.utils.checkpoint as checkpoint_module
+
+    monkeypatch.setattr(checkpoint_module, "OTUFormerEncoder", FakeEncoder)
 
     model, size, name = cam_module.load_model_from_checkpoint(
         tmp_path / "model.pth", "vit_tiny_patch16_224", torch.device("cpu")
