@@ -9,7 +9,7 @@ from pathlib import Path
 
 import typer
 
-from otuformer.cli import SIZE_EXAMPLES, _parse_size, format_user_command
+from otuformer.cli import SIZE_EXAMPLES, _parse_size, docs_url, format_user_command
 
 app = typer.Typer(
     help=(
@@ -20,6 +20,8 @@ app = typer.Typer(
         "Quick example:\n\n"
         "  otuformer export --checkpoint runs/finetune/best.pt\n"
         "  otuformer export --checkpoint best.pt --imgsz 224 --opset 17\n"
+        "\nDocs:\n"
+        f"  {docs_url('export')}\n"
     )
 )
 

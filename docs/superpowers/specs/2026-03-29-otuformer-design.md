@@ -1,4 +1,4 @@
-# OTU-Former Toolbox — Design Spec (v0.1.0)
+# OTU-Former Toolbox — Design Spec
 
 Date: 2026-03-29
 
@@ -8,7 +8,7 @@ OTU-Former is a Python CLI toolbox for image-based biodiversity analysis. It con
 
 The toolbox packages an existing research workflow (ref/ibot20260115.py, ref/embeddings_tree20260206.py, ref/GradCam_heatmap.py, ref/diversity_index.txt) into a single installable Python package with a unified CLI.
 
-**Version:** 0.1.0
+**Package version:** see `pyproject.toml`
 
 **Python:** ≥ 3.11
 
@@ -20,49 +20,21 @@ The toolbox packages an existing research workflow (ref/ibot20260115.py, ref/emb
 
 ### 2.1 Package structure
 
+```text
+src/otuformer/
+├── cli/          command parsing and orchestration
+├── training/     pretraining and fine-tuning
+├── embedding/    extraction, evaluation, pseudo-label logic
+├── delineation/  distances, trees, partitions, diversity
+├── vision/       CAM generation and ONNX export
+└── utils/        shared I/O, device, path, size, logging, checkpoint helpers
 ```
-otuformer/
-├── pyproject.toml
-├── README.md
-├── src/
-│   └── otuformer/
-│       ├── __init__.py
-│       ├── cli/
-│       │   ├── main.py          # Typer app, registers all sub-commands
-│       │   ├── pretrain.py
-│       │   ├── finetune.py
-│       │   ├── extract.py
-│       │   ├── evaluate.py
-│       │   ├── cluster.py
-│       │   ├── annotate.py
-│       │   ├── diversity.py
-│       │   ├── cam.py
-│       │   ├── export.py
-│       │   └── doctor.py
-│       ├── training/
-│       │   ├── model.py         # ViT encoder + 3-layer MLP projector
-│       │   ├── loss.py          # SSL losses + ArcFace; loss registry for future methods
-│       │   ├── trainer.py       # Training loop (pretrain / finetune)
-│       │   ├── dataset.py       # Dataset, multi-crop augmentation
-│       │   └── scheduler.py     # LR cosine schedule, EMA momentum, teacher temperature warmup
-│       ├── embedding/
-│       │   ├── extractor.py     # checkpoint → embeddings CSV
-│       │   ├── evaluator.py     # kNN, linear probe, Recall@K, mAP, NMI/ARI/AMI, UMAP
-│       │   └── pseudo_label.py  # planned: in-memory sparse-label scoring + diagnostics
-│       ├── delineation/
-│       │   ├── distance.py      # Cosine + Euclidean distance, PCA whitening, local scaling
-│       │   ├── tree.py          # UPGMA construction, bootstrap support
-│       │   ├── partition.py     # Two-stage dynamic threshold scan, partition export
-│       │   ├── annotate.py      # Expert correction write-back
-│       │   └── diversity.py     # Alpha diversity indices + MPD
-│       ├── vision/
-│       │   └── cam.py           # GradCAM, GradCAM++, ScoreCAM, LayerCAM, EigenCAM, AblationCAM
-│       └── utils/
-│           ├── io.py            # CSV/JSON read-write helpers
-│           ├── logging.py       # TeeLogger (stdout → console + file)
-│           └── checkpoint.py    # Checkpoint load/save utilities
-└── tests/
-```
+
+The tree is deliberately directory-level. A file-by-file list was maintained here
+until v0.10.1 and had drifted: it listed a `cli/` module that never existed and
+omitted several modules that do (`cli/update.py`, `vision/export.py`,
+`constants.py`, and four `utils/` modules). The user-facing command reference for these modules lives under
+`docs/commands/` (Section 7) and is not duplicated here.
 
 ### 2.2 Layer convention
 
@@ -76,125 +48,62 @@ The CLI layer is thin (argument parsing + logging scope + result printing). Core
 
 ## 3. Sub-commands
 
+Each sub-command below records its purpose, its outputs, the constraints a later
+change must not break, and links to the design document that introduced each
+behaviour. Flags, defaults, and allowed values are **not** listed here: they are
+owned by the user-facing command documents under `docs/commands/` (Section 7),
+while the design docs linked below remain the record of *why* each behaviour
+exists.
+
 ### 3.1 `pretrain`
 SSL self-supervised pre-training (teacher-student self-distillation + patch-level objective).
-All parameters migrated from `ref/ibot20260115.py` `get_parser()`, mode=pretrain. Full list:
-
-- `--train-data` : CSV with `image` column (no label required for SSL)
-- `--input-images-dir` : root image directory
-- `--out-dir` : output directory for checkpoints and logs
-- `--model-name` : supported timm VisionTransformer backbone [default: vit_small_patch16_224]; a `vit_*` name alone does not establish compatibility (see Section 4.9)
-- `--out-dim` : SSL projector output dimension [default: 256]
-- `--max-epochs` [default: 50]
-- `--lr` [default: 5e-4], `--weight-decay` [default: 0.05], `--warmup-epochs` [default: 3]
-- `--global-crop-size` [default: auto; `auto` resolves to the backbone's native `default_cfg["input_size"]` on a new run or the checkpoint's recorded size on `--resume`; explicit values 224/384/448 are common, 518 is patch-14-only]; `--local-crop-size` [default: 96], `--local-crops` [default: 6]. On `--resume`, omitted `--local-crop-size` and `--local-crops` inherit the checkpoint's saved values; explicit conflicting values fail, and changing them requires a new run.
-- `--augmentation` : pretraining augmentation profile — `global-barcode` (new-run default), `color-robust`, or `legacy`
-- `--orientation-policy` : geometric orientation policy — `sensitive` (new-run default) or `invariant` (opt-in broad rotation and reflection)
-- `--patch-loss` : patch-level objective — `none`, `consistency` (default; visible same-position cosine consistency, not input masking), `masked-feature` (A+; continuous masked feature prediction), or `ibot` (experimental prototype prediction)
-- `--masking-strategy` : real-masking geometry for `masked-feature`/`ibot` — `random` (default), `blockwise`, or `hybrid`
-- `--mask-ratio` [default: auto; `auto` resolves to 0.30 on a new run, while v0.6.x defaulted to 0.50; a legacy `--resume` keeps its recorded value or falls back to 0.50], `--lambda-local` [default: 1.5], `--lambda-mask` [default: 1.0]
-- `--ibot-prototypes` [default: 512; any integer >= 2, larger values suit larger datasets]
-- `--teacher-momentum` [default: 0.995], `--teacher-momentum-end` [default: 0.999]
-- `--student-temp` [default: 0.1], `--teacher-temp-start` [default: 0.04], `--teacher-temp-end` [default: 0.07]
-- `--disable-cross-view-loss` : disable cross-view pairing (view1×view2)
-- `--resume` : checkpoint path to resume from
-- `--log-every-n-steps` [default: 50], `--save-every-epochs` [default: 10], `--keep-last-checkpoints` [default: 10]
-- `--batch-size` [default: 32], `--num-workers` [default: 4], `--cpus` [default: 12]
-- `--device` [default: mps, choices: cpu/cuda/mps], `--seed` [default: 42]
-- `--visualize-data` : CSV with `image` and optional `label` columns for periodic evaluation; without labels, only UMAP is generated
+All parameters migrated from `ref/ibot20260115.py` `get_parser()`, mode=pretrain.
 
 **Outputs:** `SSL_latest.pth` (and epoch checkpoints `SSL_epoch_*.pth`), `metrics.pretrain.csv`, `instant_metrics.csv`, training curves PDF, log file. When labels are absent or contain fewer than two classes, supervised metric fields remain empty while the epoch row is retained; an image-only visualization CSV still produces UMAP. `--metrics-sample-size` limits both supervised metric and UMAP inputs when positive.
 
----
+**Key constraints:**
+- `--global-crop-size` : `auto` resolves to the backbone's native `default_cfg["input_size"]` on a new run or the checkpoint's recorded size on `--resume`
+- On `--resume`, omitted `--local-crop-size` and `--local-crops` inherit the checkpoint's saved values; explicit conflicting values fail, and changing them requires a new run.
+- `--mask-ratio` : `auto` resolves to 0.30 on a new run, while v0.6.x defaulted to 0.50; a legacy `--resume` keeps its recorded value or falls back to 0.50
+- `--patch-loss` : patch-level objective — `none`, `consistency` (default; visible same-position cosine consistency, not input masking), `masked-feature` (A+; continuous masked feature prediction), or `ibot` (experimental prototype prediction)
+- `--masking-strategy` : real-masking geometry for `masked-feature`/`ibot` — `random` (default), `blockwise`, or `hybrid`
+- `--model-name` : a `vit_*` name alone does not establish compatibility (see Section 4.9)
+- Transform-level profile definitions live in [`2026-09-07-otuformer-training-augmentation-design.md`](2026-09-07-otuformer-training-augmentation-design.md).
 
-### Training augmentation contract
-
-```text
-pretrain: global-barcode (default), color-robust, legacy
-finetune: none (default), conservative
-orientation-policy: sensitive (default for new runs), invariant
-```
-
-- `global-barcode` is the default whole-specimen barcode profile: modest photometric jitter; color is preserved (no grayscale). Its geometry follows the selected orientation policy (`sensitive` by default, `invariant` opt-in).
-- `color-robust` uses the same geometry and blur as `global-barcode` with stronger color jitter and grayscale; it may reduce sensitivity to diagnostic body color, color patterns, or metallic sheen.
-- `legacy` reproduces OTU-Former 0.2.1 augmentation exactly for old-run continuation and comparison, not new runs; it records either orientation policy without changing its historical transforms.
-- `none` is the unchanged deterministic fine-tuning default: `Resize -> CenterCrop -> ToTensor -> Normalize`.
-- `conservative` is an experimental opt-in fine-tuning profile, not proven superior to `none`; evaluate it on held-out individuals and held-out species. It adds no crop, grayscale, blur, or solarization.
-- `orientation-policy=sensitive` is the new-run default and a caller-selected policy (never inferred) for direction-sensitive markers: rotation `[-15°, 15°]` and no horizontal reflection for every global/local pretraining view and for fine-tuning `conservative`. `invariant` is the opt-in broad-rotation/reflection policy for orientation-insensitive markers and preserves the existing behavior. `legacy` accepts either policy but keeps its historical flips.
-- Dorsal, ventral, lateral, whole-body, and anatomical-part images are distinct markers and must not be mixed as interchangeable views of one marker; arbitrary in-plane orientation is supported. The complete-marker requirement applies to the source image, not to every stochastic SSL crop. Augmentation encourages but does not guarantee embedding invariance.
-
-Resume and inheritance: omitted `--augmentation`/`--orientation-policy` inherit on resume; explicit conflicts fail, and changing a profile's expanded parameters requires a new run. Old pretrain checkpoints map to `legacy`/`invariant`; old finetune checkpoints map to `none`/`invariant`. New fine-tuning from `--checkpoint` is initialization, not resume: it never inherits the pretraining augmentation profile, and an omitted policy inherits the pretraining checkpoint policy (fallback `sensitive` for old checkpoints). Both fine-tuning profiles use the checkpoint-recorded training input size with a `224` fallback for old checkpoints. Checkpoint metadata (`config.augmentation_profile`, `config.augmentation_config`) provides configuration traceability, not bitwise deterministic replay.
-
-Transform-level profile definitions live in [`2026-09-07-otuformer-training-augmentation-design.md`](2026-09-07-otuformer-training-augmentation-design.md).
-
----
+**Design history:**
+[pretrain alignment](2026-03-30-otuformer-pretrain-alignment-design.md),
+[v0.6 masked pretraining](2026-09-20-otuformer-masked-pretrain-v070-design.md)
+(the v0.7.0 masked patch objectives),
+[v0.7.1 CLI and metric corrections](2026-09-21-otuformer-v071-cli-metrics-corrections.md),
+[optional register tokens](2026-09-28-otuformer-optional-registers-design.md).
 
 ### 3.2 `finetune`
-Supervised metric-learning fine-tuning on top of a pretrained checkpoint. ArcFace remains the default; v0.8.0 also implements SupCon, Sub-center ArcFace, and compact Sub-center ArcFace. New runs initialized from SSL checkpoints replace the SSL projector with a compact, unnormalized `backbone_dim -> 512 -> metric_embed_dim` embedding head; the selected loss handles its required normalization. Fine-tuning uses separate backbone and metric-head learning rates, defaults to AdamW `weight_decay=1e-4` as a conservative supervised-training choice rather than a full legacy-script reproduction, and does not apply gradient clipping.
-
-Initialization semantics for `--checkpoint`: an SSL pretrain checkpoint installs a fresh `ArcFaceEmbeddingHead`; a fine-tune checkpoint whose head and width match the head being trained keeps its trained projector; a `ProjectionHead` checkpoint (OTU historical SFT, or `projection_mlp_2048` metadata) keeps its projector and therefore fixes the embedding width.
-
-Checkpoints record the actual `config.embedding_head` (`arcface_mlp_512` for new runs, `projection_mlp_2048` for runs initialized from a historical SFT checkpoint) and `config.freeze_ratio`. The historical `loss_state_dict` marker is recognized when metadata is absent; missing metadata without fine-tune markers remains valid SSL initialization. On resume, the checkpoint's optimizer state restores its saved parameter-group settings, so CLI LR and weight-decay values are inert, and a changed `--freeze-ratio` is rejected because the optimizer parameter groups depend on it.
-
-Ref-script checkpoints (`ref/ibot20260115.py`: `model`/`teacher`/`student` weight keys, `projector.<i>` projector naming, an `args` dict instead of `config`, `loss_func.W` classifier) are readable by `extract`, `export`, and `cam`, but cannot be resumed by `finetune` — see 4.8.
-
-All parameters migrated from `ref/ibot20260115.py` `get_parser()`, mode=finetune. Full list:
-
-- `--checkpoint` : pretrained checkpoint path (auto-detected if empty)
-- `--train-data` : CSV with `image` and `label` columns
-- `--input-images-dir` : root image directory
-- `--out-dir`
-- `--model-name` : timm backbone (must match pretrain) [default: vit_small_patch16_224]
-- `--metric-embed-dim` : fine-tune embedding dimension (the ArcFace head output, not the raw CLS dimension) [default: inherit the checkpoint's recorded metric dimension, else the pretrained projector dimension]. An explicit value that conflicts with a `ProjectionHead` checkpoint is rejected, because that projector's output width is fixed by the pretrained weights. On `--resume` the value must match the checkpoint (resizing is only valid for a new `--checkpoint` run).
-- `--finetune-epochs` [default: 20], `--finetune-lr` : backbone learning rate [default: 1e-4]
-- `--metric-head-lr` : learning rate for the ArcFace embedding head and classifier; omitted means inherit `--finetune-lr`. On `--resume`, saved optimizer state takes precedence.
-- `--weight-decay` : AdamW weight decay [default: 1e-4, a conservative supervised SFT choice; pass 0.05 for the legacy script's setting]
-- `--freeze-ratio` : fraction of transformer blocks to freeze [default: 0.7]; recorded in `config.freeze_ratio` and required to match on `--resume`, because the optimizer only holds `requires_grad` backbone parameters
-- `--loss` : `arcface` | `supcon` | `subcenter-arcface` | `subcenter-arcface-compact` [default: arcface]; implementation and compatibility are specified in [the metric-loss design](2026-09-24-otuformer-metric-loss-v080-design.md)
-- `--augmentation` : fine-tuning augmentation profile — `none` (new-run default) or `conservative` (experimental)
-- `--orientation-policy` : orientation policy — `sensitive` (new-run default) or `invariant` (opt-in broad rotation and reflection); when initializing from `--checkpoint`, an omitted value inherits the pretraining checkpoint's saved policy
-- `--batch-size`, `--num-workers`, `--cpus`, `--device`, `--seed`
-- `--log-every-n-steps`, `--save-every-epochs`, `--keep-last-checkpoints`
-- `--visualize-data` : CSV with `image` and optional `label` columns for periodic evaluation; without labels, only UMAP is generated
-
-The following sparse-label extension is implemented (v0.9.0):
-
-- `--long-tail` : `none` | `cb-drw` [default: none]; CB-DRW applies only to ArcFace-family cross-entropy and must match between pseudo rounds
-- `--pseudo-label-from` : completed finetune#1 ArcFace-family checkpoint used to generate one automatic pseudo-feedback round
-- `--pseudo-similarity-floor` : winning top-three-mean raw-CLS cosine floor in `[-1,1]` [default: 0.75]
-- `--pseudo-min-gap` : winning score minus runner-up gap in `[0,2]` [default: 0.10]
-- `--pseudo-neighbors` : positive neighbor count for asymmetric own-class-excluded mutual-kNN [default: 15]
-- `--pseudo-cap-multiplier` : per-class acceptance cap multiplier, `min(multiplier * expert_seed_count, absolute_cap)`, integer >= 1 [default: 3]
-- `--pseudo-absolute-cap` : absolute per-class acceptance cap, integer >= 1 [default: 50]
-
-Without `--pseudo-label-from`, ordinary fine-tune semantics are unchanged. Pseudo mode uses two explicit finetune commands. Omitted experiment options inherit finetune#1 resolved values rather than new-run defaults; explicit conflicts fail. Finetune#2 always initializes from the same original SSL checkpoint, never finetune#1. In pseudo mode the existing `--checkpoint` only locates that SSL file after it has moved, and its file SHA-256 must match. Full rules are specified in [the sparse-label pseudo-feedback design](2026-09-26-otuformer-sparse-label-pseudolabel-design.md).
+Supervised metric-learning fine-tuning on top of a pretrained checkpoint. ArcFace remains the default; v0.8.0 also implements SupCon, Sub-center ArcFace, and compact Sub-center ArcFace. New runs initialized from SSL checkpoints replace the SSL projector with a compact, unnormalized `backbone_dim -> 512 -> metric_embed_dim` embedding head; the selected loss handles its required normalization.
 
 **Outputs:** `finetune_latest.pth` (and epoch checkpoints `finetune_epoch_*.pth`), `metrics.finetune.csv`, `instant_metrics.csv`, training curves PDF, log file. Pseudo mode additionally writes `pseudo_labels.csv` and `pseudo_summary.json` in the finetune#2 directory. When labels are absent or contain fewer than two classes, supervised metric fields remain empty while the epoch row is retained; an image-only visualization CSV still produces UMAP. `--metrics-sample-size` limits both supervised metric and UMAP inputs when positive.
 
-New ordinary fine-tune checkpoints add `pseudo_round=0`, the existing expert-manifest hash, original SSL resolved path and file SHA-256, resolved experiment identity, and `pseudo_source_eligible` plus an optional reason. Finetune#2 adds `pseudo_round=1`, pseudo-source SHA-256, authoritative accepted pseudo rows and their hash, rule/preprocessing metadata, counts, and long-tail schedule. These fields are additive; existing model/config keys remain authoritative.
+**Key constraints:**
+- Fine-tuning uses separate backbone and metric-head learning rates, defaults to AdamW `weight_decay=1e-4` as a conservative supervised-training choice rather than a full legacy-script reproduction, and does not apply gradient clipping.
+- Initialization semantics for `--checkpoint`: an SSL pretrain checkpoint installs a fresh `ArcFaceEmbeddingHead`; a fine-tune checkpoint whose head and width match the head being trained keeps its trained projector; a `ProjectionHead` checkpoint (OTU historical SFT, or `projection_mlp_2048` metadata) keeps its projector and therefore fixes the embedding width.
+- `--metric-embed-dim` : An explicit value that conflicts with a `ProjectionHead` checkpoint is rejected, because that projector's output width is fixed by the pretrained weights. On `--resume` the value must match the checkpoint (resizing is only valid for a new `--checkpoint` run).
+- `--metric-head-lr` : omitted means inherit `--finetune-lr`. On `--resume`, saved optimizer state takes precedence.
+- `--orientation-policy` : when initializing from `--checkpoint`, an omitted value inherits the pretraining checkpoint's saved policy
+- Checkpoints record the actual `config.embedding_head` (`arcface_mlp_512` for new runs, `projection_mlp_2048` for runs initialized from a historical SFT checkpoint) and `config.freeze_ratio`. The historical `loss_state_dict` marker is recognized when metadata is absent; missing metadata without fine-tune markers remains valid SSL initialization. On resume, the checkpoint's optimizer state restores its saved parameter-group settings, so CLI LR and weight-decay values are inert, and a changed `--freeze-ratio` is rejected because the optimizer parameter groups depend on it.
+- Ref-script checkpoints (`ref/ibot20260115.py`: `model`/`teacher`/`student` weight keys, `projector.<i>` projector naming, an `args` dict instead of `config`, `loss_func.W` classifier) are readable by `extract`, `export`, and `cam`, but cannot be resumed by `finetune` — see 4.8.
+- `--long-tail` : CB-DRW applies only to ArcFace-family cross-entropy and must match between pseudo rounds
+- The following sparse-label extension is implemented (v0.9.0):
+- Without `--pseudo-label-from`, ordinary fine-tune semantics are unchanged. Pseudo mode uses two explicit finetune commands. Omitted experiment options inherit finetune#1 resolved values rather than new-run defaults; explicit conflicts fail. Finetune#2 always initializes from the same original SSL checkpoint, never finetune#1. In pseudo mode the existing `--checkpoint` only locates that SSL file after it has moved, and its file SHA-256 must match. Full rules are specified in [the sparse-label pseudo-feedback design](2026-09-26-otuformer-sparse-label-pseudolabel-design.md).
+- New ordinary fine-tune checkpoints add `pseudo_round=0`, the existing expert-manifest hash, original SSL resolved path and file SHA-256, resolved experiment identity, and `pseudo_source_eligible` plus an optional reason. Finetune#2 adds `pseudo_round=1`, pseudo-source SHA-256, authoritative accepted pseudo rows and their hash, rule/preprocessing metadata, counts, and long-tail schedule. These fields are additive; existing model/config keys remain authoritative.
 
----
+**Design history:**
+[v0.8.0 metric losses](2026-09-24-otuformer-metric-loss-v080-design.md),
+[v0.9.0 sparse-label pseudo-feedback](2026-09-26-otuformer-sparse-label-pseudolabel-design.md),
+[training augmentation](2026-09-07-otuformer-training-augmentation-design.md).
 
 ### 3.3 `extract`
 Extract embeddings from images using a trained checkpoint.
 
-Parameters migrated from `ref/ibot20260115.py` `get_parser()`, mode=extract. Full list:
-
-- `--checkpoint` : path to pretrain or finetune checkpoint
-- `--input-images-dir` : root image directory **or** parent directory containing subdirectories (batch mode, auto-detected)
-- `--out-dir`
-- `--model-name` : timm backbone (must match training) [default: vit_small_patch16_224]
-- `--extract-size` [default: auto; `auto` uses the checkpoint's recorded training size; explicit values (224/384/448, 518 = patch-14 models only) must be divisible by the backbone patch size]
-- `--eval-transform` : `center-crop` | `whole-specimen-pad` [default: center-crop; deterministic evaluation preprocessing protocol, applied to extraction and CAM]
-- `--use-projector-output` : use SSL projector output for SSL checkpoints, or the ArcFace embedding for fine-tune checkpoints; recommended for fine-tuned-class retrieval and closed-set clustering
-- `--token-mode` : `cls` | `patch-topk` | `attention-pool` [default: cls]; `cls` is raw CLS and remains the comparison baseline for unseen classes, cross-dataset transfer, and general morphology representation
-- `--topk-patches` : for patch-topk mode, choices: 10/20/30 [default: 20]
-- `--attention-pooling-type` : `lightweight` | `multihead` | `gated` [default: lightweight]
-- `--attention-pooling-epochs` [default: 20]
-- `--label-csv` : CSV with required `image` and optional `label`; labels enable quality metrics, while image-only input enables unlabeled UMAP. Attention-pool query training still requires `label`.
-- `--metrics-sample-size` [default: 10000; limits metric/UMAP inputs when positive, no cap when <=0]
-- `--batch-size`, `--num-workers`, `--device`, `--seed`
-- `--prefix` : OTU name prefix applied to cluster IDs downstream [default: OTU]
+Parameters migrated from `ref/ibot20260115.py` `get_parser()`, mode=extract.
 
 **Batch mode:** When `--input-images-dir` contains subdirectories, each subdirectory is treated as an independent sample set. All embeddings are extracted and merged into a single CSV with a `sample` column recording the source subdirectory. This ensures consistent OTU naming across datasets when feeding into `cluster`.
 
@@ -202,53 +111,20 @@ Parameters migrated from `ref/ibot20260115.py` `get_parser()`, mode=extract. Ful
 
 **Outputs:** `embeddings.csv` (columns: `id`, `sample` (batch only), then embedding dimensions), optional `umap.pdf`, and `metrics.csv` only when at least two label classes are available. Positive `--metrics-sample-size` limits both metric and UMAP inputs; values <=0 disable the cap.
 
----
+**Key constraints:**
+- `--use-projector-output` : use SSL projector output for SSL checkpoints, or the ArcFace embedding for fine-tune checkpoints; recommended for fine-tuned-class retrieval and closed-set clustering
+- `--token-mode` : `cls` is raw CLS and remains the comparison baseline for unseen classes, cross-dataset transfer, and general morphology representation
+- `--label-csv` : labels enable quality metrics, while image-only input enables unlabeled UMAP. Attention-pool query training still requires `label`.
+- `--eval-transform` : `center-crop` | `whole-specimen-pad` [default: center-crop; deterministic evaluation preprocessing protocol, applied to extraction and CAM]
 
-### 3.4 `evaluate`
-Evaluate embedding quality from multiple angles.
+**Design history:**
+[v0.7.1 metric corrections](2026-09-21-otuformer-v071-cli-metrics-corrections.md),
+[optional register tokens](2026-09-28-otuformer-optional-registers-design.md).
 
-Parameters partially from `ref/ibot20260115.py` visualisation/metrics block:
-
-- `--embeddings` : embeddings CSV
-- `--labels` : CSV with columns `[id, label]`
-- `--out-dir`
-- `--umap-dims` : 2 or 3 [default: 2]
-- `--umap-n-neighbors` [default: 15], `--umap-min-dist` [default: 0.1], `--umap-metric` [default: cosine]
-- `--visualize-class-number` : max classes shown in UMAP [default: 20, 0 = all]
-- `--knn-k` : comma-separated k values for kNN [default: 1,5,10]
-- `--metrics-sample-size` [default: 10000]
-
-**Metrics computed:**
-- Classification transferability: kNN accuracy (k=1,5,10), Linear Probing accuracy
-- Retrieval: Recall@K (K=1,5,10), mAP
-- Clustering quality: NMI, ARI, AMI, Silhouette Score, Purity
-- Metric learning diagnostics: Intra-Class Var, Inter-Class Dist, embedding norms
-- Visualisation: UMAP 2D/3D plot (PDF)
-
-**Outputs:** `metrics.json`, `metrics.csv`, `umap.pdf`, log file.
-
----
-
-### 3.5 `cluster`
+### 3.4 `cluster`
 Compute pairwise distances, build UPGMA tree, scan partitions.
 
 Parameters migrated from `ref/embeddings_tree20260206.py`:
-
-- `--embeddings` : embeddings CSV
-- `--out-dir`
-- `--distance` : `cosine` | `euclidean` [default: cosine]
-- `--prefix` : OTU name prefix [default: OTU]
-- `--pca-whitening` / `--pca-components` [default: 256]
-- `--local-scaling` : enable k-NN based local scaling of distance matrix
-- `--local-k` [default: 0 = auto], `--local-k-strategy` : `adaptive` | `sqrt` | `log` | `fixed` [default: adaptive]
-- `--cutoff-min` [default: 0.05], `--cutoff-max` [default: 1.0], `--cutoff-step` [default: 0.05]
-- `--custom-cutoffs` : comma-separated values (overrides range)
-- `--num-bootstraps` [default: 0], `--bootstrap-subsample-ratio` [default: 0.8], `--bootstrap-display-cutoff` [default: 50.0]
-- `--save-distances` : save pairwise distance matrix CSV
-- `--max-distance-pairs` [default: 1_000_000]
-- `--labels` : optional, for partition quality metrics (NMI, ARI, BCubed-F etc.)
-- `--metrics-sample-size` [default: 10000]
-- `--cpus` [default: 8], `--random-state` [default: 42]
 
 **Outputs (under `--out-dir`):**
 - `upgma.nwk` : Newick tree file
@@ -261,19 +137,15 @@ Parameters migrated from `ref/embeddings_tree20260206.py`:
 - `metrics.csv` (if `--labels` provided): NMI, ARI, AMI, BCubed-F, V-measure, Silhouette per cutoff
 - `intraclass_distances.csv` (if `--labels` provided)
 
----
+**Key constraints:**
+- `--labels` : optional, for partition quality metrics (NMI, ARI, BCubed-F etc.)
 
-### 3.6 `annotate`
+**Design history:**
+[v0.7.1 metric corrections](2026-09-21-otuformer-v071-cli-metrics-corrections.md),
+[output safety and resume](2026-07-18-output-safety-and-resume-design.md).
+
+### 3.5 `annotate`
 Write expert taxonomic corrections back into partition assignments.
-
-- `--raw-assignments` : cluster-run `partition_{cutoff}_assignments.csv` (columns: `id, cluster`)
-- `--corrections` : CSV with `id` (or `image`) and `cluster` (or `corrected_cluster`)
-- `--embeddings` : optional embeddings CSV for distance recomputation and annotated UPGMA PDF
-- `--out-dir`
-
-**Logic:**
-- IDs present in `corrections` override the cluster assignment in `raw_assignments`
-- IDs absent from `corrections` are kept unchanged
 
 **Outputs:**
 - `partition_{cutoff}_assignments.csv` and `partition_{cutoff}_assignments_changed_only.csv`
@@ -281,17 +153,15 @@ Write expert taxonomic corrections back into partition assignments.
 - `annotation_summary.json` : number of corrections, clusters affected, before/after distribution
 - `pairwise_distance_summary_intra-class.csv` and `UPGMA_tree_partitions_annotated.pdf` (only with `--embeddings`)
 
----
+**Key constraints:**
+- IDs present in `corrections` override the cluster assignment in `raw_assignments`
+- IDs absent from `corrections` are kept unchanged
 
-### 3.7 `diversity`
+**Design history:**
+[the annotate design](2026-04-01-annotate-design.md).
+
+### 3.6 `diversity`
 Compute alpha diversity indices from a (potentially annotated) partition assignments file.
-
-- `--assignments` : assignments CSV (annotated or raw from `cluster`)
-- `--out-dir`
-- `--prefix` : OTU name prefix (must match `cluster` step) [default: OTU]
-- `--min-abundance` : comma-separated filter thresholds [default: 0,2,5]
-- `--phylo` : compute MPD (Morphological Dendrogram Diversity); requires `--tree`
-- `--tree` : UPGMA Newick file (required if `--phylo`)
 
 **Diversity indices computed (per `--min-abundance` threshold):**
 
@@ -304,62 +174,47 @@ Compute alpha diversity indices from a (potentially annotated) partition assignm
 | Hill numbers | q=0, q=1, q=2                                                            |
 | Morpho tree  | MPD (optional, `--phylo`)                                                |
 
-**Output format:** Wide table — rows = indices, columns = `min_abundance_0`, `min_abundance_2`, `min_abundance_5` etc.
-
 **Outputs:** `diversity.csv`, `diversity_summary.pdf` (bar charts per index), log file.
 
-**Note:** All diversity calculations in pure Python (scipy/scikit-bio/numpy). No usearch dependency.
+**Key constraints:**
+- `--phylo` : compute MPD (Morphological Dendrogram Diversity); requires `--tree`
+- `--tree` : UPGMA Newick file (required if `--phylo`)
+- All diversity calculations in pure Python (scipy/scikit-bio/numpy). No usearch dependency.
 
----
+**Output format:** Wide table — rows = indices, columns = `min_abundance_0`, `min_abundance_2`, `min_abundance_5` etc.
 
-### 3.8 `cam`
+**Design history:**
+[the diversity design](2026-04-01-diversity-design.md).
+
+### 3.7 `cam`
 Generate CAM heatmaps for visual explanation of morphological features.
 
 Implementation mirrors `entomokit classify cam` (`/Users/zf/data/coding/entomokit/entomokit/classify/cam.py` and `src/classification/cam.py`), adapted for OTU-Former checkpoints (timm ViT backbone, no AutoGluon).
 
-- `--checkpoint` : pretrain or finetune checkpoint (OTU or ref-script format)
-- `--images-dir` : image directory
-- `--model-name` : fallback timm backbone for checkpoints that record no model name (ref-script SFT) [default: `vit_tiny_patch16_224`]
-- `--label-csv` : optional CSV with `image` and `label` columns; if omitted all images in `--images-dir` are used
-- `--out-dir`
-- `--cam-method` : `gradcam` | `gradcampp` | `scorecam` | `layercam` | `eigencam` | `ablationcam` [default: gradcam]
-- `--arch` : `cnn` | `vit` (auto-detected if not set)
-- `--target-layer-name` : specific model layer (auto-selected when omitted)
-- `--image-weight` [default: 0.5] : blend weight of original image in overlay
-- `--fig-format` : `png` | `jpg` | `pdf` [default: png]
-- `--save-npy` : save raw CAM arrays as .npy
-- `--dump-model-structure` : write layer names to `model_layers.txt`
-- `--max-images` : limit number of images processed
-- `--cam-batch-size` [default: 32], `--num-workers` [default: 4], `--device`
-- `--eval-transform` : `center-crop` | `whole-specimen-pad` [default: center-crop; deterministic evaluation preprocessing protocol shared with extraction]
-
-Heatmaps are overlaid on the full original image via the correct inverse of the selected preprocessing: with `center-crop` the heatmap is confined to the model's field of view using a binary FOV mask (out-of-view pixels are dimmed directly, never routed through the heatmap colormap); with `whole-specimen-pad` the heatmap covers the whole specimen. The figure is a gradient-attribution heatmap of the raw CLS feature (its argmax treated as a pseudo-class), not a verified class-discriminative CAM; that semantic is tracked separately.
-
 **Outputs:** Per-image overlay images, `cam_summary.csv`, `model_layers.txt` (if `--dump-model-structure`).
 
----
+**Key constraints:**
+- Heatmaps are overlaid on the full original image via the correct inverse of the selected preprocessing: with `center-crop` the heatmap is confined to the model's field of view using a binary FOV mask (out-of-view pixels are dimmed directly, never routed through the heatmap colormap); with `whole-specimen-pad` the heatmap covers the whole specimen. The figure is a gradient-attribution heatmap of the raw CLS feature (its argmax treated as a pseudo-class), not a verified class-discriminative CAM; that semantic is tracked separately.
+- `--eval-transform` : `center-crop` | `whole-specimen-pad` [default: center-crop; deterministic evaluation preprocessing protocol shared with extraction]
 
-### 3.9 `export`
+**Design history:**
+[optional register tokens](2026-09-28-otuformer-optional-registers-design.md).
+
+### 3.8 `export`
 Export encoder + projector to ONNX for deployment.
-
-- `--checkpoint` : pretrain or finetune checkpoint (OTU or ref-script format)
-- `--out-dir`
-- `--imgsz` : input image size [default: auto; `auto` uses the checkpoint's recorded training size]
-- `--opset` : ONNX opset version [default: 17]
-- `--model-name` : fallback timm backbone for checkpoints that record no model name (ref-script SFT) [default: `vit_tiny_patch16_224`]
-
-**Note:** Always exports encoder + projector only. The projector is rebuilt from the checkpoint's `config.embedding_head`, falling back to the projector shapes, so fine-tune checkpoints with an `ArcFaceEmbeddingHead` export correctly; the ref-script `projector.<i>` naming is normalized on read. Output embedding dimension is read from the checkpoint metadata (set by `--out-dim` or `--metric-embed-dim` at training time) — not hardcoded. A backbone that does not fit the resolved model name raises an error naming whether the conflict is in the checkpoint metadata or in `--model-name`.
 
 **Outputs:** `encoder.onnx`, `export_report.json`.
 
----
+**Key constraints:**
+- Always exports encoder + projector only. The projector is rebuilt from the checkpoint's `config.embedding_head`, falling back to the projector shapes, so fine-tune checkpoints with an `ArcFaceEmbeddingHead` export correctly; the ref-script `projector.<i>` naming is normalized on read. Output embedding dimension is read from the checkpoint metadata (set by `--out-dim` or `--metric-embed-dim` at training time) — not hardcoded. A backbone that does not fit the resolved model name raises an error naming whether the conflict is in the checkpoint metadata or in `--model-name`.
 
-### 3.10 `doctor`
+**Design history:**
+[optional register tokens](2026-09-28-otuformer-optional-registers-design.md).
+
+### 3.9 `doctor`
 Check environment health.
 
 **Checks:** Python version, PyTorch + CUDA/MPS availability, timm, scikit-bio, umap-learn, grad-cam, onnx, key package versions.
-
----
 
 ## 4. Key Design Decisions
 
@@ -441,3 +296,37 @@ tqdm >= 4.66
 - `report` sub-command (HTML/PDF summary of a full analysis run)
 - Beta diversity matrix + cross-sample OTU comparison
 - Python API / skill for notebook-based non-CLI analysis (after interfaces stabilise)
+
+---
+
+## 7. Documentation Conventions
+
+The documentation has three layers, each with one owner:
+
+```text
+README.md / README.cn.md          front page, installation, operational flags,
+                                  and the command table
+    └── links to →                docs/commands/<command>.md (+ .cn.md)
+
+docs/superpowers/specs/*.md       design record: purpose, contracts, invariants
+docs/superpowers/plans/*.md       execution plans
+```
+
+The load-bearing rules:
+
+- **`docs/commands/` owns the analysis-command flag surface.** Defaults, allowed
+  values, and worked examples live there. The CLI is the executable source of
+  truth and the document must match generated `--help`.
+- **The master design links to design specs only**, never to `docs/commands/`.
+  Reader path to current flags: README → command document.
+- **Design specs may name flags a decision or invariant requires**, but they do
+  not duplicate an exhaustive current parameter reference.
+- **Documentation is fully bilingual** with the `.cn.md` suffix, enforced by a
+  pairing and structure test.
+- **Documentation assertions read a corpus**, not fixed filenames, so moving
+  reference material cannot silently break a content test.
+
+The full conventions — layer model, language and naming rules, the command
+document skeleton, the `--help` boundary, the new-command checklist, and the test
+corpus contract — are in
+[the documentation conventions design](2026-09-29-otuformer-documentation-conventions-design.md).

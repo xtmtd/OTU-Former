@@ -10,7 +10,7 @@ from pathlib import Path
 
 import typer
 
-from otuformer.cli import format_user_command
+from otuformer.cli import docs_url, format_user_command
 
 app = typer.Typer(
     help=(
@@ -22,6 +22,8 @@ app = typer.Typer(
         "  otuformer cam --checkpoint runs/finetune/best.pt --images-dir ./images\n"
         "  otuformer cam --checkpoint best.pt --images-dir ./images --cam-method gradcampp --save-npy raw\n"
         "  otuformer cam --checkpoint best.pt --images-dir ./images --dump-model-structure  # list layers first\n"
+        "\nDocs:\n"
+        f"  {docs_url('cam')}\n"
     ),
 )
 

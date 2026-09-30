@@ -2,47 +2,28 @@
 
 [中文文档](README.cn.md) | **English**
 
-An image-based morphological OTU (Operational Taxonomic Unit) delineation toolkit. Provides a unified `otuformer` CLI with commands for self-supervised pretraining, supervised metric-learning finetuning (`--loss` selects `arcface`, `supcon`, `subcenter-arcface`, or `subcenter-arcface-compact`), embedding extraction (including quality metrics/UMAP when labels are provided), UPGMA hierarchical clustering, expert-corrected annotation, community diversity analysis, CAM visualization, and ONNX model export.
+An image-based morphological OTU (Operational Taxonomic Unit) delineation toolkit. Provides a unified `otuformer` CLI for self-supervised pretraining, supervised metric-learning finetuning, embedding extraction, UPGMA hierarchical clustering, expert-corrected annotation, community diversity analysis, CAM visualization, and ONNX model export.
 
-## Overview
+## Why OTU-Former
 
-All functionality is accessed through a single entry point:
+Turning specimen photographs into reproducible OTUs usually means stitching an embedding script, a clustering notebook, and a diversity calculation together by hand. OTU-Former packages that path into one command-line workflow:
 
-```
-otuformer <command> [options]
-```
+- **Images in, morphological barcodes out.** The toolkit consumes standardised specimen images and produces morphological barcodes, morphOTUs, and diversity data: a trained encoder turns each image into a fixed-dimension embedding, and every downstream step works on those vectors. It does not assemble reads, call targets, or infer ortholog groups upstream.
+- **Traceable steps.** Each command writes its outputs, logs, and resolved parameters into a predictable directory, so a run can be inspected, resumed, or reproduced.
+- **Expert corrections are first-class.** `annotate` folds manual OTU corrections back into the partition and reports the intra-class distances they imply.
+- **Diversity from morphology.** `diversity` computes alpha diversity, including Faith's PD from an OTU-centroid tree built from the embeddings.
 
-| Command | Description |
-|---------|-------------|
-| `doctor` | Diagnose environment and dependency status |
-| `pretrain` | Self-supervised contrastive pretraining (DINO/iBOT style) |
-| `finetune` | Supervised metric-learning finetuning (`--loss` selects the objective) |
-| `extract` | Extract image embeddings (ONNX-accelerated) |
-| `cluster` | UPGMA hierarchical clustering into morphological OTUs |
-| `annotate` | Apply expert corrections to produce refined OTU annotations |
-| `diversity` | Compute community alpha diversity indices (Shannon, Simpson, Chao1, Faith's PD, etc.) |
-| `cam` | Generate GradCAM and other heatmaps |
-| `export` | Export model to ONNX format |
-| `update` | Check for and install the latest published version |
+## Workflow Overview
 
-## Features
+1. **`doctor`** — check the environment and dependencies.
+2. **`pretrain`** — self-supervised contrastive pretraining; no labels required.
+3. **`finetune`** — supervised metric-learning finetuning with a selectable objective.
+4. **`extract`** — extract embeddings from images.
+5. **`cluster`** — UPGMA hierarchical clustering into morphological OTUs.
+6. **`annotate`** — apply expert corrections to the partition.
+7. **`diversity`** — compute community alpha diversity indices.
 
-- **Unified CLI**: Single `otuformer` entry point — covers the complete pipeline from pretraining to diversity analysis
-- **Self-Supervised Pretraining**: DINO/iBOT-style teacher-student ViT contrastive learning with global/local crops and masked-token consistency
-- **Supervised Metric-Learning Finetuning**: Optimize the model with labelled data and a selectable supervised objective (`arcface` by default, or `supcon`, `subcenter-arcface`, `subcenter-arcface-compact`) to produce discriminative embeddings for OTU clustering
-- **Multi-Mode Embedding Extraction**: CLS token, patch-topk, and attention-pool modes; optional ONNX acceleration
-- **Embedding Quality Evaluation**: NMI, ARI, Recall@K, kNN accuracy, mAP@R, Silhouette Score, Linear Probing Accuracy, and more
-- **UPGMA Hierarchical Clustering**: Build distance matrix and phylogenetic tree, auto-partition OTUs at multiple distance cutoffs
-- **PCA Whitening & Local Scaling**: Optional PCA whitening and Mutual-Proximity-style local scaling for improved clustering
-- **Bootstrap Support Estimation**: Subsample/bootstrap modes for branch support estimation
-- **Expert-Corrected Annotation**: Accept manual correction CSVs to produce refined OTU assignments with intra-class distance summaries
-- **Community Diversity Analysis**: Richness, Chao1, ACE, Shannon, Simpson, Hill numbers (q0/q1/q2), Pielou evenness, Faith's PD (MPD), weighted PD (MPD_w), and other alpha diversity metrics; phylogenetic diversity is computed from an OTU-centroid neighbor-joining tree when embeddings are provided
-- **Model Interpretability**: Six CAM algorithms — Grad-CAM, Grad-CAM++, LayerCAM, Score-CAM, Eigen-CAM, Ablation-CAM
-- **ONNX Export & Acceleration**: Export to ONNX format for 2-5x faster CPU inference
-- **UMAP Visualization**: Embedding space dimensionality reduction for intuitive morphological distribution
-- **Parallel Processing**: Multi-threaded image processing with configurable CPU threads
-- **Comprehensive Logging**: All commands automatically save run logs to the `logs/` subdirectory of the output directory
-- **Graceful Shutdown**: Safe Ctrl+C interruption with partial result preservation
+`cam` and `export` are side branches: interpretability heatmaps and ONNX export.
 
 ## Requirements
 
@@ -65,43 +46,39 @@ cd OTU-Former
 
 Choose one of the following:
 
-**Option 1: conda**
-
 ```bash
+# Option 1: conda
 conda create -n otuformer python=3.11 -y
 conda activate otuformer
 pip install -e .
-```
 
-**Option 2: uv + venv**
-
-```bash
+# Option 2: uv + venv
 uv venv .venv
 source .venv/bin/activate
 uv pip install -e .
-```
 
-**Option 3: stdlib venv + pip**
-
-```bash
+# Option 3: stdlib venv + pip
 python -m venv .venv
 source .venv/bin/activate
 pip install -e .
 ```
 
-## Usage
+## Quick Start
 
-Recommended workflow command order:
+```bash
+otuformer doctor
+otuformer pretrain --input-images-dir ./images --out-dir runs/pretrain
+otuformer finetune --checkpoint runs/pretrain/SSL_latest.pth \
+    --train-data labels.csv --input-images-dir ./images --out-dir runs/finetune
+otuformer extract --checkpoint runs/finetune/finetune_latest.pth \
+    --input-images-dir ./images --out-dir runs/extract
+otuformer cluster --embeddings runs/extract/embeddings.csv --out-dir runs/cluster
+```
 
-1. `doctor` — Check environment
-2. `pretrain` — Self-supervised pretraining
-3. `finetune` — supervised metric-learning finetuning
-4. `extract` — Extract embeddings
-5. `cluster` — UPGMA clustering into OTUs
-6. `annotate` — Apply expert corrections
-7. `diversity` — Diversity analysis
+Every command has its own reference document; they are linked from the table at the end of this file, and `otuformer <command> --help` shows the same link.
 
-### Doctor Command
+<a id="doctor-command"></a>
+## Doctor Command
 
 Diagnose environment and dependency readiness.
 
@@ -109,14 +86,10 @@ Diagnose environment and dependency readiness.
 otuformer doctor
 ```
 
-The report includes:
-- Python version and available devices (`cpu`, `cuda`, `mps`)
-- Key package versions and status (ok/missing/outdated)
+The report covers the Python version, the available devices (`cpu`, `cuda`, `mps`), and key package versions with an ok/missing/outdated status.
 
-**Output**:
-- Diagnostic report printed to terminal
-
-### Update Command
+<a id="update-command"></a>
+## Update Command
 
 ```bash
 otuformer update
@@ -124,15 +97,20 @@ otuformer update --check
 otuformer update --yes
 ```
 
+| Option | Meaning |
+|--------|---------|
+| `--check` | Only show version information. |
+| `--yes`, `-y` | Install without prompting. |
+
 Checks published Git tags and installs the latest release only after confirmation.
 
-### Output Safety
+## Output Safety
 
 Commands refuse a non-empty `--out-dir` by default. Pass `--overwrite` to clear
 it deliberately. Training `--resume` runs keep and append to their existing
 output directory; `--resume` and `--overwrite` cannot be combined.
 
-### Hugging Face Weights
+## Hugging Face Weights
 
 New pretrain and finetune runs initialize from public timm weights. An
 unauthenticated Hugging Face warning is expected when those weights are first
@@ -140,814 +118,11 @@ downloaded or absent from the local cache; `HF_TOKEN` is optional and only raise
 rate limits. CAM, extract, and export load their supplied local checkpoint and
 do not require Hugging Face access.
 
----
-
-### Pretrain Command
-
-Self-supervised contrastive pretraining using DINO/iBOT-style teacher-student ViT, no labels required.
-
-**Patch-level objectives (v0.7.0).** `--patch-loss` selects the patch objective:
-
-| `--patch-loss` | Student input | Objective |
-|---|---|---|
-| `none` | unmasked | no patch objective |
-| `consistency` (default) | unmasked | normalized cosine regression at selected visible same-position patches |
-| `masked-feature` | masked | continuous masked feature prediction |
-| `ibot` (experimental) | masked | prototype-distribution prediction |
-
-`consistency` selects fully visible patch positions, so it is **masked-position
-patch consistency**, not masked image modeling: the student still observes every
-selected pixel. `masked-feature` (continuous masked feature prediction) and
-`ibot` (experimental) replace the selected student patch
-embeddings with a learnable mask token before positional encoding, so the
-student never sees the selected content while its position is preserved. The
-teacher target for masked-feature is the L2-normalized mean of the teacher's
-final four block outputs. iBOT predicts the teacher's centered prototype
-distribution
-(`--ibot-prototypes`, default 512; any integer >= 2, with larger dictionaries
-for larger datasets) with moving-average centering.
-`masked-feature` and `ibot` are mutually exclusive and are never combined.
-
-`--masking-strategy` chooses the real-masking geometry for `masked-feature` and
-`ibot`; it has no effect for `none` or `consistency`:
-
-- `random` (default) — `round(ratio * N)` unique patch positions, sampled
-  independently per sample and per global view.
-- `blockwise` — two to four rectangle proposals per round, merged on overlap. A
-  legal rectangle has sides of at least two patches, an aspect ratio within
-  `[0.5, 2.0]`, and an area of at most `floor(0.20 * N)` patches. Overlap is
-  counted once, and the result is trimmed or random-filled to exactly
-  `round(ratio * N)` positions. A grid where no legal rectangle fits (for
-  example `4 x 4`, whose maximum block area is 3 while a `2 x 2` block needs 4)
-  fails before the training loop instead of silently degrading to `random`.
-- `hybrid` — exactly `floor(target / 2)` blockwise positions, then random fill
-  to the target count.
-
-Every strategy clamps the count to at least one masked and at least one visible
-patch.
-
-`--lambda-mask` (default `1.0`) weights the patch loss. iBOT's cross-entropy is
-on a different scale from the cosine patch losses, so `--patch-loss ibot` often
-needs a lower value (for example `0.25`-`0.5`). Loss values are not comparable
-across patch modes.
-
-**Migration notice: `--mask-ratio` now defaults to `auto` and a new run resolves
-it to 0.30, where v0.6.x used a 0.50 default.** Resuming a legacy checkpoint
-keeps its recorded ratio (0.50 when absent) and cannot switch to
-`masked-feature` or `ibot`. For `consistency`, `--mask-ratio` is the visible
-same-position share; for `masked-feature`/`ibot` it is the masked student-input
-fraction. Explicitly passing an option that the selected mode does not use is
-rejected rather than ignored.
-
-**Optional register tokens (v0.10.0).** `--register-tokens` accepts `none` (the default), `0` or `4`
-for an eligible single-CLS timm `VisionTransformer`. `4` adds four trainable
-registers and migrates the one-CLS pretrained backbone: the register token keeps
-its native initialization while every CLS/patch/block weight and position is
-preserved. `none` keeps the backbone's own architecture, so a native-register
-model keeps its own count; an explicit value on a native-register or CLS-free
-backbone is rejected, and DINOv3/Eva backbones are not supported by this option.
-Registers are never image patches: `patch-topk`, `attention-pool` extraction,
-CAM reshape, and the patch objective all skip every prefix token
-(`backbone.num_prefix_tokens`). New attention-pool checkpoints record their patch
-policy (`num_prefix_tokens`, `register_tokens`, `prefix_excluded`,
-`attention_pooling_type`) and are saved to a policy-tagged sibling, so a pool
-trained on a different patch set is never silently reused. ONNX export also
-compares CPU FP32 PyTorch against CPU ONNX Runtime on the same input
-(`atol=1e-4`, `rtol=1e-3`) and records `validation_status`, `max_abs_diff`, and
-the register count in `export_report.json`. A fine-tune run's register layout
-is part of the v0.9.0 pseudo-label experiment identity, so finetune#2 must
-initialize from a source with the same patch set.
-
-Masked-feature and iBOT add one masked student forward per global view, so
-student encoder work grows by roughly 1.65x at the default two-global/six-local
-crop layout. Extraction, fine-tuning, CAM, and export are unchanged: the default
-path is still the raw CLS token, they never load the training-only patch state,
-and they never invoke the mask token, predictor, or iBOT heads. Pretraining and
-pretraining resume support standard timm ViT backbones only. v0.7.0 resume is
-strict: patch mode, resolved ratio, masking strategy, prototype count, and the
-fixed target/center settings must match the checkpoint, and masked-feature/iBOT
-checkpoints
-must carry their `patch_objective` state. RNG state round-trips for v0.7.0
-checkpoints; legacy checkpoints resume best-effort with a warning.
-
-These objectives are self-supervised contextual feature prediction. They do not
-by themselves establish anatomical part semantics or dense morphology
-supervision, and v0.7.0 makes no dense-representation claim.
-
-When `--visualize-data` has no `label` column, periodic supervised metrics are skipped and UMAP is still generated from the visualization embeddings.
-
-To continue pretraining after adding images, create a CSV containing both old and
-new images, keep the same `--out-dir`, pass the latest checkpoint to `--resume`,
-and increase `--max-epochs`:
-
-```bash
-otuformer pretrain --train-data images_union.csv --input-images-dir ./images \
-    --out-dir runs/pretrain --resume runs/pretrain/SSL_latest.pth --max-epochs 100
-```
-
-An extended run may use a larger union dataset. A same-plan resume requires the
-original DataLoader length. Training on only newly added images is possible but
-can forget previously learned data.
-
-```bash
-# Basic usage
-otuformer pretrain \
-    --augmentation global-barcode \
-    --input-images-dir ./images \
-    --out-dir runs/pretrain
-
-# Use CSV to specify training subset
-otuformer pretrain \
-    --train-data images.csv \
-    --input-images-dir ./images \
-    --out-dir runs/pretrain
-
-# Custom model and training parameters
-otuformer pretrain \
-    --input-images-dir ./images \
-    --model-name vit_small_patch16_224 \
-    --max-epochs 100 \
-    --lr 1e-3 \
-    --batch-size 64 \
-    --out-dir runs/pretrain
-```
-
-| Parameter | Description | Default |
-|-----------|-------------|---------|
-| `--train-data` | Training data CSV (with `image` column, paths relative to `--input-images-dir`); if omitted, all images under `--input-images-dir` are used recursively | None |
-| `--input-images-dir` | Root image directory | Required |
-| `--out-dir` | Output directory | `runs/pretrain` |
-| `--model-name` | timm backbone name | `vit_tiny_patch16_224` |
-| `--register-tokens` | Register tokens for an eligible single-CLS ViT: `none`, `0` or `4`. `none` keeps the backbone's own architecture (no registers, or a native-register model's own count); explicit `0` is rejected on a CLS-free backbone | `none` |
-| `--out-dim` | SSL projector output dimension | 256 |
-| `--max-epochs` | Pretraining epochs | 50 |
-| `--lr` | Base learning rate | 5e-4 |
-| `--weight-decay` | AdamW weight decay | 0.05 |
-| `--warmup-epochs` | Warmup epochs | 3 |
-| `--global-crop-size` | Global crop resolution; `auto` uses the backbone's native input size (new run) or the checkpoint's recorded size (`--resume`). Common: 224, 384, 448 (518 = patch-14 models only) | auto |
-| `--local-crop-size` | Local crop resolution (must be divisible by the backbone patch size, e.g. 98 or 112 for patch-14 models) | 96 |
-| `--local-crops` | Number of local crops | 6 |
-| `--augmentation` | Pretraining augmentation profile: `global-barcode` (new-run default), `color-robust`, or `legacy`; omit to inherit the saved profile on `--resume` | `global-barcode` |
-| `--orientation-policy` | Orientation policy for every global and local view (no transform effect for `legacy`): `sensitive` (new-run default; rotation `[-15°, 15°]`, no horizontal reflection) or `invariant` (opt-in broad rotation and reflection); omit to inherit the saved policy on `--resume` | `sensitive` |
-| `--patch-loss` | Patch-level objective: `none`, `consistency` (default; visible same-position cosine consistency, not input masking), `masked-feature` (continuous masked feature prediction) or `ibot` (experimental prototype prediction) | `consistency` |
-| `--masking-strategy` | Real-masking geometry for `masked-feature`/`ibot`: `random`, `blockwise` or `hybrid` | `random` |
-| `--mask-ratio` | `auto` or a float in (0, 1). `auto` resolves to 0.30 for a new run (v0.6.x used 0.50); a legacy resume keeps its recorded value (0.50 when absent) | auto |
-| `--ibot-prototypes` | Prototype dictionary size for `ibot`; any integer >= 2, default 512, larger for larger datasets | 512 |
-| `--lambda-local` | Local crop loss weight | 1.5 |
-| `--lambda-mask` | Patch-loss weight; lower it for `ibot` (for example 0.25-0.5) | 1.0 |
-| `--teacher-momentum` | Initial EMA momentum | 0.995 |
-| `--teacher-momentum-end` | Final EMA momentum | 0.999 |
-| `--student-temp` | Student temperature | 0.1 |
-| `--teacher-temp-start` | Initial teacher temperature | 0.04 |
-| `--teacher-temp-end` | Final teacher temperature | 0.07 |
-| `--disable-cross-view-loss` | Disable cross-view global loss | No |
-| `--resume` | Checkpoint path for resuming interrupted training | None |
-| `--log-every-n-steps` | Log metrics every N steps | 50 |
-| `--save-every-epochs` | Save checkpoint every N epochs | 10 |
-| `--keep-last-checkpoints` | Keep only last N checkpoints | 10 |
-| `--visualize-data` | CSV with `image` and optional `label`; without labels, only UMAP is generated; if omitted, `--train-data` is reused | None |
-| `--extract-size` | Image size for embedding extraction; `auto` uses the model's img_size | auto |
-| `--metrics-sample-size` | Max samples for periodic metrics and UMAP; <=0 means no cap | 10000 |
-| `--umap-n-neighbors` | UMAP n_neighbors | 15 |
-| `--umap-min-dist` | UMAP min_dist | 0.1 |
-| `--umap-metric` | UMAP distance metric | `cosine` |
-| `--visualize-class-number` | Max classes in UMAP plot | 20 |
-| `--disable-embedding-metrics` | Disable periodic embedding metrics + UMAP | No |
-| `--batch-size` | Batch size | 32 |
-| `--num-workers` | DataLoader workers | 4 |
-| `--cpus` | PyTorch/MKL CPU threads | 12 |
-| `--device` | `auto`/`cpu`/`cuda`/`mps` | `auto` |
-| `--seed` | Random seed | 42 |
-
-**Local-view resume inheritance.** On `--resume`, omitted `--local-crop-size` and `--local-crops` inherit the checkpoint's saved values; explicit conflicting values fail, and changing them requires a new run.
-
-**Output**:
-- `logs/pretrain.log` — Run log
-- `SSL_latest.pth`, `SSL_epoch_*.pth` — Model checkpoints, written to `--out-dir` (there is no `checkpoints/` subdirectory and no `SSL_best.pth`)
-- `logs/metrics.pretrain.csv` — Periodic embedding metrics
-- `logs/instant_metrics.pretrain.csv` — Per-iteration training metrics
-- `logs/training_curves_pretrain.pdf` — Training-curve plot
-- `logs/umap.train.epoch_<N>.pdf` — Periodic UMAP plots (when not disabled)
-
----
-
-### Finetune Command
-
-Supervised metric-learning finetuning with labelled data; `--loss` selects the
-objective (see "Metric-loss modes (v0.8.0)").
-
-A separate image-only `--visualize-data` CSV may be used for UMAP; supervised metrics require at least two label classes.
-
-To add images to known classes, train with a CSV containing the union of old and
-new labeled images, keep the same `--out-dir`, resume from the latest fine-tune
-checkpoint, and increase `--finetune-epochs`:
-
-```bash
-otuformer finetune --train-data labels_union.csv --input-images-dir ./images \
-    --out-dir runs/finetune --resume runs/finetune/finetune_latest.pth \
-    --finetune-epochs 50
-```
-
-The resumed CSV must retain exactly the same label set. New classes require a
-new fine-tune initialized with `--checkpoint` rather than `--resume`.
-
-```bash
-# Basic usage
-otuformer finetune \
-    --checkpoint runs/pretrain/SSL_latest.pth \
-    --train-data labels.csv \
-    --input-images-dir ./images \
-    --out-dir runs/finetune
-
-# Resume training
-otuformer finetune \
-    --resume runs/finetune/finetune_latest.pth \
-    --train-data labels.csv \
-    --input-images-dir ./images \
-    --out-dir runs/finetune
-
-# Custom parameters
-otuformer finetune \
-    --checkpoint runs/pretrain/SSL_latest.pth \
-    --train-data labels.csv \
-    --input-images-dir ./images \
-    --model-name vit_small_patch16_224 \
-    --augmentation conservative \
-    --finetune-epochs 50 \
-    --finetune-lr 3e-4 \
-    --freeze-ratio 0.5 \
-    --loss arcface \
-    --out-dir runs/finetune
-```
-
-**Sparse-label pseudo-label feedback.** One optional round recovers unlabeled
-images of known species without a candidate-list input: candidates are discovered
-automatically as supported images under `--input-images-dir` minus the expert CSV
-references. Use a dedicated data root separate from the run tree
-(`DATA_ROOT/dorsal/` vs `RUN_ROOT/finetune1/`); `--out-dir` must not overlap the
-image root, and every file-valued input must stay outside `--out-dir`.
-
-```bash
-# finetune#1 records its expert-manifest and SSL identity for later reuse
-otuformer finetune --checkpoint runs/pretrain/SSL_latest.pth \
-    --train-data labels.csv --input-images-dir DATA_ROOT/dorsal \
-    --out-dir RUN_ROOT/finetune1 --finetune-epochs 20
-
-# finetune#2: one automatic pseudo round from the same original SSL checkpoint
-otuformer finetune --train-data labels.csv --input-images-dir DATA_ROOT/dorsal \
-    --pseudo-label-from RUN_ROOT/finetune1/finetune_latest.pth \
-    --out-dir RUN_ROOT/finetune2 --finetune-epochs 20
-```
-
-- Pseudo mode is ArcFace-family only and one round only; a finetune#2 checkpoint
-  cannot seed another round.
-- Omitted experiment options inherit finetune#1 resolved values; explicit
-  conflicts fail. Finetune#2 always initializes from the same original SSL
-  checkpoint; `--checkpoint` in pseudo mode only locates that SSL file after it
-  moved (its file SHA-256 must still match).
-- Preprocessing is fixed to `center-crop`. Outputs are `pseudo_labels.csv` (one
-  diagnostic row per candidate) and `pseudo_summary.json`.
-- `--pseudo-similarity-floor` (default 0.75) is an uncalibrated raw-CLS
-  top-three-mean cosine class score, not a probability. Higher floor and gap
-  reject more; smaller `--pseudo-neighbors` (default 15) is usually more local
-  and stricter. Each class additionally accepts at most
-  `min(--pseudo-cap-multiplier * expert_seed_count, --pseudo-absolute-cap)`
-  rows (defaults 3 and 50) after the three feature rules.
-- The diagnostic CSV is not an approval gate; an empty accepted set fails before
-  creating the output directory.
-- `--long-tail cb-drw` is an independent conventional long-tail option for
-  ArcFace-family losses (fixed beta 0.99, cap 3.0, deferred 50%/50%..10%); it must
-  match between pseudo rounds.
-- `--input-images-dir` must be a real directory tree (directory symlinks are
-  not traversed and are reported); explicit `--visualize-data` still works for
-  arbitrary UMAP/metric diagnostics.
-- Evaluate RUN1 vs RUN2 on held-out images under a separate `HELDOUT_ROOT`:
-  `otuformer extract --input-images-dir HELDOUT_ROOT --label-csv HELDOUT.csv`.
-  Held-out images left inside the training root would become pseudo candidates.
-
-| Parameter | Description | Default |
-|-----------|-------------|---------|
-| `--checkpoint` | Pretrained checkpoint path (typically `runs/pretrain/SSL_latest.pth`); optional in `--pseudo-label-from` mode (where it only relocates the recorded SSL file) and on `--resume` | Required (except pseudo mode or `--resume`) |
-| `--resume` | Finetune checkpoint path to resume from | None |
-| `--train-data` | Training data CSV (with `image` and `label` columns) | Required |
-| `--input-images-dir` | Root image directory | Required |
-| `--out-dir` | Output directory | `runs/finetune` |
-| `--model-name` | timm backbone name | `vit_tiny_patch16_224` |
-| `--metric-embed-dim` | Fine-tune embedding dimension (metric-embedding head output, not raw CLS). An explicit value resizes the head; it is rejected for a historical `ProjectionHead` checkpoint, whose width is fixed by the pretrained projector | inherit the checkpoint's metric dimension |
-| `--finetune-epochs` | Finetuning epochs | 20 |
-| `--finetune-lr` | Backbone learning rate | 1e-4 |
-| `--metric-head-lr` | Embedding head and, for prototype losses, classifier learning rate; omitted inherits `--finetune-lr` | `--finetune-lr` |
-| `--weight-decay` | Fine-tune AdamW weight decay; default `1e-4` is a conservative supervised choice, while `0.05` reproduces the legacy script's setting | 1e-4 |
-| `--freeze-ratio` | Fraction of backbone blocks to freeze (0.0=none, 1.0=all) | 0.7 |
-| `--loss` | Metric-learning loss: `arcface` (default), `supcon`, `subcenter-arcface`, or `subcenter-arcface-compact`; see "Metric-loss modes (v0.8.0)" | `arcface` |
-| `--subcenters` | Centers per class (K) for `--loss subcenter-arcface` or `subcenter-arcface-compact`: an integer from 2 to 8; `arcface` and `supcon` reject the flag | 2 |
-| `--compact-weight` | Same-class center-distance hinge weight for `--loss subcenter-arcface-compact` (cap is fixed at 0.5) | 0.1 |
-| `--supcon-temperature` | Temperature for `--loss supcon`; must be greater than 0 | 0.07 |
-| `--long-tail` | Long-tail strategy: `none` or `cb-drw` (ArcFace-family only; fixed beta 0.99, cap 3.0, deferred 50%/10%) | `none` |
-| `--pseudo-label-from` | Completed finetune#1 ArcFace-family checkpoint for one automatic pseudo round | None |
-| `--pseudo-similarity-floor` | Uncalibrated raw-CLS top-three-mean cosine class-score floor in [-1, 1] | 0.75 |
-| `--pseudo-min-gap` | Winning-score minus runner-up-score gap in [0, 2] | 0.10 |
-| `--pseudo-neighbors` | Neighbor count for the asymmetric own-class-excluded mutual-kNN check | 15 |
-| `--pseudo-cap-multiplier` | Per-class acceptance cap multiplier: `min(multiplier * expert_seed_count, absolute_cap)` | 3 |
-| `--pseudo-absolute-cap` | Absolute per-class acceptance cap | 50 |
-| `--trace-batch-ids` | Write the ordered image IDs of every training batch to `logs/batch_ids.finetune.jsonl` (opt-in, can be large) | No |
-| `--augmentation` | Fine-tuning augmentation profile: `none` (new-run default) or `conservative` (experimental); omit to inherit the saved profile on `--resume` | `none` |
-| `--orientation-policy` | Orientation policy: `sensitive` (new-run default) or `invariant`; affects `conservative` only. Omit on `--checkpoint` initialization to inherit the pretraining checkpoint's saved policy; omit on `--resume` to inherit the saved policy | `sensitive` |
-| `--batch-size` | Batch size | 32 |
-| `--num-workers` | DataLoader workers | 4 |
-| `--cpus` | PyTorch/MKL CPU threads | 12 |
-| `--device` | `auto`/`cpu`/`cuda`/`mps` | `auto` |
-| `--seed` | Random seed | 42 |
-| `--log-every-n-steps` | Log metrics every N steps | 50 |
-| `--save-every-epochs` | Save checkpoint every N epochs | 10 |
-| `--keep-last-checkpoints` | Keep only last N checkpoints | 10 |
-| `--visualize-data` | CSV with `image` and optional `label`; without labels, only UMAP is generated; if omitted, `--train-data` is reused | None |
-| `--extract-size` | Image size for embedding extraction; `auto` uses the model's img_size | auto |
-| `--metrics-sample-size` | Max samples for periodic metrics and UMAP; <=0 means no cap | 10000 |
-| `--umap-n-neighbors` | UMAP n_neighbors | 15 |
-| `--umap-min-dist` | UMAP min_dist | 0.1 |
-| `--umap-metric` | UMAP distance metric | `cosine` |
-| `--visualize-class-number` | Max classes in UMAP plot | 20 |
-| `--disable-embedding-metrics` | Disable periodic embedding metrics + UMAP | No |
-
-**Output**:
-- `logs/finetune.log` — Run log
-- `finetune_latest.pth`, `finetune_epoch_*.pth` — Model checkpoints, written to `--out-dir` (there is no `checkpoints/` subdirectory and no `finetune_best.pth`)
-- `logs/metrics.finetune.csv` — Periodic embedding metrics
-- `logs/instant_metrics.finetune.csv` — Per-iteration training metrics
-- `logs/loss_diagnostics.finetune.csv` — Per-epoch v0.8.0 loss diagnostics
-- `logs/batch_ids.finetune.jsonl` — Training-batch ID trace (only with `--trace-batch-ids`)
-- `logs/training_curves_finetune.pdf` — Training-curve plot
-- `logs/umap.train.epoch_<N>.pdf` — Periodic UMAP plots (when not disabled)
-
-**Checkpoint handling**:
-
-- `--checkpoint` starts a new run. An SSL pretrain checkpoint installs a fresh embedding head; a fine-tune checkpoint whose head and width match keeps its trained projector. A historical `ProjectionHead` checkpoint keeps its projector, which fixes the embedding width.
-- `--resume` restores the saved optimizer state, so `--finetune-lr`, `--metric-head-lr`, and `--weight-decay` have no effect. `--freeze-ratio` must match the saved value.
-- Ref-script checkpoints (`ref/ibot20260115.py`) can be read by `extract`, `export`, and `cam`, but cannot be resumed by `finetune`.
-
-**Metric-loss modes (v0.8.0).** `--loss` accepts four explicit supervised
-targets, and rejects an unknown name or a setting that does not apply to the
-resolved mode before creating any output. ArcFace stays the default and the
-v0.8.0 reference loss.
-
-| Mode | Objective |
-|------|-----------|
-| `arcface` | One angular-margin classifier center per labelled species (default) |
-| `supcon` | Single-view supervised contrastive loss over batch-wise image pairs |
-| `subcenter-arcface` | K centers per species; a sample approaches its closest center |
-| `subcenter-arcface-compact` | Sub-center ArcFace plus a bounded same-class center-distance penalty |
-
-- Classifier centers are **training-only** state: `extract`, `cluster`, and the
-  default downstream workflow never read them, and morphology metadata never
-  enters training.
-- **Raw CLS stays the comparison target.** The loss acts on the fine-tune head
-  while the default `extract` vector is the backbone's raw CLS embedding, so a
-  lower training loss does not by itself prove better distances. Hold
-  `--freeze-ratio`, the backbone and metric-head learning rates, the epoch
-  budget, augmentation, the training manifest, batch size, and seed fixed
-  across modes. An **open-set** comparison calibrates each loss on held-out
-  known species and applies it without retuning to unseen species.
-- First-round exploratory settings are SupCon temperature `0.07`, K `2`,
-  cosine-distance cap `0.5`, and compact weight `0.1`. They are starting values,
-  not validated optima; there is no first-round parameter grid or benchmark
-  runner.
-- `supcon` skips a batch with no valid positive anchor or no different-species
-  pair, reports the skipped batches, and fails the run when a whole epoch is
-  unusable instead of saving a checkpoint trained on an empty signal.
-- New v0.8.0 checkpoints record the loss name and its effective settings, the
-  seed, the source-checkpoint SHA-256 values, `train_manifest_sha256`, the
-  optimizer layout, and the prototype weight-decay rule. New v0.8.0 ArcFace
-  runs set zero weight decay on the L2-normalized prototypes where v0.7.x
-  applied the requested decay (default `1e-4`). Because the forward pass
-  normalizes the prototypes, that decay only rescaled their norm, which the
-  loss never observes; at the default `--finetune-lr 1e-4` and
-  `--weight-decay 1e-4` it is below float32 resolution, so results are
-  numerically identical to v0.7.x. A larger learning-rate x weight-decay
-  product does change the raw prototype norm, so cross-version checkpoints are
-  not guaranteed to be loss-only controlled comparisons. A legacy `--resume`
-  keeps its saved optimizer semantics, and resuming an SSL or classifier-free
-  initialization checkpoint is rejected.
-- `logs/loss_diagnostics.finetune.csv` holds one row per completed epoch
-  (usable and skipped batches, valid anchors, margin-satisfied fraction, compact
-  hinge activation and penalty, per-class/per-center assignment counts, and
-  center-direction cosine). `logs/batch_ids.finetune.jsonl` is written only
-  with `--trace-batch-ids`. The existing `logs/metrics.finetune.csv` and
-  `logs/instant_metrics.finetune.csv` schemas are unchanged.
-
----
-
-### Embedding Metrics (v0.7.1)
-
-`pretrain`, `finetune`, and `extract` compute the same embedding-quality metrics
-under the same field names. Periodic logs live in `logs/metrics.pretrain.csv` and
-`logs/metrics.finetune.csv`; `extract` writes `metrics.csv` when `--label-csv`
-provides at least two classes.
-
-- Cross-validated kNN and linear-probe scores share one explicit shuffled
-  `StratifiedKFold(shuffle=True, random_state=42)`. The fold count is
-  `min(5, smallest class count)`, so a two-class dataset is no longer forced to
-  two folds. Every CV metric is unavailable when a class has a single sample.
-- The historical fields `kNN_Acc_k1`, `kNN_Acc_k5`, and `kNN_Acc_k20` are
-  retained. A requested `k` larger than the smallest training fold (or than
-  `n_samples - 1` for `Recall@k`) is unavailable rather than silently renamed.
-- `Linear_Probing_Acc` is the ordinary CV accuracy; the new
-  `Linear_Probing_Balanced_Acc` is the class-balanced accuracy from the same CV
-  pass.
-- Metrics that cannot be computed are written as empty CSV fields and appear as
-  gaps, not zeros, in training plots. Clustering metrics are unavailable when
-  there are fewer distinct normalized embeddings than classes, instead of
-  fabricating a single cluster.
-- `mAP` ranks only non-query samples and excludes queries with no non-self
-  relevant item. `Recall@k` intentionally keeps every query in its denominator,
-  including singleton labels; the two singleton-query conventions differ on
-  purpose for historical comparability.
-- `Silhouette_Score` is the cosine silhouette computed against the true labels.
-
-`cam` and `extract` validate enumerated query parameters natively and reject
-values outside their choices before any output directory is created.
-
-**Comparability.** Values recorded before v0.7.1 are not numerically comparable
-with v0.7.1 outputs: CV fold selection, subsample ordering, `mAP` self-inclusion,
-and unsupported-value handling all changed. Field names and historical rows stay
-readable, and a resumed v0.7.0 `metrics.pretrain.csv`/`metrics.finetune.csv` is
-migrated in place by adding an empty `Linear_Probing_Balanced_Acc` column.
-
----
-
-### Training Augmentation Profiles
-
-`pretrain` accepts `--augmentation global-barcode|color-robust|legacy` (new-run default `global-barcode`) and `--orientation-policy invariant|sensitive` (new-run default `sensitive`). `finetune` accepts `--augmentation none|conservative` (new-run default `none`) and the same orientation policies.
-
-| Profile | Stage | Summary |
-|---------|-------|---------|
-| `global-barcode` | pretrain (default) | Whole-specimen barcode profile; orientation handling follows the selected policy. Modest photometric jitter; color is preserved (no grayscale). |
-| `color-robust` | pretrain | Same geometry and blur as `global-barcode` with stronger color jitter and grayscale. **Warning:** it may reduce sensitivity to diagnostic body color, color patterns, or metallic sheen. |
-| `legacy` | pretrain | Reproduces OTU-Former 0.2.1 augmentation exactly for old-run continuation and comparison, not for new runs. It records either orientation policy without changing its historical transforms. |
-| `none` | finetune (default) | Unchanged deterministic `Resize -> CenterCrop -> ToTensor -> Normalize`. |
-| `conservative` | finetune | Experimental opt-in profile, not proven superior to `none`; evaluate it on held-out individuals and held-out species. It adds no crop, grayscale, blur, or solarization. |
-
-**Biological contract.** Dorsal, ventral, lateral, whole-body, and anatomical-part images are distinct markers and must not be mixed as interchangeable views of one marker; arbitrary in-plane orientation is supported. The complete-marker requirement applies to the source image, not to every stochastic SSL crop. Global and local crops are partial SSL observations of one complete source marker, so augmentation encourages but does not guarantee embedding invariance.
-
-**Orientation policy.** `sensitive` is the new-run default and an explicit caller choice (never inferred) for direction-sensitive markers: every global/local pretraining view and fine-tuning `conservative` uses rotation `[-15°, 15°]` and no horizontal reflection. The default was chosen because the 50-epoch implementation comparison, which used the then-default `invariant` and did not evaluate `sensitive`, found no rotation-consistency gain from broad `invariant` rotation, and ±180° rotation is not a plausible routine augmentation. `invariant` is the opt-in broad-rotation/reflection policy for orientation-insensitive markers and preserves the existing behavior. `legacy` accepts either policy but keeps its historical flips.
-
-**Input size.** Both fine-tuning profiles use the checkpoint-recorded training input size, with a `224` fallback for old checkpoints that do not record one.
-
-**Resume and inheritance.** Omitted `--augmentation` and `--orientation-policy` inherit on resume; explicit conflicts fail, and changing a profile's expanded parameters requires a new run. Old pretrain checkpoints map to `legacy`/`invariant`; old finetune checkpoints map to `none`/`invariant`. Starting a new fine-tuning run from `--checkpoint` is initialization, not resume: it never inherits the pretraining augmentation profile, and an omitted policy inherits the pretraining checkpoint policy (fallback `sensitive` for old checkpoints).
-
-Checkpoint metadata (`config.augmentation_profile`, `config.augmentation_config`) provides configuration traceability, not bitwise deterministic replay. Full transform-level definitions are in [`docs/superpowers/specs/2026-09-07-otuformer-training-augmentation-design.md`](docs/superpowers/specs/2026-09-07-otuformer-training-augmentation-design.md).
-
----
-
-### Extract Command
-
-Extract embeddings from images. Supports ONNX model for accelerated CPU inference.
-
-Accepts OTU checkpoints and ref-script checkpoints (`ref/ibot20260115.py`). The embedding head is rebuilt from `config.embedding_head`, falling back to the projector shapes in the weights.
-
-`--label-csv` requires an `image` column and accepts an optional `label` column. Image-only input generates UMAP without supervised metrics; attention-pool query training still requires labels.
-
-```bash
-# Using PyTorch checkpoint (CLS token mode)
-otuformer extract \
-    --checkpoint runs/finetune/finetune_latest.pth \
-    --input-images-dir ./images \
-    --out-dir runs/extract
-
-# Using ONNX model (2-5x faster on CPU)
-otuformer extract \
-    --checkpoint runs/finetune/finetune_latest.pth \
-    --input-images-dir ./images \
-    --onnx-path runs/export/encoder.onnx \
-    --out-dir runs/extract
-
-# With label CSV in attention-pool mode
-otuformer extract \
-    --checkpoint runs/finetune/finetune_latest.pth \
-    --input-images-dir ./images \
-    --label-csv labels.csv \
-    --token-mode attention-pool \
-    --out-dir runs/extract
-```
-
-| Parameter | Description | Default |
-|-----------|-------------|---------|
-| `--checkpoint` | Pretrain or finetune checkpoint path; required unless `--onnx-path` is provided | None |
-| `--input-images-dir` | Input image directory | Required |
-| `--out-dir` | Output directory | `runs/extract` |
-| `--model-name` | timm backbone name | `vit_tiny_patch16_224` |
-| `--extract-size` | Resize/crop size for extraction; `auto` uses the checkpoint's recorded training size | auto |
-| `--eval-transform` | Evaluation preprocessing protocol: `center-crop` (default) or `whole-specimen-pad` (aspect-preserving square padding, reserved) | `center-crop` |
-| `--use-projector-output` | Use SSL projector output, or the fine-tune task embedding for fine-tune checkpoints | No |
-| `--use-student` | Load student weights instead of teacher (EMA) | No |
-| `--token-mode` | `cls`/`patch-topk`/`attention-pool` | `cls` |
-| `--topk-patches` | Top-K patch tokens for patch-topk mode | 20 |
-| `--attention-pooling-type` | `lightweight`/`multihead`/`gated` | `lightweight` |
-| `--attention-pooling-epochs` | Epochs to finetune attention query | 20 |
-| `--label-csv` | CSV with `image` and optional `label`; image-only input generates UMAP without supervised metrics; attention-pool training still needs `label` | None |
-| `--metrics-sample-size` | Max samples for metrics and UMAP evaluation; <=0 means no cap | 10000 |
-| `--umap-n-neighbors` | UMAP n_neighbors | 15 |
-| `--umap-min-dist` | UMAP min_dist | 0.1 |
-| `--umap-metric` | UMAP distance metric | `cosine` |
-| `--visualize-class-number` | Max classes in UMAP plot | 20 |
-| `--disable-umap` | Skip UMAP generation | No |
-| `--batch-size` | Batch size | 32 |
-| `--num-workers` | DataLoader workers | 4 |
-| `--device` | `auto`/`cpu`/`cuda`/`mps` | `auto` |
-| `--onnx-path` | ONNX model path (uses ONNX Runtime when provided) | None |
-| `--seed` | Random seed | 42 |
-
-**Output**:
-- `embeddings.csv` — Embedding vectors (`id`, `dim_0`, `dim_1`, ...)
-- `metrics.csv` — Quality metrics (when `--label-csv` provides at least two classes)
-- `umap.pdf` — UMAP visualization (when `--label-csv` is provided and not disabled)
-
----
-
-### Cluster Command
-
-Cluster embeddings into morphological OTUs via UPGMA hierarchical clustering.
-
-```bash
-# Basic usage
-otuformer cluster \
-    --embeddings runs/extract/embeddings.csv \
-    --out-dir runs/cluster
-
-# With PCA whitening, local scaling, and bootstrap support
-otuformer cluster \
-    --embeddings runs/extract/embeddings.csv \
-    --pca-whitening true \
-    --local-scaling true \
-    --num-replicates 100 \
-    --out-dir runs/cluster
-
-# Custom distance metric and cutoff range
-otuformer cluster \
-    --embeddings runs/extract/embeddings.csv \
-    --distance euclidean \
-    --cutoff-min 0.1 \
-    --cutoff-max 0.8 \
-    --cutoff-step 0.02 \
-    --out-dir runs/cluster
-
-# With label CSV for partition quality evaluation
-otuformer cluster \
-    --embeddings runs/extract/embeddings.csv \
-    --label-csv labels.csv \
-    --out-dir runs/cluster
-```
-
-| Parameter | Description | Default |
-|-----------|-------------|---------|
-| `--embeddings` | Embeddings CSV | Required |
-| `--out-dir` | Output directory | `runs/cluster` |
-| `--distance` | Distance metric: `cosine`/`euclidean` | `cosine` |
-| `--prefix` | Cluster prefix for partition table labels | `OTU` |
-| `--pca-whitening` | Enable PCA whitening (`true`/`false`) | `false` |
-| `--pca-components` | PCA components | 256 |
-| `--local-scaling` | Enable Mutual-Proximity local scaling (`true`/`false`) | `false` |
-| `--local-k` | Fixed k for local scaling (0=auto) | 0 |
-| `--local-k-strategy` | Auto-k strategy: `adaptive`/`sqrt`/`log`/`fixed` | `adaptive` |
-| `--cutoff-min` | Minimum distance cutoff | 0.05 |
-| `--cutoff-max` | Maximum distance cutoff | 1.0 |
-| `--cutoff-step` | Cutoff step size | 0.05 |
-| `--custom-cutoffs` | Custom cutoffs (comma-separated, overrides min/max/step) | None |
-| `--support-mode` | Support estimation mode: `subsample`/`bootstrap` | `subsample` |
-| `--num-replicates` | Support estimation replicates (0=disabled) | 0 |
-| `--subsample-ratio` | Feature fraction for subsample mode | 0.8 |
-| `--support-display-cutoff` | Minimum support threshold for tree labels | 50.0 |
-| `--save-bootstrap-trees` | Save all bootstrap trees (`true`/`false`) | `false` |
-| `--save-distances` | Save full distance matrix (`true`/`false`) | `false` |
-| `--max-distance-pairs` | Max distance matrix pairs | 1000000 |
-| `--label-csv` / `--labels` | Optional label CSV for partition quality evaluation | None |
-| `--metrics-sample-size` | Max samples for metrics | 10000 |
-| `--cpus` | CPU threads | 8 |
-| `--random-state` | Random seed | 42 |
-
-**Output**:
-- `UPGMA/UPGMA_Cosine.nwk` — Newick format phylogenetic tree
-- `UPGMA/partitions/partition_scan.csv` — Threshold scan results
-- `UPGMA/partitions/tables/partition_<cutoff>_assignments.csv` — OTU assignments at each cutoff
-- `UPGMA/partitions/UPGMA_tree_partitions.pdf` — Tree and partition visualization
-- `UPGMA/metrics.csv` — Partition quality metrics (when `--label-csv` is provided)
-- `UPGMA/metrics_dashboard.pdf` — Metrics dashboard (when `--label-csv` is provided)
-- `distance_statistics/` — Distance statistics and distribution plots
-
----
-
-### Annotate Command
-
-Apply expert corrections to cluster assignments, producing refined OTU annotations.
-
-```bash
-# Basic usage
-otuformer annotate \
-    --raw-assignments runs/cluster/UPGMA/partitions/tables/partition_0.30_assignments.csv \
-    --corrections corrections.csv \
-    --out-dir runs/annotate
-
-# With embeddings (recompute intra-class distances and annotated UPGMA tree)
-otuformer annotate \
-    --raw-assignments runs/cluster/UPGMA/partitions/tables/partition_0.30_assignments.csv \
-    --corrections corrections.csv \
-    --embeddings runs/extract/embeddings.csv \
-    --show-annotation-bar \
-    --out-dir runs/annotate
-```
-
-| Parameter | Description | Default |
-|-----------|-------------|---------|
-| `--raw-assignments` | Raw partition assignment CSV from cluster output | Required |
-| `--corrections` | Corrections CSV (minimum: `id`/`image` and `cluster` columns) | Required |
-| `--embeddings` | Optional embeddings CSV for distance recomputation | None |
-| `--support-display-cutoff` | Minimum support threshold for annotated UPGMA tree labels | 50.0 |
-| `--figure-width` | Annotated UPGMA PDF width in inches | Auto |
-| `--annotate-bar-width` | Relative width of corrected OTU color bars | 0.08 |
-| `--show-annotation-bar` | Show corrected OTU annotation bars in annotated UPGMA PDF | No |
-| `--show-partitioning-bars` | Show partitioning bars in annotated UPGMA PDF | No |
-| `--out-dir` | Output directory | `runs/annotate` |
-
-**Output**:
-- `partition_<cutoff>_assignments.csv` — Corrected assignments
-- `partition_<cutoff>_assignments_changed_only.csv` — Changed rows only
-- `otu_table.csv` — OTU table
-- `pairwise_distance_summary_intra-class.csv` — Intra-class distance summary (with `--embeddings`)
-- `UPGMA_tree_partitions_annotated.pdf` — Annotated UPGMA tree (with `--embeddings`)
-- `annotation_summary.json` — Correction summary
-
----
-
-### Diversity Command
-
-Compute community alpha diversity indices. Supports two input modes: partition assignment CSV or OTU table CSV. For Faith's PD, the recommended path is to provide `--embeddings`, which builds an OTU-centroid neighbor-joining (NJ) tree internally. The older `--tree` input remains available as a legacy fallback.
-
-```bash
-# From partition assignments
-otuformer diversity \
-    --assignments runs/cluster/UPGMA/partitions/tables/partition_0.30_assignments.csv \
-    --out-dir runs/diversity
-
-# With Faith's PD from OTU-centroid NJ (recommended)
-otuformer diversity \
-    --assignments runs/cluster/UPGMA/partitions/tables/partition_0.30_assignments.csv \
-    --phylo \
-    --embeddings runs/extract/embeddings.csv \
-    --save-nj-tree \
-    --nj-bootstrap 100 \
-    --out-dir runs/diversity
-
-# Legacy Faith's PD path from an existing Newick tree
-otuformer diversity \
-    --assignments runs/cluster/UPGMA/partitions/tables/partition_0.30_assignments.csv \
-    --phylo \
-    --tree runs/cluster/UPGMA/UPGMA_Cosine.nwk \
-    --out-dir runs/diversity
-
-# From OTU table
-otuformer diversity \
-    --otu-table-csv otu_table.csv \
-    --out-dir runs/diversity
-```
-
-| Parameter | Description | Default |
-|-----------|-------------|---------|
-| `--assignments` | Partition assignment CSV (`id`/`image`, `cluster`, optional `sample`) | One of two |
-| `--otu-table-csv` | OTU table CSV (sample column + OTU ID headers) | One of two |
-| `--otu-table-has-header` | Force first row as header (required if OTU IDs are numeric) | No |
-| `--out-dir` | Output directory | `runs/diversity` |
-| `--min-abundance` | Minimum abundance thresholds (comma-separated) | `0,2,5` |
-| `--phylo` | Enable Faith's PD / PD-related metrics | No |
-| `--embeddings` | Embeddings CSV; recommended for PD because OTU-centroid NJ is built internally | None |
-| `--tree` | Legacy Newick tree path used only when `--embeddings` is absent | None |
-| `--save-nj-tree` | Save the inferred OTU-centroid NJ tree to `NJ_OTU.nwk` | No |
-| `--nj-bootstrap` | Bootstrap replicates for NJ support; writes `NJ_OTU_bootstrap.nwk` | `0` |
-| `--save-nj-centroids` | Save OTU centroid embeddings to `NJ_OTU_centroids.csv` | No |
-
-**Output metrics** (saved to `diversity_indices.csv`, global and per-sample):
-- **Richness**: Number of unique OTUs
-- **Chao1**: Estimated richness (accounts for rare OTUs)
-- **ACE**: Abundance-based coverage estimator
-- **Shannon**: Entropy-based diversity (higher = more diverse)
-- **Simpson**: Probability two individuals differ (higher = more diverse)
-- **Hill q0/q1/q2**: Hill numbers (richness/evenness/diversity at orders 0,1,2)
-- **Pielou_J**: Evenness (Shannon / log(richness))
-- **Faith's PD (MPD)**: Morphological phylogenetic diversity computed from the OTU-centroid NJ tree (or legacy `--tree` input)
-- **MPD_w**: Abundance-weighted rooted PD (rPD_w)
-- **PD_richness_norm**: Faith's PD / species richness
-
-**Output**:
-- `diversity_indices.csv` — Global diversity indices
-- `per-sample/` — Per-sample diversity files (when valid sample column exists)
-- `NJ_OTU.nwk` — OTU-centroid NJ tree (with `--embeddings --save-nj-tree`)
-- `NJ_OTU_bootstrap.nwk` — NJ tree with bootstrap support labels (with `--nj-bootstrap > 0`)
-- `NJ_OTU_centroids.csv` — OTU centroid embeddings (with `--save-nj-centroids`)
-
----
-
-### CAM Command
-
-Generate CAM heatmaps for model interpretability analysis.
-
-Accepts OTU checkpoints and ref-script checkpoints (`ref/ibot20260115.py`); CAM uses the backbone only.
-
-```bash
-# Basic usage
-otuformer cam \
-    --checkpoint runs/finetune/finetune_latest.pth \
-    --images-dir ./images \
-    --out-dir runs/cam
-
-# Use Grad-CAM++ and save raw arrays
-otuformer cam \
-    --checkpoint runs/finetune/finetune_latest.pth \
-    --images-dir ./images \
-    --cam-method gradcampp \
-    --save-npy raw \
-    --out-dir runs/cam
-
-# Inspect model layer structure first
-otuformer cam \
-    --checkpoint runs/finetune/finetune_latest.pth \
-    --images-dir ./images \
-    --dump-model-structure \
-    --out-dir runs/cam
-```
-
-| Parameter | Description | Default |
-|-----------|-------------|---------|
-| `--checkpoint` | OTU-Former checkpoint path (`.ckpt` or `.pth`) | Required |
-| `--images-dir` | Directory of images to generate CAM for | Required |
-| `--label-csv` | Optional CSV with `image` and `label` columns; if omitted, all images in `--images-dir` are used | None |
-| `--out-dir` | Output directory | `runs/cam` |
-| `--cam-method` | `gradcam`/`gradcampp`/`layercam`/`scorecam`/`eigencam`/`ablationcam` | `gradcam` |
-| `--arch` | Force architecture: `cnn`/`vit` (auto-detected if omitted) | Auto |
-| `--target-layer-name` | Specific CAM target layer (auto-selected if omitted) | Auto |
-| `--image-weight` | Blend weight of original image in CAM overlay (0-1) | 0.5 |
-| `--fig-format` | Output format: `png`/`jpg`/`pdf` | `png` |
-| `--save-npy` | `none` (default, no array), `raw` (positive unnormalized CAM), or `normalized` (per-image min-max `[0, 1]`) | `none` |
-| `--dump-model-structure` | Write model layer names to `model_layers.txt` | No |
-| `--max-images` | Maximum images to process (None = all) | All |
-| `--cam-batch-size` | Batch size for CAM inference | 32 |
-| `--num-workers` | Dataloader worker processes | 4 |
-| `--device` | `auto`/`cpu`/`cuda`/`mps` | `auto` |
-| `--model-name` | Fallback timm backbone for checkpoints that record no model name (ref-script SFT) | `vit_tiny_patch16_224` |
-| `--eval-transform` | Evaluation preprocessing protocol: `center-crop` (heatmap confined to the model's field of view) or `whole-specimen-pad` (heatmap covers the whole specimen) | `center-crop` |
-
-**Output**:
-- `figures/` — CAM overlay images
-- `cam_summary.csv` — Metadata summary
-- `arrays/` — CAM arrays, created only for `--save-npy raw` or `--save-npy normalized` (no array is written by default). Saved arrays stay `float32` at model input resolution.
-- `model_layers.txt` — Model layer names (with `--dump-model-structure`)
-
-**CAM array semantics**:
-- `--save-npy raw` keeps the positive unnormalized CAM magnitude (after ReLU and resize to model resolution). `--save-npy normalized` writes the per-image min-max `[0, 1]` copy, which preserves the previous saved-array semantics. The overlay always uses a separate normalized copy, and pixel-identical PNG output is not a contract.
-- Raw magnitudes are comparable only within the same model, target layer, and preprocessing configuration; they are not comparable across backbones, layers, or CAM methods. `eigencam` raw values come from an SVD projection with arbitrary sign and are exported for completeness, but are unsuitable for response-strength statistics.
-
----
-
-### Export Command
-
-Export a PyTorch checkpoint to ONNX format for deployment and accelerated inference.
-
-Accepts OTU checkpoints and ref-script checkpoints (`ref/ibot20260115.py`). The projector is rebuilt from `config.embedding_head`, falling back to the projector shapes in the weights.
-
-```bash
-# Basic usage
-otuformer export \
-    --checkpoint runs/finetune/finetune_latest.pth \
-    --out-dir runs/export
-
-# Custom image size and opset
-otuformer export \
-    --checkpoint runs/finetune/finetune_latest.pth \
-    --imgsz 224 \
-    --opset 17 \
-    --out-dir runs/export
-```
-
-| Parameter | Description | Default |
-|-----------|-------------|---------|
-| `--checkpoint` | Checkpoint path | Required |
-| `--out-dir` | Output directory | `runs/export` |
-| `--imgsz` | Input image size for ONNX export; `auto` uses the checkpoint's recorded training size | auto |
-| `--opset` | ONNX opset version | 18 |
-| `--model-name` | Fallback timm backbone for checkpoints that record no model name (ref-script SFT) | `vit_tiny_patch16_224` |
-
-**Output**:
-- `encoder.onnx` — ONNX encoder model
-
----
-
 ## Common Behaviours
 
 ### Logging
 
-All commands save log files (e.g. `pretrain.log`, `finetune.log`, `extract.log`, `cluster.log`, `annotate.log`, `diversity.log`, `cam.log`, `export.log`) to the `logs/` subdirectory of the output directory, containing:
-- Full command line
-- Timestamp
-- All parameter values
-- Runtime output
+All commands write a log file (`pretrain.log`, `finetune.log`, `extract.log`, `cluster.log`, `annotate.log`, `diversity.log`, `cam.log`, `export.log`) to the `logs/` subdirectory of the output directory, recording the full command line, a timestamp, all parameter values, and runtime output.
 
 ### Graceful Shutdown
 
@@ -955,10 +130,7 @@ Press `Ctrl+C` — the current image finishes before exiting; partial results ar
 
 ### Device Selection
 
-`--device auto` chooses automatically:
-1. CUDA (if available)
-2. MPS / Apple Silicon (if available)
-3. CPU (fallback)
+`--device auto` prefers CUDA, then MPS on Apple Silicon, then CPU.
 
 ### Shell Completion
 
@@ -972,6 +144,8 @@ Supported shells: bash, zsh, fish
 
 ### Version
 
+Current version: `0.10.1`.
+
 Show installed version:
 
 ```bash
@@ -981,47 +155,26 @@ otuformer -v
 
 ## Project Structure
 
-```
-.
-├── src/otuformer/            # Core package
-│   ├── cli/                  # Command-line interface
-│   │   ├── main.py           # Entry point dispatcher
-│   │   ├── doctor.py         # otuformer doctor
-│   │   ├── pretrain.py       # otuformer pretrain
-│   │   ├── finetune.py       # otuformer finetune
-│   │   ├── extract.py        # otuformer extract
-│   │   ├── cluster.py        # otuformer cluster
-│   │   ├── annotate.py       # otuformer annotate
-│   │   ├── diversity.py      # otuformer diversity
-│   │   ├── cam.py            # otuformer cam
-│   │   └── export.py         # otuformer export
-│   ├── training/             # Training logic
-│   │   ├── model.py          # Model definition
-│   │   ├── dataset.py        # Dataset
-│   │   ├── loss.py           # Loss functions
-│   │   ├── trainer.py        # Trainer
-│   │   └── scheduler.py      # Learning rate scheduler
-│   ├── embedding/            # Embedding extraction
-│   │   ├── extractor.py      # Embedding extractor
-│   │   └── evaluator.py      # Embedding evaluator
-│   ├── delineation/          # OTU delineation
-│   │   ├── distance.py       # Distance computation
-│   │   ├── tree.py           # UPGMA tree building
-│   │   ├── partition.py      # Partitioning and metrics
-│   │   └── annotate.py       # Correction and annotation
-│   ├── vision/               # Vision utilities
-│   │   ├── cam.py            # CAM visualization
-│   │   └── export.py         # ONNX export
-│   └── utils/                # Utility functions
-│       ├── device.py         # Device detection
-│       ├── logging.py        # TeeLogger
-│       ├── checkpoint.py     # Checkpoint handling
-│       └── io.py             # CSV/JSON I/O
-├── tests/                    # Test files
-├── examples/                 # Sample data assets
-├── docs/                     # Documentation
-└── pyproject.toml            # Project configuration
-```
+See [`src/otuformer/`](src/otuformer/) for the current package layout and the
+[master design](docs/superpowers/specs/2026-03-29-otuformer-design.md) for
+architectural responsibilities.
+
+## Commands
+
+| Command | Purpose | Documentation |
+|---------|---------|---------------|
+| `otuformer doctor` | Diagnose environment and dependency status. | [Doctor](#doctor-command) |
+| `otuformer update` | Check for and install the latest published version. | [Update](#update-command) |
+| `otuformer pretrain` | Self-supervised contrastive pretraining (DINO/iBOT style). | [docs/commands/pretrain.md](docs/commands/pretrain.md) |
+| `otuformer finetune` | Supervised metric-learning finetuning (`--loss` selects the objective). | [docs/commands/finetune.md](docs/commands/finetune.md) |
+| `otuformer extract` | Extract image embeddings (ONNX-accelerated). | [docs/commands/extract.md](docs/commands/extract.md) |
+| `otuformer cluster` | UPGMA hierarchical clustering into morphological OTUs. | [docs/commands/cluster.md](docs/commands/cluster.md) |
+| `otuformer annotate` | Apply expert corrections to produce refined OTU annotations. | [docs/commands/annotate.md](docs/commands/annotate.md) |
+| `otuformer diversity` | Compute community alpha diversity indices. | [docs/commands/diversity.md](docs/commands/diversity.md) |
+| `otuformer cam` | Generate GradCAM and other heatmaps. | [docs/commands/cam.md](docs/commands/cam.md) |
+| `otuformer export` | Export model to ONNX format. | [docs/commands/export.md](docs/commands/export.md) |
+
+Two cross-command contracts have their own documents: [Training Augmentation](docs/commands/training-augmentation.md) for the `--augmentation` and `--orientation-policy` behaviour shared by `pretrain` and `finetune`, and [Embedding Metrics](docs/commands/embedding-metrics.md) for the metrics shared by `pretrain`, `finetune`, and `extract`.
 
 ## License
 

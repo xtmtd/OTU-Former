@@ -10,7 +10,7 @@ from pathlib import Path
 
 import typer
 
-from otuformer.cli import format_user_command
+from otuformer.cli import docs_url, format_user_command
 
 app = typer.Typer(
     help=(
@@ -21,6 +21,8 @@ app = typer.Typer(
         "Quick example:\n\n"
         "  otuformer annotate --raw-assignments runs/cluster/UPGMA/partitions/tables/partition_0.30_assignments.csv --corrections corrections.csv\n"
         "  otuformer annotate --raw-assignments partition_0.30_assignments.csv --corrections corrections.csv --embeddings runs/extract/embeddings.csv --show-annotation-bar\n"
+        "\nDocs:\n"
+        f"  {docs_url('annotate')}\n"
     )
 )
 

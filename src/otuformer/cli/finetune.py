@@ -17,6 +17,7 @@ from otuformer.cli import (
     _parse_size,
     _validate_augmentation,
     _validate_orientation_policy,
+    docs_url,
     finetune_augmentation_choices,
     format_user_command,
     orientation_policy_choices,
@@ -269,36 +270,9 @@ app = typer.Typer(
         "  otuformer finetune --train-data labels.csv --input-images-dir DATA_ROOT/dorsal \\\n"
         "      --pseudo-label-from RUN_ROOT/finetune1/finetune_latest.pth \\\n"
         "      --out-dir RUN_ROOT/finetune2 --finetune-epochs 50\n"
-        "\nAugmentation contract:\n"
-        "\n"
-        "  --augmentation: none or conservative.\n"
-        "  default for a new run: none.\n"
-        "  conservative is experimental.\n"
-        "  --orientation-policy: invariant or sensitive.\n"
-        "  default for a new run: sensitive.\n"
-        "  invariant (opt-in): full rotation and horizontal reflection.\n"
-        "\n"
-        "  Dorsal, ventral, and lateral images are distinct markers, as are\n"
-        "  anatomical-part views; arbitrary in-plane orientation is supported.\n"
-        "  conservative uses the selected policy. Orientation-policy=sensitive\n"
-        "  keeps every conservative view free of horizontal flip, with only -15 to\n"
-        "  15 degrees of rotation.\n"
-        "  orientation-policy is a no-op for augmentation=none; an omitted\n"
-        "  initialization inherits the pretraining checkpoint policy.\n"
-        "  Augmentation encourages but does not guarantee invariance.\n"
-        "  sensitive is not inferred automatically from the image or taxon.\n"
-        "  Omitted values inherit on resume; conflicting explicit values fail, and\n"
-        "  parameter changes require a new run.\n"
-        "\n"
-        "Pseudo-label mode:\n"
-        "\n"
-        "  With --pseudo-label-from, omitted experiment options inherit finetune#1\n"
-        "  resolved values instead of the new-run defaults above; explicit conflicts\n"
-        "  fail. --long-tail, loss settings, augmentation, freeze ratio, effective\n"
-        "  learning rates, batch size, seed, embedding size, and epochs must match\n"
-        "  the source run; --pseudo-similarity-floor, --pseudo-min-gap, and\n"
-        "  --pseudo-neighbors are the optional feature-rule overrides. Finetune#2\n"
-        "  always initializes from the same original SSL checkpoint.\n"
+        "\nDocs:\n"
+        f"  {docs_url('finetune')}\n"
+        f"  {docs_url('training-augmentation')}\n"
     )
 )
 
@@ -421,7 +395,9 @@ def finetune(
             "Completed finetune#1 ArcFace-family checkpoint used to generate one "
             "automatic known-class pseudo-label round. Finetune#2 still initializes "
             "from the same original SSL checkpoint; in that mode --checkpoint only "
-            "locates that SSL file if it moved."
+            "locates that SSL file if it moved. Omitted experiment options inherit "
+            "finetune#1 resolved values instead of the new-run defaults; explicit "
+            f"conflicts fail. See {docs_url('finetune')}."
         ),
     ),
     pseudo_similarity_floor: float = typer.Option(
@@ -482,8 +458,9 @@ def finetune(
         autocompletion=finetune_augmentation_choices,
         help=(
             "Augmentation profile: none or conservative. Default for a new "
-            "run: none. Omit to inherit the saved profile on --resume. See "
-            "'Augmentation contract' above."
+            "run: none. `conservative` is experimental and not proven superior "
+            "to `none`. Omit to inherit the saved profile on --resume. See "
+            f"{docs_url('training-augmentation')}."
         ),
     ),
     orientation_policy: str | None = typer.Option(
@@ -494,7 +471,7 @@ def finetune(
             "Orientation policy: invariant or sensitive. Default for a new "
             "run: sensitive. Affects conservative; a no-op for none. Omit on "
             "initialization to inherit the checkpoint policy. See "
-            "'Augmentation contract' above."
+            f"{docs_url('training-augmentation')}."
         ),
     ),
     batch_size: int = typer.Option(32, "--batch-size", help="Batch size."),

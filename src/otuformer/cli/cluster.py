@@ -10,7 +10,7 @@ from typing import Literal
 
 import typer
 
-from otuformer.cli import format_user_command
+from otuformer.cli import docs_url, format_user_command
 
 app = typer.Typer(
     help=(
@@ -21,6 +21,8 @@ app = typer.Typer(
         "Quick example:\n\n"
         "  otuformer cluster --embeddings runs/extract/embeddings.csv\n"
         "  otuformer cluster --embeddings embeddings.csv --pca-whitening true --local-scaling true --num-replicates 100\n"
+        "\nDocs:\n"
+        f"  {docs_url('cluster')}\n"
     )
 )
 

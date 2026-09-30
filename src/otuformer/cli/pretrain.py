@@ -16,6 +16,7 @@ from otuformer.cli import (
     _parse_size,
     _validate_augmentation,
     _validate_orientation_policy,
+    docs_url,
     format_user_command,
     orientation_policy_choices,
     pretrain_augmentation_choices,
@@ -28,35 +29,13 @@ app = typer.Typer(
         "Trains a student-teacher ViT backbone using global/local crops and a\n"
         "patch-level objective (none | consistency | masked-feature | ibot).\n"
         "Outputs checkpoints that can be used for fine-tuning or direct\n"
-        "embedding extraction. See the pretrain section of the README for the\n"
-        "full patch-loss and masking contract.\n\n"
+        "embedding extraction.\n\n"
         "Quick example:\n\n"
         "  otuformer pretrain --train-data images.csv --input-images-dir ./images\n"
         "  otuformer pretrain --input-images-dir ./images --model-name vit_small_patch16_224 --max-epochs 100\n"
-        "\nAugmentation contract:\n"
-        "\n"
-        "  --augmentation: global-barcode, color-robust, or legacy.\n"
-        "  default for a new run: global-barcode.\n"
-        "  --orientation-policy: invariant or sensitive.\n"
-        "  default for a new run: sensitive.\n"
-        "  invariant (opt-in): full rotation and horizontal reflection.\n"
-        "\n"
-        "  Dorsal, ventral, and lateral images are distinct markers, as are\n"
-        "  anatomical-part views; arbitrary in-plane orientation is supported.\n"
-        "  color-robust can suppress diagnostic color, pattern, or metallic sheen.\n"
-        "  legacy reproduces 0.2.1 and records either policy without changing its\n"
-        "  historical transforms. An omitted policy can still be inherited by a new\n"
-        "  fine-tuning conservative run from that checkpoint.\n"
-        "  sensitive is not inferred automatically from the image or taxon.\n"
-        "  Orientation-policy=sensitive keeps every new pretraining view and\n"
-        "  fine-tuning conservative view free of horizontal flip, with only -15 to\n"
-        "  15 degrees of rotation.\n"
-        "  All global and local pretraining views use the selected policy, so\n"
-        "  local-to-global training cannot silently reintroduce broad rotation or\n"
-        "  reflection.\n"
-        "  Augmentation encourages but does not guarantee invariance.\n"
-        "  Omitted values inherit on resume; conflicting explicit values fail, and\n"
-        "  parameter changes require a new run.\n"
+        "\nDocs:\n"
+        f"  {docs_url('pretrain')}\n"
+        f"  {docs_url('training-augmentation')}\n"
     )
 )
 
@@ -166,7 +145,9 @@ def pretrain(
         help=(
             "Augmentation profile: global-barcode, color-robust, or legacy. "
             "Default for a new run: global-barcode. Omit to inherit the saved "
-            "profile on --resume. See 'Augmentation contract' above."
+            "profile on --resume. color-robust may suppress diagnostic color, "
+            "pattern, or metallic sheen; legacy reproduces 0.2.1 and keeps its "
+            f"historical transforms. See {docs_url('training-augmentation')}."
         ),
     ),
     orientation_policy: str | None = typer.Option(
@@ -176,7 +157,7 @@ def pretrain(
         help=(
             "Orientation policy for every global and local view: invariant or "
             "sensitive. Default for a new run: sensitive. Omit to inherit the "
-            "saved policy on --resume. See 'Augmentation contract' above."
+            f"saved policy on --resume. See {docs_url('training-augmentation')}."
         ),
     ),
     global_crop_size: str = typer.Option(
@@ -225,7 +206,7 @@ def pretrain(
             "independent patch positions; 'blockwise' merges bounded rectangular "
             "regions; 'hybrid' takes half blockwise and half random positions. "
             "Not applicable to none/consistency; the exact geometry limits are "
-            "documented in the README."
+            f"documented at {docs_url('pretrain')}."
         ),
     ),
     mask_ratio: str = typer.Option(

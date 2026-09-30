@@ -10,7 +10,7 @@ from pathlib import Path
 
 import typer
 
-from otuformer.cli import SIZE_EXAMPLES, _parse_size, format_user_command
+from otuformer.cli import SIZE_EXAMPLES, _parse_size, docs_url, format_user_command
 
 app = typer.Typer(
     help=(
@@ -22,6 +22,8 @@ app = typer.Typer(
         "  otuformer extract --checkpoint runs/finetune/best.pt --input-images-dir ./images\n"
         "  otuformer extract --checkpoint runs/finetune/best.pt --input-images-dir ./images --label-csv labels.csv --token-mode attention-pool\n"
         "  otuformer extract --onnx-path runs/export/encoder.onnx --input-images-dir ./images\n"
+        "\nDocs:\n"
+        f"  {docs_url('extract')}\n"
     )
 )
 

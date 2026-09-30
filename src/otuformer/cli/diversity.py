@@ -9,7 +9,7 @@ from pathlib import Path
 
 import typer
 
-from otuformer.cli import format_user_command
+from otuformer.cli import docs_url, format_user_command
 
 app = typer.Typer(
     help=(
@@ -21,25 +21,13 @@ app = typer.Typer(
         "Outputs:\n\n"
         "  diversity_indices.csv - global (all-samples) diversity table.\n"
         "  per-sample/ - one file per sample when sample labels are valid.\n\n"
-        "Metrics:\n\n"
-        "  Richness: number of unique OTUs.\n"
-        "  Chao1: estimated richness (accounts for rare OTUs).\n"
-        "  ACE: abundance-based coverage estimator.\n"
-        "  Shannon: entropy-based diversity (higher = more diverse).\n"
-        "  Simpson: probability two individuals differ (higher = more diverse).\n"
-        "  Hill_q0/q1/q2: Hill numbers (richness/evenness/diversity at orders 0,1,2).\n"
-        "  Pielou_J: evenness (Shannon / log(richness)).\n"
-        "  Faith's PD (MPD): morphological phylogenetic diversity, computed as "
-        "the sum of branch lengths of the minimal spanning subtree via "
-        "scikit-bio alpha_diversity('faith_pd').\n"
-        "  MPD_w: abundance-weighted rooted PD (rPD_w), branches weighted by "
-        "relative abundance of descending taxa.\n"
-        "  PD_richness_norm: Faith's PD divided by species richness (PD per species).\n\n"
         "Quick example:\n\n"
         "  otuformer diversity --assignments runs/cluster/UPGMA/partitions/tables/partition_0.30_assignments.csv\n"
         "  otuformer diversity --assignments partition_0.30_assignments.csv --phylo --tree runs/cluster/UPGMA/UPGMA_Cosine.nwk\n"
         "  otuformer diversity --otu-table-csv otu_table.csv\n\n"
-        "Note: --no-phylo has been removed; omit --phylo to disable MPD."
+        "Note: --no-phylo has been removed; omit --phylo to disable MPD.\n\n"
+        "Docs:\n"
+        f"  {docs_url('diversity')}\n"
     )
 )
 

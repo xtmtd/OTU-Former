@@ -8,11 +8,15 @@ import sys
 
 import typer
 
+from otuformer.cli import README_URL
+
 app = typer.Typer(
     help=(
         "Check environment and dependency health.\n\n"
         "Quick example:\n\n"
         "  otuformer doctor\n"
+        "\nDocs:\n"
+        f"  {README_URL}#doctor-command\n"
     )
 )
 

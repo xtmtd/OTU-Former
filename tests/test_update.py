@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 from typer.testing import CliRunner
 
+from otuformer import __version__
 from otuformer.cli.main import app
 from otuformer.cli.update import fetch_remote_version
 
@@ -40,6 +41,8 @@ def test_update_check_never_runs_pip(monkeypatch):
 
     assert result.exit_code == 0
     assert not called
+    # ``tests/test_version.py`` pins __version__; here only the rendering matters.
+    assert f"Current version : {__version__}" in result.output
 
 
 def test_update_yes_installs_exact_tag(monkeypatch):

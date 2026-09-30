@@ -2,47 +2,28 @@
 
 **中文** | [English](README.md)
 
-一个基于图像形态学的 OTU（操作分类单元）划分工具包。提供统一的 `otuformer` 命令行工具，支持自监督预训练、监督度量学习微调（`--loss` 可选 `arcface`、`supcon`、`subcenter-arcface` 或 `subcenter-arcface-compact`）、嵌入向量提取（提供标签时可直接输出质量指标/UMAP）、UPGMA 层次聚类、专家校正标注、群落多样性分析、CAM 可视化以及 ONNX 模型导出等功能。
+基于图像的形态学 OTU（可操作分类单元）划分工具。提供统一的 `otuformer` CLI，覆盖自监督预训练、监督度量学习微调、嵌入提取、UPGMA 层次聚类、专家校正标注、群落多样性分析、CAM 可视化以及 ONNX 模型导出。
 
-## 概述
+## 为什么选择 OTU-Former
 
-所有功能通过单一入口访问：
+把标本照片变成可复现的 OTU，通常需要手工把嵌入脚本、聚类 notebook 和多样性计算拼在一起。OTU-Former 把这条链路打包成一个命令行工作流：
 
-```
-otuformer <command> [options]
-```
+- **输入图像，输出形态学条码。** 本工具消费标准化的标本图像，产出形态学条码、morphOTU 与多样性数据：训练好的编码器把每张图像变成固定维度的嵌入向量，后续所有步骤都基于这些向量。它不组装 reads、不调用 targets、不推断 ortholog groups。
+- **每一步可追溯。** 每个命令都会把输出、日志与解析后的参数写入可预期的目录，便于检查、续跑与复现。
+- **专家校正是一等公民。** `annotate` 会把人工 OTU 校正回写到划分结果，并报告其隐含的类内距离。
+- **从形态学得到多样性。** `diversity` 计算 alpha 多样性，包括基于嵌入构建的 OTU 质心树得到的 Faith's PD。
 
-| 命令 | 描述 |
-|---------|-------------|
-| `doctor` | 诊断环境与依赖状态 |
-| `pretrain` | 自监督对比学习预训练（DINO/iBOT 风格） |
-| `finetune` | 监督度量学习微调（`--loss` 选择目标函数） |
-| `extract` | 提取图像嵌入向量（支持 ONNX 加速） |
-| `cluster` | UPGMA 层次聚类划分形态学 OTU |
-| `annotate` | 应用专家校正，生成 refined OTU 标注 |
-| `diversity` | 计算群落 alpha 多样性指标（Shannon、Simpson、Chao1、Faith's PD 等） |
-| `cam` | 生成 GradCAM 等热力图 |
-| `export` | 导出模型为 ONNX 格式 |
-| `update` | 检查并安装最新已发布版本 |
+## 工作流程
 
-## 功能特性
+1. **`doctor`** — 检查环境与依赖。
+2. **`pretrain`** — 自监督对比预训练，无需标签。
+3. **`finetune`** — 监督度量学习微调，目标函数可选。
+4. **`extract`** — 从图像提取嵌入向量。
+5. **`cluster`** — UPGMA 层次聚类为形态学 OTU。
+6. **`annotate`** — 对划分结果应用专家校正。
+7. **`diversity`** — 计算群落 alpha 多样性指数。
 
-- **统一命令行接口**：单一 `otuformer` 入口，覆盖从预训练到多样性分析的完整流程
-- **自监督预训练**：基于 DINO/iBOT 风格的教师-学生 ViT 对比学习，支持全局/局部裁剪与掩码 token 一致性
-- **监督度量学习微调**：利用标注数据和可选监督目标（默认 `arcface`，另有 `supcon`、`subcenter-arcface`、`subcenter-arcface-compact`）优化模型，产出判别性嵌入用于 OTU 聚类
-- **多模式嵌入提取**：支持 CLS token、patch-topk、attention-pool 三种模式，可选 ONNX 加速
-- **嵌入质量评估**：NMI、ARI、Recall@K、kNN 准确率、mAP@R、轮廓系数、线性探测准确率等
-- **UPGMA 层次聚类**：构建距离矩阵与系统发育树，在多个距离阈值下自动划分 OTU
-- **PCA 白化与局部缩放**：可选的 PCA 白化与 Mutual-Proximity 风格局部缩放，提升聚类质量
-- **Bootstrap 支持率估计**：支持 subsample/bootstrap 模式估计分支支持率
-- **专家校正标注**：接受人工校正 CSV，生成 refined OTU 分配与类内距离摘要
-- **群落多样性分析**：Richness、Chao1、ACE、Shannon、Simpson、Hill 数（q0/q1/q2）、Pielou 均匀度、Faith's PD（MPD）、加权 PD（MPD_w）等 alpha 多样性指标；当提供嵌入向量时，PD 基于 OTU 质心 NJ 树计算
-- **模型可解释性**：支持 Grad-CAM、Grad-CAM++、LayerCAM、Score-CAM、Eigen-CAM、Ablation-CAM 六种算法
-- **ONNX 导出加速**：导出为 ONNX 格式，CPU 推理提速 2-5 倍
-- **UMAP 可视化**：嵌入空间降维可视化，直观展示形态学分布
-- **并行处理**：多线程图像处理，可配置 CPU 线程数
-- **完整日志**：所有命令自动保存运行日志到输出目录的 `logs/` 子目录
-- **优雅退出**：Ctrl+C 安全中断，保留已处理结果
+`cam` 与 `export` 是两条支线：可解释性热图与 ONNX 导出。
 
 ## 系统要求
 
@@ -65,43 +46,39 @@ cd OTU-Former
 
 可任选其一：
 
-**选项 1：conda**
-
 ```bash
+# 选项 1：conda
 conda create -n otuformer python=3.11 -y
 conda activate otuformer
 pip install -e .
-```
 
-**选项 2：uv + venv**
-
-```bash
+# 选项 2：uv + venv
 uv venv .venv
 source .venv/bin/activate
 uv pip install -e .
-```
 
-**选项 3：标准库 venv + pip**
-
-```bash
+# 选项 3：标准库 venv + pip
 python -m venv .venv
 source .venv/bin/activate
 pip install -e .
 ```
 
-## 使用方法
+## 快速开始
 
-推荐的工作流命令顺序：
+```bash
+otuformer doctor
+otuformer pretrain --input-images-dir ./images --out-dir runs/pretrain
+otuformer finetune --checkpoint runs/pretrain/SSL_latest.pth \
+    --train-data labels.csv --input-images-dir ./images --out-dir runs/finetune
+otuformer extract --checkpoint runs/finetune/finetune_latest.pth \
+    --input-images-dir ./images --out-dir runs/extract
+otuformer cluster --embeddings runs/extract/embeddings.csv --out-dir runs/cluster
+```
 
-1. `doctor` — 检查环境
-2. `pretrain` — 自监督预训练
-3. `finetune` — 监督度量学习微调
-4. `extract` — 提取嵌入向量
-5. `cluster` — UPGMA 聚类为 OTU
-6. `annotate` — 应用专家校正
-7. `diversity` — 多样性分析
+每个命令都有自己的参考文档；见文末命令表中的链接，或运行 `otuformer <命令> --help`。
 
-### doctor 命令
+<a id="doctor-command"></a>
+## doctor 命令
 
 诊断环境与依赖是否满足当前功能需求。
 
@@ -109,14 +86,10 @@ pip install -e .
 otuformer doctor
 ```
 
-报告内容包括：
-- Python 版本与可用设备（`cpu`、`cuda`、`mps`）
-- 关键依赖的版本与状态（ok/missing/outdated）
+报告内容涵盖 Python 版本、可用设备（`cpu`、`cuda`、`mps`）以及关键依赖的版本与 ok/missing/outdated 状态。
 
-**输出**：
-- 终端打印诊断报告
-
-### update 命令
+<a id="update-command"></a>
+## update 命令
 
 ```bash
 otuformer update
@@ -124,737 +97,31 @@ otuformer update --check
 otuformer update --yes
 ```
 
+| 选项 | 说明 |
+|------|------|
+| `--check` | 仅显示版本信息。 |
+| `--yes`、`-y` | 不再询问，直接安装。 |
+
 从已发布的 Git tag 检查更新，并在确认后安装最新版本。
 
-### 输出安全
+## 输出安全
 
 默认情况下，命令拒绝使用非空的 `--out-dir`。请显式使用 `--overwrite`
 清空该目录。训练时的 `--resume` 会保留并追加已有输出目录；`--resume`
 与 `--overwrite` 不能同时使用。
 
-### Hugging Face 权重
+## Hugging Face 权重
 
 新的 pretrain 和 finetune 会使用公开 timm 权重初始化。首次下载权重或本地
 缓存缺失时，出现未认证 Hugging Face 请求的 warning 属于正常现象；`HF_TOKEN`
 可选，仅用于提高限额。CAM、extract 和 export 会加载指定的本地 checkpoint，
 不需要访问 Hugging Face。
 
----
-
-### pretrain 命令
-
-基于 DINO/iBOT 风格的教师-学生 ViT 对比学习进行自监督预训练，无需标注数据。
-
-**patch 级目标（v0.7.0）。** `--patch-loss` 选择 patch 目标：
-
-| `--patch-loss` | student 输入 | 目标 |
-|---|---|---|
-| `none` | 未遮挡 | 无 patch 目标 |
-| `consistency`（默认） | 未遮挡 | 在选中的可见同位 patch 上做归一化余弦回归 |
-| `masked-feature` | 遮挡 | continuous masked feature prediction（连续掩码特征预测） |
-| `ibot`（实验性） | 遮挡 | 原型分布预测 |
-
-`consistency` 选择完全可见的 patch 位置，因此它是 **masked-position patch
-consistency**，而不是 masked image modeling：student 仍能看到被选中的每个像素。
-`masked-feature`（即 continuous masked feature prediction）与 `ibot`
-（实验性）会在位置编码之前把选中的 student patch embedding 替换为可学习的 mask
-token，因此 student 看不到被选中的内容，但位置信息保留。`masked-feature` 的
-teacher 目标是 teacher 最后四个 block 输出的 L2 归一化均值。iBOT 预测 teacher 的
-中心化原型分布
-（`--ibot-prototypes`，默认 512；任意 >= 2 的整数，数据集越大可用越大），使用移动平均中心。
-`masked-feature` 与 `ibot` 互斥，不会叠加。
-
-`--masking-strategy` 为 `masked-feature` 与 `ibot` 选择真实遮挡几何；对 `none`
-与 `consistency` 无效：
-
-- `random`（默认）——每个样本、每个 global view 独立采样 `round(ratio * N)` 个
-  互不重复的 patch 位置。
-- `blockwise`——每轮生成二到四个矩形提案，重叠部分合并。合法矩形的边长至少为 2
-  个 patch，长宽比在 `[0.5, 2.0]` 内，面积不超过 `floor(0.20 * N)` 个 patch。
-  重叠只计一次，最后裁剪或随机填充到恰好 `round(ratio * N)` 个位置。若网格无法
-  容纳任何合法矩形（例如 `4 x 4`：最大块面积为 3，而 `2 x 2` 块需要 4），会在
-  训练循环开始前报错，而不是静默降级为 `random`。
-- `hybrid`——先取恰好 `floor(target / 2)` 个块状位置，再随机填充到目标数量。
-
-所有策略都会把数量限制为至少遮挡一个、至少保留一个可见 patch。
-
-`--lambda-mask`（默认 `1.0`）是 patch 损失的权重。iBOT 的交叉熵与余弦类 patch
-损失不在同一量级，因此使用 `--patch-loss ibot` 时通常需要调低（例如 `0.25`-`0.5`）。
-不同 patch 模式的损失值不可直接比较。
-
-**迁移提示：`--mask-ratio` 现在默认 `auto`，新运行会解析为 0.30，而 v0.6.x 的
-默认值是 0.50。** 恢复旧检查点会保留其记录的比值（缺失时为 0.50），且不能切换到
-`masked-feature` 或 `ibot`。对 `consistency`，`--mask-ratio` 是参与损失的可见同位
-比例；对 `masked-feature`/`ibot`，它是被替换为 mask token 的 student patch 比例。
-显式传入当前模式不使用的选项会被拒绝，而不是静默忽略。
-
-**可选 register token（v0.10.0）。** `--register-tokens` 对合格的单 CLS timm
-`VisionTransformer` 接受 `none`（默认）、`0` 或 `4`。`4` 会新增四个可训练 register，并迁移单 CLS
-的预训练骨干：register token 保留其原生初始化，而所有 CLS/patch/block 权重与位置
-保持不变。`none` 保留骨干网络自身结构，原生 register 模型会保留自身数量；对原生
-register 或无 CLS 的骨干传入显式值会被拒绝，DINOv3/Eva 骨干不被该选项支持。
-register 永远不是图像 patch：`patch-topk`、`attention-pool` 提取、CAM reshape 与
-patch 目标都会跳过所有前缀 token（`backbone.num_prefix_tokens`）。新的 attention-pool
-checkpoint 会记录其 patch 策略（`num_prefix_tokens`、`register_tokens`、
-`prefix_excluded`、`attention_pooling_type`）并保存到带策略标签的同级文件，因此
-在不同 patch 集上训练的 pool 不会被静默复用。ONNX 导出还会在同一输入上比对 CPU
-FP32 PyTorch 与 CPU ONNX Runtime（`atol=1e-4`、`rtol=1e-3`），并在
-`export_report.json` 中记录 `validation_status`、`max_abs_diff` 与 register 数量。微调运行的 register 布局属于 v0.9.0 伪标签实验同一性的一部分，因此 finetune#2 必须从具有相同 patch 集合的源初始化。
-
-`masked-feature` 与 iBOT 会为每个 global view 增加一次 masked student 前向，在默认
-的两 global / 六 local 裁剪布局下，student 编码器计算量约增至 1.65 倍。
-extract、finetune、CAM、export 均未改变：默认仍使用原始 CLS token，它们从不加载
-训练专用的 patch 状态，也从不调用 mask token、predictor 或 iBOT head。预训练与
-预训练续训仅支持标准 timm ViT 骨干网络。v0.7.0 的续训是严格的：patch 模式、解析后的
-比值、遮挡策略、原型数量以及固定的 target/center 设置都必须与检查点一致，
-`masked-feature`/iBOT 检查点必须携带其 `patch_objective` 状态。v0.7.0 检查点会完整往返 RNG 状态；旧检查点
-只能尽力恢复并会给出警告。
-
-这些目标属于自监督上下文特征预测，本身并不建立解剖部位语义或稠密形态学监督，
-v0.7.0 也不对稠密表示做出任何声明。
-
-当 `--visualize-data` 没有 `label` 列时，周期性监督指标会被跳过，但仍会基于可视化嵌入生成 UMAP。
-
-如需加入新图像继续预训练，请创建同时包含旧图和新图的 CSV，保持相同的
-`--out-dir`，使用最新 checkpoint 的 `--resume`，并增加 `--max-epochs`：
-
-```bash
-otuformer pretrain --train-data images_union.csv --input-images-dir ./images \
-    --out-dir runs/pretrain --resume runs/pretrain/SSL_latest.pth --max-epochs 100
-```
-
-扩展训练可以使用更大的合并数据集；原计划的中断恢复则需要保持原来的
-DataLoader 长度。只用新增图像训练虽然可行，但可能遗忘已有数据。
-
-```bash
-# 基本用法
-otuformer pretrain \
-    --augmentation global-barcode \
-    --input-images-dir ./images \
-    --out-dir runs/pretrain
-
-# 使用 CSV 指定训练子集
-otuformer pretrain \
-    --train-data images.csv \
-    --input-images-dir ./images \
-    --out-dir runs/pretrain
-
-# 自定义模型与训练参数
-otuformer pretrain \
-    --input-images-dir ./images \
-    --model-name vit_small_patch16_224 \
-    --max-epochs 100 \
-    --lr 1e-3 \
-    --batch-size 64 \
-    --out-dir runs/pretrain
-```
-
-| 参数 | 描述 | 默认值 |
-|-----------|-------------|---------|
-| `--train-data` | 训练数据 CSV（含 `image` 列，路径相对于 `--input-images-dir`）；省略则递归使用所有图像 | 无 |
-| `--input-images-dir` | 图像根目录 | 必填 |
-| `--out-dir` | 输出目录 | `runs/pretrain` |
-| `--model-name` | timm 骨干网络名称 | `vit_tiny_patch16_224` |
-| `--out-dim` | SSL 投影器输出维度 | 256 |
-| `--max-epochs` | 预训练轮数 | 50 |
-| `--lr` | 基础学习率 | 5e-4 |
-| `--weight-decay` | AdamW 权重衰减 | 0.05 |
-| `--warmup-epochs` | 预热轮数 | 3 |
-| `--global-crop-size` | 全局裁剪分辨率；`auto` 在新运行时使用骨干网络原生输入尺寸，`--resume` 时使用检查点记录尺寸（如 224、384、448，518 仅适用于 patch-14 模型） | auto |
-| `--local-crop-size` | 局部裁剪分辨率（必须能被骨干网络 patch size 整除，patch-14 模型如 98 或 112） | 96 |
-| `--local-crops` | 局部裁剪数量 | 6 |
-| `--augmentation` | 预训练数据增强配置：`global-barcode`（新运行默认）、`color-robust` 或 `legacy`；`--resume` 时省略则继承已保存配置 | `global-barcode` |
-| `--orientation-policy` | 所有全局与局部视图的方向策略（对 `legacy` 无变换效果）：`sensitive`（新运行默认；旋转 `[-15°, 15°]`，不做水平翻转）或 `invariant`（可选加入的宽角度旋转与翻转）；`--resume` 时省略则继承已保存策略 | `sensitive` |
-| `--patch-loss` | patch 级目标：`none`、`consistency`（默认；可见同位余弦一致性，不是输入遮挡）、`masked-feature`（连续掩码特征预测）或 `ibot`（实验性原型预测） | `consistency` |
-| `--register-tokens` | 仅适用于合格的单 CLS ViT 的 register token：`none`、`0` 或 `4`。`none` 保留骨干网络自身结构（无 register，或原生 register 模型的自身数量）；显式 `0` 在无 CLS 骨干上会被拒绝 | `none` |
-| `--masking-strategy` | `masked-feature`/`ibot` 的真实遮挡几何：`random`、`blockwise` 或 `hybrid` | `random` |
-| `--mask-ratio` | `auto` 或 (0, 1) 内的浮点数。新运行 `auto` 解析为 0.30（v0.6.x 为 0.50）；旧检查点续训保留其记录值（缺失时为 0.50） | auto |
-| `--ibot-prototypes` | `ibot` 的原型字典大小；任意 >= 2 的整数，默认 512，数据集越大可越大 | 512 |
-| `--lambda-local` | 局部裁剪损失权重 | 1.5 |
-| `--lambda-mask` | patch 损失权重；`ibot` 建议调低（例如 0.25-0.5） | 1.0 |
-| `--teacher-momentum` | 初始 EMA 动量 | 0.995 |
-| `--teacher-momentum-end` | 最终 EMA 动量 | 0.999 |
-| `--student-temp` | 学生温度 | 0.1 |
-| `--teacher-temp-start` | 初始教师温度 | 0.04 |
-| `--teacher-temp-end` | 最终教师温度 | 0.07 |
-| `--disable-cross-view-loss` | 禁用跨视图全局损失 | 否 |
-| `--resume` | 恢复中断训练的检查点路径 | 无 |
-| `--log-every-n-steps` | 每 N 步记录指标 | 50 |
-| `--save-every-epochs` | 每 N 轮保存检查点 | 10 |
-| `--keep-last-checkpoints` | 保留最近 N 个检查点 | 10 |
-| `--visualize-data` | 含 `image` 列及可选 `label` 列的 CSV；无 label 时仅生成 UMAP；省略则复用 `--train-data` | 无 |
-| `--extract-size` | 嵌入提取图像尺寸；`auto` 使用模型 img_size | auto |
-| `--metrics-sample-size` | 指标与 UMAP 最大样本数（<=0 不设上限） | 10000 |
-| `--umap-n-neighbors` | UMAP 邻居数 | 15 |
-| `--umap-min-dist` | UMAP 最小距离 | 0.1 |
-| `--umap-metric` | UMAP 距离度量 | `cosine` |
-| `--visualize-class-number` | UMAP 最大显示类别数 | 20 |
-| `--disable-embedding-metrics` | 禁用周期嵌入指标与 UMAP | 否 |
-| `--batch-size` | 批量大小 | 32 |
-| `--num-workers` | DataLoader 工作线程数 | 4 |
-| `--cpus` | PyTorch/MKL CPU 线程数 | 12 |
-| `--device` | `auto`/`cpu`/`cuda`/`mps` | `auto` |
-| `--seed` | 随机种子 | 42 |
-
-**局部视图的续训继承。** `--resume` 时，省略的 `--local-crop-size` 与 `--local-crops` 继承 checkpoint 已保存的值；显式指定冲突值会报错，修改这些值需要开启新运行。
-
-**输出**：
-- `logs/pretrain.log` — 运行日志
-- `SSL_latest.pth`、`SSL_epoch_*.pth` — 模型检查点，写入 `--out-dir` 根目录（不存在 `checkpoints/` 子目录，也没有 `SSL_best.pth`）
-- `logs/metrics.pretrain.csv` — 周期嵌入指标
-- `logs/instant_metrics.pretrain.csv` — 每次迭代的训练指标
-- `logs/training_curves_pretrain.pdf` — 训练曲线图
-- `logs/umap.train.epoch_<N>.pdf` — 周期 UMAP 图（未禁用时）
-
----
-
-### finetune 命令
-
-利用标注数据进行监督度量学习微调；`--loss` 选择目标函数（参见“度量损失模式（v0.8.0）”）。
-
-如需为已有类别加入新图像，请使用同时包含旧图和新图标注的 CSV，保持相同的
-`--out-dir`，从最新微调 checkpoint 使用 `--resume`，并增加
-`--finetune-epochs`：
-
-```bash
-otuformer finetune --train-data labels_union.csv --input-images-dir ./images \
-    --out-dir runs/finetune --resume runs/finetune/finetune_latest.pth \
-    --finetune-epochs 50
-```
-
-恢复时 CSV 必须保留完全相同的标签集合。增加新类别时，应使用
-`--checkpoint` 新建微调，而不能使用 `--resume`。
-
-```bash
-# 基本用法
-otuformer finetune \
-    --checkpoint runs/pretrain/SSL_latest.pth \
-    --train-data labels.csv \
-    --input-images-dir ./images \
-    --out-dir runs/finetune
-
-# 恢复训练
-otuformer finetune \
-    --resume runs/finetune/finetune_latest.pth \
-    --train-data labels.csv \
-    --input-images-dir ./images \
-    --out-dir runs/finetune
-
-# 自定义参数
-otuformer finetune \
-    --checkpoint runs/pretrain/SSL_latest.pth \
-    --train-data labels.csv \
-    --input-images-dir ./images \
-    --model-name vit_small_patch16_224 \
-    --augmentation conservative \
-    --finetune-epochs 50 \
-    --finetune-lr 3e-4 \
-    --freeze-ratio 0.5 \
-    --loss arcface \
-    --out-dir runs/finetune
-```
-
-**稀疏标签伪标签反馈。** 可选一轮，自动回收已知物种的未标注图像，无需候选清单输入：候选图是 `--input-images-dir` 下受支持图像减去专家 CSV 引用后的集合。请使用与 run 树分离的专用数据根（`DATA_ROOT/dorsal/` 与 `RUN_ROOT/finetune1/`）；`--out-dir` 不得与图像根重叠，所有文件型输入都必须位于 `--out-dir` 之外。
-
-```bash
-# finetune#1 记录专家清单与 SSL 身份，供后续复用
-otuformer finetune --checkpoint runs/pretrain/SSL_latest.pth \
-    --train-data labels.csv --input-images-dir DATA_ROOT/dorsal \
-    --out-dir RUN_ROOT/finetune1 --finetune-epochs 20
-
-# finetune#2：从同一原始 SSL 检查点出发的一轮自动伪标签
-otuformer finetune --train-data labels.csv --input-images-dir DATA_ROOT/dorsal \
-    --pseudo-label-from RUN_ROOT/finetune1/finetune_latest.pth \
-    --out-dir RUN_ROOT/finetune2 --finetune-epochs 20
-```
-
-- 伪标签仅支持 ArcFace 家族损失且仅一轮；finetune#2 检查点不能再作为伪标签来源。
-- 省略的实验类选项继承 finetune#1 的解析值，显式冲突会报错。finetune#2 始终从同一原始 SSL 检查点初始化；伪标签模式下 `--checkpoint` 仅用于 SSL 文件迁移后的定位（文件 SHA-256 必须一致）。
-- 预处理固定为 `center-crop`；输出 `pseudo_labels.csv`（每个候选一行诊断）与 `pseudo_summary.json`。
-- `--pseudo-similarity-floor`（默认 0.75）是未经校准的 raw-CLS 前三均值余弦类别分数，不是概率；floor 与 gap 越大越严格，`--pseudo-neighbors`（默认 15）越小通常越局部、越严格。每个类在三关之后最多接受 `min(--pseudo-cap-multiplier * 专家种子数, --pseudo-absolute-cap)` 行（默认 3 与 50）。
-- 诊断 CSV 不是人工审批环节；接受集为空时会在创建输出目录前失败。
-- `--long-tail cb-drw` 是独立的长尾选项（仅 ArcFace 家族，beta 0.99、cap 3.0、50% 起、10% 斜坡），两轮之间必须一致。
-- `--input-images-dir` 必须是真实目录树（不遍历目录符号链接，并在 summary 中报告）；显式 `--visualize-data` 仍可用于任意 UMAP/指标诊断。
-- RUN1/RUN2 对比请使用独立 `HELDOUT_ROOT`：`otuformer extract --input-images-dir HELDOUT_ROOT --label-csv HELDOUT.csv`；留在训练根内的留出图像会成为伪标签候选。
-
-| 参数 | 描述 | 默认值 |
-|-----------|-------------|---------|
-| `--checkpoint` | 预训练检查点路径（通常为 `runs/pretrain/SSL_latest.pth`）；在 `--pseudo-label-from` 模式（仅用于定位已记录的 SSL 文件）与 `--resume` 下均可省略 | 必填（伪标签模式或 `--resume` 除外） |
-| `--resume` | 恢复微调检查点路径 | 无 |
-| `--train-data` | 训练数据 CSV（含 `image` 和 `label` 列） | 必填 |
-| `--input-images-dir` | 图像根目录 | 必填 |
-| `--out-dir` | 输出目录 | `runs/finetune` |
-| `--model-name` | timm 骨干网络名称 | `vit_tiny_patch16_224` |
-| `--metric-embed-dim` | 微调嵌入维度（度量嵌入头输出，非原始 CLS）。显式传值会重建该头；对历史 `ProjectionHead` 检查点会报错，其宽度由预训练投影器固定 | 继承检查点记录的维度 |
-| `--finetune-epochs` | 微调轮数 | 20 |
-| `--finetune-lr` | 骨干网络学习率 | 1e-4 |
-| `--metric-head-lr` | 嵌入头与（原型损失时的）分类器学习率；省略时继承 `--finetune-lr` | `--finetune-lr` |
-| `--weight-decay` | 微调使用的 AdamW weight decay；默认 `1e-4` 是保守的监督训练选择，传 `0.05` 可复现旧脚本设置 | 1e-4 |
-| `--freeze-ratio` | 冻结骨干网络比例（0.0=不冻结，1.0=全冻结） | 0.7 |
-| `--loss` | 度量学习损失：`arcface`（默认）、`supcon`、`subcenter-arcface` 或 `subcenter-arcface-compact`；参见“度量损失模式（v0.8.0）” | `arcface` |
-| `--subcenters` | `--loss subcenter-arcface` 或 `subcenter-arcface-compact` 的每类中心数（K）：2 到 8 的整数；`arcface` 与 `supcon` 会拒绝该参数 | 2 |
-| `--compact-weight` | `--loss subcenter-arcface-compact` 的同类别中心距离 hinge 权重（cap 固定为 0.5） | 0.1 |
-| `--supcon-temperature` | `--loss supcon` 的温度；必须大于 0 | 0.07 |
-| `--long-tail` | 长尾策略：`none` 或 `cb-drw`（仅 ArcFace 家族；beta 0.99、cap 3.0、50% 起 10% 斜坡） | `none` |
-| `--pseudo-label-from` | 用于一轮自动伪标签的已完成 finetune#1 ArcFace 家族检查点 | 无 |
-| `--pseudo-similarity-floor` | 未经校准的 raw-CLS 前三均值余弦类别分数下限，取值 [-1, 1] | 0.75 |
-| `--pseudo-min-gap` | 获胜分数与次高分数之差，取值 [0, 2] | 0.10 |
-| `--pseudo-neighbors` | 非对称、排除同类 mutual-kNN 的邻居数 | 15 |
-| `--pseudo-cap-multiplier` | 每类接受上限乘数：`min(multiplier * 专家种子数, absolute_cap)` | 3 |
-| `--pseudo-absolute-cap` | 每类绝对接受上限 | 50 |
-| `--trace-batch-ids` | 将每个训练批次的图像 ID 按顺序写入 `logs/batch_ids.finetune.jsonl`（需显式开启，文件可能较大） | 否 |
-| `--augmentation` | 微调数据增强配置：`none`（新运行默认）或 `conservative`（实验性）；`--resume` 时省略则继承已保存配置 | `none` |
-| `--orientation-policy` | 方向策略：`sensitive`（新运行默认）或 `invariant`；仅影响 `conservative`。`--checkpoint` 初始化时省略则继承预训练 checkpoint 的策略；`--resume` 时省略则继承已保存策略 | `sensitive` |
-| `--batch-size` | 批量大小 | 32 |
-| `--num-workers` | DataLoader 工作线程数 | 4 |
-| `--cpus` | PyTorch/MKL CPU 线程数 | 12 |
-| `--device` | `auto`/`cpu`/`cuda`/`mps` | `auto` |
-| `--seed` | 随机种子 | 42 |
-| `--log-every-n-steps` | 每 N 步记录指标 | 50 |
-| `--save-every-epochs` | 每 N 轮保存检查点 | 10 |
-| `--keep-last-checkpoints` | 保留最近 N 个检查点 | 10 |
-| `--visualize-data` | 含 `image` 列及可选 `label` 列的 CSV；无 label 时仅生成 UMAP；省略则复用 `--train-data` | 无 |
-| `--extract-size` | 嵌入提取图像尺寸；`auto` 使用模型 img_size | auto |
-| `--metrics-sample-size` | 指标与 UMAP 最大样本数（<=0 不设上限） | 10000 |
-| `--umap-n-neighbors` | UMAP 邻居数 | 15 |
-| `--umap-min-dist` | UMAP 最小距离 | 0.1 |
-| `--umap-metric` | UMAP 距离度量 | `cosine` |
-| `--visualize-class-number` | UMAP 最大显示类别数 | 20 |
-| `--disable-embedding-metrics` | 禁用周期嵌入指标与 UMAP | 否 |
-
-**输出**：
-- `logs/finetune.log` — 运行日志
-- `finetune_latest.pth`、`finetune_epoch_*.pth` — 模型检查点，写入 `--out-dir` 根目录（不存在 `checkpoints/` 子目录，也没有 `finetune_best.pth`）
-- `logs/metrics.finetune.csv` — 周期嵌入指标
-- `logs/instant_metrics.finetune.csv` — 每次迭代的训练指标
-- `logs/loss_diagnostics.finetune.csv` — v0.8.0 每轮损失诊断
-- `logs/batch_ids.finetune.jsonl` — 训练批次 ID 轨迹（仅当传入 `--trace-batch-ids`）
-- `logs/training_curves_finetune.pdf` — 训练曲线图
-- `logs/umap.train.epoch_<N>.pdf` — 周期 UMAP 图（未禁用时）
-
-**检查点处理**：
-
-- `--checkpoint` 开启新运行。SSL 预训练检查点会安装全新的嵌入头；头类型与宽度都匹配的微调检查点会保留已训练的投影器。历史 `ProjectionHead` 检查点保留其投影器，因此嵌入宽度由它决定。
-- `--resume` 会恢复保存的优化器状态，因此 `--finetune-lr`、`--metric-head-lr`、`--weight-decay` 不生效。`--freeze-ratio` 必须与保存值一致。
-- 旧脚本检查点（`ref/ibot20260115.py`）可被 `extract`、`export`、`cam` 读取，但不能被 `finetune` 续训。
-
-**度量损失模式（v0.8.0）。** `--loss` 接受四种显式监督目标；未知名称或与解析出的模式不匹配的设置会在创建任何输出之前报错。ArcFace 仍是默认值，也是 v0.8.0 的参考损失。
-
-| 模式 | 目标 |
-|------|------|
-| `arcface` | 每个已标注物种一个角度间隔分类中心（默认） |
-| `supcon` | 单视图监督对比损失，基于批内图像对 |
-| `subcenter-arcface` | 每个物种 K 个中心；样本靠近最近的中心 |
-| `subcenter-arcface-compact` | 子中心 ArcFace 加同类别中心距离上限惩罚 |
-
-- 分类中心是**仅训练期**状态：`extract`、`cluster` 及默认下游流程都不会读取它们，形态学元数据也从不进入训练。
-- **原始 CLS 仍是对比目标。** 损失作用于微调头，而默认 `extract` 向量是骨干网络的原始 CLS 嵌入，因此训练损失更低并不能单独证明距离更好。跨模式比较应固定 `--freeze-ratio`、骨干与微调头学习率、轮数、数据增强、训练清单、批量大小和随机种子。**开集**比较需要在留出的已知物种上标定每种损失，再不重新调参地应用于未见物种。
-- 首轮探索性设置：SupCon 温度 `0.07`、K `2`、余弦距离上限 `0.5`、compact 权重 `0.1`。这些是起始值，不是已验证的最优值；首轮不设参数网格，也不包含 benchmark runner。
-- `supcon` 会跳过没有有效正样本或没有不同物种负样本的批次并报告跳过数量；若整个 epoch 都不可用则直接失败，而不是在空信号上保存 checkpoint。
-- 新的 v0.8.0 checkpoint 会记录损失名称及其有效设置、随机种子、源 checkpoint 的 SHA-256、`train_manifest_sha256`、优化器布局与原型 weight decay 规则。新的 v0.8.0 ArcFace 运行对前向中 L2 归一化的原型使用**零 weight decay**，而 v0.7.x 会施加请求的 decay（默认 `1e-4`）。由于前向会归一化原型，该 decay 只缩放其范数，而损失不观测范数；在默认 `--finetune-lr 1e-4` 与 `--weight-decay 1e-4` 下，每步缩放低于 float32 分辨率，因此结果与 v0.7.x 数值完全一致。只有当学习率 × weight decay 的乘积更大时，原始原型范数才会改变并扰动轨迹，因此跨版本 checkpoint 不保证是仅损失不同的对照比较。旧 checkpoint 使用 `--resume` 会保留其保存的优化器语义；对 SSL 或无分类器的初始化 checkpoint 使用 `--resume` 会被拒绝。
-- `logs/loss_diagnostics.finetune.csv` 每个完成的 epoch 记录一行（可用/跳过批次数、有效锚点数、满足间隔的比例、compact hinge 激活比例与惩罚、每类每中心的分配计数、中心方向余弦）。`logs/batch_ids.finetune.jsonl` 仅在 `--trace-batch-ids` 时写出。既有 `logs/metrics.finetune.csv` 与 `logs/instant_metrics.finetune.csv` 的 schema 不变。
-
----
-
-### 嵌入指标（v0.7.1）
-
-`pretrain`、`finetune` 与 `extract` 以相同字段名计算嵌入质量指标。周期日志位于
-`logs/metrics.pretrain.csv` 与 `logs/metrics.finetune.csv`；`extract` 在 `--label-csv`
-至少包含两个类别时写入 `metrics.csv`。
-
-- kNN 与线性探测共用同一个显式打乱的
-  `StratifiedKFold(shuffle=True, random_state=42)`；折数为 `min(5, 最小类别样本数)`，
-  两类数据不再被强制为两折。某类只有 1 个样本时，所有 CV 指标不可用。
-- 保留历史字段 `kNN_Acc_k1`、`kNN_Acc_k5`、`kNN_Acc_k20`。请求的 `k` 超过最小训练折
-  （`Recall@k` 为 `n_samples - 1`）时按不可用处理，不再静默改名。
-- `Linear_Probing_Acc` 为普通 CV 准确率；新增的 `Linear_Probing_Balanced_Acc` 为同一
-  CV 过程的类别均衡准确率。
-- 无法计算的指标写为空 CSV 字段，绘图时表现为断点而非 0。当归一化后的不同嵌入数少于
-  类别数时，聚类指标按不可用处理，不再伪造单一簇。
-- `mAP` 只对非查询样本排序，并排除没有非自身相关项的查询。`Recall@k` 刻意保留全部查询
-  （含单例标签）作为分母；两者的单例查询口径不同，用于保持历史可比性。
-- `Silhouette_Score` 是相对真实标签的余弦轮廓系数。
-
-`cam` 与 `extract` 使用原生校验：在创建任何输出目录之前，对枚举取值之外的输入直接拒绝。
-
-**可比性。** v0.7.1 之前的数值与 v0.7.1 输出不可直接比较：CV 折选择、子采样顺序、`mAP`
-自包含以及不可用值处理均已改变。字段名与历史行仍可读取；`--resume` 的 v0.7.0
-`metrics.pretrain.csv`/`metrics.finetune.csv` 会就地迁移，补一列空的
-`Linear_Probing_Balanced_Acc`。
-
----
-
-### 训练数据增强配置
-
-`pretrain` 支持 `--augmentation global-barcode|color-robust|legacy`（新运行默认 `global-barcode`）与 `--orientation-policy invariant|sensitive`（新运行默认 `sensitive`）。`finetune` 支持 `--augmentation none|conservative`（新运行默认 `none`）以及相同的方向策略。
-
-| Profile | 阶段 | 说明 |
-|---------|------|------|
-| `global-barcode` | pretrain（默认） | 整标本条形码配置；方向处理取决于所选方向策略。温和的光度扰动；保留颜色（不做灰度化）。 |
-| `color-robust` | pretrain | 几何与模糊设置与 `global-barcode` 相同，但颜色扰动更强并启用灰度化。**警告**：可能降低模型对诊断性体色、色斑或金属光泽的敏感度。 |
-| `legacy` | pretrain | 完全复现 OTU-Former 0.2.1 的数据增强，仅用于旧运行的续训与对比，不建议用于新运行。它会记录所选的任一方向策略，但不改变其历史变换。 |
-| `none` | finetune（默认） | 保持原有的确定性 `Resize -> CenterCrop -> ToTensor -> Normalize`。 |
-| `conservative` | finetune | 实验性可选项，尚无证据表明优于 `none`；请在留出个体和留出物种上评估。不包含裁剪、灰度化、模糊或曝光反转。 |
-
-**生物学约定。** 背面、腹面、侧面、整体以及解剖部位图像属于不同的标记，不得作为同一个标记的等价视图混用；支持任意平面内朝向。完整标记的要求针对源图像，而不是每一个随机 SSL 裁剪视图。全局与局部裁剪都是同一完整源标记的部分 SSL 观测，因此数据增强有助于提高嵌入一致性，但并不保证嵌入不变性。
-
-**方向策略。** `sensitive` 是新运行默认值，也是调用者显式选择的策略（程序不会自动推断），用于方向敏感标记：预训练的每个全局/局部视图以及微调 `conservative` 都使用 `[-15°, 15°]` 旋转且不做水平翻转。之所以采用该默认值，是因为 50 轮实现对比使用的是当时的默认策略 `invariant`，并未评估 `sensitive`；该对比未发现宽角度 `invariant` 旋转带来旋转一致性提升，且 ±180° 旋转并不是合理的常规数据增强。`invariant` 是可选加入的宽角度旋转/翻转策略，用于方向不敏感标记，并保留现有行为。`legacy` 接受任一策略，但保留其历史翻转。
-
-**输入尺寸。** 两种微调配置都使用 checkpoint 记录的训练输入尺寸；对于未记录尺寸的旧 checkpoint，回退到 `224`。
-
-**续训与继承。** 省略 `--augmentation` 和 `--orientation-policy` 时，续训会继承已保存的值；显式冲突会报错，修改某个配置展开后的参数需要开启新运行。旧 pretrain checkpoint 映射为 `legacy`/`invariant`；旧 finetune checkpoint 映射为 `none`/`invariant`。通过 `--checkpoint` 开始新的微调属于初始化而非续训：它不会继承预训练的数据增强配置，省略策略时继承预训练 checkpoint 的策略（旧 checkpoint 回退为 `sensitive`）。
-
-checkpoint 元数据（`config.augmentation_profile`、`config.augmentation_config`）用于配置溯源，并不提供逐位确定性的复现。完整的变换级定义见 [`docs/superpowers/specs/2026-09-07-otuformer-training-augmentation-design.md`](docs/superpowers/specs/2026-09-07-otuformer-training-augmentation-design.md)。
-
----
-
-### extract 命令
-
-从图像中提取嵌入向量。支持 ONNX 模型加速 CPU 推理。
-
-可读取 OTU 检查点与旧脚本检查点（`ref/ibot20260115.py`）。嵌入头优先按 `config.embedding_head` 重建，缺失时按权重中的投影器形状推断。
-
-```bash
-# 使用 PyTorch 检查点（CLS token 模式）
-otuformer extract \
-    --checkpoint runs/finetune/finetune_latest.pth \
-    --input-images-dir ./images \
-    --out-dir runs/extract
-
-# 使用 ONNX 模型（CPU 推理加速 2-5 倍）
-otuformer extract \
-    --checkpoint runs/finetune/finetune_latest.pth \
-    --input-images-dir ./images \
-    --onnx-path runs/export/encoder.onnx \
-    --out-dir runs/extract
-
-# 带标签 CSV 的 attention-pool 模式
-otuformer extract \
-    --checkpoint runs/finetune/finetune_latest.pth \
-    --input-images-dir ./images \
-    --label-csv labels.csv \
-    --token-mode attention-pool \
-    --out-dir runs/extract
-```
-
-| 参数 | 描述 | 默认值 |
-|-----------|-------------|---------|
-| `--checkpoint` | 预训练或微调检查点路径；除非提供 `--onnx-path` 否则必填 | 无 |
-| `--input-images-dir` | 输入图像目录 | 必填 |
-| `--out-dir` | 输出目录 | `runs/extract` |
-| `--model-name` | timm 骨干网络名称 | `vit_tiny_patch16_224` |
-| `--extract-size` | 提取时图像缩放/裁剪尺寸；`auto` 使用检查点记录的训练尺寸 | auto |
-| `--eval-transform` | 评估预处理协议：`center-crop`（默认）或 `whole-specimen-pad`（保持宽高比的方形填充，预留） | `center-crop` |
-| `--use-projector-output` | 使用 SSL 投影器输出；微调 checkpoint 则使用微调任务嵌入 | 否 |
-| `--use-student` | 加载学生权重而非教师（EMA） | 否 |
-| `--token-mode` | `cls`/`patch-topk`/`attention-pool` | `cls` |
-| `--topk-patches` | patch-topk 模式的 top-K 值 | 20 |
-| `--attention-pooling-type` | `lightweight`/`multihead`/`gated` | `lightweight` |
-| `--attention-pooling-epochs` | attention-pool 查询微调轮数 | 20 |
-| `--label-csv` | 含 `image` 列及可选 `label` 列的 CSV；仅 image 时生成 UMAP，不计算监督指标 | 无 |
-| `--metrics-sample-size` | 指标与 UMAP 最大样本数（<=0 不设上限） | 10000 |
-| `--umap-n-neighbors` | UMAP 邻居数 | 15 |
-| `--umap-min-dist` | UMAP 最小距离 | 0.1 |
-| `--umap-metric` | UMAP 距离度量 | `cosine` |
-| `--visualize-class-number` | UMAP 最大显示类别数 | 20 |
-| `--disable-umap` | 跳过 UMAP 生成 | 否 |
-| `--batch-size` | 批量大小 | 32 |
-| `--num-workers` | DataLoader 工作线程数 | 4 |
-| `--device` | `auto`/`cpu`/`cuda`/`mps` | `auto` |
-| `--onnx-path` | ONNX 模型路径（提供时使用 ONNX Runtime 推理） | 无 |
-| `--seed` | 随机种子 | 42 |
-
-**输出**：
-- `embeddings.csv` — 嵌入向量（`id`, `dim_0`, `dim_1`, ...）
-- `metrics.csv` — 质量指标（`--label-csv` 至少包含两个类别时）
-- `umap.pdf` — UMAP 可视化（提供 `--label-csv`、未禁用且抽样后至少有 10 个样本时）
-
----
-
-### cluster 命令
-
-基于 UPGMA 层次聚类将嵌入向量划分为形态学 OTU。
-
-```bash
-# 基本用法
-otuformer cluster \
-    --embeddings runs/extract/embeddings.csv \
-    --out-dir runs/cluster
-
-# 启用 PCA 白化、局部缩放与 Bootstrap 支持率
-otuformer cluster \
-    --embeddings runs/extract/embeddings.csv \
-    --pca-whitening true \
-    --local-scaling true \
-    --num-replicates 100 \
-    --out-dir runs/cluster
-
-# 自定义距离度量与 cutoff 范围
-otuformer cluster \
-    --embeddings runs/extract/embeddings.csv \
-    --distance euclidean \
-    --cutoff-min 0.1 \
-    --cutoff-max 0.8 \
-    --cutoff-step 0.02 \
-    --out-dir runs/cluster
-
-# 带标签 CSV 用于划分质量评估
-otuformer cluster \
-    --embeddings runs/extract/embeddings.csv \
-    --label-csv labels.csv \
-    --out-dir runs/cluster
-```
-
-| 参数 | 描述 | 默认值 |
-|-----------|-------------|---------|
-| `--embeddings` | 嵌入向量 CSV | 必填 |
-| `--out-dir` | 输出目录 | `runs/cluster` |
-| `--distance` | 距离度量：`cosine`/`euclidean` | `cosine` |
-| `--prefix` | 聚类前缀（用于分区表标签） | `OTU` |
-| `--pca-whitening` | 启用 PCA 白化（`true`/`false`） | `false` |
-| `--pca-components` | PCA 成分数 | 256 |
-| `--local-scaling` | 启用 Mutual-Proximity 局部缩放（`true`/`false`） | `false` |
-| `--local-k` | 局部缩放固定 k 值（0=自动） | 0 |
-| `--local-k-strategy` | 自动 k 策略：`adaptive`/`sqrt`/`log`/`fixed` | `adaptive` |
-| `--cutoff-min` | 最小距离阈值 | 0.05 |
-| `--cutoff-max` | 最大距离阈值 | 1.0 |
-| `--cutoff-step` | 距离阈值步长 | 0.05 |
-| `--custom-cutoffs` | 自定义阈值列表（逗号分隔，覆盖 min/max/step） | 无 |
-| `--support-mode` | 支持率估计模式：`subsample`/`bootstrap` | `subsample` |
-| `--num-replicates` | 支持率估计重复次数（0=禁用） | 0 |
-| `--subsample-ratio` | subsample 模式特征比例 | 0.8 |
-| `--support-display-cutoff` | 树上显示支持率标签的最小阈值 | 50.0 |
-| `--save-bootstrap-trees` | 保存所有 Bootstrap 树（`true`/`false`） | `false` |
-| `--save-distances` | 保存完整距离矩阵（`true`/`false`） | `false` |
-| `--max-distance-pairs` | 最大距离矩阵对数 | 1000000 |
-| `--label-csv` / `--labels` | 可选标签 CSV，用于分区质量评估 | 无 |
-| `--metrics-sample-size` | 指标最大样本数 | 10000 |
-| `--cpus` | CPU 线程数 | 8 |
-| `--random-state` | 随机种子 | 42 |
-
-**输出**：
-- `UPGMA/UPGMA_Cosine.nwk` — Newick 格式系统发育树
-- `UPGMA/partitions/partition_scan.csv` — 阈值扫描结果
-- `UPGMA/partitions/tables/partition_<cutoff>_assignments.csv` — 各阈值下的 OTU 分配
-- `UPGMA/partitions/UPGMA_tree_partitions.pdf` — 树与分区可视化
-- `UPGMA/metrics.csv` — 分区质量指标（提供 `--label-csv` 时）
-- `UPGMA/metrics_dashboard.pdf` — 指标面板（提供 `--label-csv` 时）
-- `distance_statistics/` — 距离统计与分布图
-
----
-
-### annotate 命令
-
-应用专家校正到聚类分配，生成 refined OTU 标注。
-
-```bash
-# 基本用法
-otuformer annotate \
-    --raw-assignments runs/cluster/UPGMA/partitions/tables/partition_0.30_assignments.csv \
-    --corrections corrections.csv \
-    --out-dir runs/annotate
-
-# 带嵌入向量（重新计算类内距离与标注 UPGMA 树）
-otuformer annotate \
-    --raw-assignments runs/cluster/UPGMA/partitions/tables/partition_0.30_assignments.csv \
-    --corrections corrections.csv \
-    --embeddings runs/extract/embeddings.csv \
-    --show-annotation-bar \
-    --out-dir runs/annotate
-```
-
-| 参数 | 描述 | 默认值 |
-|-----------|-------------|---------|
-| `--raw-assignments` | cluster 输出的原始分区分配 CSV | 必填 |
-| `--corrections` | 校正 CSV（至少含 `id`/`image` 和 `cluster` 列） | 必填 |
-| `--embeddings` | 可选嵌入向量 CSV，用于距离重计算 | 无 |
-| `--support-display-cutoff` | 标注 UPGMA 树上显示支持率的最小阈值 | 50.0 |
-| `--figure-width` | 标注 UPGMA PDF 宽度（英寸） | 自动 |
-| `--annotate-bar-width` | 校正 OTU 颜色条相对宽度 | 0.08 |
-| `--show-annotation-bar` | 在标注 UPGMA PDF 中显示校正 OTU 条 | 否 |
-| `--show-partitioning-bars` | 在标注 UPGMA PDF 中显示分区条带 | 否 |
-| `--out-dir` | 输出目录 | `runs/annotate` |
-
-**输出**：
-- `partition_<cutoff>_assignments.csv` — 校正后的分配
-- `partition_<cutoff>_assignments_changed_only.csv` — 仅变更行
-- `otu_table.csv` — OTU 表
-- `pairwise_distance_summary_intra-class.csv` — 类内距离摘要（提供 `--embeddings` 时）
-- `UPGMA_tree_partitions_annotated.pdf` — 标注 UPGMA 树（提供 `--embeddings` 时）
-- `annotation_summary.json` — 校正摘要
-
----
-
-### diversity 命令
-
-计算群落 alpha 多样性指标。支持两种输入模式：分区分配 CSV 或 OTU 表 CSV。若要计算 Faith's PD，推荐提供 `--embeddings`，程序会在内部基于 OTU 质心构建 neighbor-joining（NJ）树。旧的 `--tree` 方式仍保留为兼容回退路径。
-
-```bash
-# 从分区分配计算
-otuformer diversity \
-    --assignments runs/cluster/UPGMA/partitions/tables/partition_0.30_assignments.csv \
-    --out-dir runs/diversity
-
-# 启用 Faith's PD（推荐：内部构建 OTU 质心 NJ 树）
-otuformer diversity \
-    --assignments runs/cluster/UPGMA/partitions/tables/partition_0.30_assignments.csv \
-    --phylo \
-    --embeddings runs/extract/embeddings.csv \
-    --save-nj-tree \
-    --nj-bootstrap 100 \
-    --out-dir runs/diversity
-
-# 旧方式：基于现有 Newick 树计算 Faith's PD
-otuformer diversity \
-    --assignments runs/cluster/UPGMA/partitions/tables/partition_0.30_assignments.csv \
-    --phylo \
-    --tree runs/cluster/UPGMA/UPGMA_Cosine.nwk \
-    --out-dir runs/diversity
-
-# 从 OTU 表计算
-otuformer diversity \
-    --otu-table-csv otu_table.csv \
-    --out-dir runs/diversity
-```
-
-| 参数 | 描述 | 默认值 |
-|-----------|-------------|---------|
-| `--assignments` | 分区分配 CSV（含 `id`/`image`、`cluster`，可选 `sample`） | 二选一 |
-| `--otu-table-csv` | OTU 表 CSV（样本列 + OTU ID 列头） | 二选一 |
-| `--otu-table-has-header` | 强制将 OTU 表首行作为列头（OTU ID 为数值时必需） | 否 |
-| `--out-dir` | 输出目录 | `runs/diversity` |
-| `--min-abundance` | 最小丰度阈值（逗号分隔） | `0,2,5` |
-| `--phylo` | 启用 Faith's PD / PD 相关指标 | 否 |
-| `--embeddings` | 嵌入向量 CSV；PD 推荐使用，会在内部构建 OTU 质心 NJ 树 | 无 |
-| `--tree` | 旧版 Newick 树路径，仅在未提供 `--embeddings` 时使用 | 无 |
-| `--save-nj-tree` | 保存推断得到的 OTU 质心 NJ 树到 `NJ_OTU.nwk` | 否 |
-| `--nj-bootstrap` | NJ 支持率 bootstrap 次数；输出 `NJ_OTU_bootstrap.nwk` | `0` |
-| `--save-nj-centroids` | 保存 OTU 质心嵌入到 `NJ_OTU_centroids.csv` | 否 |
-
-**输出指标**（保存到 `diversity_indices.csv`，含全局与 per-sample）：
-- **Richness**：OTU 数量
-- **Chao1**：估计丰富度（考虑稀有 OTU）
-- **ACE**：基于丰度的覆盖度估计
-- **Shannon**：基于熵的多样性（越高 = 越多样）
-- **Simpson**：两个个体不同的概率（越高 = 越多样）
-- **Hill q0/q1/q2**：Hill 数（丰富度/均匀度/多样性）
-- **Pielou_J**：均匀度（Shannon / log(richness)）
-- **Faith's PD (MPD)**：形态系统发育多样性，默认基于 OTU 质心 NJ 树计算（或使用旧 `--tree` 输入）
-- **MPD_w**：丰度加权根 PD（rPD_w）
-- **PD_richness_norm**：Faith's PD / 物种丰富度
-
-**输出**：
-- `diversity_indices.csv` — 全局多样性指标
-- `per-sample/` — 各样本多样性指标（当存在有效 sample 列时）
-- `NJ_OTU.nwk` — OTU 质心 NJ 树（使用 `--embeddings --save-nj-tree` 时）
-- `NJ_OTU_bootstrap.nwk` — 带 bootstrap 支持率标签的 NJ 树（`--nj-bootstrap > 0` 时）
-- `NJ_OTU_centroids.csv` — OTU 质心嵌入（使用 `--save-nj-centroids` 时）
-
----
-
-### cam 命令
-
-生成 CAM 热力图用于模型可解释性分析。
-
-可读取 OTU 检查点与旧脚本检查点（`ref/ibot20260115.py`）；CAM 只使用 backbone。
-
-```bash
-# 基本用法
-otuformer cam \
-    --checkpoint runs/finetune/finetune_latest.pth \
-    --images-dir ./images \
-    --out-dir runs/cam
-
-# 使用 Grad-CAM++ 并保存原始数组
-otuformer cam \
-    --checkpoint runs/finetune/finetune_latest.pth \
-    --images-dir ./images \
-    --cam-method gradcampp \
-    --save-npy raw \
-    --out-dir runs/cam
-
-# 先查看模型层结构
-otuformer cam \
-    --checkpoint runs/finetune/finetune_latest.pth \
-    --images-dir ./images \
-    --dump-model-structure \
-    --out-dir runs/cam
-```
-
-| 参数 | 描述 | 默认值 |
-|-----------|-------------|---------|
-| `--checkpoint` | OTU-Former 检查点路径（`.ckpt` 或 `.pth`） | 必填 |
-| `--images-dir` | 待生成 CAM 的图像目录 | 必填 |
-| `--label-csv` | 可选标签 CSV（含 `image` 和 `label` 列）；省略则使用目录下所有图像 | 无 |
-| `--out-dir` | 输出目录 | `runs/cam` |
-| `--cam-method` | `gradcam`/`gradcampp`/`layercam`/`scorecam`/`eigencam`/`ablationcam` | `gradcam` |
-| `--arch` | 强制架构类型：`cnn`/`vit`（省略则自动检测） | 自动 |
-| `--target-layer-name` | 指定 CAM 目标层（省略则自动选择） | 自动 |
-| `--image-weight` | CAM 叠加中原始图像的混合权重（0-1） | 0.5 |
-| `--fig-format` | 输出格式：`png`/`jpg`/`pdf` | `png` |
-| `--save-npy` | `none`（默认，不保存）、`raw`（未归一化正值 CAM）或 `normalized`（逐图 min-max，落在 `[0, 1]`） | `none` |
-| `--dump-model-structure` | 输出模型层名称到 `model_layers.txt` | 否 |
-| `--max-images` | 最大处理图像数（None = 全部） | 全部 |
-| `--cam-batch-size` | CAM 推理批量大小 | 32 |
-| `--num-workers` | DataLoader 工作进程数 | 4 |
-| `--device` | `auto`/`cpu`/`cuda`/`mps` | `auto` |
-| `--model-name` | 检查点未记录模型名（旧脚本 SFT）时的 timm backbone 回退值 | `vit_tiny_patch16_224` |
-| `--eval-transform` | 评估预处理协议：`center-crop`（热力图限定在模型视野内）或 `whole-specimen-pad`（热力图覆盖整个标本） | `center-crop` |
-
-**输出**：
-- `figures/` — CAM 叠加图像
-- `cam_summary.csv` — 元数据摘要
-- `arrays/` — CAM 数组，仅在 `--save-npy raw` 或 `--save-npy normalized` 时生成（默认不写任何数组）。保存的数组为模型输入分辨率的 `float32`。
-- `model_layers.txt` — 模型层名称（使用 `--dump-model-structure` 时）
-
-**CAM 数组语义**：
-- `--save-npy raw` 保留 ReLU 后、缩放到模型分辨率后的正值未归一化 CAM 幅值（在逐图 min-max 归一化之前）；`--save-npy normalized` 写入逐图 min-max `[0, 1]` 副本，与旧版本的保存数组语义一致。叠加图始终使用独立的归一化副本，PNG 像素级一致不是契约。
-- raw 幅值仅在同一模型、同一目标层、同一预处理配置内可比，不适用于跨 backbone、跨层或跨 CAM 方法比较。`eigencam` 的 raw 数值来自符号任意的 SVD 投影，为完整性而导出，但不适合用于响应强度统计。
-
----
-
-### export 命令
-
-将 PyTorch 检查点导出为 ONNX 格式用于部署和加速推理。
-
-可读取 OTU 检查点与旧脚本检查点（`ref/ibot20260115.py`）。投影器优先按 `config.embedding_head` 重建，缺失时按权重中的投影器形状推断。
-
-```bash
-# 基本用法
-otuformer export \
-    --checkpoint runs/finetune/finetune_latest.pth \
-    --out-dir runs/export
-
-# 自定义图像尺寸与 opset
-otuformer export \
-    --checkpoint runs/finetune/finetune_latest.pth \
-    --imgsz 224 \
-    --opset 17 \
-    --out-dir runs/export
-```
-
-| 参数 | 描述 | 默认值 |
-|-----------|-------------|---------|
-| `--checkpoint` | 检查点路径 | 必填 |
-| `--out-dir` | 输出目录 | `runs/export` |
-| `--imgsz` | ONNX 导出输入图像尺寸；`auto` 使用检查点记录的训练尺寸 | auto |
-| `--opset` | ONNX opset 版本 | 18 |
-| `--model-name` | 检查点未记录模型名（旧脚本 SFT）时的 timm backbone 回退值 | `vit_tiny_patch16_224` |
-
-**输出**：
-- `encoder.onnx` — ONNX 编码器模型
-
----
-
 ## 通用行为
 
 ### 日志
 
-所有命令会在输出目录的 `logs/` 子目录中保存日志文件（如 `pretrain.log`、`finetune.log`、`extract.log`、`cluster.log`、`annotate.log`、`diversity.log`、`cam.log`、`export.log`），包含：
-- 完整命令行
-- 时间戳
-- 所有参数值
-- 运行时输出
+所有命令会在输出目录的 `logs/` 子目录中写入日志文件（`pretrain.log`、`finetune.log`、`extract.log`、`cluster.log`、`annotate.log`、`diversity.log`、`cam.log`、`export.log`），记录完整命令行、时间戳、所有参数值与运行时输出。
 
 ### 优雅退出
 
@@ -862,10 +129,7 @@ otuformer export \
 
 ### 设备选择
 
-`--device auto` 自动选择：
-1. CUDA（如果可用）
-2. MPS / Apple Silicon（如果可用）
-3. CPU（回退）
+`--device auto` 依次优先选择 CUDA、Apple Silicon 上的 MPS，最后回退到 CPU。
 
 ### Shell 补全
 
@@ -879,6 +143,8 @@ otuformer --install-completion
 
 ### 版本号
 
+当前版本：`0.10.1`。
+
 查看已安装版本：
 
 ```bash
@@ -888,47 +154,25 @@ otuformer -v
 
 ## 项目结构
 
-```
-.
-├── src/otuformer/            # 核心包
-│   ├── cli/                  # 命令行接口
-│   │   ├── main.py           # 入口点调度器
-│   │   ├── doctor.py         # otuformer doctor
-│   │   ├── pretrain.py       # otuformer pretrain
-│   │   ├── finetune.py       # otuformer finetune
-│   │   ├── extract.py        # otuformer extract
-│   │   ├── cluster.py        # otuformer cluster
-│   │   ├── annotate.py       # otuformer annotate
-│   │   ├── diversity.py      # otuformer diversity
-│   │   ├── cam.py            # otuformer cam
-│   │   └── export.py         # otuformer export
-│   ├── training/             # 训练逻辑
-│   │   ├── model.py          # 模型定义
-│   │   ├── dataset.py        # 数据集
-│   │   ├── loss.py           # 损失函数
-│   │   ├── trainer.py        # 训练器
-│   │   └── scheduler.py      # 学习率调度
-│   ├── embedding/            # 嵌入向量
-│   │   ├── extractor.py      # 嵌入提取器
-│   │   └── evaluator.py      # 嵌入评估器
-│   ├── delineation/          # OTU 划分
-│   │   ├── distance.py       # 距离计算
-│   │   ├── tree.py           # UPGMA 树构建
-│   │   ├── partition.py      # 分区与指标
-│   │   └── annotate.py       # 校正与标注
-│   ├── vision/               # 视觉工具
-│   │   ├── cam.py            # CAM 可视化
-│   │   └── export.py         # ONNX 导出
-│   └── utils/                # 工具函数
-│       ├── device.py         # 设备检测
-│       ├── logging.py        # TeeLogger
-│       ├── checkpoint.py     # 检查点处理
-│       └── io.py             # CSV/JSON I/O
-├── tests/                    # 测试文件
-├── examples/                 # 示例数据
-├── docs/                     # 文档
-└── pyproject.toml            # 项目配置
-```
+当前包结构见 [`src/otuformer/`](src/otuformer/)；架构职责见
+[总设计文档](docs/superpowers/specs/2026-03-29-otuformer-design.md)。
+
+## 命令
+
+| 命令 | 用途 | 文档 |
+|------|------|------|
+| `otuformer doctor` | 诊断环境与依赖状态。 | [doctor](#doctor-command) |
+| `otuformer update` | 检查并安装最新发布版本。 | [update](#update-command) |
+| `otuformer pretrain` | 自监督对比预训练（DINO/iBOT 风格）。 | [docs/commands/pretrain.cn.md](docs/commands/pretrain.cn.md) |
+| `otuformer finetune` | 监督度量学习微调（`--loss` 选择目标函数）。 | [docs/commands/finetune.cn.md](docs/commands/finetune.cn.md) |
+| `otuformer extract` | 提取图像嵌入向量（支持 ONNX 加速）。 | [docs/commands/extract.cn.md](docs/commands/extract.cn.md) |
+| `otuformer cluster` | UPGMA 层次聚类为形态学 OTU。 | [docs/commands/cluster.cn.md](docs/commands/cluster.cn.md) |
+| `otuformer annotate` | 应用专家校正，生成精化后的 OTU 标注。 | [docs/commands/annotate.cn.md](docs/commands/annotate.cn.md) |
+| `otuformer diversity` | 计算群落 alpha 多样性指数。 | [docs/commands/diversity.cn.md](docs/commands/diversity.cn.md) |
+| `otuformer cam` | 生成 GradCAM 等热图。 | [docs/commands/cam.cn.md](docs/commands/cam.cn.md) |
+| `otuformer export` | 导出 ONNX 模型。 | [docs/commands/export.cn.md](docs/commands/export.cn.md) |
+
+两份跨命令契约有独立文档：[训练数据增强](docs/commands/training-augmentation.cn.md)（`pretrain` 与 `finetune` 共享的 `--augmentation` 与 `--orientation-policy` 行为）与 [嵌入指标](docs/commands/embedding-metrics.cn.md)（`pretrain`、`finetune` 与 `extract` 共享的指标）。
 
 ## 许可证
 

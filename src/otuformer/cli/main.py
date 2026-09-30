@@ -7,6 +7,7 @@ import sys
 import typer
 
 from otuformer import __version__
+from otuformer.cli import README_URL
 
 
 def detect_removed_no_phylo(argv: list[str]) -> bool:
@@ -39,6 +40,8 @@ app = typer.Typer(
         "  otuformer extract --checkpoint runs/finetune/finetune_latest.pth --input-images-dir ./images\n\n"
         "  otuformer cluster --embeddings embeddings.csv\n\n"
         "  otuformer doctor\n"
+        "\nDocs:\n"
+        f"  {README_URL}\n"
     ),
     no_args_is_help=True,
     context_settings={"help_option_names": ["-h", "--help"]},

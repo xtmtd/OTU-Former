@@ -1,5 +1,6 @@
 import argparse
 import functools
+import inspect
 import re
 import pytest
 import pandas as pd
@@ -11,15 +12,39 @@ from pathlib import Path
 import typer
 from typer.testing import CliRunner
 
+from otuformer.cli import README_URL, docs_url
 from otuformer.cli.main import app
 
+from test_docs import TOKEN_RE, all_docs, cn_docs, en_docs
+
 runner = CliRunner()
+
+
+def _docs_corpus(pairs) -> str:
+    return "\n".join(text for _, text in pairs)
+
+
+def _update_section(text: str) -> str:
+    """Body of the README Update section, located by its explicit anchor.
+
+    Bounded by the anchor's own level-2 heading and the next level-2 heading, so
+    one rule serves both languages and neither the heading text nor a
+    translated title is matched.
+    """
+    lines = text[text.index('<a id="update-command"></a>'):].splitlines()
+    start = next(i for i, line in enumerate(lines) if line.startswith("## "))
+    for i in range(start + 1, len(lines)):
+        if lines[i].startswith("## "):
+            return "\n".join(lines[start + 1:i])
+    return "\n".join(lines[start + 1:])
 
 
 def test_help():
     result = runner.invoke(app, ["--help"])
     assert result.exit_code == 0
     assert "otu-former" in result.output.lower() or "otuformer" in result.output.lower()
+    # Documentation conventions 5.1: the root help links the README.
+    assert README_URL in "".join(result.output.split())
 
 
 @pytest.mark.parametrize(
@@ -514,12 +539,26 @@ def test_finetune_registered_source_preflight_precedes_overwrite(tmp_path, monke
 
 
 def test_readmes_document_update_and_continued_training():
-    for path in ["README.md", "README.cn.md"]:
-        text = Path(path).read_text(encoding="utf-8")
-        assert "otuformer update" in text
-        assert "--overwrite" in text
-        assert "--resume" in text
-        assert "HF_TOKEN" in text
+    for corpus in (_docs_corpus(en_docs()), _docs_corpus(cn_docs())):
+        assert "otuformer update" in corpus
+        assert "--overwrite" in corpus
+        assert "--resume" in corpus
+        assert "HF_TOKEN" in corpus
+
+    # The inline Update surface must list every option the CLI defines.
+    from otuformer.cli import update as update_module
+
+    callback = update_module.app.registered_callback.callback
+    expected = set()
+    for parameter in inspect.signature(callback).parameters.values():
+        expected.update(parameter.default.param_decls or ())
+    for name in ("README.md", "README.cn.md"):
+        section = _update_section(Path(name).read_text(encoding="utf-8"))
+        flags = set(TOKEN_RE.findall(section))
+        assert flags == expected, (
+            f"{name}: Update section documents {sorted(flags)}, "
+            f"expected {sorted(expected)}"
+        )
 
 
 def test_finetune_optimizer_arguments_are_forwarded(monkeypatch, tmp_path):
@@ -1808,31 +1847,32 @@ def test_pretrain_help_documents_patch_modes_and_mask_migration():
         assert flag in output
 
 
-def test_pretrain_help_defers_the_full_contract_to_the_readme():
+def test_pretrain_help_links_the_full_contract_document():
     result = runner.invoke(app, ["pretrain", "--help"])
     assert result.exit_code == 0
     assert "Patch-loss contract" not in result.output
-    assert "README" in result.output
+    compact = "".join(result.output.split())
+    assert docs_url("pretrain") in compact
+    assert docs_url("training-augmentation") in compact
 
 
 def test_readmes_document_v07_patch_loss_contract():
-    for name in ["README.md", "README.cn.md"]:
-        text = Path(name).read_text(encoding="utf-8")
+    for text in (_docs_corpus(en_docs()), _docs_corpus(cn_docs())):
         for token in ("--patch-loss", "--masking-strategy", "--ibot-prototypes"):
-            assert token in text, (name, token)
+            assert token in text, token
         for token in ("none", "consistency", "masked-feature", "ibot"):
-            assert token in text, (name, token)
+            assert token in text, token
         for token in ("random", "blockwise", "hybrid"):
-            assert token in text, (name, token)
-        assert "A+" not in text, name
+            assert token in text, token
+        assert "A+" not in text
         assert (
             "continuous masked feature prediction" in text
             or "连续掩码特征预测" in text
-        ), name
-        assert "experimental" in text.lower() or "实验" in text, name
+        ), text[:80]
+        assert "experimental" in text.lower() or "实验" in text
         # New-run migration notice and legacy resume rule.
-        assert "0.50" in text and "0.30" in text and "auto" in text, name
-        assert "0.7.0" in text, name
+        assert "0.50" in text and "0.30" in text and "auto" in text
+        assert "0.7.0" in text
 
 
 def test_pretrain_help_mentions_umap_metric_choices_and_extract_auto():
@@ -2602,15 +2642,15 @@ def test_training_help_documents_augmentation_contract(command, profiles, defaul
     result = runner.invoke(app, [command, "--help"])
     assert result.exit_code == 0
     output = result.output.lower()
+    # Option help renders inside a bordered table, so a phrase can be split by a
+    # border or a line wrap; normalize before matching the longer phrases.
+    flat = " ".join(output.replace("│", " ").split())
     assert "--augmentation" in output
     assert "--orientation-policy" in output
     assert "invariant" in output and "sensitive" in output
     assert all(profile in output for profile in profiles)
-    assert f"default for a new run: {default}" in output
-    assert "default for a new run: sensitive" in output
-    assert "dorsal" in output and "ventral" in output and "lateral" in output
-    assert "in-plane" in output
-    assert "does not guarantee" in output
+    assert f"default for a new run: {default}" in flat
+    assert "default for a new run: sensitive" in flat
 
 
 def test_augmentation_completion_choices_match_dataset_constants():
@@ -3939,11 +3979,11 @@ def test_finetune_help_documents_pseudo_and_long_tail_options():
     assert "[default: 15]" in result.output
     assert "[default: 50]" in result.output
     # Typer/rich hard-wraps help text with panel borders; normalize before matching.
-    normalized = " ".join(result.output.replace("│", " ").split())
+    normalized = " ".join(result.output.replace("│", " ").split()).lower()
     assert "not a probability" in normalized
-    assert "Higher rejects more" in normalized
-    assert "asymmetric own-class-excluded mutual-kNN" in normalized
-    assert "omitted experiment options inherit finetune#1" in normalized
+    assert "higher rejects more" in normalized
+    assert "asymmetric own-class-excluded mutual-knn" in normalized
+    assert "omitted experiment options inherit finetune#1 resolved values" in normalized
 
 def test_finetune_param_classification_is_complete():
     from otuformer.cli.finetune import (
@@ -4000,19 +4040,19 @@ def test_finetune_rejects_invalid_pseudo_options(tmp_path, extra):
 
 
 def test_readmes_document_sparse_label_workflow():
-    for path in ["README.md", "README.cn.md"]:
-        text = Path(path).read_text(encoding="utf-8")
-        assert "--pseudo-label-from" in text
-        assert "--long-tail" in text
-        assert "--pseudo-cap-multiplier" in text
-        assert "--pseudo-absolute-cap" in text
-        assert "HELDOUT_ROOT" in text
-        assert "center-crop" in text
-        assert "pseudo_labels.csv" in text
-        # Options removed from the final design must not be documented.
-        assert "--on-empty-pseudo" not in text
-        assert "--allow-config-diff" not in text
-        assert "--pseudo-weight" not in text
+    for corpus in (_docs_corpus(en_docs()), _docs_corpus(cn_docs())):
+        assert "--pseudo-label-from" in corpus
+        assert "--long-tail" in corpus
+        assert "--pseudo-cap-multiplier" in corpus
+        assert "--pseudo-absolute-cap" in corpus
+        assert "HELDOUT_ROOT" in corpus
+        assert "center-crop" in corpus
+        assert "pseudo_labels.csv" in corpus
+    # Options removed from the final design must not be documented anywhere.
+    corpus = _docs_corpus(all_docs())
+    assert "--on-empty-pseudo" not in corpus
+    assert "--allow-config-diff" not in corpus
+    assert "--pseudo-weight" not in corpus
 
 
 def test_finetune_pseudo_overwrite_is_allowed(monkeypatch, tmp_path):

@@ -13,13 +13,22 @@ from functools import total_ordering
 import typer
 
 from otuformer import __version__
+from otuformer.cli import README_URL
 
 _REPO = "xtmtd/OTU-Former"
 _TAGS_API_URL = f"https://api.github.com/repos/{_REPO}/tags"
 _INSTALL_URL = f"git+https://github.com/{_REPO}.git@v{{version}}"
 _SEMVER_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$")
 
-app = typer.Typer(help="Check for published updates and optionally install the latest version.")
+app = typer.Typer(
+    help=(
+        "Check for published updates and optionally install the latest version.\n\n"
+        "Quick example:\n\n"
+        "  otuformer update --check\n"
+        "\nDocs:\n"
+        f"  {README_URL}#update-command\n"
+    )
+)
 
 
 @total_ordering

@@ -6,6 +6,17 @@ import typer
 
 SIZE_EXAMPLES = "Common examples: 224, 384, 448 (e.g. 518 for patch-14 models)."
 
+# Published documentation. The wheel ships only ``src/otuformer``, so a
+# repository-relative path would be dead for anyone who installed via pip or
+# ``otuformer update``; help text points at the GitHub URL instead.
+DOCS_BASE_URL = "https://github.com/xtmtd/OTU-Former/blob/main/docs"
+README_URL = "https://github.com/xtmtd/OTU-Former/blob/main/README.md"
+
+
+def docs_url(name: str) -> str:
+    """Published URL of a command or reference document under docs/commands/."""
+    return f"{DOCS_BASE_URL}/commands/{name}.md"
+
 # Shell-completion choices. These duplicate ``otuformer.training.dataset`` so
 # the CLI stays torch-free and Tab completion is instant; a test asserts they
 # stay in sync with the dataset constants.
