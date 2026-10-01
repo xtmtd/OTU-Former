@@ -27,6 +27,10 @@ from otuformer.utils.checkpoint import (
     resolve_checkpoint,
 )
 from otuformer.utils.device import resolve_device
+from otuformer.constants import (
+    ATTENTION_POOLING_TYPES,
+    TOKEN_MODES,
+)
 from otuformer.utils.size import (
     resolve_onnx_input_size,
     resolve_training_image_size,
@@ -34,7 +38,6 @@ from otuformer.utils.size import (
 )
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
-ATTENTION_POOLING_TYPES = {"lightweight", "multihead", "gated"}
 
 
 class ImageFolderDataset(Dataset):
@@ -909,9 +912,10 @@ def extract_embeddings(
       - ``attention-pool``: attention pool patch tokens (learned pool if available,
         otherwise CLS-query pooling)
     """
-    if token_mode not in {"cls", "patch-topk", "attention-pool"}:
+    if token_mode not in TOKEN_MODES:
         raise ValueError(
-            f"Unsupported token_mode '{token_mode}', choose from: cls, patch-topk, attention-pool"
+            f"Unsupported token_mode '{token_mode}', choose from: "
+            f"{', '.join(TOKEN_MODES)}"
         )
     if topk_patches < 1:
         raise ValueError("--topk-patches must be >= 1")

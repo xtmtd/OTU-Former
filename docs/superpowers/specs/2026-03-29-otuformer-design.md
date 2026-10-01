@@ -295,6 +295,7 @@ tqdm >= 4.66
 - Metric-loss comparisons for morphOTU delineation: see [the v0.8.0 design](2026-09-24-otuformer-metric-loss-v080-design.md). ProxyAnchor remains a possible later experiment, not a v0.8.0 requirement.
 - `report` sub-command (HTML/PDF summary of a full analysis run)
 - Beta diversity matrix + cross-sample OTU comparison
+- CLI conversational workflow Skill: see [the workflow Skill design](2026-09-30-otuformer-workflow-skill-design.md). This is the agent-CLI Skill (`skills/otuformer-workflow/`), distinct from the notebook/Python API work below.
 - Python API / skill for notebook-based non-CLI analysis (after interfaces stabilise)
 
 ---

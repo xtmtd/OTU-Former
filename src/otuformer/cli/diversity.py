@@ -10,6 +10,7 @@ from pathlib import Path
 import typer
 
 from otuformer.cli import docs_url, format_user_command
+from otuformer.cli.constraints import validate_diversity_sources
 
 app = typer.Typer(
     help=(
@@ -35,8 +36,7 @@ app = typer.Typer(
 def validate_input_sources(
     assignments: Path | None, otu_table_csv: Path | None
 ) -> None:
-    if (assignments is None) == (otu_table_csv is None):
-        raise ValueError("Provide exactly one of --assignments or --otu-table-csv")
+    validate_diversity_sources(assignments, otu_table_csv)
 
 
 @app.callback(invoke_without_command=True)

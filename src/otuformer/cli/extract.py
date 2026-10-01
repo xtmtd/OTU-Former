@@ -11,6 +11,8 @@ from pathlib import Path
 import typer
 
 from otuformer.cli import SIZE_EXAMPLES, _parse_size, docs_url, format_user_command
+from otuformer.cli.constraints import validate_eval_transform, validate_size_option
+from otuformer.constants import EVAL_TRANSFORM_CHOICES
 
 app = typer.Typer(
     help=(
@@ -28,21 +30,28 @@ app = typer.Typer(
 )
 
 
-_EVAL_TRANSFORM_CHOICES = ("center-crop", "whole-specimen-pad")
+_EVAL_TRANSFORM_CHOICES = EVAL_TRANSFORM_CHOICES
 
 
-def _validate_extract_options(*, eval_transform: str) -> None:
-    """Reject extract options outside their enumerated values before any output.
+def _validate_extract_options(
+    *, eval_transform: str, topk_patches: int = 20, attention_pooling_epochs: int = 20
+) -> None:
+    """Reject extract options outside their accepted values before any output.
 
     Uses Typer-native validation instead of a Click-specific choice type so
     Typer builds commands the same way whether Click is installed or vendored
-    by Typer.
+    by Typer. The size guards mirror otuformer.embedding.extractor; running them
+    here keeps a bad --topk-patches/--attention-pooling-epochs proposal from
+    clearing an overwritten --out-dir before the core rejects it.
     """
-    if eval_transform not in _EVAL_TRANSFORM_CHOICES:
-        raise typer.BadParameter(
-            "--eval-transform must be one of: "
-            f"{', '.join(_EVAL_TRANSFORM_CHOICES)}; got {eval_transform!r}"
+    try:
+        validate_eval_transform(eval_transform)
+        validate_size_option(topk_patches, stage="--topk-patches")
+        validate_size_option(
+            attention_pooling_epochs, stage="--attention-pooling-epochs"
         )
+    except ValueError as error:
+        raise typer.BadParameter(str(error)) from None
 
 
 @app.callback(invoke_without_command=True)
@@ -183,7 +192,11 @@ def extract(
     if ctx.invoked_subcommand is not None:
         return
 
-    _validate_extract_options(eval_transform=eval_transform)
+    _validate_extract_options(
+        eval_transform=eval_transform,
+        topk_patches=topk_patches,
+        attention_pooling_epochs=attention_pooling_epochs,
+    )
 
     from otuformer.embedding.extractor import extract_embeddings
     from otuformer.utils.io import prepare_output_dir, write_csv

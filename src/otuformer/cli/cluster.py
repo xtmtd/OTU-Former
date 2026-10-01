@@ -11,6 +11,7 @@ from typing import Literal
 import typer
 
 from otuformer.cli import docs_url, format_user_command
+from otuformer.cli.constraints import validate_bool_literal
 
 app = typer.Typer(
     help=(
@@ -774,14 +775,10 @@ def _compute_monophyly_proportion_upgma(
 
 
 def _parse_bool_option(name: str, value: str) -> bool:
-    normalized = value.strip().lower()
-    if normalized in {"true", "1", "yes", "y"}:
-        return True
-    if normalized in {"false", "0", "no", "n"}:
-        return False
-    raise typer.BadParameter(
-        f"Invalid value for --{name}: {value!r}. Use true or false."
-    )
+    try:
+        return validate_bool_literal(name, value)
+    except ValueError as error:
+        raise typer.BadParameter(str(error)) from None
 
 
 def _l2_normalize_rows(x):

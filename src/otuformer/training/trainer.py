@@ -21,7 +21,14 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from otuformer.constants import ARCFACE_FAMILY_LOSSES, MAX_SUBCENTERS, MIN_SUBCENTERS
+from otuformer.constants import (
+    ARCFACE_FAMILY_LOSSES,
+    IBOT_PROTOTYPES_MIN,
+    MASKING_STRATEGIES,
+    MAX_SUBCENTERS,
+    MIN_SUBCENTERS,
+    PATCH_LOSS_MODES,
+)
 from otuformer.embedding.evaluator import (
     compute_clustering_metrics,
     compute_knn_accuracy,
@@ -369,9 +376,6 @@ def _ssl_loss(
     return -(teacher_probs * student_log_probs).sum(dim=1).mean()
 
 
-PATCH_LOSS_MODES = ("none", "consistency", "masked-feature", "ibot")
-MASKING_STRATEGIES = ("random", "blockwise", "hybrid")
-IBOT_PROTOTYPES_MIN = 2
 PATCH_CENTER_MOMENTUM = 0.9
 _DEFAULT_PATCH_RATIOS = {
     "consistency": 0.30,

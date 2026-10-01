@@ -33,34 +33,32 @@
 
 ## 安装
 
-推荐使用隔离的 Python 环境，避免与系统/全局 site-packages 发生依赖冲突。
-
-安装前请先克隆仓库并进入项目目录：
+推荐使用隔离的 Python 环境，避免与系统/全局 site-packages 发生依赖冲突。安装前请先克隆仓库并进入项目目录：
 
 ```bash
-git clone https://github.com/xtmtd/OTU-Former.git
-cd OTU-Former
+git clone https://github.com/xtmtd/OTU-Former.git && cd OTU-Former
 ```
 
 ### 隔离环境
 
-可任选其一：
-
 ```bash
 # 选项 1：conda
-conda create -n otuformer python=3.11 -y
-conda activate otuformer
-pip install -e .
-
+conda create -n otuformer python=3.11 -y && conda activate otuformer && pip install -e .
 # 选项 2：uv + venv
-uv venv .venv
-source .venv/bin/activate
-uv pip install -e .
-
+uv venv .venv && source .venv/bin/activate && uv pip install -e .
 # 选项 3：标准库 venv + pip
-python -m venv .venv
-source .venv/bin/activate
-pip install -e .
+python -m venv .venv && source .venv/bin/activate && pip install -e .
+```
+
+## 智能体 Skill（对话驱动工作流）
+
+[`skills/otuformer-workflow/`](skills/otuformer-workflow/SKILL.md) 是面向智能体 CLI 的可移植 Skill，`pip install` 不会安装它。按工具注册或链接 —— Pi：`--skill <dir>`、`.pi/settings.json` 的 `skills` 条目，或 `.pi/skills/`、`~/.pi/agent/skills/`（[文档](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/skills.md)）；Claude Code：`.claude/skills/<name>/` 或 `~/.claude/skills/<name>/`（[文档](https://code.claude.com/docs/en/skills)）；Codex：技能目录，或 `~/.codex/config.toml` 中带 `path = ".../SKILL.md"` 的 `[[skills.config]]` 条目（对外分发可打包为仅含 Skill 的 plugin）（[文档](https://developers.openai.com/codex/skills)）；OpenCode：`.opencode/skills/<name>/` 或 `~/.config/opencode/skills/<name>/`（[文档](https://opencode.ai/docs/skills/)）。
+各工具规则不同：Pi 与 Claude Code 需要项目信任后才会加载项目级 Skill，且 Pi 在同名冲突时保留先发现者并告警。复制 Skill 时必须一并保留 `LICENSE.txt`，并显式传入 examples 根目录。升级 `otuformer` 后请同步 Skill 正文与脚本；其演示在获批的 demo 目录下使用全部 230 张 `examples/Epidorcus` 图片，不会静默改用你的数据。
+
+```text
+你：用 OTU-Former 跑 ./images，并告诉我下一步该做什么 | 机器人：doctor -> 完整参数卡 -> 你确认 -> 只执行一步 -> 报告结果
+你：用 runs/finetune/finetune_latest.pth 提取特征 | 机器人：参数卡 -> 确认 -> runs/extract/embeddings.csv
+你：跑 230 张示例演示，现在进行到哪一步了？ | 机器人：demo 目录下全部示例；读取日志/产物，并给出继续 / 重做 / 停止的建议
 ```
 
 ## 快速开始
@@ -143,7 +141,7 @@ otuformer --install-completion
 
 ### 版本号
 
-当前版本：`0.10.1`。
+当前版本：`0.11.0`。
 
 查看已安装版本：
 
@@ -176,7 +174,8 @@ otuformer -v
 
 ## 许可证
 
-本项目采用 MIT 许可证 — 详见 LICENSE 文件。
+自 v0.11.0 起，本项目按 [OTU-Former Research and Commercial Use License Notice](LICENSE) 分发：在保留本声明的前提下允许学术、教育与非商业研究使用；商业使用（包括企业内部使用、付费分析或咨询、商业再分发）需事先获得版权持有人的书面许可。这是 source-available 软件，**并非 OSI 认证的开源软件**；v0.11.0 之前发布的版本仍可按 MIT 许可证使用。
+你运行软件产生的输出（嵌入、OTU/丰度表、多样性统计、图表、CAM 图像）不因本声明附加任何限制；检查点、导出的模型与第三方材料仍适用各自的条款。
 
 ## 联系方式
 

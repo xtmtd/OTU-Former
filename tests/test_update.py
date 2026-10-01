@@ -1,6 +1,7 @@
 import json
 from types import SimpleNamespace
 
+import pytest
 from typer.testing import CliRunner
 
 from otuformer import __version__
@@ -32,12 +33,13 @@ def test_fetch_remote_version_uses_highest_semver_tag(monkeypatch):
     assert fetch_remote_version() == "0.2.0"
 
 
-def test_update_check_never_runs_pip(monkeypatch):
+@pytest.mark.parametrize("arguments", [["--check"], ["--check", "--yes"]])
+def test_update_check_never_runs_pip(monkeypatch, arguments):
     monkeypatch.setattr("otuformer.cli.update.fetch_remote_version", lambda: "9.9.9")
     called = []
     monkeypatch.setattr("subprocess.run", lambda *args, **kwargs: called.append(args))
 
-    result = runner.invoke(app, ["update", "--check"])
+    result = runner.invoke(app, ["update", *arguments])
 
     assert result.exit_code == 0
     assert not called

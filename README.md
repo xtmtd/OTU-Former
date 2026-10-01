@@ -33,34 +33,32 @@ Turning specimen photographs into reproducible OTUs usually means stitching an e
 
 ## Installation
 
-Recommended: use an isolated Python environment to avoid dependency conflicts with your system/site-packages.
-
-Before installation, clone the repository and enter the project directory:
+Recommended: use an isolated Python environment to avoid dependency conflicts with your system/site-packages. Before installation, clone the repository and enter the project directory:
 
 ```bash
-git clone https://github.com/xtmtd/OTU-Former.git
-cd OTU-Former
+git clone https://github.com/xtmtd/OTU-Former.git && cd OTU-Former
 ```
 
 ### Isolated Environment
 
-Choose one of the following:
-
 ```bash
 # Option 1: conda
-conda create -n otuformer python=3.11 -y
-conda activate otuformer
-pip install -e .
-
+conda create -n otuformer python=3.11 -y && conda activate otuformer && pip install -e .
 # Option 2: uv + venv
-uv venv .venv
-source .venv/bin/activate
-uv pip install -e .
-
+uv venv .venv && source .venv/bin/activate && uv pip install -e .
 # Option 3: stdlib venv + pip
-python -m venv .venv
-source .venv/bin/activate
-pip install -e .
+python -m venv .venv && source .venv/bin/activate && pip install -e .
+```
+
+## Agent Skill (chat-driven workflow)
+
+[`skills/otuformer-workflow/`](skills/otuformer-workflow/SKILL.md) is a portable Skill for agent CLIs; `pip install` does not install it. Register or link it per tool — Pi: `--skill <dir>`, a `skills` entry in `.pi/settings.json`, or `.pi/skills/`/`~/.pi/agent/skills/` ([docs](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/skills.md)); Claude Code: `.claude/skills/<name>/` or `~/.claude/skills/<name>/` ([docs](https://code.claude.com/docs/en/skills)); Codex: a skill directory, or a `[[skills.config]]` entry with `path = ".../SKILL.md"` in `~/.codex/config.toml`, packaged as a skill-only plugin for distribution ([docs](https://developers.openai.com/codex/skills)); OpenCode: `.opencode/skills/<name>/` or `~/.config/opencode/skills/<name>/` ([docs](https://opencode.ai/docs/skills/)).
+Per-tool rules differ: Pi and Claude Code load project-level skills only after project trust, and Pi keeps the first skill found on a name collision and warns. A copied Skill must carry `LICENSE.txt` and be given the examples root explicitly. After upgrading `otuformer`, refresh the Skill's prose and scripts; its demo uses all 230 `examples/Epidorcus` images under an approved demo root, never your data silently.
+
+```text
+You: run OTU-Former on ./images and tell me what to do next | Bot: doctor -> full parameter card -> your approval -> one step -> results
+You: extract embeddings with runs/finetune/finetune_latest.pth | Bot: card -> approval -> runs/extract/embeddings.csv
+You: show the 230-image demo, then how far did it get? | Bot: all examples under runs/demo; reads logs/artifacts, then recommends continue / redo / stop
 ```
 
 ## Quick Start
@@ -144,7 +142,7 @@ Supported shells: bash, zsh, fish
 
 ### Version
 
-Current version: `0.10.1`.
+Current version: `0.11.0`.
 
 Show installed version:
 
@@ -178,7 +176,8 @@ Two cross-command contracts have their own documents: [Training Augmentation](do
 
 ## License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+From v0.11.0 this project is distributed under the [OTU-Former Research and Commercial Use License Notice](LICENSE): academic, educational, and non-commercial research use is permitted with the notice retained, while commercial use (including enterprise internal use, paid analysis or consulting, and commercial redistribution) requires prior written permission from the copyright holder. This is source-available software, **not OSI-approved open source**; versions published before v0.11.0 remain available under the MIT License.
+Outputs you generate (embeddings, OTU/abundance tables, diversity statistics, figures, CAM images) carry no additional restriction from this notice, while checkpoints, exported models, and third-party material keep their own terms.
 
 ## Contact
 

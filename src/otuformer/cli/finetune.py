@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 import sys
 import traceback
@@ -22,6 +21,7 @@ from otuformer.cli import (
     format_user_command,
     orientation_policy_choices,
 )
+from otuformer.cli.constraints import validate_pseudo_options
 from otuformer.constants import ARCFACE_FAMILY_LOSSES, MAX_SUBCENTERS, MIN_SUBCENTERS
 
 # Every finetune CLI parameter is classified so that pseudo-mode inheritance and
@@ -198,42 +198,19 @@ def _validate_pseudo_options(
     explicit_options: frozenset[str],
 ) -> None:
     """Reject invalid pseudo/long-tail settings before any output exists."""
-    if long_tail not in ("none", "cb-drw"):
-        raise typer.BadParameter(
-            f"--long-tail must be none or cb-drw, got {long_tail!r}."
+    try:
+        validate_pseudo_options(
+            long_tail=long_tail,
+            loss=loss,
+            pseudo_label_from=pseudo_label_from,
+            similarity_floor=similarity_floor,
+            min_gap=min_gap,
+            neighbors=neighbors,
+            cap_multiplier=cap_multiplier,
+            absolute_cap=absolute_cap,
         )
-    if not math.isfinite(similarity_floor) or not (-1.0 <= similarity_floor <= 1.0):
-        raise typer.BadParameter(
-            "--pseudo-similarity-floor must be a finite value in [-1, 1], "
-            f"got {similarity_floor}."
-        )
-    if not math.isfinite(min_gap) or not (0.0 <= min_gap <= 2.0):
-        raise typer.BadParameter(
-            f"--pseudo-min-gap must be a finite value in [0, 2], got {min_gap}."
-        )
-    if neighbors < 1:
-        raise typer.BadParameter(
-            f"--pseudo-neighbors must be a positive integer, got {neighbors}."
-        )
-    if cap_multiplier < 1:
-        raise typer.BadParameter(
-            "--pseudo-cap-multiplier must be a positive integer, got "
-            f"{cap_multiplier}."
-        )
-    if absolute_cap < 1:
-        raise typer.BadParameter(
-            f"--pseudo-absolute-cap must be a positive integer, got {absolute_cap}."
-        )
-    if long_tail == "cb-drw" and loss == "supcon":
-        raise typer.BadParameter(
-            "--long-tail cb-drw is rejected for --loss supcon: SupCon has no "
-            "class-level cross-entropy term."
-        )
-    if pseudo_label_from and loss == "supcon":
-        raise typer.BadParameter(
-            "Pseudo-label feedback supports only ArcFace-family losses; a SupCon "
-            "checkpoint cannot be a --pseudo-label-from source."
-        )
+    except ValueError as error:
+        raise typer.BadParameter(str(error)) from None
     supplied = set(explicit_options) & set(PSEUDO_RULE_OPTIONS)
     if supplied and not pseudo_label_from and not resume:
         raise typer.BadParameter(

@@ -14,6 +14,13 @@ from torch.utils.data import Dataset
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode, functional as TF
 
+from otuformer.constants import (
+    EVAL_TRANSFORM_CHOICES,
+    FINETUNE_AUGMENTATIONS,
+    ORIENTATION_POLICIES,
+    PRETRAIN_AUGMENTATIONS,
+)
+
 IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.webp', '.tif', '.tiff'}
 
 # 8-bit ImageNet mean, used as the background fill fallback when edge-median
@@ -23,9 +30,6 @@ _BACKGROUND_FILL_FALLBACK = (124, 116, 104)
 _IMAGENET_MEAN = [0.485, 0.456, 0.406]
 _IMAGENET_STD = [0.229, 0.224, 0.225]
 
-PRETRAIN_AUGMENTATIONS: tuple[str, ...] = ("global-barcode", "color-robust", "legacy")
-FINETUNE_AUGMENTATIONS: tuple[str, ...] = ("none", "conservative")
-ORIENTATION_POLICIES: tuple[str, ...] = ("invariant", "sensitive")
 
 _PRETRAIN_GLOBAL_SCALE = [0.4, 1.0]
 _PRETRAIN_LOCAL_SCALE = [0.05, 0.4]

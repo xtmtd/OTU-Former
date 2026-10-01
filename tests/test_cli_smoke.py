@@ -414,6 +414,28 @@ def test_pretrain_new_run_rejects_an_impossible_register_option_before_overwrite
     assert sentinel.read_text(encoding="utf-8") == "keep"
 
 
+def test_extract_rejects_an_invalid_patch_count_before_overwrite(tmp_path):
+    """--overwrite must not clear an existing output before rejecting a bad size."""
+    out_dir = tmp_path / "extract_out"
+    out_dir.mkdir()
+    sentinel = out_dir / "keep.txt"
+    sentinel.write_text("keep", encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        [
+            "extract", "--input-images-dir", str(tmp_path),
+            "--checkpoint", str(tmp_path / "missing.pth"),
+            "--out-dir", str(out_dir), "--overwrite",
+            "--topk-patches", "0",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "topk" in result.output.lower() or "top-k" in result.output.lower()
+    assert sentinel.read_text(encoding="utf-8") == "keep"
+
+
 def test_pretrain_registered_resume_preflight_preserves_existing_output(tmp_path, monkeypatch):
     from otuformer.training.model import OTUFormerEncoder
 
@@ -3259,9 +3281,12 @@ def test_source_helper_recognizes_foreign_commandline_enum():
 
 
 def test_cli_modules_do_not_couple_to_external_click():
-    cli_dir = Path(__file__).resolve().parents[1] / "src" / "otuformer" / "cli"
+    package_root = Path(__file__).resolve().parents[1] / "src" / "otuformer"
+    cli_dir = package_root / "cli"
+    # The runtime schema module shares the CLI's framework-independence contract.
+    candidates = sorted(cli_dir.glob("*.py")) + [package_root / "cli_schema.py"]
     offenders = {}
-    for path in sorted(cli_dir.glob("*.py")):
+    for path in candidates:
         text = path.read_text(encoding="utf-8")
         if (
             re.search(r"^\s*(?:import click|from click\b)", text, re.MULTILINE)

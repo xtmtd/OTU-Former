@@ -22,6 +22,16 @@ from otuformer.cli import (
     pretrain_augmentation_choices,
     source_is_commandline as _source_is_commandline,
 )
+from otuformer.cli.constraints import (
+    validate_mask_ratio,
+    validate_patch_options,
+)
+from otuformer.constants import (
+    IBOT_PROTOTYPES_MIN,
+    MASKING_STRATEGIES,
+    PATCH_LOSS_MODES,
+    REGISTER_TOKEN_CHOICES,
+)
 
 app = typer.Typer(
     help=(
@@ -42,46 +52,26 @@ app = typer.Typer(
 
 def _parse_mask_ratio(value: object) -> object:
     """Parse ``auto`` or a float in ``(0, 1)``; return ``"auto"`` or the float."""
-    if value is None or value == "auto":
-        return "auto"
     try:
-        ratio = float(value)
-    except (TypeError, ValueError):
-        raise typer.BadParameter(
-            f"--mask-ratio must be 'auto' or a float in (0, 1), got '{value}'"
-        ) from None
-    if not 0.0 < ratio < 1.0:
-        raise typer.BadParameter(
-            f"--mask-ratio must be 'auto' or a float in (0, 1), got '{value}'"
-        )
-    return ratio
+        return validate_mask_ratio(value)
+    except ValueError as error:
+        raise typer.BadParameter(str(error)) from None
 
 
-PATCH_LOSS_CHOICES = ("none", "consistency", "masked-feature", "ibot")
-MASKING_STRATEGY_CHOICES = ("random", "blockwise", "hybrid")
-REGISTER_TOKEN_CHOICES = ("none", "0", "4")
-IBOT_PROTOTYPES_MIN = 2
+# Canonical values shared with the training code and the schema export. The
+# imported names are used directly; no local copy is kept.
+PATCH_LOSS_CHOICES = PATCH_LOSS_MODES
+MASKING_STRATEGY_CHOICES = MASKING_STRATEGIES
 
 
 def _validate_patch_options(
     patch_loss: str, masking_strategy: str, ibot_prototypes: int
 ) -> None:
     """Reject unknown enum values before any output directory is touched."""
-    if patch_loss not in PATCH_LOSS_CHOICES:
-        raise typer.BadParameter(
-            f"--patch-loss must be one of {', '.join(PATCH_LOSS_CHOICES)}, "
-            f"got '{patch_loss}'"
-        )
-    if masking_strategy not in MASKING_STRATEGY_CHOICES:
-        raise typer.BadParameter(
-            f"--masking-strategy must be one of {', '.join(MASKING_STRATEGY_CHOICES)}, "
-            f"got '{masking_strategy}'"
-        )
-    if ibot_prototypes < IBOT_PROTOTYPES_MIN:
-        raise typer.BadParameter(
-            f"--ibot-prototypes must be an integer >= {IBOT_PROTOTYPES_MIN}, "
-            f"got '{ibot_prototypes}'"
-        )
+    try:
+        validate_patch_options(patch_loss, masking_strategy, ibot_prototypes)
+    except ValueError as error:
+        raise typer.BadParameter(str(error)) from None
 
 
 @app.callback(invoke_without_command=True)

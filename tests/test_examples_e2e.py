@@ -1,3 +1,10 @@
+"""Low-memory automated regression over two example images.
+
+This is a portable smoke/regression test, not teaching evidence: teaching mode uses
+all 230 example images with an approved full parameter card, which this test
+deliberately does not do.
+"""
+
 from pathlib import Path
 
 import pandas as pd
@@ -25,7 +32,7 @@ def _make_ckpt(tmp_path: Path, out_dim: int = 32) -> Path:
 
 
 def _prepare_example_subset(tmp_path: Path) -> tuple[Path, Path]:
-    examples_root = Path("/Users/zf/data/coding/OTU-Former/examples/Epidorcus/images")
+    examples_root = Path(__file__).resolve().parents[1] / 'examples' / 'Epidorcus' / 'images'
     src_a = sorted((examples_root / "Epidorcus_gracilis").glob("*.jpg"))[0]
     src_b = sorted((examples_root / "Epidorcus_tonkinensis").glob("*.jpg"))[0]
 
@@ -60,6 +67,7 @@ def _prepare_example_subset(tmp_path: Path) -> tuple[Path, Path]:
 
 
 def test_examples_epidorcus_e2e_low_memory(tmp_path: Path):
+    """Two-image RNG/plumbing regression, not an all-image teaching run."""
     ckpt = _make_ckpt(tmp_path)
     image_dir, labels_path, id_labels_path = _prepare_example_subset(tmp_path)
 

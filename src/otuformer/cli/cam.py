@@ -11,6 +11,15 @@ from pathlib import Path
 import typer
 
 from otuformer.cli import docs_url, format_user_command
+from otuformer.cli.constraints import validate_cam_options
+from otuformer.constants import (
+    CAM_ARCH_CHOICES,
+    CAM_DEVICE_CHOICES,
+    CAM_FIG_FORMAT_CHOICES,
+    CAM_METHOD_CHOICES,
+    CAM_SAVE_NPY_CHOICES,
+    EVAL_TRANSFORM_CHOICES,
+)
 
 app = typer.Typer(
     help=(
@@ -28,19 +37,12 @@ app = typer.Typer(
 )
 
 
-_CAM_METHOD_CHOICES = (
-    "gradcam",
-    "gradcampp",
-    "layercam",
-    "scorecam",
-    "eigencam",
-    "ablationcam",
-)
-_ARCH_CHOICES = ("cnn", "vit")
-_FIG_FORMAT_CHOICES = ("png", "jpg", "pdf")
-_SAVE_NPY_CHOICES = ("none", "raw", "normalized")
-_EVAL_TRANSFORM_CHOICES = ("center-crop", "whole-specimen-pad")
-_DEVICE_CHOICES = ("auto", "cpu", "cuda", "mps")
+_CAM_METHOD_CHOICES = CAM_METHOD_CHOICES
+_ARCH_CHOICES = CAM_ARCH_CHOICES
+_FIG_FORMAT_CHOICES = CAM_FIG_FORMAT_CHOICES
+_SAVE_NPY_CHOICES = CAM_SAVE_NPY_CHOICES
+_EVAL_TRANSFORM_CHOICES = EVAL_TRANSFORM_CHOICES
+_DEVICE_CHOICES = CAM_DEVICE_CHOICES
 
 
 def _validate_cam_options(
@@ -58,20 +60,17 @@ def _validate_cam_options(
     Typer builds commands the same way whether Click is installed or vendored
     by Typer.
     """
-    for option, value, allowed in (
-        ("--cam-method", cam_method, _CAM_METHOD_CHOICES),
-        ("--arch", arch, _ARCH_CHOICES),
-        ("--fig-format", fig_format, _FIG_FORMAT_CHOICES),
-        ("--save-npy", save_npy, _SAVE_NPY_CHOICES),
-        ("--eval-transform", eval_transform, _EVAL_TRANSFORM_CHOICES),
-        ("--device", device, _DEVICE_CHOICES),
-    ):
-        if value is None:
-            continue
-        if value not in allowed:
-            raise typer.BadParameter(
-                f"{option} must be one of: {', '.join(allowed)}; got {value!r}"
-            )
+    try:
+        validate_cam_options(
+            cam_method=cam_method,
+            arch=arch,
+            fig_format=fig_format,
+            save_npy=save_npy,
+            eval_transform=eval_transform,
+            device=device,
+        )
+    except ValueError as error:
+        raise typer.BadParameter(str(error)) from None
 
 
 @app.callback(invoke_without_command=True)
