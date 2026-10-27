@@ -290,7 +290,7 @@ def test_resolve_onnx_input_size_reads_static_square_nchw(monkeypatch, tmp_path)
         resolve_onnx_input_size(tmp_path / "m.onnx")
 
 
-def test_extract_onnx_auto_size_reads_graph_and_explicit_must_match(tmp_path):
+def test_extract_onnx_auto_size_reads_graph_and_explicit_must_match(tmp_path, capsys):
     ckpt = make_checkpoint(tmp_path)
     img_dir = tmp_path / "images"
     make_images(img_dir, n=2)
@@ -306,6 +306,9 @@ def test_extract_onnx_auto_size_reads_graph_and_explicit_must_match(tmp_path):
         extract_size=None,
     )
     assert len(auto_out) == 2
+    # The ONNX graph has no torch device; the provider it runs on is recorded.
+    out = capsys.readouterr().out
+    assert "Resolved device: cpu (onnxruntime CPUExecutionProvider)" in out
 
     match_out = extract_embeddings(
         checkpoint_path=ckpt,

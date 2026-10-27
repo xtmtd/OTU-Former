@@ -20,6 +20,7 @@ from otuformer.cli import (
     finetune_augmentation_choices,
     format_user_command,
     orientation_policy_choices,
+    requested_display,
 )
 from otuformer.cli.constraints import validate_pseudo_options
 from otuformer.constants import ARCFACE_FAMILY_LOSSES, MAX_SUBCENTERS, MIN_SUBCENTERS
@@ -769,6 +770,7 @@ def finetune(
             preflight_finetune_source(source_checkpoint, model_name)
     except (ValueError, OSError) as exc:
         raise typer.BadParameter(str(exc)) from exc
+    requested_extract_size = _parse_size(extract_size, stage="--extract-size")
     prepare_output_dir(out_dir, overwrite=overwrite, allow_existing=bool(resume))
     tee = TeeLogger(
         out_dir / "logs" / "finetune.log",
@@ -822,7 +824,7 @@ def finetune(
             save_every_epochs=save_every_epochs,
             keep_last_checkpoints=keep_last_checkpoints,
             visualize_data=str(visualize_data) if visualize_data is not None else "",
-            extract_size=_parse_size(extract_size, stage="--extract-size"),
+            extract_size=requested_extract_size,
             metrics_sample_size=metrics_sample_size,
             umap_n_neighbors=umap_n_neighbors,
             umap_min_dist=umap_min_dist,
@@ -831,7 +833,6 @@ def finetune(
             compute_embedding_metrics=not disable_embedding_metrics,
         )
         params = vars(ns)
-        cli_command = format_user_command(ctx, params, "finetune")
         # Echo the effective loss settings so an inapplicable flag reads null
         # instead of its CLI default, matching the recorded checkpoint config.
         displayed = {
@@ -840,10 +841,17 @@ def finetune(
             "subcenters": resolved_loss["subcenters"],
             "compact_weight": resolved_loss["compact_weight"],
             "supcon_temperature": resolved_loss["supcon_temperature"],
+            "extract_size": requested_display(extract_size, requested_extract_size),
         }
         # The pseudo diagnostics payload can be thousands of rows; it is
         # summarized below and written to the output files instead of the log.
         displayed.pop("pseudo_round_data", None)
+        cli_command = format_user_command(
+            ctx,
+            # The CLI option, not its inverted core argument, is what reruns.
+            {**displayed, "disable_embedding_metrics": disable_embedding_metrics},
+            "finetune",
+        )
         print(f"Command: {cli_command}")
         print("Parameters:")
         print(json.dumps(displayed, ensure_ascii=False, indent=2, sort_keys=True))

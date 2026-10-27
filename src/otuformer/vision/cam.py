@@ -535,6 +535,7 @@ def run_cam(
             f"choose from: {', '.join(EVAL_TRANSFORMS)}"
         )
     dev = _resolve_device(device)
+    print(f"Resolved device: {dev}")
     model, checkpoint_size, resolved_name = load_model_from_checkpoint(
         checkpoint, model_name, dev
     )

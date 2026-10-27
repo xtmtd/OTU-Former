@@ -755,6 +755,8 @@ def _extract_with_onnx(
     import onnxruntime as ort
 
     session = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
+    # The ONNX graph runs on its own provider, not on a torch device.
+    print(f"Resolved device: cpu (onnxruntime {session.get_providers()[0]})")
     input_name = session.get_inputs()[0].name
 
     if extract_csv is not None:
@@ -952,6 +954,7 @@ def extract_embeddings(
         raise ValueError("--checkpoint is required when --onnx-path is not provided.")
 
     dev = resolve_device(device)
+    print(f"Resolved device: {dev}")
     model, checkpoint_size = _load_model(
         checkpoint_path, model_name, dev, use_student=use_student
     )

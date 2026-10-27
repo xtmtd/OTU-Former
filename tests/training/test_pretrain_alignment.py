@@ -1231,6 +1231,7 @@ def test_pretrain_passes_resolved_augmentation_to_dataset(
     assert captured["local_crop_size"] == 96
     assert captured["local_crops"] == 2
     out = capsys.readouterr().out
+    assert "Resolved device: cpu" in out
     assert "Augmentation profile: global-barcode" in out
     assert "Augmentation config:" in out
     assert '"profile": "global-barcode"' in out

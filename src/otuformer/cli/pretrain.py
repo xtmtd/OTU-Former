@@ -20,6 +20,7 @@ from otuformer.cli import (
     format_user_command,
     orientation_policy_choices,
     pretrain_augmentation_choices,
+    requested_display,
     source_is_commandline as _source_is_commandline,
 )
 from otuformer.cli.constraints import (
@@ -391,6 +392,7 @@ def pretrain(
     requested_global_crop_size = _parse_size(
         global_crop_size, stage="--global-crop-size"
     )
+    requested_extract_size = _parse_size(extract_size, stage="--extract-size")
     if not resume:
         # Reject an impossible register/model combination before --overwrite can
         # clear an existing output directory.
@@ -473,7 +475,7 @@ def pretrain(
             save_every_epochs=save_every_epochs,
             keep_last_checkpoints=keep_last_checkpoints,
             visualize_data=str(visualize_data) if visualize_data is not None else "",
-            extract_size=_parse_size(extract_size, stage="--extract-size"),
+            extract_size=requested_extract_size,
             metrics_sample_size=metrics_sample_size,
             umap_n_neighbors=umap_n_neighbors,
             umap_min_dist=umap_min_dist,
@@ -487,10 +489,27 @@ def pretrain(
             seed=seed,
         )
         params = vars(ns)
-        cli_command = format_user_command(ctx, params, "pretrain")
+        # ``Parameters:`` records the request, so an auto/none default reads as
+        # the word the user used instead of the internal ``None`` placeholder.
+        displayed = {
+            **params,
+            "global_crop_size": requested_display(
+                global_crop_size, requested_global_crop_size
+            ),
+            "extract_size": requested_display(extract_size, requested_extract_size),
+            "register_tokens": requested_display(
+                register_tokens, requested_register_tokens
+            ),
+        }
+        cli_command = format_user_command(
+            ctx,
+            # The CLI option, not its inverted core argument, is what reruns.
+            {**displayed, "disable_embedding_metrics": disable_embedding_metrics},
+            "pretrain",
+        )
         print(f"Command: {cli_command}")
         print("Parameters:")
-        print(json.dumps(params, ensure_ascii=False, indent=2, sort_keys=True))
+        print(json.dumps(displayed, ensure_ascii=False, indent=2, sort_keys=True))
         print("-" * 80)
 
         from otuformer.training.trainer import run_pretrain

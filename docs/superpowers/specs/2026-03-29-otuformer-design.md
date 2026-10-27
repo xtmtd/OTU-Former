@@ -44,6 +44,71 @@ CLI (cli/)  →  app service (inline in cli/)  →  core logic (training/ embedd
 
 The CLI layer is thin (argument parsing + logging scope + result printing). Core logic modules are importable independently of the CLI, enabling future Python API / skill usage.
 
+### 2.3 Run log contract
+
+Every command records its invocation and its effective settings in
+`<out_dir>/logs/<command>.log` before doing any work, and the record has two
+separate jobs:
+
+- `Command:` replays the options the user actually typed, so the line can be
+  copied and rerun. Different CLI options that feed one core argument are
+  replayed as the CLI option (`--disable-embedding-metrics`, not the derived
+  `compute_embedding_metrics`), and values are POSIX-shell quoted so a path
+  containing spaces survives the copy.
+- `Parameters:` records the **requested** values. A keyword option keeps the
+  word that was used — `--global-crop-size auto`, `--extract-size auto`, and
+  `--register-tokens none` read `"auto"` / `"none"` — and `null` is reserved
+  for an option the user did not supply. An internal `None` placeholder that
+  means "auto" must never leak into the block, and an option with a keyword
+  default is never rendered as `null`.
+- A size is recorded in the form the command holds at print time: `pretrain`
+  and `finetune` log the parsed integer, while `extract` and `export` log the
+  option text as typed (`"224"` stays a string). Both satisfy the contract; only
+  the keyword word and the meaning of `null` are normative.
+- `finetune` echoes resolved values beyond the request: its loss settings
+  (`loss`, `subcenters`, `compact_weight`, `supcon_temperature`) and, on a
+  resume or pseudo round, the experiment settings inherited from the source
+  configuration (`model_name`, `metric_embed_dim`, `finetune_epochs`,
+  `finetune_lr`, `metric_head_lr`, `weight_decay`, `freeze_ratio`,
+  `augmentation`, `orientation_policy`, `batch_size`, `seed`). Those rows are
+  resolved or inherited rather than requested, so an inherited setting cannot
+  be misread as the CLI default; an explicit option always wins.
+
+Values inferred at run time are recorded **after** they are resolved, never
+substituted back into `Parameters:`, because a later reader must be able to tell
+which settings were requested from which were derived from a checkpoint, a
+backbone, or the local machine. The resolved records are `Patch config:`
+(`mask_ratio_requested` / `mask_ratio_resolved`), `Augmentation profile:` plus
+`Augmentation config:` (resolved sizes, crops, and orientation policy),
+`[Info] Auto ... size ...` lines, and `Resolved device:` for the compute device
+actually used. The ONNX extraction path has no torch device, so it records the
+provider it runs on: `cpu (onnxruntime CPUExecutionProvider)`.
+
+A `Patch config:` line reports every patch option the selected `patch_loss` does
+not use as `null` — `masking_strategy` and `ibot_prototypes` under
+`consistency`, for example. That `null` means "not applicable to this mode", not
+"not supplied", and it is not a `Parameters:` value.
+
+The block is display-only: the argument object handed to the core layer keeps
+the normalized form (`None` for `auto`) that resolution and `--resume`
+comparisons depend on, and the log never becomes an input to a run. What the
+checkpoints store differs per command:
+
+- `pretrain` saves a top-level `args` (the namespace) plus `config`. `args`
+  keeps the normalized form for the keyword options (`mask_ratio`,
+  `register_tokens`) and for the periodic-evaluation `extract_size`, but the
+  trainer writes resolved values back before saving — `global_crop_size`,
+  `local_crop_size`, `local_crops`, `augmentation`, and `orientation_policy` — so
+  a pretrain checkpoint records what actually ran. An `auto` periodic-evaluation
+  size stays `None` in `args`; what it resolved to is recorded only by the
+  `[Info] Auto eval crop size from model img_size` log line.
+- `finetune` saves no top-level `args`; its `config` carries the resolved model,
+  loss, optimizer, and register settings instead.
+
+Nothing outside `cluster` parses the log block, so neither form is a
+compatibility surface there; `cluster` is the exception: its `Parameters:` block
+is parsed by `annotate`, so its keys and value spelling must stay stable.
+
 ---
 
 ## 3. Sub-commands

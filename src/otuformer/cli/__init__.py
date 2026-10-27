@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import shlex
+
 import typer
 
 from otuformer.constants import (
@@ -59,6 +61,15 @@ def _parse_size(value: str, *, stage: str) -> int | None:
         raise typer.BadParameter(str(error)) from None
 
 
+def requested_display(requested: str, parsed: int | None) -> int | str:
+    """Render a keyword-or-number option by the word or number requested.
+
+    ``--global-crop-size auto`` must read ``auto`` in the run log, not the
+    internal ``None`` placeholder ``_parse_size`` returns for it.
+    """
+    return requested if parsed is None else parsed
+
+
 def _validate_augmentation(value: str | None, *, stage: str) -> None:
     """Reject an unknown augmentation profile before any training starts."""
     try:
@@ -91,7 +102,8 @@ def format_user_command(
 
     Only command-line-sourced parameters are echoed, so a copied line reruns
     the same command instead of its defaults. A boolean flag is written as
-    ``--flag`` (never ``--flag true``), matching how Typer parses it.
+    ``--flag`` (never ``--flag true``), matching how Typer parses it. Values are
+    POSIX-shell quoted, so a path containing spaces survives the copy.
     """
     parts = ["otuformer", command]
     for key, value in params.items():
@@ -104,5 +116,5 @@ def format_user_command(
             continue
         if value in (None, ""):
             continue
-        parts.extend([option, str(value)])
+        parts.extend([option, shlex.quote(str(value))])
     return " ".join(parts)

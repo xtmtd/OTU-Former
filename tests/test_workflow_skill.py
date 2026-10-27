@@ -951,7 +951,7 @@ def test_installed_distribution_schema_and_skill_copy(tmp_path: Path) -> None:
         )
         assert check.returncode == 0, check.stderr
         payload = json.loads(check.stdout)
-        assert payload["runtime"]["package_version"] == "0.11.0"
+        assert payload["runtime"]["package_version"] == "0.11.1"
         # the isolated interpreter must load the installed distribution, never
         # the source checkout
         assert str(environment) in payload["runtime"]["package_dir"], payload["runtime"]

@@ -3268,6 +3268,17 @@ def test_format_user_command_renders_boolean_flags_without_a_value():
     assert "--resume" not in command
 
 
+def test_format_user_command_quotes_values_a_shell_would_split():
+    from otuformer.cli import format_user_command
+
+    ctx = _ForeignContext(["input_images_dir"])
+    command = format_user_command(
+        ctx, {"input_images_dir": "/tmp/images with spaces"}, "pretrain"
+    )
+
+    assert command == "otuformer pretrain --input-images-dir '/tmp/images with spaces'"
+
+
 def test_source_helper_recognizes_foreign_commandline_enum():
     from otuformer.cli import source_is_commandline
 
@@ -3717,6 +3728,40 @@ def test_finetune_loss_mode_forwards_explicit_options_without_namespace_markers(
     assert "supcon_temperature" in dumped
 
 
+def test_pretrain_log_records_requested_auto_and_none_keywords(tmp_path, monkeypatch):
+    """An auto/none default must read as its keyword, not as the internal None."""
+    seen = {}
+
+    def fake_run_pretrain(ns):
+        seen.update(vars(ns))
+
+    monkeypatch.setattr("otuformer.training.trainer.run_pretrain", fake_run_pretrain)
+
+    out_dir = tmp_path / "pretrain_auto"
+    result = runner.invoke(
+        app,
+        [
+            "pretrain",
+            "--train-data",
+            str(tmp_path / "images.csv"),
+            "--input-images-dir",
+            str(tmp_path),
+            "--out-dir",
+            str(out_dir),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+
+    log_text = (out_dir / "logs" / "pretrain.log").read_text(encoding="utf-8")
+    assert '"global_crop_size": "auto"' in log_text
+    assert '"extract_size": "auto"' in log_text
+    assert '"register_tokens": "none"' in log_text
+    # The core layer keeps the normalized form that resolution depends on.
+    assert seen["global_crop_size"] is None
+    assert seen["extract_size"] is None
+    assert seen["register_tokens"] is None
+
+
 def test_finetune_loss_mode_defaults_to_no_explicit_options(tmp_path, monkeypatch):
     seen = {}
 
@@ -3728,6 +3773,44 @@ def test_finetune_loss_mode_defaults_to_no_explicit_options(tmp_path, monkeypatc
 
     assert result.exit_code == 0, result.output
     assert seen["explicit"] == set()
+    dumped = result.output.split("Parameters:", 1)[1]
+    assert '"extract_size": "auto"' in dumped
+
+
+def test_pretrain_command_replay_keeps_the_disable_metrics_switch(tmp_path, monkeypatch):
+    """The replay line must show the CLI switch, not its inverted core argument."""
+    monkeypatch.setattr("otuformer.training.trainer.run_pretrain", lambda _ns: None)
+
+    result = runner.invoke(
+        app,
+        [
+            "pretrain",
+            "--train-data",
+            str(tmp_path / "images.csv"),
+            "--input-images-dir",
+            str(tmp_path),
+            "--out-dir",
+            str(tmp_path / "pretrain_no_metrics"),
+            "--disable-embedding-metrics",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "--disable-embedding-metrics" in result.output
+
+
+def test_finetune_command_replay_keeps_explicit_auto_extract_size(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        "otuformer.training.trainer.run_finetune", lambda *_a, **_k: None
+    )
+    result = runner.invoke(
+        app, _finetune_cli_argv(tmp_path, "--extract-size", "auto")
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "--extract-size auto" in result.output
 
 
 def test_finetune_resume_rejects_legacy_compact_k_conflict_before_output(tmp_path):

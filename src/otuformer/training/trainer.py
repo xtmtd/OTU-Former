@@ -2276,6 +2276,7 @@ def run_pretrain(args: argparse.Namespace) -> None:
     _set_seed(args.seed)
     _set_cpus(args.cpus)
     device = _resolve_device(args.device)
+    print(f"Resolved device: {device}")
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -4174,6 +4175,7 @@ def run_finetune(
     _set_seed(args.seed)
     _set_cpus(args.cpus)
     device = _resolve_device(args.device)
+    print(f"Resolved device: {device}")
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
