@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Iterable
+import io
+import os
+from dataclasses import dataclass, field
+from pathlib import Path, PurePosixPath
+from typing import Any, Iterable
 
 import numpy as np
 import pandas as pd
@@ -36,8 +39,51 @@ from otuformer.utils.size import (
     resolve_training_image_size,
     validate_input_size,
 )
+from otuformer.data.provenance import sha256_bytes, snapshot_bytes
+from otuformer.data.records import DataBundle, FileSnapshot
+from otuformer.embedding.record_dataset import (
+    RecordImageDataset,
+    RecordLabelDataset,
+)
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
+
+
+@dataclass
+class ExtractionResult:
+    """Frame plus the settings and input bytes actually used."""
+
+    frame: pd.DataFrame
+    effective: dict[str, Any] = field(default_factory=dict)
+    used_files: tuple[FileSnapshot, ...] = ()
+
+
+def _transform_normalization(transform) -> dict[str, Any]:
+    """Read mean/std from the executed eval transform instead of assuming."""
+    for step in getattr(transform, "transforms", []):
+        mean = getattr(step, "mean", None)
+        std = getattr(step, "std", None)
+        if mean is not None and std is not None:
+            return {
+                "mean": [float(value) for value in mean],
+                "std": [float(value) for value in std],
+            }
+    return {"available": False, "reason": "no Normalize step in the eval transform"}
+
+
+def _check_records_root(records: DataBundle, images_dir: Path) -> None:
+    from otuformer.data.paths import require_contained
+
+    root = Path(images_dir).expanduser().resolve()
+    if records.images_dir != root:
+        raise ValueError(
+            "records were built from "
+            f"{records.images_dir} but --input-images-dir is {root}"
+        )
+    for record in records.records:
+        # Re-resolve now: validation pinned bytes, not the path a later swap can
+        # redirect outside the root.
+        require_contained(root, record.access_path, record.image_key)
 
 
 class ImageFolderDataset(Dataset):
@@ -378,20 +424,27 @@ def _finetune_attention_query(
     model: OTUFormerEncoder,
     attention_pool: nn.Module,
     images_dir: Path,
-    label_csv: Path,
+    label_csv: Path | None,
     extract_size: int,
     device: torch.device,
     batch_size: int,
     num_workers: int,
     num_epochs: int,
     eval_transform: str = "center-crop",
+    *,
+    dataset: RecordLabelDataset | None = None,
 ) -> None:
-    dataset = LabelCSVImageDataset(
-        images_dir=images_dir,
-        label_csv=label_csv,
-        extract_size=extract_size,
-        eval_transform=eval_transform,
-    )
+    if dataset is None:
+        if label_csv is None:
+            raise ValueError(
+                "attention-query training needs a labelled CSV or data records"
+            )
+        dataset = LabelCSVImageDataset(
+            images_dir=images_dir,
+            label_csv=label_csv,
+            extract_size=extract_size,
+            eval_transform=eval_transform,
+        )
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -475,14 +528,175 @@ def _finetune_attention_query(
     attention_pool.eval()
 
 
-def _apply_patch_topk_pca(embeddings: np.ndarray, topk_patches: int) -> np.ndarray:
+def _frame_dim(frame) -> int | None:
+    """Feature width actually emitted, read from the frame itself."""
+    dimensions = [column for column in frame.columns if column.startswith("dim_")]
+    return len(dimensions) or None
+
+
+def _record_effective_k(effective: dict[str, Any] | None, k: int) -> None:
+    """Record the patch count the top-K branch actually used."""
+    if effective is None:
+        return
+    chain = effective.setdefault("patch_topk_effective_k", [])
+    if k not in chain:
+        chain.append(int(k))
+
+
+def _projector_normalizes(model: torch.nn.Module) -> bool:
+    """Whether the loaded projector head ends in a normalization step."""
+    projector = getattr(model, "projector", None)
+    if projector is None:
+        return False
+    code = getattr(type(projector).forward, "__code__", None)
+    return bool(code is not None and "normalize" in code.co_names)
+
+
+def _probe_backbone_norm(backbone) -> dict:
+    """Watch whether the backbone's own norm layers run during this extraction.
+
+    Recorded from forward hooks on the modules themselves: "extraction adds no
+    normalization" and "the backbone did not normalize" are different claims, and
+    only the hook can tell them apart. No-op placeholders (``nn.Identity``) are not
+    norm layers and are not reported as one.
+    """
+    state: dict[str, Any] = {"layers": [], "fired": []}
+    if backbone is None:
+        return state
+    for name in ("fc_norm", "norm"):
+        module = getattr(backbone, name, None)
+        if not isinstance(module, torch.nn.Module) or isinstance(
+            module, torch.nn.Identity
+        ):
+            continue
+        label = f"backbone.{name} ({type(module).__name__})"
+        state["layers"].append(label)
+
+        def mark(*_args, label=label):
+            if label not in state["fired"]:
+                state["fired"].append(label)
+
+        module.register_forward_hook(mark)
+    return state
+
+
+def _backbone_norm_record(state: dict | None) -> dict[str, Any]:
+    if state is None:
+        return {
+            "status": "unavailable",
+            "reason": "this backend does not expose a backbone normalization contract",
+        }
+    if not state["layers"]:
+        return {
+            "status": "not_applied",
+            "detail": "the backbone exposes no final norm module",
+        }
+    if state["fired"]:
+        return {
+            "status": "applied",
+            "stage": "inside backbone forward_features",
+            "layers": list(state["fired"]),
+            "detail": "extraction adds no further normalization after forward_features",
+        }
+    return {
+        "status": "not_applied",
+        "layers": list(state["layers"]),
+        "detail": "the backbone's norm module did not run on this path",
+    }
+
+
+def _record_feature_chain(
+    effective: dict[str, Any],
+    *,
+    token_mode: str,
+    use_projector_output: bool,
+    model: torch.nn.Module | None,
+    output_dim: int | None,
+    input_dim: int | None = None,
+) -> None:
+    """Record the feature path that actually executed, not the flags requested."""
+    # patch-topk and attention-pool never consume the projector, whatever the flag.
+    projector_used = token_mode == "cls" and use_projector_output
+    if projector_used:
+        ops = ["projector"]
+    elif token_mode == "cls":
+        ops = ["cls_token_index_0"]
+    elif token_mode == "patch-topk":
+        ops = ["topk_by_patch_l2_norm", "flatten"]
+        policy = effective.get("patch_topk_pca") or {}
+        # PCA is skipped for tiny selections, so its steps are only recorded when
+        # they ran.
+        if policy.get("mode") == "fit_transform":
+            ops = [*ops, "standard_scaler", "pca"]
+        elif policy.get("mode") == "truncate_first_dims":
+            ops = [*ops, "truncate_first_dims"]
+    else:
+        ops = ["attention_pool_forward"]
+
+    if projector_used and model is not None:
+        normalizes = _projector_normalizes(model)
+        effective["vector_normalization"] = (
+            {
+                "status": "applied",
+                "stage": "projector_head_l2",
+                "detail": "the projector head normalizes its own output",
+            }
+            if normalizes
+            else {"status": "none", "detail": "the projector head output is unnormalized"}
+        )
+        if normalizes:
+            ops = [*ops, "l2_normalize"]
+    else:
+        effective["vector_normalization"] = {
+            "status": "none",
+            "detail": "no post-feature normalization runs after this token mode",
+        }
+
+    chain: dict[str, Any] = {"token_mode": token_mode, "ops": ops}
+    if input_dim is not None:
+        chain["input_dim"] = int(input_dim)
+    if output_dim is not None:
+        chain["output_dim"] = int(output_dim)
+    # ``post_feature_ops`` is the flat operation list the records export has always
+    # carried; ``feature_chain`` is the same chain plus the dimensions.
+    effective["post_feature_ops"] = list(ops)
+    effective["feature_chain"] = chain
+
+
+def _feature_input_dim(effective: dict[str, Any], model: torch.nn.Module | None) -> int | None:
+    """Width of the tensor the recorded operations consumed."""
+    policy = effective.get("patch_topk_pca") or {}
+    if policy.get("input_dim") is not None:
+        return int(policy["input_dim"])
+    backbone = getattr(model, "backbone", None)
+    width = getattr(backbone, "num_features", None)
+    return int(width) if isinstance(width, int) else None
+
+
+def _apply_patch_topk_pca(
+    embeddings: np.ndarray,
+    topk_patches: int,
+    effective: dict[str, Any] | None = None,
+) -> np.ndarray:
     from sklearn.decomposition import PCA
     from sklearn.preprocessing import StandardScaler
 
     n_samples, dim = embeddings.shape
     preferred_dim = {10: 256, 20: 512, 30: 1024}.get(topk_patches, 512)
+    policy: dict[str, Any] = {
+        "topk_patches": topk_patches,
+        "preferred_dim": preferred_dim,
+        "input_dim": int(dim),
+        "samples": int(n_samples),
+        "seed": 42,
+    }
+    if effective is not None:
+        effective["patch_topk_pca"] = policy
     if n_samples < 3:
         target_dim = min(preferred_dim, dim)
+        policy["mode"] = "truncate_first_dims" if 0 < target_dim < dim else "none"
+        policy["reason"] = "fewer than three samples"
+        policy["output_dim"] = int(min(target_dim, dim) if 0 < target_dim < dim else dim)
         if 0 < target_dim < dim:
             return embeddings[:, :target_dim]
         return embeddings
@@ -490,22 +704,43 @@ def _apply_patch_topk_pca(embeddings: np.ndarray, topk_patches: int) -> np.ndarr
     max_possible_dim = min(n_samples - 1, dim)
     target_dim = min(preferred_dim, max_possible_dim)
     if target_dim <= 0 or target_dim >= dim:
+        policy["mode"] = "none"
+        policy["output_dim"] = int(dim)
         return embeddings
+    policy.update(
+        {
+            "mode": "fit_transform",
+            "fit_scope": "all extracted rows in this run",
+            "scaler": "standard",
+            "explained_variance": None,
+        }
+    )
 
     scaler = StandardScaler()
     embeddings_scaled = scaler.fit_transform(embeddings)
     pca = PCA(n_components=target_dim, random_state=42)
     reduced = pca.fit_transform(embeddings_scaled)
     explained = float(pca.explained_variance_ratio_.sum())
+    policy["output_dim"] = int(target_dim)
+    policy["explained_variance"] = explained
+    # sklearn resolves "auto" privately; record the solver that actually ran rather
+    # than the request.
+    policy["solver"] = str(
+        getattr(pca, "_fit_svd_solver", None) or getattr(pca, "svd_solver", "unknown")
+    )
     print(f"[Info] PCA: {dim}D -> {target_dim}D (explained variance: {explained:.2%})")
     return reduced
 
 
-def _apply_patch_topk_pca_to_df(df: pd.DataFrame, topk_patches: int) -> pd.DataFrame:
+def _apply_patch_topk_pca_to_df(
+    df: pd.DataFrame, topk_patches: int, effective: dict[str, Any] | None = None
+) -> pd.DataFrame:
     dim_cols = [c for c in df.columns if c.startswith("dim_")]
     if not dim_cols:
         return df
-    reduced = _apply_patch_topk_pca(df[dim_cols].to_numpy(), topk_patches=topk_patches)
+    reduced = _apply_patch_topk_pca(
+        df[dim_cols].to_numpy(), topk_patches=topk_patches, effective=effective
+    )
     reduced_cols = [f"dim_{i}" for i in range(reduced.shape[1])]
     fixed_cols = [c for c in df.columns if not c.startswith("dim_")]
     out = df[fixed_cols].copy()
@@ -529,6 +764,9 @@ def _load_model(
     model_name: str,
     device: torch.device,
     use_student: bool = False,
+    *,
+    payload: dict[str, Any] | None = None,
+    effective: dict[str, Any] | None = None,
 ) -> tuple[OTUFormerEncoder, int]:
     """Load model from checkpoint and return ``(model, checkpoint_size)``.
 
@@ -548,7 +786,7 @@ def _load_model(
     ``projector.<i>`` projector names, ``args`` instead of ``config``) are
     supported for reading; see :mod:`otuformer.utils.checkpoint`.
     """
-    ckpt = load_checkpoint(checkpoint_path)
+    ckpt = payload if payload is not None else load_checkpoint(checkpoint_path)
     architecture = resolve_checkpoint(ckpt, model_name, prefer_student=use_student)
     checkpoint_size = resolve_training_image_size(ckpt)
     model, architecture = load_checkpoint_encoder(
@@ -557,6 +795,20 @@ def _load_model(
     validate_input_size(checkpoint_size, model, architecture.model_name)
     model.eval().to(device)
     print(f"[Info] Loaded weights from checkpoint key: '{architecture.source_key}'")
+    if effective is not None:
+        effective["checkpoint"] = {
+            "source_key": architecture.source_key,
+            "model_name": architecture.model_name,
+            "model_name_from_metadata": architecture.model_name_from_metadata,
+            "embedding_head": architecture.embedding_head,
+            "embedding_dim": architecture.embedding_dim,
+            "checkpoint_image_size": checkpoint_size,
+            "register_tokens": {
+                "actual": architecture.actual_register_tokens,
+                "added": architecture.added_register_tokens,
+            },
+            "requested_student": bool(use_student),
+        }
     return model, checkpoint_size
 
 
@@ -572,6 +824,7 @@ def _extract_one_dir(
     topk_patches: int = 20,
     apply_patch_topk_pca: bool = True,
     eval_transform: str = "center-crop",
+    effective: dict[str, Any] | None = None,
 ) -> pd.DataFrame:
     from otuformer.training.model import OTUFormerEncoder
 
@@ -600,6 +853,7 @@ def _extract_one_dir(
                 patch_tokens = _patch_features(model.backbone, feats)
                 num_patches = patch_tokens.shape[1]
                 k = min(topk_patches, num_patches)
+                _record_effective_k(effective, k)
                 if k <= 0:
                     raise ValueError("--topk-patches must be >= 1")
                 patch_norms = patch_tokens.norm(dim=-1)
@@ -652,7 +906,7 @@ def _extract_one_dir(
 def _extract_one_csv(
     model: torch.nn.Module,
     images_dir: Path,
-    csv_path: Path,
+    csv_path: Path | None,
     extract_size: int,
     batch_size: int,
     device: torch.device,
@@ -661,13 +915,23 @@ def _extract_one_csv(
     token_mode: str = "cls",
     topk_patches: int = 20,
     eval_transform: str = "center-crop",
+    *,
+    dataset: RecordImageDataset | None = None,
+    effective: dict[str, Any] | None = None,
 ) -> pd.DataFrame:
-    ds = CSVImageDataset(
-        images_dir=images_dir,
-        csv_path=csv_path,
-        extract_size=extract_size,
-        eval_transform=eval_transform,
-    )
+    if dataset is not None:
+        if csv_path is not None:
+            raise ValueError("pass either a CSV path or a prebuilt dataset, not both")
+        ds = dataset
+    else:
+        if csv_path is None:
+            raise ValueError("a CSV path or a prebuilt dataset is required")
+        ds = CSVImageDataset(
+            images_dir=images_dir,
+            csv_path=csv_path,
+            extract_size=extract_size,
+            eval_transform=eval_transform,
+        )
     loader = DataLoader(
         ds, batch_size=batch_size, shuffle=False, num_workers=num_workers
     )
@@ -699,6 +963,7 @@ def _extract_one_csv(
                 patch_tokens = _patch_features(model.backbone, feats)
                 num_patches = patch_tokens.shape[1]
                 k = min(topk_patches, num_patches)
+                _record_effective_k(effective, k)
                 patch_norms = patch_tokens.norm(dim=-1)
                 _, topk_indices = torch.topk(patch_norms, k=k, dim=1)
                 topk_indices = topk_indices.unsqueeze(-1).expand(
@@ -734,13 +999,155 @@ def _extract_one_csv(
     arr = np.concatenate(all_embs, axis=0)
     if token_mode == "patch-topk":
         print(f"[Info] Applying PCA reduction for Top-{topk_patches} patches...")
-        arr = _apply_patch_topk_pca(arr, topk_patches=topk_patches)
+        arr = _apply_patch_topk_pca(
+            arr, topk_patches=topk_patches, effective=effective
+        )
     cols = [f"dim_{i}" for i in range(arr.shape[1])]
     out = pd.DataFrame(arr, columns=cols)
     out.insert(0, "id", all_ids)
     if all_samples is not None:
         out.insert(1, "sample", all_samples)
     return out
+
+
+def _iter_external_tensors(proto):
+    """Every TensorProto in the model, including those held in node attributes.
+
+    A ``Constant`` node keeps its payload in an attribute tensor, and attributes can
+    nest subgraphs, so walking only ``graph.initializer`` misses legal external data.
+    """
+    import onnx
+
+    def walk_graph(graph):
+        for tensor in graph.initializer:
+            yield tensor
+        for sparse in getattr(graph, "sparse_initializer", ()):
+            yield sparse.values
+            yield sparse.indices
+        for node in graph.node:
+            for attribute in node.attribute:
+                yield from walk_attribute(attribute)
+
+    def walk_attribute(attribute):
+        if attribute.type == onnx.AttributeProto.TENSOR:
+            yield attribute.t
+        elif attribute.type == onnx.AttributeProto.TENSORS:
+            yield from attribute.tensors
+        elif attribute.type == onnx.AttributeProto.GRAPH:
+            yield from walk_graph(attribute.g)
+        elif attribute.type == onnx.AttributeProto.GRAPHS:
+            for graph in attribute.graphs:
+                yield from walk_graph(graph)
+        elif attribute.type in (
+            onnx.AttributeProto.SPARSE_TENSOR,
+            onnx.AttributeProto.SPARSE_TENSORS,
+        ):
+            # A sparse payload has two tensors of its own, each of which can be
+            # stored externally. Covering sparse graph initializers says nothing
+            # about sparse attributes.
+            sparse = (
+                [attribute.sparse_tensor]
+                if attribute.type == onnx.AttributeProto.SPARSE_TENSOR
+                else attribute.sparse_tensors
+            )
+            for entry in sparse:
+                yield entry.values
+                yield entry.indices
+
+    yield from walk_graph(proto.graph)
+    for function in getattr(proto, "functions", ()):
+        # A FunctionProto carries default values for its own attributes, and a node
+        # inside the body reaches them through ``ref_attr_name`` rather than holding
+        # the payload itself. Walking only the body nodes misses that data entirely.
+        for attribute in getattr(function, "attribute_proto", ()):
+            yield from walk_attribute(attribute)
+        for node in function.node:
+            for attribute in node.attribute:
+                yield from walk_attribute(attribute)
+
+
+def _onnx_graph_path(onnx_path: Path) -> Path:
+    """The graph path as it is handed to the runtime: absolute, *not* resolved.
+
+    onnxruntime resolves an external-data ``location`` against the path it was
+    given. Resolving first would make the file names we hash and record differ
+    from the file names it opens, so the entry spelling is the one that governs
+    every step (enumeration, session, hashing, records).
+    """
+    graph = Path(onnx_path).expanduser()
+    return graph if graph.is_absolute() else Path.cwd() / graph
+
+
+def _external_entry(root: Path, location: str) -> Path:
+    """The access path the runtime uses for one external-data ``location``.
+
+    The runtime opens ``root / location`` unchanged and lets the kernel resolve it,
+    so that expression -- not a folded or pre-resolved spelling -- is what must be
+    hashed, checked and recorded. Resolving it first would bind the hash to whatever
+    the link pointed at then, and a later, permanent redirection of an intermediate
+    link would silently load different bytes.
+
+    Containment is still judged on the resolved target, so a link that escapes the
+    graph directory is refused.
+    """
+    parts = PurePosixPath(location).parts
+    if not parts:
+        raise ValueError("external tensor location is empty")
+    return root.joinpath(*parts)
+
+
+def _onnx_external_files(onnx_path: Path) -> list[Path]:
+    """External tensor files referenced anywhere in the model, next to its path.
+
+    The same enumeration drives input protection, the session loading mode and the
+    hash checks, so a tensor cannot be visible to one and invisible to another. The
+    returned paths keep the graph's own directory spelling; only the containment
+    check looks through symlinks, so a payload cannot be smuggled in from outside.
+
+    A location that resolves outside the graph directory is refused here as well as
+    by the runtime, so enumeration, loading and the protection list agree.
+    """
+    import onnx
+
+    graph = _onnx_graph_path(onnx_path)
+    proto = onnx.load(str(graph), load_external_data=False)
+    root = graph.parent
+    root_resolved = root.resolve()
+    found: list[Path] = []
+    for tensor in _iter_external_tensors(proto):
+        if tensor.data_location != onnx.TensorProto.EXTERNAL:
+            continue
+        locations = [
+            entry.value for entry in tensor.external_data if entry.key == "location"
+        ]
+        if len(locations) != 1:
+            # Readers disagree on which duplicate wins (onnx takes the first,
+            # onnxruntime the last), so one of them would read a file the others
+            # never hashed. Refuse rather than pick a side.
+            raise ValueError(
+                f"external tensor {tensor.name!r} declares {len(locations)} 'location' "
+                "entries; exactly one is required so every step reads the same file"
+            )
+        location = locations[0]
+        candidate = _external_entry(root, location)
+        resolved = candidate.resolve()
+        if resolved != root_resolved and root_resolved not in resolved.parents:
+            raise ValueError(
+                f"external tensor {tensor.name!r} resolves outside the graph directory"
+            )
+        if not candidate.is_file():
+            raise FileNotFoundError(f"ONNX external tensor file is missing: {candidate}")
+        found.append(candidate)
+    return sorted(set(found))
+
+
+def _require_unchanged(snapshots: list[FileSnapshot]) -> None:
+    for snapshot in snapshots:
+        data = snapshot.path.read_bytes()
+        if len(data) != snapshot.size_bytes or sha256_bytes(data) != snapshot.sha256:
+            raise RuntimeError(
+                f"ONNX input changed while the session was loading: {snapshot.path}"
+            )
 
 
 def _extract_with_onnx(
@@ -751,15 +1158,73 @@ def _extract_with_onnx(
     num_workers: int,
     extract_csv: Path | None,
     eval_transform: str = "center-crop",
+    *,
+    records: DataBundle | None = None,
+    dataset: RecordImageDataset | None = None,
+    effective: dict[str, Any] | None = None,
+    used_files: list[FileSnapshot] | None = None,
 ) -> pd.DataFrame:
     import onnxruntime as ort
 
-    session = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
+    # One path governs loading, hashing and records: the entry spelling.
+    graph = _onnx_graph_path(onnx_path)
+    graph_bytes: bytes | None = None
+    graph_snapshot: FileSnapshot | None = None
+    external_inputs: list[FileSnapshot] = []
+    external_paths: list[Path] = []
+    if records is not None:
+        graph_bytes, graph_snapshot = snapshot_bytes(graph, follow_symlink=False)
+        if used_files is not None:
+            used_files.append(graph_snapshot)
+        external_paths = _onnx_external_files(graph)
+        for external in external_paths:
+            _data, external_snapshot = snapshot_bytes(external, follow_symlink=False)
+            external_inputs.append(external_snapshot)
+            if used_files is not None:
+                used_files.append(external_snapshot)
+    # An external-data graph can only be opened from its original path; the
+    # hashes around session construction bound the window rather than closing it
+    # (a concurrent change-and-restore is not detectable). The graph is part of
+    # that check, not only its tensors.
+    pinned = [*([graph_snapshot] if graph_snapshot is not None else []), *external_inputs]
+    if pinned:
+        _require_unchanged(pinned)
+    if graph_bytes is not None and not external_inputs:
+        session = ort.InferenceSession(graph_bytes, providers=["CPUExecutionProvider"])
+    else:
+        session = ort.InferenceSession(str(graph), providers=["CPUExecutionProvider"])
+    if pinned:
+        _require_unchanged(pinned)
     # The ONNX graph runs on its own provider, not on a torch device.
     print(f"Resolved device: cpu (onnxruntime {session.get_providers()[0]})")
     input_name = session.get_inputs()[0].name
+    if effective is not None:
+        output = session.get_outputs()[0]
+        effective["onnx"] = {
+            "provider": session.get_providers()[0],
+            "input_name": input_name,
+            "output_name": output.name,
+            "output_shape": list(output.shape),
+            "graph_file": str(graph),
+            "external_tensor_files": [str(path) for path in external_paths],
+            "hash_window": (
+                "graph and external tensors are re-hashed before and after session "
+                "construction"
+                if pinned
+                else "not_applicable: this call is not record-backed"
+            ),
+            "undetectable_change": (
+                "a concurrent change-and-restore inside that window is not detectable"
+                if pinned
+                else None
+            ),
+            "internal_feature_contract": {
+                "status": "unavailable",
+                "reason": "an ONNX graph does not expose an internal layer/norm contract",
+            },
+        }
 
-    if extract_csv is not None:
+    if extract_csv is not None or dataset is not None:
         return _extract_one_csv_onnx(
             session=session,
             input_name=input_name,
@@ -769,6 +1234,7 @@ def _extract_with_onnx(
             batch_size=batch_size,
             num_workers=num_workers,
             eval_transform=eval_transform,
+            dataset=dataset,
         )
 
     if detect_batch_mode(images_dir):
@@ -836,18 +1302,27 @@ def _extract_one_csv_onnx(
     session,
     input_name: str,
     images_dir: Path,
-    csv_path: Path,
+    csv_path: Path | None,
     extract_size: int,
     batch_size: int,
     num_workers: int,
     eval_transform: str = "center-crop",
+    *,
+    dataset: RecordImageDataset | None = None,
 ) -> pd.DataFrame:
-    ds = CSVImageDataset(
-        images_dir=images_dir,
-        csv_path=csv_path,
-        extract_size=extract_size,
-        eval_transform=eval_transform,
-    )
+    if dataset is not None:
+        if csv_path is not None:
+            raise ValueError("pass either a CSV path or a prebuilt dataset, not both")
+        ds = dataset
+    else:
+        if csv_path is None:
+            raise ValueError("a CSV path or a prebuilt dataset is required")
+        ds = CSVImageDataset(
+            images_dir=images_dir,
+            csv_path=csv_path,
+            extract_size=extract_size,
+            eval_transform=eval_transform,
+        )
     loader = DataLoader(
         ds, batch_size=batch_size, shuffle=False, num_workers=num_workers
     )
@@ -878,6 +1353,14 @@ def _extract_one_csv_onnx(
     return out
 
 
+_EXTRACT_PARAMETERS = """
+checkpoint_path, images_dir, model_name, extract_size, batch_size, device,
+num_workers, use_projector_output, use_student, token_mode, topk_patches,
+attention_pooling_type, attention_pooling_epochs, attention_train_csv, seed,
+extract_csv, attention_pooling_checkpoint_path, onnx_path, eval_transform
+"""
+
+
 def extract_embeddings(
     checkpoint_path: Path | None,
     images_dir: Path,
@@ -898,8 +1381,58 @@ def extract_embeddings(
     attention_pooling_checkpoint_path: Path | None = None,
     onnx_path: Path | None = None,
     eval_transform: str = "center-crop",
+    *,
+    records: DataBundle | None = None,
 ) -> pd.DataFrame:
-    """Extract embeddings and return DataFrame.
+    """Extract embeddings and return DataFrame (see ``_extract_embeddings_result``)."""
+    return _extract_embeddings_result(
+        checkpoint_path=checkpoint_path,
+        images_dir=images_dir,
+        model_name=model_name,
+        extract_size=extract_size,
+        batch_size=batch_size,
+        device=device,
+        num_workers=num_workers,
+        use_projector_output=use_projector_output,
+        use_student=use_student,
+        token_mode=token_mode,
+        topk_patches=topk_patches,
+        attention_pooling_type=attention_pooling_type,
+        attention_pooling_epochs=attention_pooling_epochs,
+        attention_train_csv=attention_train_csv,
+        seed=seed,
+        extract_csv=extract_csv,
+        attention_pooling_checkpoint_path=attention_pooling_checkpoint_path,
+        onnx_path=onnx_path,
+        eval_transform=eval_transform,
+        records=records,
+    ).frame
+
+
+def _extract_embeddings_result(
+    checkpoint_path: Path | None,
+    images_dir: Path,
+    model_name: str = "vit_tiny_patch16_224",
+    extract_size: int | None = None,
+    batch_size: int = 32,
+    device: str = "auto",
+    num_workers: int = 0,
+    use_projector_output: bool = False,
+    use_student: bool = False,
+    token_mode: str = "cls",
+    topk_patches: int = 20,
+    attention_pooling_type: str = "lightweight",
+    attention_pooling_epochs: int = 20,
+    attention_train_csv: Path | None = None,
+    seed: int = 42,
+    extract_csv: Path | None = None,
+    attention_pooling_checkpoint_path: Path | None = None,
+    onnx_path: Path | None = None,
+    eval_transform: str = "center-crop",
+    *,
+    records: DataBundle | None = None,
+) -> ExtractionResult:
+    """Extract embeddings and return the frame plus what actually ran.
 
     For SSL pretrain checkpoints the teacher (EMA model) is loaded by default,
     consistent with the ref script and DINO/iBOT convention.  Pass
@@ -928,6 +1461,114 @@ def extract_embeddings(
     if attention_pooling_epochs < 1:
         raise ValueError("--attention-pooling-epochs must be >= 1")
 
+    if records is not None:
+        if extract_csv is not None or attention_train_csv is not None:
+            raise ValueError(
+                "records cannot be combined with extract_csv or attention_train_csv; "
+                "the manifest already supplies the selection and labels"
+            )
+        records.raise_for_errors()
+        _check_records_root(records, images_dir)
+
+    effective: dict[str, Any] = {
+        "requested": {
+            "model_name": model_name,
+            "extract_size": extract_size,
+            "device": device,
+            "token_mode": token_mode,
+            "use_projector_output": bool(use_projector_output),
+            "use_student": bool(use_student),
+            "topk_patches": topk_patches,
+            "attention_pooling_type": attention_pooling_type,
+            "attention_pooling_epochs": attention_pooling_epochs,
+            "eval_transform": eval_transform,
+        },
+        "data_path": "records" if records is not None else (
+            "csv" if extract_csv is not None else "directory"
+        ),
+    }
+    used_files: list[FileSnapshot] = []
+    record_dataset = None
+    if records is not None:
+        effective["selection"] = {
+            "selection_rule": records.selection_rule,
+            "records": len(records.records),
+            "selector_columns": list(records.selector_columns),
+        }
+        if records.selector is not None:
+            used_files.append(records.selector)
+
+    norm_probe: list[dict] = []
+    # Set only by a run that trained a pool; written by ``_result`` so that a failure
+    # anywhere before success leaves no unregistered weights behind.
+    pending_pool: dict[str, Any] = {"path": None, "make_payload": None}
+
+    def _persist_pool() -> None:
+        """Publish the trained pool, owning the file outright or not at all.
+
+        The entry is created with ``O_EXCL``, so the no-overwrite rule holds at the
+        instant of writing rather than at some earlier check: a file that appeared in
+        between is never clobbered. The protected scope opens *before* the descriptor
+        exists, so an interruption arriving right after a successful create -- not
+        only a failure during the write -- still closes and removes it.
+        """
+        path = pending_pool["path"]
+        if path is None or pending_pool["make_payload"] is None:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        raw_fd: int | None = None
+        handle = None
+        try:
+            try:
+                raw_fd = os.open(
+                    path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644
+                )
+            except FileExistsError:
+                raise ValueError(
+                    "Refusing to overwrite the existing attention pooling "
+                    f"checkpoint: {path}"
+                ) from None
+            handle = os.fdopen(raw_fd, "wb")
+            raw_fd = None
+            with handle:
+                torch.save(pending_pool["make_payload"](), handle)
+                handle.flush()
+                os.fsync(handle.fileno())
+            effective["attention_pooling"]["written_file"] = str(path)
+            print(f"[Info] Saved finetuned attention pooling checkpoint: {path}")
+        except BaseException:
+            # A descriptor or a wrapped handle is proof this call created the entry;
+            # the FileExistsError path has neither and must never touch the file.
+            owned = handle is not None or raw_fd is not None
+            if handle is not None and not handle.closed:
+                try:
+                    handle.close()
+                except OSError:  # pragma: no cover - already closed
+                    pass
+            elif raw_fd is not None:
+                try:
+                    os.close(raw_fd)
+                except OSError:  # pragma: no cover - already closed
+                    pass
+            if owned:
+                try:
+                    Path(path).unlink(missing_ok=True)
+                except OSError as cleanup_error:
+                    # Best effort: never let a failed removal replace the real error.
+                    print(
+                        f"[Warning] could not remove the partial attention pooling "
+                        f"checkpoint {path}: {cleanup_error}"
+                    )
+            raise
+
+    def _result(frame: pd.DataFrame) -> ExtractionResult:
+        if norm_probe:
+            effective["backbone_output_norm"] = _backbone_norm_record(norm_probe[0])
+        _persist_pool()
+        return ExtractionResult(
+            frame=frame, effective=dict(effective), used_files=tuple(used_files)
+        )
+
     if onnx_path is not None:
         if token_mode != "cls":
             raise ValueError(
@@ -940,7 +1581,24 @@ def extract_embeddings(
                 f"--extract-size {extract_size} does not match ONNX input size "
                 f"{onnx_size} (the ONNX graph governs the resolution)."
             )
-        return _extract_with_onnx(
+        if records is not None:
+            record_dataset = RecordImageDataset(records, onnx_size, eval_transform)
+            effective["input_normalization"] = _transform_normalization(
+                record_dataset.transform
+            )
+        effective["input_size"] = onnx_size
+        effective["device"] = "cpu (onnxruntime)"
+        effective["feature_output"] = "onnx_graph_output"
+        effective["backbone_output_norm"] = {
+            "status": "unavailable",
+            "reason": "ONNX graph does not expose backbone normalization",
+        }
+        effective["post_feature_ops"] = []
+        effective["vector_normalization"] = {
+            "status": "unavailable",
+            "reason": "the graph output contract is not introspectable",
+        }
+        frame = _extract_with_onnx(
             onnx_path=Path(onnx_path),
             images_dir=images_dir,
             extract_size=onnx_size,
@@ -948,20 +1606,60 @@ def extract_embeddings(
             num_workers=num_workers,
             extract_csv=extract_csv,
             eval_transform=eval_transform,
+            records=records,
+            dataset=record_dataset,
+            effective=effective,
+            used_files=used_files,
         )
+        dim = _frame_dim(frame)
+        effective["feature_chain"] = {
+            "token_mode": token_mode,
+            "ops": ["onnx_graph_output"],
+            "output_dim": dim,
+        }
+        return _result(frame)
 
     if checkpoint_path is None:
         raise ValueError("--checkpoint is required when --onnx-path is not provided.")
 
     dev = resolve_device(device)
+    effective["device"] = str(dev)
     print(f"Resolved device: {dev}")
+    checkpoint_payload = None
+    if records is not None and checkpoint_path is not None:
+        from otuformer.data.provenance import read_verified_bytes
+
+        checkpoint_bytes, checkpoint_snapshot = snapshot_bytes(checkpoint_path)
+        used_files.append(checkpoint_snapshot)
+        checkpoint_payload = torch.load(
+            io.BytesIO(read_verified_bytes(checkpoint_snapshot)),
+            map_location="cpu",
+            weights_only=False,
+        )
+        del checkpoint_bytes
     model, checkpoint_size = _load_model(
-        checkpoint_path, model_name, dev, use_student=use_student
+        checkpoint_path,
+        model_name,
+        dev,
+        use_student=use_student,
+        payload=checkpoint_payload,
+        effective=effective,
     )
     requested_size = checkpoint_size if extract_size is None else extract_size
     validate_input_size(
         requested_size, model, getattr(model, "model_name", model_name)
     )
+    effective["input_size"] = requested_size
+    effective["preprocessing"] = {
+        "eval_transform": eval_transform,
+        "input_size": requested_size,
+    }
+    if records is not None:
+        # Build the record view only once the effective resolution is known.
+        record_dataset = RecordImageDataset(records, requested_size, eval_transform)
+        effective["input_normalization"] = _transform_normalization(
+            record_dataset.transform
+        )
     if extract_size is None:
         print(f"[Info] Auto extract size from checkpoint: {requested_size}")
     print(
@@ -984,10 +1682,20 @@ def extract_embeddings(
         ).to(dev)
 
         ckpt_path: Path | None = None
+        pool_source: dict[str, Any] = {"status": "missing"}
         for candidate in ckpt_candidates:
             if not candidate.exists():
                 continue
-            payload = torch.load(candidate, map_location="cpu", weights_only=False)
+            if records is not None:
+                _pool_bytes, pool_snapshot = snapshot_bytes(candidate)
+                used_files.append(pool_snapshot)
+                payload = torch.load(
+                    io.BytesIO(read_verified_bytes(pool_snapshot)),
+                    map_location="cpu",
+                    weights_only=False,
+                )
+            else:
+                payload = torch.load(candidate, map_location="cpu", weights_only=False)
             compatible, reason = _pool_policy_compatible(payload, policy)
             if not compatible:
                 if candidate == save_ckpt_path:
@@ -1005,6 +1713,17 @@ def extract_embeddings(
             if isinstance(payload, dict) and "teacher" in payload:
                 model.attention_pool = attention_pool
                 msg = model.load_state_dict(payload["teacher"], strict=False)
+                missing_pool = [
+                    key for key in msg.missing_keys if key.startswith("attention_pool.")
+                ]
+                if missing_pool:
+                    # Older files saved the model before the trained pool was
+                    # attached; loading them would silently use random weights.
+                    raise ValueError(
+                        f"Attention pooling checkpoint {candidate} contains no trained "
+                        f"pool parameters ({len(missing_pool)} missing, e.g. "
+                        f"{missing_pool[0]}); retrain it instead of reusing it."
+                    )
                 if msg.missing_keys or msg.unexpected_keys:
                     print(
                         f"[Warning] Finetuned checkpoint loaded with missing={len(msg.missing_keys)}, "
@@ -1023,24 +1742,25 @@ def extract_embeddings(
                 attention_pool.load_state_dict(state, strict=True)
                 model.attention_pool = attention_pool
             ckpt_path = candidate
+            pool_source = {"status": "cached", "path": str(candidate)}
             print(f"[Info] Loaded finetuned attention pooling from: {ckpt_path}")
             break
         if ckpt_path is None:
-            if attention_train_csv is None:
+            if attention_train_csv is None and records is None:
                 raise ValueError(
                     "attention-pool needs a compatible attention-pool checkpoint. "
                     "None was found for num_prefix_tokens="
                     f"{policy['num_prefix_tokens']}, register_tokens="
                     f"{policy['register_tokens']}, attention_pooling_type="
                     f"{policy['attention_pooling_type']} at {save_ckpt_path}; "
-                    "provide --label-csv with 'image' and 'label' columns to "
-                    "train one."
+                    "provide --label-csv or a labelled manifest to train one."
                 )
-            columns = set(pd.read_csv(attention_train_csv, nrows=0).columns)
-            if "image" not in columns or "label" not in columns:
-                raise ValueError(
-                    "attention-pool query training requires --label-csv with 'image' and 'label' columns"
-                )
+            if records is None:
+                columns = set(pd.read_csv(attention_train_csv, nrows=0).columns)
+                if "image" not in columns or "label" not in columns:
+                    raise ValueError(
+                        "attention-pool query training requires --label-csv with 'image' and 'label' columns"
+                    )
             print(
                 f"[Info] No finetuned attention pooling checkpoint found: {save_ckpt_path}. "
                 f"Starting query finetuning for {attention_pooling_epochs} epochs..."
@@ -1056,15 +1776,26 @@ def extract_embeddings(
                 num_workers=num_workers,
                 num_epochs=attention_pooling_epochs,
                 eval_transform=eval_transform,
+                dataset=(
+                    RecordLabelDataset(records, requested_size, eval_transform)
+                    if records is not None
+                    else None
+                ),
             )
+            pool_source = {"status": "trained_in_this_run"}
             if save_ckpt_path.exists():
                 raise ValueError(
                     "Refusing to overwrite the existing attention pooling "
                     f"checkpoint: {save_ckpt_path}"
                 )
-            save_ckpt_path.parent.mkdir(parents=True, exist_ok=True)
-            torch.save(
-                {
+            # Attach before serializing: ``model.state_dict()`` is what gets saved,
+            # and it only contains attention_pool.* once the trained module is on the
+            # model. Saving first produced a checkpoint with no trained parameters.
+            model.attention_pool = attention_pool
+            pending_pool["path"] = save_ckpt_path
+
+            def _pool_payload() -> dict[str, Any]:
+                return {
                     "teacher": model.state_dict(),
                     "args": {
                         "model_name": model_name,
@@ -1074,17 +1805,33 @@ def extract_embeddings(
                         "source_checkpoint": str(checkpoint_path),
                         "seed": seed,
                     },
-                },
-                save_ckpt_path,
-            )
-            print(
-                f"[Info] Saved finetuned attention pooling checkpoint: {save_ckpt_path}"
-            )
+                }
+
+            # Serialized only once the run is about to succeed, so the saved weights
+            # are the final ones and a failure never leaves an unregistered file.
+            pending_pool["make_payload"] = _pool_payload
         if not hasattr(model, "attention_pool"):
             model.attention_pool = attention_pool
         model.attention_pool.eval()
+        effective["attention_pooling"] = {
+            "type": attention_pooling_type,
+            "source": pool_source,
+            # Only set when this run wrote the file: the name carries a policy tag
+            # the caller cannot derive, and provenance must name what was produced.
+            "written_file": None,
+            "policy": {key: policy[key] for key in ("num_prefix_tokens", "register_tokens", "attention_pooling_type") if key in policy},
+        }
 
-    if extract_csv is not None:
+    effective["feature_output"] = {
+        "cls": "projector_output" if use_projector_output else "backbone_cls_token",
+        "patch-topk": "topk_patch_tokens_flattened",
+        "attention-pool": "attention_pooled_patch_tokens",
+    }[token_mode]
+    # Whether the backbone normalized its own output is observed by a hook, not
+    # assumed from the fact that extraction adds nothing.
+    norm_probe.append(_probe_backbone_norm(getattr(model, "backbone", None)))
+
+    if extract_csv is not None or record_dataset is not None:
         out_df = _extract_one_csv(
             model=model,
             images_dir=images_dir,
@@ -1097,8 +1844,18 @@ def extract_embeddings(
             token_mode=token_mode,
             topk_patches=topk_patches,
             eval_transform=eval_transform,
+            dataset=record_dataset,
+            effective=effective,
         )
-        return out_df
+        _record_feature_chain(
+            effective,
+            token_mode=token_mode,
+            use_projector_output=use_projector_output,
+            model=model,
+            input_dim=_feature_input_dim(effective, model),
+            output_dim=_frame_dim(out_df),
+        )
+        return _result(out_df)
 
     if detect_batch_mode(images_dir):
         subdirs = sorted(p for p in images_dir.iterdir() if p.is_dir())
@@ -1116,18 +1873,29 @@ def extract_embeddings(
                 topk_patches=topk_patches,
                 apply_patch_topk_pca=False,
                 eval_transform=eval_transform,
+                effective=effective,
             )
             if len(df) == 0:
                 continue
             df.insert(1, "sample", sub.name)
             frames.append(df)
         if len(frames) == 0:
-            return pd.DataFrame(columns=["id", "sample"])
+            return _result(pd.DataFrame(columns=["id", "sample"]))
         out_df = pd.concat(frames, ignore_index=True)
         if token_mode == "patch-topk":
             print(f"[Info] Applying PCA reduction for Top-{topk_patches} patches...")
-            out_df = _apply_patch_topk_pca_to_df(out_df, topk_patches=topk_patches)
-        return out_df
+            out_df = _apply_patch_topk_pca_to_df(
+                out_df, topk_patches=topk_patches, effective=effective
+            )
+        _record_feature_chain(
+            effective,
+            token_mode=token_mode,
+            use_projector_output=use_projector_output,
+            model=model,
+            input_dim=_feature_input_dim(effective, model),
+            output_dim=_frame_dim(out_df),
+        )
+        return _result(out_df)
     out_df = _extract_one_dir(
         model,
         images_dir,
@@ -1140,8 +1908,19 @@ def extract_embeddings(
         topk_patches=topk_patches,
         apply_patch_topk_pca=False,
         eval_transform=eval_transform,
+        effective=effective,
     )
     if token_mode == "patch-topk":
         print(f"[Info] Applying PCA reduction for Top-{topk_patches} patches...")
-        out_df = _apply_patch_topk_pca_to_df(out_df, topk_patches=topk_patches)
-    return out_df
+        out_df = _apply_patch_topk_pca_to_df(
+            out_df, topk_patches=topk_patches, effective=effective
+        )
+    _record_feature_chain(
+        effective,
+        token_mode=token_mode,
+        use_projector_output=use_projector_output,
+        model=model,
+        input_dim=_feature_input_dim(effective, model),
+        output_dim=_frame_dim(out_df),
+    )
+    return _result(out_df)

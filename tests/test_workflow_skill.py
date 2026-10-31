@@ -167,7 +167,7 @@ def test_all_teaching_assets_resolve_without_mutation(tmp_path: Path) -> None:
 
     before = sample_digest()
 
-    rows = list(csv.DictReader(LABEL_CSV.open(encoding="utf-8")))
+    rows = read_csv_rows(LABEL_CSV)
     assert len(rows) == 230
     assert all(set(row) >= {"image", "label"} for row in rows)
     counts: dict[str, int] = {}
@@ -238,8 +238,14 @@ def write_embeddings(path: Path, ids: list[str]) -> None:
             writer.writerow([image_id, float(index), float(index) + 0.5])
 
 
+def read_csv_rows(path: Path, *, fields: bool = True):
+    """Rows of a CSV read through a closed handle, so no file object leaks."""
+    with path.open(newline="", encoding="utf-8") as handle:
+        return list(csv.DictReader(handle) if fields else csv.reader(handle))
+
+
 def example_ids() -> list[str]:
-    rows = list(csv.DictReader(LABEL_CSV.open(encoding="utf-8")))
+    rows = read_csv_rows(LABEL_CSV)
     return [Path(row["image"]).name for row in rows]
 
 
@@ -250,7 +256,7 @@ def test_teaching_id_mapping_recipe(tmp_path: Path) -> None:
     ids = example_ids()
     expected = {
         Path(row["image"]).name: row["label"]
-        for row in csv.DictReader(LABEL_CSV.open(encoding="utf-8"))
+        for row in read_csv_rows(LABEL_CSV)
     }
 
     embeddings = demo_root / "embeddings.csv"
@@ -266,7 +272,7 @@ def test_teaching_id_mapping_recipe(tmp_path: Path) -> None:
         )
         == 230
     )
-    written = list(csv.DictReader(labels_out.open(encoding="utf-8")))
+    written = read_csv_rows(labels_out)
     assert len(written) == 230
     assert {row["id"]: row["label"] for row in written} == expected
 
@@ -284,7 +290,7 @@ def test_teaching_id_mapping_recipe(tmp_path: Path) -> None:
         )
         == 230
     )
-    nested_written = {row["id"] for row in csv.DictReader(nested_out.open(encoding="utf-8"))}
+    nested_written = {row["id"] for row in read_csv_rows(nested_out)}
     assert nested_written == set(nested_ids)
 
     # fabricated absolute ids with real example basenames are refused: matching a
@@ -318,7 +324,7 @@ def test_teaching_id_mapping_recipe(tmp_path: Path) -> None:
         )
         == 0
     )
-    assert list(csv.reader(clean_out.open(encoding="utf-8"))) == [["id", "cluster"]]
+    assert read_csv_rows(clean_out, fields=False) == [["id", "cluster"]]
 
     # a partition that disagrees yields label-informed corrections only
     wrong = demo_root / "wrong.csv"
@@ -342,7 +348,7 @@ def test_teaching_id_mapping_recipe(tmp_path: Path) -> None:
         )
         == len(moved)
     )
-    corrections = list(csv.DictReader(corrections_out.open(encoding="utf-8")))
+    corrections = read_csv_rows(corrections_out)
     assert {row["id"] for row in corrections} == set(moved)
     for row in corrections:
         assert row["cluster"] == f"OTU_{expected[row['id']]}"
@@ -379,7 +385,7 @@ def test_teaching_id_mapping_recipe(tmp_path: Path) -> None:
         },
     )
     assert chosen_count > 0
-    for row in csv.DictReader(chosen.open(encoding="utf-8")):
+    for row in read_csv_rows(chosen):
         expected_cluster = "OTU_A" if expected[row["id"]] == "Epidorcus_gracilis" else "OTU_B"
         assert row["cluster"] == expected_cluster
     with pytest.raises(ValueError):
@@ -502,7 +508,7 @@ def test_teaching_id_mapping_recipe(tmp_path: Path) -> None:
         )
         > 0
     )
-    assert " OTU_A " in {row["cluster"] for row in csv.DictReader(padded_out.open(encoding="utf-8"))}
+    assert " OTU_A " in {row["cluster"] for row in read_csv_rows(padded_out)}
 
     # an explicit mapping must be a real, non-empty cluster of that label
     for broken in (
@@ -880,9 +886,13 @@ def test_installed_distribution_schema_and_skill_copy(tmp_path: Path) -> None:
     import zipfile
 
     if os.environ.get("OTUFORMER_INSTALLED_DISTRIBUTION_CHECK") != "1":
+        # An actionable skip: it names the exact command that turns this into a
+        # real result, so "not verified" is never mistaken for "verified".
         pytest.skip(
-            "installed-distribution check requires explicit authorization "
-            "(set OTUFORMER_INSTALLED_DISTRIBUTION_CHECK=1)"
+            "installed-distribution check not run (it builds a wheel and installs it "
+            "into a disposable interpreter). Authorise it with: "
+            "OTUFORMER_INSTALLED_DISTRIBUTION_CHECK=1 python -m pytest "
+            "-k installed_distribution"
         )
 
     dist = tmp_path / "dist"
@@ -1058,3 +1068,19 @@ def test_installed_distribution_schema_and_skill_copy(tmp_path: Path) -> None:
         )
         assert proposal.returncode == 0, proposal.stderr
         assert json.loads(proposal.stdout)["launcher"]["verified"] is True
+
+
+def test_skill_names_the_data_path_mode() -> None:
+    skill = (SKILL / "SKILL.md").read_text(encoding="utf-8")
+    workflow = (SKILL / "references" / "workflow.md").read_text(encoding="utf-8")
+    templates = (SKILL / "references" / "dialog-templates.md").read_text(encoding="utf-8")
+    combined = "\n".join([skill, workflow, templates])
+
+    # The legacy path is directory-only now: one CSV always means the shared path.
+    assert "legacy data path: existing semantics" in combined
+    assert "new data path: strict CSV semantics" in combined
+    assert "--manifest" not in combined
+    assert "leading zeros" in combined
+    assert "not biological absence" in skill
+    assert "data_validation.json" in combined
+    assert "run_provenance.json" in combined

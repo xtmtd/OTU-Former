@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 from pathlib import Path
 from typing import Any
@@ -43,3 +44,17 @@ def write_json(data: dict[str, Any], path: Path, indent: int = 2) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
         json.dump(data, f, indent=indent)
+
+
+def write_json_atomic(data: dict[str, Any], path: Path, indent: int = 2) -> None:
+    """Same-directory atomic replacement; the previous file survives a failure."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(path.name + ".tmp")
+    try:
+        with temp.open("w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=indent, allow_nan=False)
+            handle.flush()
+        os.replace(temp, path)
+    finally:
+        temp.unlink(missing_ok=True)

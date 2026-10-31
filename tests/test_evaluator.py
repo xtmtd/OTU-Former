@@ -286,3 +286,134 @@ def test_metric_learning_diagnostics_keys():
         "Embedding_Norm_Std",
     ]:
         assert key in result
+
+
+def _toy_embeddings(classes=3, per_class=6, dim=8, seed=0):
+    rng = np.random.default_rng(seed)
+    centres = rng.normal(size=(classes, dim))
+    rows = []
+    labels = []
+    for index in range(classes):
+        rows.append(centres[index] + rng.normal(scale=0.1, size=(per_class, dim)))
+        labels.extend([f"class_{index}"] * per_class)
+    return np.vstack(rows), np.array(labels)
+
+
+def test_metric_outcomes_preserve_public_values(monkeypatch):
+    import sklearn.model_selection as model_selection
+
+    from otuformer.embedding import evaluator
+
+    embeddings, labels = _toy_embeddings()
+    calls = {"cross_val_score": 0, "cross_validate": 0}
+    real_cvs = model_selection.cross_val_score
+    real_cv = model_selection.cross_validate
+
+    def counting_cvs(*args, **kwargs):
+        calls["cross_val_score"] += 1
+        return real_cvs(*args, **kwargs)
+
+    def counting_cv(*args, **kwargs):
+        calls["cross_validate"] += 1
+        return real_cv(*args, **kwargs)
+
+    monkeypatch.setattr(model_selection, "cross_val_score", counting_cvs)
+    monkeypatch.setattr(model_selection, "cross_validate", counting_cv)
+
+    knn = evaluator._compute_knn_accuracy_result(embeddings, labels)
+    per_run = calls["cross_val_score"]
+    assert per_run >= 1
+    assert {key: outcome.value for key, outcome in knn.items()} == evaluator.compute_knn_accuracy(
+        embeddings, labels
+    )
+    assert calls["cross_val_score"] == per_run * 2  # one CV per eligible k, no doubles
+
+    probing = evaluator._compute_linear_probing_metrics_result(embeddings, labels)
+    assert calls["cross_validate"] == 1  # one shared CV pass for both scores
+    assert {
+        key: outcome.value for key, outcome in probing.items()
+    } == evaluator.compute_linear_probing_metrics(embeddings, labels)
+    assert calls["cross_validate"] == 2  # the projection never re-runs diagnostics
+
+    assert all(
+        outcome.status == "available" for outcome in (knn["kNN_Acc_k1"], probing["Linear_Probing_Acc"])
+    )
+
+    recall = evaluator._compute_recall_at_k_result(embeddings, labels)
+    assert {key: outcome.value for key, outcome in recall.items()} == evaluator.compute_recall_at_k(
+        embeddings, labels
+    )
+    assert evaluator._compute_map_result(embeddings, labels).value == evaluator.compute_map(
+        embeddings, labels
+    )
+    clustering = evaluator._compute_clustering_metrics_result(embeddings, labels)
+    assert {
+        key: outcome.value for key, outcome in clustering.items()
+    } == evaluator.compute_clustering_metrics(embeddings, labels)
+    assert clustering["NMI"].context["cluster_distance"].startswith("euclidean")
+    assert clustering["Silhouette_Score"].context["silhouette_distance"] == "cosine"
+    assert recall["Recall@1"].context["self_exclusion"] == "query excluded from candidates"
+    assert knn["kNN_Acc_k1"].context["distance"] == "cosine"
+    assert probing["Linear_Probing_Acc"].context["classifier"] == "LogisticRegression"
+
+
+def test_metric_outcome_failure_branches(monkeypatch):
+    import sklearn.model_selection as model_selection
+
+    from otuformer.embedding import evaluator
+
+    embeddings, labels = _toy_embeddings()
+
+    one_class = evaluator._compute_knn_accuracy_result(
+        embeddings, np.array(["only"] * len(labels))
+    )
+    assert {outcome.reason for outcome in one_class.values()} == {"insufficient_classes"}
+    assert {outcome.value for outcome in one_class.values()} == {None}
+
+    singleton = evaluator._compute_knn_accuracy_result(
+        np.eye(2), np.array(["NA", "001"])
+    )
+    assert singleton["kNN_Acc_k1"].reason == "insufficient_class_count"
+    assert evaluator.compute_knn_accuracy(np.eye(2), np.array(["NA", "001"]))[
+        "kNN_Acc_k1"
+    ] is None
+
+    oversized = evaluator._compute_knn_accuracy_result(embeddings, labels, k_values=[1000])
+    assert oversized["kNN_Acc_k1000"].reason == "ineligible_k"
+
+    invalid_k = evaluator._compute_recall_at_k_result(embeddings, labels, k_values=[0])
+    assert invalid_k["Recall@0"].reason == "ineligible_k"
+
+    single = evaluator._compute_recall_at_k_result(np.eye(1), np.array(["a"]))
+    assert single["Recall@1"].reason == "insufficient_samples"
+
+    unique = evaluator._compute_map_result(embeddings, np.array([str(i) for i in range(len(labels))]))
+    assert unique.reason == "no_relevant_pairs"
+
+    collinear = evaluator._compute_clustering_metrics_result(
+        np.ones((4, 3)), np.array(["a", "b", "c", "d"])
+    )
+    assert collinear["NMI"].reason == "insufficient_distinct_vectors"
+
+    def nan_scores(*_args, **_kwargs):
+        return np.array([float("nan")] * 3)
+
+    monkeypatch.setattr(model_selection, "cross_val_score", nan_scores)
+    nonfinite = evaluator._compute_knn_accuracy_result(embeddings, labels)
+    assert nonfinite["kNN_Acc_k1"].reason == "nonfinite_result"
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("cv exploded")
+
+    monkeypatch.setattr(model_selection, "cross_val_score", boom)
+    failed = evaluator._compute_knn_accuracy_result(embeddings, labels)
+    assert failed["kNN_Acc_k1"].status == "failed"
+    assert failed["kNN_Acc_k1"].reason == "evaluation_failed"
+    assert evaluator.compute_knn_accuracy(embeddings, labels)["kNN_Acc_k1"] is None
+
+    monkeypatch.setattr(model_selection, "cross_validate", boom)
+    failed_probe = evaluator._compute_linear_probing_metrics_result(embeddings, labels)
+    assert failed_probe["Linear_Probing_Acc"].reason == "evaluation_failed"
+    assert evaluator.compute_linear_probing_metrics(embeddings, labels)[
+        "Linear_Probing_Acc"
+    ] is None

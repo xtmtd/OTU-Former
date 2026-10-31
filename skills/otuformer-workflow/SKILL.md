@@ -47,7 +47,19 @@ step at a time. Never run an analysis because this Skill was loaded.
 6. **Improve nothing silently.** Never change defaults, add flags "for safety",
    invent aliases, materialize displayed defaults into argv, or rerun a failed
    step automatically.
-7. **Interpretation stays honest.** Distinguish morphOTUs from verified species,
+7. **Name the data path in the card.** When `extract` options select the shared v2
+   data path, append the derived notice to the existing card: `legacy data path:
+   existing semantics` or `new data path: strict CSV semantics`, naming the options
+   that selected it. A CSV always means the strict path; never tell the operator that
+   adding a COCO option changes how their CSV is parsed. This is explanatory text
+   derived from the discovered options, not a new card or schema field; if the
+   installed schema lacks those options, do not propose them.
+   Missing annotations are not biological absence: an image without a COCO record,
+   an empty mask, `v=0` versus `v=1` keypoints and panoptic void are different
+   states, and no negative mask or trusted background may be inferred. Treat
+   `data_validation.json`, `data_records.jsonl` and `run_provenance.json` by their
+   recorded status: `running` or a missing pair is not a completed extraction.
+8. **Interpretation stays honest.** Distinguish morphOTUs from verified species,
    label classes from ecological samples, morphological trees from established
    phylogenies, and raw-feature gradient CAM from validated attribution.
 

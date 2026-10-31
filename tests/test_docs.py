@@ -572,3 +572,18 @@ def test_reference_links_are_correct() -> None:
                     f"{path.name} Affected Commands has no link to {target} "
                     f"(found {targets})"
                 )
+
+
+def test_extract_documents_the_shared_data_path() -> None:
+    en = (COMMAND_DOCS / "extract.md").read_text(encoding="utf-8")
+    cn = (COMMAND_DOCS / "extract.cn.md").read_text(encoding="utf-8")
+    for text in (en, cn):
+        for artifact in (
+            "data_records.jsonl",
+            "data_validation.json",
+            "run_provenance.json",
+        ):
+            assert artifact in text
+        assert "running" in text
+    assert "strict" in en.lower()
+    assert "严格" in cn
