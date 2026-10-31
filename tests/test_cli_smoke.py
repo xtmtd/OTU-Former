@@ -914,10 +914,18 @@ def test_extract_single_class_csv_skips_metrics_but_generates_umap(
         ],
     )
 
+    out = tmp_path / "extract_single_class"
     assert result.exit_code == 0, result.output
-    assert "fewer than two classes" in result.output
-    assert (tmp_path / "extract_single_class" / "umap.pdf").exists()
-    assert not (tmp_path / "extract_single_class" / "metrics.csv").exists()
+    # --label-csv now selects the shared path: the skip is a recorded fact with a
+    # reason, not a printed aside, and the visualization still runs.
+    import json as _json
+
+    record = _json.loads((out / "run_provenance.json").read_text())
+    assert record["metrics"]["skipped"]["status"] == "not_applicable"
+    assert "fewer than two label classes" in record["metrics"]["skipped"]["reason"]
+    assert record["metrics"]["visualization"]["umap"]["status"] == "written"
+    assert (out / "umap.pdf").exists()
+    assert not (out / "metrics.csv").exists()
 
 
 def test_export_command(tmp_path):
@@ -3491,7 +3499,8 @@ def test_extract_rejects_duplicate_label_images(tmp_path):
     )
 
     assert result.exit_code != 0
-    assert "duplicate" in str(result.exception).lower()
+    # The shared reader names the duplicate key itself rather than a generic message.
+    assert "duplicate_image_key" in result.output
 
 
 # --- v0.8.0 loss CLI validation ---------------------------------------------

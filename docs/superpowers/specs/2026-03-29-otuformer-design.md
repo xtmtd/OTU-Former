@@ -329,6 +329,25 @@ Finetune#2's accepted pseudo rows and provenance are additive top-level/config p
 ### 4.9 Backbone compatibility boundary
 OTU-Former does not promise support for every timm backbone or every model whose name starts with `vit_`. Pretraining's masked/student-teacher forward follows timm's standard `VisionTransformer` token and block interfaces; compatibility is determined by the actual implementation and required capabilities, not the model-name prefix. The cached `vit_tiny_patch16_224.augreg_in21k_ft_in1k` is a standard `VisionTransformer` in timm 1.0.27. In the same version, `vit_small_patch16_dinov3.lvd1689m` is implemented as `Eva`, with four native registers and a different positional-embedding/rotary-block interface; it is **not** supported by the current pretraining forward or by the [optional-register design](2026-09-28-otuformer-optional-registers-design.md). Supporting that model requires a separately reviewed Eva/DINOv3 adaptation and end-to-end tests, not a broadened `vit_*` name check. The two cached models do not imply that all models in either family are tested or supported.
 
+### 4.10 Proposed v2 data and provenance foundation
+
+See the [v2 data and provenance design](2026-10-29-otuformer-v2-data-provenance-design.md)
+for the proposed S0/data-side S1 foundation of roadmap 4.1/4.8, not this master
+design's Sections 4.1/4.8. It is not implemented behavior or full roadmap 4.1/4.8
+completion; existing command contracts remain authoritative for legacy execution.
+Shared readers serve existing commands; no separate `dataset` command group is added.
+
+The linked design owns the shared ingestion, identity, annotation-validation and
+provenance contracts, including reuse by later commands (§1). It separates
+[confirmed boundaries from author proposals](2026-10-29-otuformer-v2-data-provenance-design.md#2-decisions-and-approaches),
+proposes the [extract integration](2026-10-29-otuformer-v2-data-provenance-design.md#61-a-real-consumer-without-a-new-command-group)
+and [additive artifacts](2026-10-29-otuformer-v2-data-provenance-design.md#7-extraction-outputs-and-minimal-provenance),
+and owns the detailed validation, compatibility and acceptance requirements.
+
+The draft remains Proposed. Its [scope exclusions and approval gates](2026-10-29-otuformer-v2-data-provenance-design.md#10-documentation-scope-exclusions-and-approval-gates)
+apply: document revision or reuse does not approve the design, planning,
+implementation, analysis, version changes, or commits.
+
 ---
 
 ## 5. Dependencies
@@ -357,6 +376,7 @@ tqdm >= 4.66
 
 ## 6. Future Roadmap
 
+- Proposed v2 data/COCO ingestion and provenance foundation: see [the design](2026-10-29-otuformer-v2-data-provenance-design.md) and Section 4.10. Not yet implemented or approved for execution.
 - Metric-loss comparisons for morphOTU delineation: see [the v0.8.0 design](2026-09-24-otuformer-metric-loss-v080-design.md). ProxyAnchor remains a possible later experiment, not a v0.8.0 requirement.
 - `report` sub-command (HTML/PDF summary of a full analysis run)
 - Beta diversity matrix + cross-sample OTU comparison

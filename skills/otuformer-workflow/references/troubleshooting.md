@@ -77,3 +77,17 @@ Short demonstration training is procedural only and is not evidence of encoder
 quality. If the example assets are missing (for example the Skill was copied
 outside the repository), ask for the examples root instead of searching or
 downloading data.
+
+## Missing polygon/RLE decoder
+
+`mask_decoder_unavailable` (or a message about the optional decoder) means the
+`annotations` extra is not installed in the approved interpreter. Installing it is
+a separate approval; do not substitute a missing decoder check with a skip, and do
+not re-run the extraction before the validation failure is resolved.
+
+## Shared data-path validation failure
+
+A failed shared-path run publishes `data_validation.json` plus a `failed`
+`run_provenance.json`, and no embedding/mapping pair. Report the issue codes and the
+affected image keys instead of retrying; missing annotations must not be reread as
+biological absence, and an `interrupted` or `running` status is never success.

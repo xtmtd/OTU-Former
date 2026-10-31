@@ -266,25 +266,38 @@ def _make_onnx_graph_proto(dims):
 def test_resolve_onnx_input_size_reads_static_square_nchw(monkeypatch, tmp_path):
     import onnx
 
-    monkeypatch.setattr(
-        onnx, "load", lambda p: _make_onnx_graph_proto([1, 3, 224, 224])
-    )
+    seen: list[dict] = []
+
+    def fake_load(p, **kwargs):
+        seen.append(kwargs)
+        return _make_onnx_graph_proto([1, 3, 224, 224])
+
+    monkeypatch.setattr(onnx, "load", fake_load)
     assert resolve_onnx_input_size(tmp_path / "m.onnx") == 224
+    # The weights are irrelevant to the input shape, and loading them would use
+    # onnx's own external-data resolution instead of the runtime's.
+    assert seen == [{"load_external_data": False}]
 
     monkeypatch.setattr(
-        onnx, "load", lambda p: _make_onnx_graph_proto([1, 3, 224, 256])
+        onnx,
+        "load",
+        lambda p, **kw: _make_onnx_graph_proto([1, 3, 224, 256]),
     )
     with pytest.raises(ValueError, match="square"):
         resolve_onnx_input_size(tmp_path / "m.onnx")
 
     monkeypatch.setattr(
-        onnx, "load", lambda p: _make_onnx_graph_proto([1, 1, 224, 224])
+        onnx,
+        "load",
+        lambda p, **kw: _make_onnx_graph_proto([1, 1, 224, 224]),
     )
     with pytest.raises(ValueError, match="NCHW"):
         resolve_onnx_input_size(tmp_path / "m.onnx")
 
     monkeypatch.setattr(
-        onnx, "load", lambda p: _make_onnx_graph_proto([1, 3, "h", 224])
+        onnx,
+        "load",
+        lambda p, **kw: _make_onnx_graph_proto([1, 3, "h", 224]),
     )
     with pytest.raises(ValueError, match="static"):
         resolve_onnx_input_size(tmp_path / "m.onnx")

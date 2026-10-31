@@ -23,7 +23,7 @@ import shlex
 import shutil
 import subprocess
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Mapping, Sequence
 
 SCHEMA_VERSION = 1
@@ -718,6 +718,144 @@ def _is_within(child: Path, parent: Path) -> bool:
     return child == parent or parent in child.parents
 
 
+def _safety_forms(path: Path) -> list[Path]:
+    """Every filesystem position that naming ``path`` actually refers to.
+
+    Two matter, and they differ when a parent or the final component is a symlink:
+
+    - the real target, which is what the run reads;
+    - the directory entry that clearing the output directory removes, i.e. the
+      parent resolved *as written* with the final component kept.
+
+    ``..`` is never folded lexically first: it applies to where the preceding
+    symlink points, so folding would invent a third position no syscall reaches
+    and let the real one through unchecked.
+    """
+    entry = Path(path).expanduser()
+    if not entry.is_absolute():
+        entry = Path.cwd() / entry
+    forms = [_resolve_for_safety(entry)]
+    if entry.name:
+        # The entry itself may be a symlink inside the output directory; its name
+        # is preserved, and only the directory it sits in is resolved.
+        forms.append(_resolve_for_safety(entry.parent) / entry.name)
+    unique: list[Path] = []
+    for form in forms:
+        if form not in unique:
+            unique.append(form)
+    return unique
+
+
+_MAX_LINK_HOPS = 40
+
+
+def input_identities(paths: Sequence[Path]) -> dict[Path, Path]:
+    """Real targets of the inputs that exist now, for a post-cleanup comparison.
+
+    Output safety is decided *before* the output directory is cleared, so anything
+    that touches the tree in between can leave a checked input unreachable. This
+    snapshot does not prevent that; it makes the outcome detectable instead of
+    assumed. See ``verify_inputs_unchanged``.
+    """
+    identities: dict[Path, Path] = {}
+    for path in paths:
+        entry = Path(path).expanduser()
+        try:
+            if entry.exists() or entry.is_symlink():
+                identities[entry] = entry.resolve()
+        except OSError:  # pragma: no cover - defensive
+            continue
+    return identities
+
+
+def verify_inputs_unchanged(identities: dict[Path, Path]) -> None:
+    """Refuse when clearing the output directory broke a protected input path.
+
+    Check-then-act across a directory tree cannot be made atomic for a
+    non-cooperating process, so the guarantee is: whatever a cleanup did, the run
+    stops here with the input named, rather than continuing on a path that no longer
+    leads where it was checked. ``resolve`` is non-strict, so a missing entry shows
+    up as a different path rather than an exception.
+    """
+    for entry, expected in identities.items():
+        current = entry.resolve()
+        if current != expected:
+            raise ValueError(
+                f"clearing the output directory changed a protected input: {entry} "
+                f"resolved to {expected} before and to {current} after"
+            )
+
+
+def _removed_entries(path: Path) -> list[Path]:
+    """Every directory entry a path is reached through, links included.
+
+    The path is walked one component at a time and each component's real position is
+    recorded. Resolving a whole parent in one call would hide the links inside it:
+    with ``entry -> out/relay -> real``, ``out/relay`` is only visible while walking,
+    and deleting it makes the input unreachable even though the file itself lives
+    elsewhere. Link targets are walked too, so a link reached only by following
+    another link counts the same way.
+    """
+    entry = Path(path).expanduser()
+    if not entry.is_absolute():
+        entry = Path.cwd() / entry
+    positions: list[Path] = []
+    parts = list(PurePosixPath(entry).parts)
+    current = Path("/")
+    hops = 0
+    while parts:
+        part = parts.pop(0)
+        if part in ("", ".", "/"):
+            continue
+        if part == "..":
+            # `current` only ever holds a fully resolved position, because a link is
+            # expanded into the component queue when it is met. Applying `..` here is
+            # therefore the same as following the link and then going up.
+            current = current.parent
+            continue
+        candidate = current / part
+        if candidate not in positions:
+            positions.append(candidate)
+        if candidate.is_symlink():
+            hops += 1
+            if hops > _MAX_LINK_HOPS:
+                # Refuse rather than allow: an unreadable path is not a safe path.
+                raise ValueError(
+                    f"cannot verify output safety: {path} passes through more than "
+                    f"{_MAX_LINK_HOPS} symbolic links"
+                )
+            try:
+                target = Path(os.readlink(candidate))
+            except OSError:  # pragma: no cover - defensive
+                break
+            current = Path("/") if target.is_absolute() else candidate.parent
+            parts = list(PurePosixPath(target).parts) + parts
+        else:
+            current = candidate
+    return positions
+
+
+def check_inputs_survive_cleanup(out_dir: Path, inputs: Sequence[Path]) -> None:
+    """Refuse when clearing ``out_dir`` would remove an entry an input needs.
+
+    Only the deletion direction is checked. An output directory *inside* an input
+    root is a supported layout (a legacy run may write below its image root), while
+    an input reached through an entry inside the output directory is not: cleanup
+    would delete that entry and leave the input unreachable.
+
+    ``out_dir`` may be given already resolved; callers inside a check avoid resolving
+    twice.
+    """
+    target = _resolve_for_safety(Path(out_dir))
+    for path in inputs:
+        for position in _removed_entries(Path(path)):
+            if position != target and _is_within(position, target):
+                raise ValueError(
+                    f"clearing {target} would remove {position}, which the "
+                    f"protected input {path} is reached through"
+                )
+
+
 def check_output_safety(
     out_dir: Path,
     *,
@@ -734,15 +872,18 @@ def check_output_safety(
     not-yet-created directories. Never creates, deletes, or writes anything.
     """
     target = _resolve_for_safety(Path(out_dir))
-    permitted = [_resolve_for_safety(Path(path)) for path in allow_inside]
+    permitted = [
+        form for path in allow_inside for form in _safety_forms(Path(path))
+    ]
     conditions: list[str] = []
     for protected in protected_paths:
-        resolved = _resolve_for_safety(Path(protected))
-        if _is_within(target, resolved):
-            raise ValueError(
-                f"output directory {target} is inside protected input {resolved}"
-            )
-        if _is_within(resolved, target):
+        for resolved in _safety_forms(Path(protected)):
+            if _is_within(target, resolved):
+                raise ValueError(
+                    f"output directory {target} is inside protected input {resolved}"
+                )
+            if not _is_within(resolved, target):
+                continue
             permitted_here = any(
                 resolved == candidate or _is_within(resolved, candidate)
                 for candidate in permitted
@@ -757,6 +898,8 @@ def check_output_safety(
                 f"output directory {target} contains protected input {resolved}; "
                 "clearing it could remove inputs or results"
             )
+    if overwrite:
+        check_inputs_survive_cleanup(target, protected_paths)
     if target.exists():
         if not target.is_dir():
             raise ValueError(f"output path {target} exists and is not a directory")

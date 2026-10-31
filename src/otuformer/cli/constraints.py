@@ -174,7 +174,19 @@ _CONSTRAINTS: dict[str, dict[str, dict[str, Any]]] = {
         },
         "input_images_dir": {"path_role": "images_dir"},
         "out_dir": {"path_role": "output_dir"},
-        "label_csv": {"path_role": "label_csv"},
+        "label_csv": {
+            "path_role": "label_csv",
+            "unresolved": [
+                "the shared reader decides selection, strict CSV semantics and identity",
+            ],
+        },
+        "coco_instances": {"path_role": "annotation_source"},
+        "coco_keypoints": {"path_role": "annotation_source"},
+        "coco_panoptic": {"path_role": "annotation_source"},
+        "panoptic_masks_dir": {
+            "path_role": "annotation_source",
+            "unresolved": ["the panoptic JSON and mask root must be supplied together"],
+        },
         "eval_transform": {"choices": list(EVAL_TRANSFORM_CHOICES)},
         "token_mode": {"choices": list(TOKEN_MODES)},
         "attention_pooling_type": {"choices": list(ATTENTION_POOLING_TYPES)},
@@ -613,6 +625,25 @@ def _check_rule(option: str, value: Any, rule: Mapping[str, Any]) -> None:
         _check_bounds(option, parsed, bounds)
 
 
+def validate_extract_data_options(
+    *,
+    label_csv: object = None,
+    coco_instances: object = None,
+    coco_keypoints: object = None,
+    coco_panoptic: object = None,
+    panoptic_masks_dir: object = None,
+) -> None:
+    """Purely structural rules for the v2 data path options.
+
+    Only the panoptic JSON/root pairing is structural; geometry, label eligibility
+    and file contents belong to the shared reader.
+    """
+    if (coco_panoptic is None) != (panoptic_masks_dir is None):
+        raise ValueError(
+            "--coco-panoptic and --panoptic-masks-dir require each other"
+        )
+
+
 def validate_constraints(
     command: str,
     values: Mapping[str, object],
@@ -634,6 +665,15 @@ def validate_constraints(
         raise ValueError(f"unknown parameters for {command}: {', '.join(unknown)}")
 
     unresolved: list[str] = []
+
+    if command == "extract":
+        validate_extract_data_options(
+            label_csv=values.get("label_csv"),
+            coco_instances=values.get("coco_instances"),
+            coco_keypoints=values.get("coco_keypoints"),
+            coco_panoptic=values.get("coco_panoptic"),
+            panoptic_masks_dir=values.get("panoptic_masks_dir"),
+        )
 
     for name, value in values.items():
         rule = rules.get(name)

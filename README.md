@@ -105,8 +105,9 @@ Checks published Git tags and installs the latest release only after confirmatio
 ## Output Safety
 
 Commands refuse a non-empty `--out-dir` by default. Pass `--overwrite` to clear
-it deliberately. Training `--resume` runs keep and append to their existing
-output directory; `--resume` and `--overwrite` cannot be combined.
+it deliberately; inputs the run reads (image root, `--label-csv`, checkpoint, ONNX
+graph) stay protected, even when reached through a path inside that directory.
+Training `--resume` runs keep and append; `--resume` and `--overwrite` conflict.
 
 ## Hugging Face Weights
 
@@ -172,7 +173,7 @@ architectural responsibilities.
 | `otuformer cam` | Generate GradCAM and other heatmaps. | [docs/commands/cam.md](docs/commands/cam.md) |
 | `otuformer export` | Export model to ONNX format. | [docs/commands/export.md](docs/commands/export.md) |
 
-Two cross-command contracts have their own documents: [Training Augmentation](docs/commands/training-augmentation.md) for the `--augmentation` and `--orientation-policy` behaviour shared by `pretrain` and `finetune`, and [Embedding Metrics](docs/commands/embedding-metrics.md) for the metrics shared by `pretrain`, `finetune`, and `extract`.
+Two cross-command contracts have their own documents: [Training Augmentation](docs/commands/training-augmentation.md) for the `--augmentation` and `--orientation-policy` behaviour shared by `pretrain` and `finetune`, and [Embedding Metrics](docs/commands/embedding-metrics.md) for the metrics shared by `pretrain`, `finetune`, and `extract`. `otuformer extract` also accepts the shared v2 data path (`--label-csv`, `--coco-*`): one strict selector parse plus `data_records.jsonl`, `data_validation.json` and `run_provenance.json` ([details](docs/commands/extract.md)).
 
 ## License
 

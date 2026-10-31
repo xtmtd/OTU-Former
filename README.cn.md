@@ -104,8 +104,9 @@ otuformer update --yes
 
 ## 输出安全
 
-默认情况下，命令拒绝使用非空的 `--out-dir`。请显式使用 `--overwrite`
-清空该目录。训练时的 `--resume` 会保留并追加已有输出目录；`--resume`
+默认情况下，命令拒绝使用非空的 `--out-dir`。请显式使用 `--overwrite` 清空该目录；
+本次运行读取的输入（图像根、`--label-csv`、checkpoint、ONNX 图）始终受保护，即使要经过
+该目录内部的路径才能到达。训练时的 `--resume` 会保留并追加已有输出目录；`--resume`
 与 `--overwrite` 不能同时使用。
 
 ## Hugging Face 权重
@@ -170,7 +171,7 @@ otuformer -v
 | `otuformer cam` | 生成 GradCAM 等热图。 | [docs/commands/cam.cn.md](docs/commands/cam.cn.md) |
 | `otuformer export` | 导出 ONNX 模型。 | [docs/commands/export.cn.md](docs/commands/export.cn.md) |
 
-两份跨命令契约有独立文档：[训练数据增强](docs/commands/training-augmentation.cn.md)（`pretrain` 与 `finetune` 共享的 `--augmentation` 与 `--orientation-policy` 行为）与 [嵌入指标](docs/commands/embedding-metrics.cn.md)（`pretrain`、`finetune` 与 `extract` 共享的指标）。
+两份跨命令契约有独立文档：[训练数据增强](docs/commands/training-augmentation.cn.md)（`pretrain` 与 `finetune` 共享的 `--augmentation` 与 `--orientation-policy` 行为）与 [嵌入指标](docs/commands/embedding-metrics.cn.md)（`pretrain`、`finetune` 与 `extract` 共享的指标）。 `otuformer extract` 还支持 v2 共享数据路径（`--label-csv`、`--coco-*`）：选择器只严格解析一次，并新增 `data_records.jsonl`、`data_validation.json` 与 `run_provenance.json`（[详见](docs/commands/extract.cn.md)）。
 
 ## 许可证
 

@@ -93,7 +93,31 @@ Epochs to finetune attention query when no cached pooling checkpoint is found.
 
 **Default:** `None`
 
-CSV with an 'image' column and optional 'label' for selecting images, evaluating embedding quality, and generating UMAP. Without labels, only UMAP is generated. In attention-pool mode this CSV must include labels when cached pooling weights are missing. CSV with `image` and optional `label`; image-only input generates UMAP without supervised metrics; attention-pool training still needs `label`
+CSV with a required 'image' column plus optional 'label' and any other metadata. Supplying it selects the shared, strictly validated data path; it is the selector, the metadata source, and the metrics/UMAP label source. In attention-pool mode it must include labels when cached pooling weights are missing.
+
+### `--coco-instances`
+
+**Default:** `None`
+
+COCO instance annotations (boxes, polygons, RLE).
+
+### `--coco-keypoints`
+
+**Default:** `None`
+
+COCO keypoint annotations.
+
+### `--coco-panoptic`
+
+**Default:** `None`
+
+COCO panoptic JSON. Requires --panoptic-masks-dir.
+
+### `--panoptic-masks-dir`
+
+**Default:** `None`
+
+Root for panoptic segment-ID PNGs, resolved from each annotation's file_name as written. Requires --coco-panoptic.
 
 ### `--metrics-sample-size`
 
@@ -167,6 +191,31 @@ Random seed.
 
 Clear an existing non-empty output directory.
 
+Every input this run reads -- the image root, `--label-csv`, checkpoint, ONNX graph
+and its external tensor files, reusable pooling checkpoints -- is collected before
+anything is cleared, and an output directory that would delete one of them is
+refused. An ONNX graph whose external-data pointers are ambiguous (duplicate
+`location` entries) or that resolve outside the graph directory is rejected, because
+readers disagree on which file such a graph reads. Links are followed the way the kernel follows them, including relays and
+`..` after a link, so a path entry that cleanup would delete is refused even when the
+file itself lives elsewhere.
+
+The two data paths differ in one place, on purpose:
+
+- **Shared path** (`--label-csv` or any `--coco-*` option): an output directory that
+  contains an input, or that sits inside one, is refused outright.
+- **Legacy path** (no CSV, no `--coco-*` option): only deletion is refused. Writing
+  `--out-dir` *inside* the image root stays supported, because the run only creates
+  files there; an output directory equal to, or containing, the image root is
+  refused.
+
+**Concurrency boundary.** The check happens before the directory is cleared, so it is
+a local single-process contract: it does not defend against another process modifying
+the tree in between (the classic check-then-act window). What the run guarantees is
+detection -- after clearing, each protected input must still resolve to the same real
+path, and if it does not, the run stops immediately naming that input instead of
+continuing on a path that is no longer the checked one.
+
 ## Inputs
 
 `--input-images-dir` is an image directory, or a parent directory of per-class subdirectories (batch mode). Optional `--label-csv` needs an `image` column and accepts an optional `label` column.
@@ -213,3 +262,69 @@ Accepts OTU checkpoints and ref-script checkpoints (`ref/ibot20260115.py`). The 
 Embedding-quality metrics use the shared [embedding metrics](embedding-metrics.md) definitions and field names.
 
 `cam` and `extract` validate enumerated query parameters natively and reject values outside their choices before any output directory is created.
+
+**Shared data path (v2).** The options below together select a strictly validated data path that stays compatible with legacy extraction.
+
+Supplying `--label-csv` or any `--coco-*` option selects the shared, strictly
+validated data path. Supplying none of them keeps the legacy behaviour described
+above, including its pandas CSV parsing.
+
+- **Parsing.** The shared path parses the selector once and passes the same records
+  to selection, attention-query training, evaluation and provenance. Literal `NA`,
+  `N/A`, `unknown`, `0` and leading-zero identifiers are preserved as strings, and
+  only an empty cell is missing. There is no separate manifest option: one CSV is
+  the selector, the metadata source and the label source.
+- **Identity.** The internal key is the normalized POSIX path relative to
+  `--input-images-dir`. CSV-selected rows keep their original `image` text as the
+  output `id`; rows selected from COCO only use that key. COCO `file_name` values are
+  resolved as explicit root-relative paths without the CSV basename fallback.
+- **Annotations.** COCO documents are source-local: `instances`, `keypoints` and
+  `panoptic` are fixed roles with at most one file each, and a combined
+  instance/keypoint document may serve both roles. Category IDs stay source-local and
+  never become species labels. Ingesting boxes, polygons, RLE, keypoints and panoptic
+  maps is reading and validation only: no detector, head or task prediction runs here.
+- **Panoptic roots.** Each annotation's `file_name` is joined to
+  `--panoptic-masks-dir` exactly as written. Nothing is prefixed, stripped or
+  searched for: a prefixed name needs the parent directory as the root.
+- **Mask dependency.** Polygon and RLE decoding need the optional extra:
+  `pip install 'otuformer[annotations]'`. Without it, a source that needs it fails
+  with installation guidance instead of skipping validation. Panoptic segment-ID
+  PNG decoding and its pixel checks use only Pillow and NumPy and need no extra.
+- **Validation scope.** Structural problems (types, IDs, references, numeric
+  payloads, RLE run totals) are checked for the whole source. Geometry against the
+  actual image, decoding and pixel agreement are checked for selected images only;
+  unselected files are recorded as not performed, and a well-formed unselected image
+  need not exist locally.
+- **Missing annotations are not biological absence.** An image absent from a source,
+  an image with no annotations, an empty mask, `v=0` versus `v=1` keypoints and
+  panoptic void are distinct states. No negative mask or trusted background is
+  invented, and custom `ignore`/`unknown` fields are preserved but not interpreted.
+
+The shared path adds three artifacts to `--out-dir`:
+
+| File | Contents |
+|---|---|
+| `embeddings.csv` | the same embedding columns as the legacy path |
+| `data_records.jsonl` | one row per emitted embedding, in embedding order, with `schema_version`, `embedding_row`, `output_id`, `image_key`, dimensions, image SHA-256, metadata and `(source_id, image_id)` references |
+| `data_validation.json` | status, scope, counts, methods/tolerances, complete issues and polygon rasterization diagnostics |
+| `run_provenance.json` | run status, requested versus effective settings, source identities and hashes, selection and content digests, label schema, metric protocol and produced artifacts |
+
+The `artifacts` list records every file this run produced, with an output-relative
+path, byte count and SHA-256. That includes a pooling checkpoint trained here
+(`checkpoints/<backbone>.<policy>-<type>_pooling.pth`): it is the only record of which
+reusable weights the run generated, and if the run fails before publishing, the
+rollback deletes it rather than leaving it unregistered. A pooling checkpoint reused
+from disk is an input, so it appears in `used_files` instead and is never deleted.
+
+A pooling checkpoint trained here is published by exclusive creation: an existing
+file is never overwritten, and a run that fails at any point after reserving the name
+removes the file it created. The guarantee is about the directory entry, not about
+partial visibility -- another process reading that path while this run is still
+writing can observe an incomplete file. Treat the cache as readable only after the
+producing run has returned.
+
+A run writes `run_provenance.json` with status `running` once the output directory
+passes safety checks, then `completed`, `failed` or `interrupted`. Validation failure
+publishes `data_validation.json` and a failed record but no embedding/mapping pair; a
+hard termination can leave `running`, which never means success. Legacy runs without
+the new options do not emit these files.

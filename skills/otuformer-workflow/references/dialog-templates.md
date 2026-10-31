@@ -120,3 +120,18 @@ training here only illustrates the procedure, not encoder quality.
 [中文] 本次演示在获批的 demo 目录下使用全部 230 张示例图片，不使用你的数据，也不能
 替代对你样本的分析。短训练仅用于演示流程，不代表编码器质量。
 ```
+
+## Data-path notice in the parameter card
+
+Every `extract` card states which parsing mode applies, immediately above the
+proposed command:
+
+- `legacy data path: existing semantics` — no CSV and no `--coco-*` option, so the
+  image directory is enumerated.
+- `new data path: strict CSV semantics` — `--label-csv` or any `--coco-*` option is
+  supplied, so literal `NA`, `N/A`, `unknown`, `0` and leading zeros are preserved
+  and the run adds `data_records.jsonl`, `data_validation.json` and
+  `run_provenance.json`.
+
+Ask for a new approval when the operator changes the selector or adds a `--coco-*`
+option, because that can change parsing semantics for the same CSV file.

@@ -140,11 +140,14 @@ def infer_backbone_image_size(model, fallback: int = 224) -> int:
 def resolve_onnx_input_size(onnx_path: Path) -> int:
     """Validate the ONNX graph input and return its static H (== W).
 
-    Rejects dynamic, non-NCHW, or non-square inputs.
+    Rejects dynamic, non-NCHW, or non-square inputs. The weights are not needed, and
+    loading them would use onnx's own external-data resolution instead of the
+    runtime's, so a graph whose payload path is only reachable the way the runtime
+    resolves it would fail here for no reason.
     """
     import onnx
 
-    proto = onnx.load(str(onnx_path))
+    proto = onnx.load(str(onnx_path), load_external_data=False)
     graph = proto.graph
     if not graph.input:
         raise ValueError("ONNX graph has no inputs")

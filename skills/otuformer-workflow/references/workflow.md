@@ -54,7 +54,10 @@ rejected. Explain possible initial timm weight downloads before approval.
 
 Metric-learning fine-tuning from a pretrained checkpoint. Typical artifacts:
 `finetune_latest.pth`, `finetune_epoch_*.pth`, metrics and figures in
-`--out-dir`. `--resume` is supported; resume and overwrite conflict. Loss-specific
+`--out-dir`. `--resume` is supported; resume and overwrite conflict. The command
+refuses `--overwrite` when an input it must read is reached through a path inside the
+output directory, so approval cannot override that: name a different output directory
+instead, and never tell the operator the check is a concurrency guard. Loss-specific
 options (`--subcenters`, `--compact-weight`, pseudo-label options) apply only to
 their own loss modes; omitted options stay omitted so the resumed checkpoint
 keeps its recorded settings. Pseudo-label feedback preserves the original SSL
@@ -63,10 +66,22 @@ provenance and must not be turned into an automatic multi-round loop.
 ## extract
 
 Embedding extraction from images using a checkpoint or an exported ONNX model.
-Typical artifacts: `embeddings.csv` (`id` plus `dim_0...`, where `id` is the image
-file name), `metrics.csv` and `umap.pdf` when `--label-csv` provides at least two
-classes. Requires `--checkpoint` or `--onnx-path`; ONNX takes precedence, ignores
-the checkpoint/device, and supports only `--token-mode cls`.
+Typical artifacts: `embeddings.csv` (`id` plus `dim_0...`), `metrics.csv` only when
+the labels contain at least two classes, and `umap.pdf` when at least ten rows are
+evaluated and visualization is not disabled. `id` follows the input path: a
+directory scan emits the file's basename, a `--label-csv` selection keeps that row's
+original `image` text, and a COCO-only selection emits the root-relative key.
+Requires `--checkpoint` or `--onnx-path`; ONNX takes precedence, ignores the
+checkpoint/device, and supports only `--token-mode cls`.
+
+Supplying `--label-csv` or any `--coco-*` option selects the shared v2 data path: the
+CSV is parsed once with strict string semantics (literal `NA`, `N/A`, `unknown`, `0`
+and leading zeros are preserved), it serves as selector, metadata and label source in
+one file, annotation sources stay source-local, and the run adds
+`data_records.jsonl`, `data_validation.json` and `run_provenance.json`. One CSV means
+one option: there is no separate manifest flag, and a CSV never means two different
+things in one run. Call the mode out explicitly in the proposed card: directory
+enumeration versus strict CSV parsing.
 
 When images sit in subdirectories below `--input-images-dir`, `embeddings.csv`
 also carries a `sample` column inferred from the **first directory level** (or

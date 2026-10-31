@@ -1528,3 +1528,99 @@ def test_adapter_source_fallback_requires_canonical_checkout(
         assert str(checkout / "src") in sys.path
     finally:
         sys.path[:] = before
+
+
+def test_extract_data_schema_and_protection() -> None:
+    schema = cli_schema()
+    entries = schema.parameter_index("extract")
+    new_options = {
+        "coco_instances",
+        "coco_keypoints",
+        "coco_panoptic",
+        "panoptic_masks_dir",
+    }
+    assert new_options <= entries.keys()
+    for name in new_options:
+        assert entries[name]["type"] == "path"
+        assert entries[name]["default"] == {"kind": "null"}
+    # One CSV is the whole selector: there is no second manifest option.
+    assert "manifest" not in entries
+    assert entries["label_csv"]["type"] == "path"
+    assert schema.SCHEMA_VERSION == 1
+
+    # Structural conflicts match the CLI, independent of file contents.
+    with pytest.raises(ValueError, match="require each other"):
+        schema.validate_parameters(
+            "extract",
+            {"input_images_dir": "images", "checkpoint": "c.pt",
+             "coco_panoptic": "panoptic.json"},
+        )
+
+    # Every declared path is protected from output-directory overlap.
+    protected = schema._protected_paths_from_values(
+        "extract",
+        {
+            "out_dir": "runs/extract",
+            "label_csv": "data/figs.csv",
+            "coco_panoptic": "data/panoptic.json",
+            "panoptic_masks_dir": "data/panoptic_masks",
+        },
+    )
+    names = {path.as_posix() for path in protected}
+    assert {"data/figs.csv", "data/panoptic.json", "data/panoptic_masks"} == names
+    with pytest.raises(ValueError, match="contains protected input"):
+        schema.check_output_safety(
+            Path("data"),
+            protected_paths=protected,
+            overwrite=True,
+        )
+
+    # No derived mode field and no new command group are introduced.
+    serialized = json.dumps(schema.export_cli_schema("extract"))
+    assert "derived_mode" not in serialized
+    assert "data_path_mode" not in serialized
+    assert "dataset" not in schema.export_cli_schema(None)["commands"]
+
+
+def test_link_chain_outside_the_output_directory_is_allowed(tmp_path) -> None:
+    out = tmp_path / "out"
+    out.mkdir()
+    real = tmp_path / "real.csv"
+    real.write_text("image\n", encoding="utf-8")
+    first = tmp_path / "first.csv"
+    second = tmp_path / "second.csv"
+    try:
+        first.symlink_to(real)
+        second.symlink_to(first)
+    except (OSError, NotImplementedError):  # pragma: no cover - platform dependent
+        pytest.skip("symlinks are not available on this platform")
+
+    # Nothing cleanup touches: the whole chain lives outside the output directory.
+    # No exception: the chain is readable and nothing it needs would be removed.
+    assert (
+        cli_schema().check_output_safety(
+            out, protected_paths=[second], overwrite=True
+        )
+        == []
+    )
+
+
+def test_unresolvable_link_chain_fails_closed(tmp_path) -> None:
+    out = tmp_path / "out"
+    out.mkdir()
+    target = tmp_path / "real.csv"
+    target.write_text("image\n", encoding="utf-8")
+    previous = target
+    try:
+        for index in range(50):
+            link = tmp_path / f"hop{index}.csv"
+            link.symlink_to(previous)
+            previous = link
+    except (OSError, NotImplementedError):  # pragma: no cover - platform dependent
+        pytest.skip("symlinks are not available on this platform")
+
+    # A path this deep cannot be proven safe, so it is refused instead of allowed.
+    with pytest.raises(ValueError, match="cannot verify output safety"):
+        cli_schema().check_output_safety(
+            out, protected_paths=[previous], overwrite=True
+        )
