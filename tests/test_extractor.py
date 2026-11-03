@@ -193,7 +193,9 @@ def test_load_model_rebuilds_arcface_embedding_head(monkeypatch, tmp_path):
     checkpoint = tmp_path / "arcface.pth"
     torch.save(
         {
-            "model_state_dict": {"projector.net.0.weight": source.net[0].weight.detach()},
+            "model_state_dict": {
+                f"projector.{key}": value for key, value in source.state_dict().items()
+            },
             "config": {
                 "model_name": "vit_tiny_patch16_224",
                 "out_dim": 64,
@@ -209,7 +211,8 @@ def test_load_model_rebuilds_arcface_embedding_head(monkeypatch, tmp_path):
     )
 
     assert isinstance(model.projector, ArcFaceEmbeddingHead)
-    assert torch.equal(model.projector.net[0].weight, source.net[0].weight)
+    for name, value in source.state_dict().items():
+        assert torch.equal(model.projector.state_dict()[name], value)
 
 
 def test_load_model_constructs_at_recorded_checkpoint_size(monkeypatch, tmp_path):

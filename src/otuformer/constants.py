@@ -28,6 +28,15 @@ PATCH_LOSS_MODES = ("none", "consistency", "masked-feature", "ibot")
 MASKING_STRATEGIES = ("random", "blockwise", "hybrid")
 IBOT_PROTOTYPES_MIN = 2
 
+# SSL training identity, kept separate from the inference embedding layout: a
+# DINO checkpoint trains a prototype head but still extracts the same normalized
+# 2048-hidden MLP bottleneck as relational.
+SSL_METHODS = ("relational", "dino")
+SSL_HEADS = ("projection_mlp_2048", "dino_mlp_2048")
+SSL_HEAD_BY_METHOD = {"relational": "projection_mlp_2048", "dino": "dino_mlp_2048"}
+DINO_CENTERING_MODES = ("ema", "sinkhorn-knopp")
+DINO_PROTOTYPES_MIN = 2
+
 REGISTER_TOKEN_CHOICES = ("none", "0", "4")
 
 PRETRAIN_AUGMENTATIONS: tuple[str, ...] = ("global-barcode", "color-robust", "legacy")

@@ -24,14 +24,13 @@ from typing import Any, Mapping
 
 from otuformer.constants import (
     ATTENTION_POOLING_TYPES,
-    RELATIONAL_CENTER_SOURCE_CHOICES,
-    RELATIONAL_PAIRING_CHOICES,
-    RELATIONAL_TEACHER_VIEW_CHOICES,
     CAM_ARCH_CHOICES,
     CAM_DEVICE_CHOICES,
     CAM_FIG_FORMAT_CHOICES,
     CAM_METHOD_CHOICES,
     CAM_SAVE_NPY_CHOICES,
+    DINO_CENTERING_MODES,
+    DINO_PROTOTYPES_MIN,
     EVAL_TRANSFORM_CHOICES,
     FINETUNE_AUGMENTATIONS,
     IBOT_PROTOTYPES_MIN,
@@ -47,6 +46,10 @@ from otuformer.constants import (
     PSEUDO_MIN_GAP_BOUNDS,
     PSEUDO_SIMILARITY_BOUNDS,
     REGISTER_TOKEN_CHOICES,
+    RELATIONAL_CENTER_SOURCE_CHOICES,
+    RELATIONAL_PAIRING_CHOICES,
+    RELATIONAL_TEACHER_VIEW_CHOICES,
+    SSL_METHODS,
     TOKEN_MODES,
 )
 
@@ -80,6 +83,63 @@ _CONSTRAINTS: dict[str, dict[str, dict[str, Any]]] = {
         },
         "patch_loss": {"choices": list(PATCH_LOSS_MODES)},
         "masking_strategy": {"choices": list(MASKING_STRATEGIES)},
+        "ssl_method": {
+            "choices": list(SSL_METHODS),
+            "unresolved": [
+                "an omitted --ssl-method is inherited from a recognized resume "
+                "checkpoint; the saved method is not known before execution",
+            ],
+        },
+        "out_dim": {
+            "numeric": "int",
+            "bounds": {"min": 1},
+            "unresolved": [
+                "an omitted --out-dim is inherited only on a DINO resume; "
+                "relational resume keeps the requested/default width",
+            ],
+        },
+        "dino_prototypes": {
+            "numeric": "int",
+            "bounds": {"min": DINO_PROTOTYPES_MIN},
+            "applies_to": ["dino"],
+            "unresolved": [
+                "an omitted --dino-prototypes is inherited if the saved method "
+                "matches; a static card cannot confirm the checkpoint's method",
+            ],
+        },
+        "dino_centering": {
+            "choices": list(DINO_CENTERING_MODES),
+            "applies_to": ["dino"],
+            "unresolved": [
+                "an omitted --dino-centering is inherited if the saved method "
+                "matches; a static card cannot confirm the checkpoint's method",
+            ],
+        },
+        "koleo_weight": {
+            "numeric": "float",
+            "bounds": {"min": 0.0},
+            "applies_to": ["dino"],
+            "unresolved": [
+                "an omitted --koleo-weight is inherited if the saved method "
+                "matches; a static card cannot confirm the checkpoint's method",
+            ],
+        },
+        "teacher_temp_warmup_ratio": {
+            "numeric": "float",
+            "bounds": {"min": 0.0, "max": 1.0},
+            "unresolved": [
+                "an omitted --teacher-temp-warmup-ratio is inherited from a "
+                "resume checkpoint that records it; a payload without it is "
+                "assumed to be the historical 0.7",
+            ],
+        },
+        "no_norm_bias_weight_decay": {
+            "unresolved": [
+                "an omitted --no-norm-bias-weight-decay inherits the recorded "
+                "policy from a resume checkpoint; a payload without it is "
+                "assumed to be the historical single-group decaying policy",
+            ],
+        },
         "register_tokens": {"choices": list(REGISTER_TOKEN_CHOICES)},
         "mask_ratio": {
             "keyword_values": ["auto"],
@@ -426,6 +486,46 @@ def validate_pretrain_patch_applicability(
         )
 
 
+def validate_pretrain_ssl_applicability(
+    values: Mapping[str, object], *, explicit_options: frozenset[str]
+) -> list[str]:
+    """Reject SSL options that cannot apply to the requested method.
+
+    Mirrors ``resolve_pretrain_ssl_config`` for the static schema path: an
+    omitted method on a resume is unresolved because only the checkpoint knows
+    it, so method-dependent acceptance is deferred instead of assuming the
+    new-run relational default.
+    """
+    method = str(values.get("ssl_method") or "relational")
+    method_explicit = "ssl_method" in explicit_options
+    if values.get("resume") and not method_explicit:
+        return [
+            "DINO-only SSL options apply only if the resumed checkpoint uses "
+            "--ssl-method dino; the saved method is not known before execution"
+        ]
+    dino_only = ("dino_prototypes", "dino_centering", "koleo_weight")
+    if method == "relational":
+        for name in dino_only:
+            if name in explicit_options:
+                raise ValueError(
+                    f"--{name.replace('_', '-')} is not applicable to "
+                    "--ssl-method relational; omit it or use --ssl-method dino."
+                )
+        return []
+    relational_only = (
+        "relational_teacher_views",
+        "relational_center_source",
+        "relational_pairing",
+    )
+    for name in relational_only:
+        if name in explicit_options:
+            raise ValueError(
+                f"--{name.replace('_', '-')} is not applicable to "
+                "--ssl-method dino; omit it or use --ssl-method relational."
+            )
+    return []
+
+
 def validate_augmentation_profile(value: str | None, *, stage: str) -> None:
     """Reject an unknown augmentation profile before any training starts."""
     if value is None:
@@ -726,6 +826,13 @@ def validate_constraints(
         raise ValueError(f"unknown parameters for {command}: {', '.join(unknown)}")
 
     unresolved: list[str] = []
+
+    if command == "pretrain":
+        unresolved.extend(
+            validate_pretrain_ssl_applicability(
+                values, explicit_options=explicit_options
+            )
+        )
 
     if command == "extract":
         validate_extract_data_options(

@@ -31,10 +31,13 @@ from otuformer.cli.constraints import (
     validate_patch_options,
 )
 from otuformer.constants import (
+    DINO_CENTERING_MODES,
+    DINO_PROTOTYPES_MIN,
     IBOT_PROTOTYPES_MIN,
     MASKING_STRATEGIES,
     PATCH_LOSS_MODES,
     REGISTER_TOKEN_CHOICES,
+    SSL_METHODS,
 )
 
 app = typer.Typer(
@@ -114,7 +117,59 @@ def pretrain(
         ),
     ),
     out_dim: int = typer.Option(
-        256, "--out-dim", help="SSL projector output dimension."
+        256,
+        "--out-dim",
+        help=(
+            "SSL projector output dimension D. In relational it is the "
+            "projection width; in DINO it is the bottleneck width that "
+            "--use-projector-output extracts, never the prototype count K."
+        ),
+    ),
+    ssl_method: str = typer.Option(
+        "relational",
+        "--ssl-method",
+        help=(
+            "Global CLS training method: 'relational' (default; batch-relative "
+            "similarity distillation, unchanged) or 'dino' (prototype "
+            "distribution distillation with an explicit prototype layer). "
+            "DINO is opt-in and is not a resume of a relational run. Omit to "
+            "inherit the saved method on --resume; a cross-method resume is "
+            "rejected."
+        ),
+    ),
+    dino_prototypes: int = typer.Option(
+        64,
+        "--dino-prototypes",
+        help=(
+            f"Prototype dictionary size K for --ssl-method dino: any integer >= "
+            f"{DINO_PROTOTYPES_MIN}, default 64. Independent of "
+            "--ibot-prototypes (default 512) and never inferred from image, "
+            "species or OTU counts; prototype indices are not OTUs. DINO-only: "
+            "rejected under relational. Not applicable to other methods."
+        ),
+    ),
+    dino_centering: str = typer.Option(
+        "ema",
+        "--dino-centering",
+        help=(
+            "DINO teacher-target mechanism: 'ema' (default; exponential moving "
+            "average center) or 'sinkhorn-knopp' (three fixed iterations of "
+            "balanced assignment over both teacher global crops, no EMA CLS "
+            "center). These are alternatives, never two stacked operations. "
+            "DINO-only and not switchable on resume."
+        ),
+    ),
+    koleo_weight: float = typer.Option(
+        0.0,
+        "--koleo-weight",
+        help=(
+            "Weight for the optional KoLeo regularizer on normalized backbone "
+            "CLS features. 0 (default) disables it and skips all neighbor "
+            "search; any finite value > 0 enables it. Experimental: it spreads "
+            "the CLS space but also repels same-species and near-duplicate "
+            "specimens, batches smaller than 2 skip it, and repeated records "
+            "can dominate the total. DINO-only and not changeable on resume."
+        ),
     ),
     max_epochs: int = typer.Option(
         50, "--max-epochs", help="Total SSL pretraining epochs."
@@ -126,6 +181,18 @@ def pretrain(
     ),
     weight_decay: float = typer.Option(
         0.05, "--weight-decay", help="AdamW weight decay coefficient."
+    ),
+    no_norm_bias_weight_decay: bool = typer.Option(
+        False,
+        "--no-norm-bias-weight-decay",
+        help=(
+            "Skip weight decay for biases and normalization affine parameters. "
+            "Omitted keeps the historical uniform --weight-decay on every "
+            "trainable parameter. Applies to both SSL methods and keeps one "
+            "joint gradient-norm clipping. Omit to inherit the saved policy on "
+            "--resume; a different requested --weight-decay is not applied, and "
+            "a changed policy is rejected."
+        ),
     ),
     warmup_epochs: int = typer.Option(
         3,
@@ -418,6 +485,12 @@ def pretrain(
             "teacher_temp_start",
             "teacher_temp_end",
             "teacher_temp_warmup_ratio",
+            "out_dim",
+            "ssl_method",
+            "dino_prototypes",
+            "dino_centering",
+            "koleo_weight",
+            "no_norm_bias_weight_decay",
         )
     }
     requested_global_crop_size = _parse_size(
@@ -455,6 +528,19 @@ def pretrain(
         register_tokens=requested_register_tokens,
         model_name_explicit=model_name_explicit,
         out_dim=out_dim,
+        out_dim_explicit=explicit_sources["out_dim"],
+        ssl_method=ssl_method,
+        ssl_method_explicit=explicit_sources["ssl_method"],
+        dino_prototypes=dino_prototypes,
+        dino_prototypes_explicit=explicit_sources["dino_prototypes"],
+        dino_centering=dino_centering,
+        dino_centering_explicit=explicit_sources["dino_centering"],
+        koleo_weight=koleo_weight,
+        koleo_weight_explicit=explicit_sources["koleo_weight"],
+        no_norm_bias_weight_decay=no_norm_bias_weight_decay,
+        no_norm_bias_weight_decay_explicit=explicit_sources[
+            "no_norm_bias_weight_decay"
+        ],
         max_epochs=max_epochs,
         lr=lr,
         weight_decay=weight_decay,
@@ -518,6 +604,7 @@ def pretrain(
         _resolve_pretrain_recipe,
         preflight_pretrain_run,
         resolve_pretrain_settings,
+        resolve_pretrain_ssl_config,
         run_pretrain,
     )
 
@@ -526,6 +613,8 @@ def pretrain(
         settings = resolve_pretrain_settings(ns, resume_state)
         preflight_pretrain_run(ns, settings)
         recipe = _resolve_pretrain_recipe(ns, resume_state, settings=settings)
+        # The SSL recipe is resolved before --overwrite can clear anything.
+        ssl_config_effective = resolve_pretrain_ssl_config(ns, resume_state)
     except (ValueError, KeyError, OSError, RuntimeError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     prepare_output_dir(out_dir, overwrite=overwrite, allow_existing=bool(resume))
@@ -564,6 +653,8 @@ def pretrain(
         if resume_state is not None:
             ns.resume_state = resume_state
         ns.pretrain_settings = settings
+        # In-memory handoff, added after ``Parameters:`` so it is never saved.
+        ns.ssl_config_effective = ssl_config_effective
         run_pretrain(ns, pretrain_recipe=recipe)
     except Exception:
         traceback.print_exc(file=tee)

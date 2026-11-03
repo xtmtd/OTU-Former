@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import contextlib
 import random
+import re
 from pathlib import Path
 from typing import Any, NamedTuple
 
 import numpy as np
 import torch
 
+from otuformer.constants import SSL_HEAD_BY_METHOD, SSL_HEADS, SSL_METHODS
 from otuformer.training.model import (
     OTUFormerEncoder,
     ArcFaceEmbeddingHead,
@@ -34,6 +36,14 @@ _LAST_LINEAR_KEYS = (
     "projector.2.weight",
 )
 
+# Top-level keys that make a payload a metric/head-only/legacy candidate even
+# when it also stores SSL-shaped weights, and the fixed first-projector width
+# that likewise marks a metric layout.
+_METRIC_STATE_KEYS = ("loss_state_dict", "class_labels", "loss_func", "model")
+_METRIC_PROJECTOR_WIDTH = 512
+_SSL_PROJECTOR_WIDTH = 2048
+_SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
+
 
 class CheckpointArchitecture(NamedTuple):
     """Everything a read-only consumer needs to rebuild an encoder."""
@@ -50,6 +60,11 @@ class CheckpointArchitecture(NamedTuple):
     # "not resolved yet" and is never treated as a count of zero.
     actual_register_tokens: int | None = None
     added_register_tokens: int | None = None
+    # Active SSL training identity (method, head), separate from the inference
+    # ``embedding_head`` layout and from any recorded source lineage.
+    ssl_identity: tuple[str, str] | None = None
+    # Validated SSL ancestor identity of a metric-head descendant.
+    ssl_source_identity: tuple[str, str] | None = None
 
 
 def save_checkpoint(state: dict[str, Any], path: Path) -> None:
@@ -152,6 +167,243 @@ def normalize_legacy_projector_keys(state_dict: dict) -> dict:
     return renamed if changed else state_dict
 
 
+def _validate_ssl_pair(
+    method: Any, head: Any, *, origin: str
+) -> tuple[str, str]:
+    """Return a validated ``(method, head)`` SSL identity pair."""
+    if method not in SSL_METHODS:
+        raise ValueError(
+            f"Unsupported SSL method {method!r} in {origin}; expected one of "
+            f"{SSL_METHODS}."
+        )
+    if head not in SSL_HEADS:
+        raise ValueError(
+            f"Unsupported SSL head {head!r} in {origin}; expected one of "
+            f"{SSL_HEADS}."
+        )
+    expected = SSL_HEAD_BY_METHOD[method]
+    if head != expected:
+        raise ValueError(
+            f"SSL identity in {origin} is inconsistent: method {method!r} pairs "
+            f"with {expected!r}, not {head!r}."
+        )
+    return (method, head)
+
+
+def _has_metric_markers(checkpoint: dict) -> bool:
+    """True when the payload belongs to the metric/head-only/legacy family.
+
+    Key presence decides, not truthiness: an empty ``loss`` state still marks
+    the payload, so it cannot be relabelled as SSL from its weight shapes.
+    """
+    cfg = _config(checkpoint)
+    if "embedding_head" in cfg or "loss" in cfg:
+        return True
+    return any(key in checkpoint for key in _METRIC_STATE_KEYS)
+
+
+def _reject_contradictory_ssl(checkpoint: dict, reason: str) -> None:
+    cfg = _config(checkpoint)
+    if cfg.get("ssl_method") is not None or cfg.get("ssl_head") is not None:
+        raise ValueError(
+            f"Checkpoint mixes {reason} with active ssl_method/ssl_head metadata; "
+            "SSL identity and metric layout are separate contracts."
+        )
+    if "dino_objective" in checkpoint:
+        raise ValueError(
+            f"Checkpoint mixes {reason} with DINO training state; SSL identity and "
+            "metric layout are separate contracts."
+        )
+
+
+# The recorded identity's MLP: (layer index, parameter, expected rows, expected
+# last dimension). ``None`` means "not fixed here" (input width / D).
+_SSL_PROJECTOR_LAYOUT = (
+    (0, "weight", _SSL_PROJECTOR_WIDTH, None),
+    (0, "bias", _SSL_PROJECTOR_WIDTH, None),
+    (2, "weight", _SSL_PROJECTOR_WIDTH, _SSL_PROJECTOR_WIDTH),
+    (2, "bias", _SSL_PROJECTOR_WIDTH, None),
+    (4, "weight", None, _SSL_PROJECTOR_WIDTH),
+    (4, "bias", None, None),
+)
+
+# Config keys that describe an active DINO recipe. A relational identity that
+# still records them (or DINO training state) has contradictory metadata.
+_DINO_ONLY_CONFIG_KEYS = (
+    "dino_prototypes",
+    "dino_centering",
+    "koleo_weight",
+    "dino_hidden_dim",
+    "dino_mlp_init_std",
+    "dino_mlp_init_bias",
+    "dino_weight_norm_api",
+    "dino_prototype_scale",
+    "dino_freeze_last_layer_epochs",
+    "dino_target_dtype",
+    "dino_center_momentum",
+    "dino_sinkhorn_iterations",
+    "koleo_normalize_eps",
+    "koleo_distance_eps",
+    "koleo_log_eps",
+)
+
+
+def _projector_tensor(
+    state_dict: dict, index: int, kind: str
+) -> tuple[str, Any] | tuple[None, None]:
+    """Find one projector tensor under our naming or the ref-script naming."""
+    for prefix in ("projector.net", "projector"):
+        key = f"{prefix}.{index}.{kind}"
+        value = state_dict.get(key)
+        if isinstance(value, torch.Tensor):
+            return key, value
+    return None, None
+
+
+def _validate_ssl_projector(
+    cfg: dict, state_dict: dict, pair: tuple[str, str]
+) -> None:
+    """Require the recorded identity's complete D-dimensional MLP layout.
+
+    Every layer, bias and shape of the three-linear ``ProjectionHead`` must be
+    present: the shared readers load with ``strict=False``, so a missing tensor
+    would otherwise stay at its random initialization while the payload still
+    claims the identity.
+    """
+    last = None
+    for index, kind, rows, columns in _SSL_PROJECTOR_LAYOUT:
+        key, value = _projector_tensor(state_dict, index, kind)
+        if value is None:
+            raise ValueError(
+                f"Checkpoint records SSL identity {pair} but its projector is "
+                f"incomplete: missing projector.{index}.{kind}. A complete "
+                f"{_SSL_PROJECTOR_WIDTH}-hidden MLP is required."
+            )
+        expected_ndim = 2 if kind == "weight" else 1
+        if value.ndim != expected_ndim:
+            raise ValueError(
+                f"Checkpoint records SSL identity {pair} but {key} has "
+                f"{value.ndim} dimensions instead of {expected_ndim}."
+            )
+        if rows is not None and int(value.shape[0]) != rows:
+            raise ValueError(
+                f"Checkpoint records SSL identity {pair} but {key} has shape "
+                f"{tuple(value.shape)}; the recorded MLP needs {rows} rows."
+            )
+        if columns is not None and int(value.shape[-1]) != columns:
+            raise ValueError(
+                f"Checkpoint records SSL identity {pair} but {key} has shape "
+                f"{tuple(value.shape)}; the recorded MLP needs last dimension "
+                f"{columns}."
+            )
+        if index == 4 and kind == "weight":
+            last = value
+    assert last is not None  # guarded by the layout loop
+    out_dim = cfg.get("out_dim")
+    bias_key, bias = _projector_tensor(state_dict, 4, "bias")
+    if int(bias.shape[0]) != int(last.shape[0]):
+        raise ValueError(
+            f"Checkpoint records SSL identity {pair} but {bias_key} has "
+            f"{int(bias.shape[0])} entries while the output layer has "
+            f"{int(last.shape[0])} rows."
+        )
+    if out_dim is None:
+        return
+    if isinstance(out_dim, bool) or not isinstance(out_dim, int) or out_dim <= 0:
+        raise ValueError(
+            f"Checkpoint records an invalid out_dim {out_dim!r} for SSL identity "
+            f"{pair}; expected a positive integer."
+        )
+    if int(last.shape[0]) != out_dim:
+        raise ValueError(
+            f"Checkpoint SSL identity {pair} records out_dim={out_dim} but the "
+            f"projector outputs {int(last.shape[0])} dimensions."
+        )
+
+
+def resolve_checkpoint_ssl_identity(
+    checkpoint: dict, state_dict: dict
+) -> tuple[str, str] | None:
+    """Return the payload's active SSL identity, or ``None`` when it has none.
+
+    Metric/head-only/legacy payloads own no SSL identity; a historical
+    relational payload is inferred from its recognized MLP layout so old files
+    keep loading, but that inference is never emitted as recorded provenance.
+    """
+    cfg = _config(checkpoint)
+    method = cfg.get("ssl_method")
+    head = cfg.get("ssl_head")
+    declared = method is not None or head is not None
+
+    if _has_metric_markers(checkpoint):
+        _reject_contradictory_ssl(checkpoint, "a metric/legacy embedding payload")
+        return None
+
+    first = _linear_weight(state_dict, _FIRST_LINEAR_KEYS)
+    width = int(first.shape[0]) if first is not None else None
+    if width == _METRIC_PROJECTOR_WIDTH:
+        _reject_contradictory_ssl(checkpoint, "a 512-wide metric projector")
+        return None
+
+    if declared:
+        pair = _validate_ssl_pair(method, head, origin="checkpoint config")
+        _validate_ssl_projector(cfg, state_dict, pair)
+        if pair[0] == "relational":
+            # Relational owns no DINO-exclusive config or objective state; its
+            # presence means the payload is mislabelled or inconsistent.
+            recorded = sorted(
+                name for name in _DINO_ONLY_CONFIG_KEYS if name in cfg
+            )
+            if "dino_objective" in checkpoint or recorded:
+                raise ValueError(
+                    "Checkpoint records SSL identity "
+                    f"{pair} but also carries DINO-only state "
+                    f"({', '.join(recorded) or 'dino_objective'}); a relational "
+                    "payload must not record DINO config or objective tensors."
+                )
+        return pair
+
+    if "dino_objective" in checkpoint:
+        raise ValueError(
+            "Checkpoint stores DINO training state without a complete "
+            "ssl_method/ssl_head identity pair."
+        )
+
+    if width == _SSL_PROJECTOR_WIDTH and (
+        _linear_weight(state_dict, _LAST_LINEAR_KEYS) is not None
+    ):
+        return ("relational", PROJECTION_EMBEDDING_HEAD)
+    return None
+
+
+def resolve_checkpoint_ssl_source(checkpoint: dict) -> tuple[str, str] | None:
+    """Return a metric payload's validated SSL source pair, if it records one.
+
+    The pair is provenance only: it names the SSL ancestor and is anchored by a
+    valid ``ssl_initialization_checkpoint_sha256``. A hash or path alone cannot
+    establish method/head, and a missing pair stays valid for historical files.
+    """
+    cfg = _config(checkpoint)
+    method = cfg.get("ssl_source_method")
+    head = cfg.get("ssl_source_head")
+    if method is None and head is None:
+        return None
+    if method is None or head is None:
+        raise ValueError(
+            "Checkpoint records an incomplete SSL source identity: "
+            "ssl_source_method and ssl_source_head must both be present."
+        )
+    pair = _validate_ssl_pair(method, head, origin="ssl_source_* provenance")
+    sha = cfg.get("ssl_initialization_checkpoint_sha256")
+    if not isinstance(sha, str) or not _SHA256_HEX.match(sha.strip().lower()):
+        raise ValueError(
+            f"Checkpoint records SSL source identity {pair} without a valid "
+            "ssl_initialization_checkpoint_sha256 (64 hex characters); a path or "
+            "method name alone cannot anchor the source."
+        )
+    return pair
+
+
 def resolve_checkpoint(
     checkpoint: dict,
     default_model_name: str,
@@ -184,6 +436,8 @@ def resolve_checkpoint(
         state_dict=state_dict,
         source_key=source_key,
         model_name_from_metadata=bool(recorded_name),
+        ssl_identity=resolve_checkpoint_ssl_identity(checkpoint, state_dict),
+        ssl_source_identity=resolve_checkpoint_ssl_source(checkpoint),
     )
 
 
@@ -421,6 +675,33 @@ def load_checkpoint_encoder(
     return encoder, resolved
 
 
+def assert_complete_projector(state_dict: dict, projector: torch.nn.Module) -> None:
+    """Reject partial saved heads before permissive encoder loading.
+
+    Historical backbone-only files keep their existing fallback. Once a head
+    has saved tensors, every parameter must fit the selected inference layout.
+    """
+    state = normalize_legacy_projector_keys(state_dict)
+    provided = {key: value for key, value in state.items() if key.startswith("projector.")}
+    if not provided:
+        return
+    expected = {f"projector.{key}": value for key, value in projector.state_dict().items()}
+    missing = sorted(set(expected) - set(provided))
+    unexpected = sorted(set(provided) - set(expected))
+    mismatched = sorted(
+        key for key in set(expected) & set(provided)
+        if not isinstance(provided[key], torch.Tensor)
+        or provided[key].shape != expected[key].shape
+    )
+    if missing or unexpected or mismatched:
+        raise ValueError(
+            "Checkpoint projector is incomplete or incompatible with the selected head: "
+            f"{len(missing)} missing, {len(unexpected)} unexpected, "
+            f"{len(mismatched)} shape-mismatched tensor(s) "
+            f"(e.g. {(missing + unexpected + mismatched)[0]})."
+        )
+
+
 def apply_checkpoint_weights(model, architecture: CheckpointArchitecture) -> None:
     """Install the checkpoint's embedding head on ``model`` and load its weights."""
     if architecture.embedding_head == ARCFACE_EMBEDDING_HEAD:
@@ -431,4 +712,8 @@ def apply_checkpoint_weights(model, architecture: CheckpointArchitecture) -> Non
         model, normalize_legacy_projector_keys(architecture.state_dict)
     )
     _reject_backbone_mismatch(model, state_dict, architecture)
+    if architecture.ssl_identity is None and any(
+        key.startswith("projector.") for key in state_dict
+    ):
+        assert_complete_projector(state_dict, model.projector)
     model.load_state_dict(state_dict, strict=False)

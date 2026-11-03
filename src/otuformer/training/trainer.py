@@ -23,6 +23,8 @@ from tqdm import tqdm
 
 from otuformer.constants import (
     ARCFACE_FAMILY_LOSSES,
+    DINO_CENTERING_MODES,
+    DINO_PROTOTYPES_MIN,
     IBOT_PROTOTYPES_MIN,
     LEGACY_RELATIONAL_PAIRING,
     MASKING_STRATEGIES,
@@ -32,6 +34,8 @@ from otuformer.constants import (
     RELATIONAL_CENTER_SOURCE_CHOICES,
     RELATIONAL_PAIRING_CHOICES,
     RELATIONAL_TEACHER_VIEW_CHOICES,
+    SSL_HEAD_BY_METHOD,
+    SSL_METHODS,
 )
 from otuformer.embedding.evaluator import (
     compute_clustering_metrics,
@@ -56,12 +60,19 @@ from otuformer.training.dataset import (
     build_weak_teacher_augmentation_config,
     center_crop_eval_transform,
 )
+from otuformer.training.dino import (
+    DINOObjective,
+    check_dino_weight_norm_api_record,
+    validate_dino_prototype_layer,
+)
 from otuformer.training.loss import (
     ArcFaceLoss,
     LOSS_REGISTRY,
     SubCenterArcFaceLoss,
     SupConLoss,
+    dino_distillation_loss,
     ibot_patch_loss,
+    koleo_loss,
     masked_patch_cosine_loss,
 )
 from otuformer.training.model import (
@@ -163,13 +174,296 @@ def update_teacher(student: nn.Module, teacher: nn.Module, momentum: float) -> N
 
 
 def _student_optimizer_parameters(
-    student: nn.Module, patch_objective: nn.Module | None
+    student: nn.Module,
+    patch_objective: nn.Module | None,
+    dino_objective: nn.Module | None = None,
 ) -> list[nn.Parameter]:
-    """Student-side parameters plus the selected objective's trainable state."""
+    """Student-side parameters plus each objective's trainable state.
+
+    One stable order: encoder parameters, patch parameters, then the DINO
+    student prototype direction. This is the ordered source for the optimizer
+    groups; gradient-norm statistics and clipping always cover the joined list,
+    independent of how many weight-decay groups it is split into.
+    """
     params = [p for p in student.parameters() if p.requires_grad]
     if patch_objective is not None:
         params.extend(patch_objective.trainable_parameters())
+    if dino_objective is not None:
+        params.extend(dino_objective.trainable_parameters())
     return params
+
+
+def _norm_affine_types() -> tuple[type[nn.Module], ...]:
+    """Normalization modules whose direct affine parameters skip weight decay."""
+    types: list[type[nn.Module]] = [
+        nn.LayerNorm,
+        nn.GroupNorm,
+        nn.modules.batchnorm._BatchNorm,
+        nn.modules.instancenorm._InstanceNorm,
+    ]
+    rms_norm = getattr(nn, "RMSNorm", None)
+    if isinstance(rms_norm, type) and rms_norm not in types:
+        types.append(rms_norm)
+    return tuple(types)
+
+
+def _no_decay_parameter_ids(
+    student: nn.Module,
+    patch_objective: nn.Module | None,
+    dino_objective: nn.Module | None,
+) -> set[int]:
+    """Identity set of parameters that skip weight decay under the opt-in policy.
+
+    Membership is module-based: every directly named ``bias`` and the affine
+    ``weight`` of a recognized normalization module. Tokens, generic scales and
+    weight-normed ``weight_v`` are deliberately not exempt.
+    """
+    types = _norm_affine_types()
+    roots: list[nn.Module] = [student]
+    for objective in (patch_objective, dino_objective):
+        if objective is not None:
+            roots.append(objective)
+    ids: set[int] = set()
+    for root in roots:
+        for module in root.modules():
+            bias = getattr(module, "bias", None)
+            if isinstance(bias, nn.Parameter):
+                ids.add(id(bias))
+            if isinstance(module, types):
+                weight = getattr(module, "weight", None)
+                if isinstance(weight, nn.Parameter):
+                    ids.add(id(weight))
+    return ids
+
+
+def _pretrain_optimizer_groups(
+    student: nn.Module,
+    patch_objective: nn.Module | None,
+    dino_objective: nn.Module | None,
+    *,
+    weight_decay: float,
+    norm_bias_weight_decay: bool,
+) -> list[dict[str, Any]]:
+    """Build the pretrain optimizer groups for the selected WD policy.
+
+    ``True`` returns the historical single group unchanged: no explicit
+    ``weight_decay`` key, so ``AdamW`` supplies the same default it always did.
+    ``False`` splits the same ordered parameter list into a decay group followed
+    by a no-decay group, each keeping source-relative order and empty groups
+    omitted.
+    """
+    params = _student_optimizer_parameters(student, patch_objective, dino_objective)
+    if norm_bias_weight_decay:
+        return [{"params": params}]
+    no_decay_ids = _no_decay_parameter_ids(
+        student, patch_objective, dino_objective
+    )
+    seen: set[int] = set()
+    decay: list[nn.Parameter] = []
+    no_decay: list[nn.Parameter] = []
+    for parameter in params:
+        if id(parameter) in seen:
+            # Alias registration can expose one Norm parameter twice; the
+            # optimizer must never see it in both groups.
+            continue
+        seen.add(id(parameter))
+        if id(parameter) in no_decay_ids:
+            no_decay.append(parameter)
+        else:
+            decay.append(parameter)
+    groups: list[dict[str, Any]] = []
+    if decay:
+        groups.append({"params": decay, "weight_decay": float(weight_decay)})
+    if no_decay:
+        groups.append({"params": no_decay, "weight_decay": 0.0})
+    return groups
+
+
+def _pretrain_decay_partition_empty(
+    student: nn.Module,
+    patch_objective: nn.Module | None,
+    dino_objective: nn.Module | None,
+) -> bool:
+    """True when no trainable parameter keeps weight decay under the opt-in policy."""
+    params = _student_optimizer_parameters(student, patch_objective, dino_objective)
+    no_decay_ids = _no_decay_parameter_ids(
+        student, patch_objective, dino_objective
+    )
+    return all(id(parameter) in no_decay_ids for parameter in params)
+
+
+def _validate_saved_optimizer_structure(
+    saved_optimizer: Any,
+    *,
+    norm_bias_weight_decay: bool,
+    label: str,
+) -> list[dict[str, Any]]:
+    """Validate the saved optimizer envelope without rebuilding the model.
+
+    Covers the group envelope, the group counts the recorded policy can produce,
+    the canonical parameter-id order of a saved optimizer and the two-group
+    no-decay coefficient. Group sizes and the meaning of a single group need the
+    rebuilt parameter partition, so ``_validate_pretrain_optimizer_layout`` owns
+    those.
+    """
+    saved_groups = (
+        saved_optimizer.get("param_groups")
+        if isinstance(saved_optimizer, dict)
+        else None
+    )
+    if not isinstance(saved_groups, list) or not saved_groups:
+        raise ValueError(
+            f"Cannot resume: the {label} optimizer state records no parameter "
+            "groups."
+        )
+    # True is always one all-parameter group; False is one or two.
+    allowed = (1,) if norm_bias_weight_decay else (1, 2)
+    if len(saved_groups) not in allowed:
+        expected = "one" if len(allowed) == 1 else "one or two"
+        raise ValueError(
+            f"Cannot resume: norm_bias_weight_decay={norm_bias_weight_decay} "
+            f"rebuilds {expected} optimizer parameter group(s), but the "
+            f"checkpoint records {len(saved_groups)}. A saved decay/no-decay "
+            "partition is never converted on resume; start a new run to change "
+            "the policy."
+        )
+    offset = 0
+    for index, saved in enumerate(saved_groups):
+        _validate_adamw_param_group(saved, label)
+        saved_params = saved.get("params")
+        if not isinstance(saved_params, list) or not saved_params:
+            raise ValueError(
+                f"Cannot resume: optimizer group {index} lists no parameters."
+            )
+        # A saved optimizer numbers its parameters 0..N-1 in group order. Any
+        # other order would attach saved moments to a different parameter of the
+        # same shape, which load_state_dict() maps by position and cannot detect.
+        if list(saved_params) != list(range(offset, offset + len(saved_params))):
+            raise ValueError(
+                f"Cannot resume: optimizer group {index} records parameter ids "
+                "in an order a saved optimizer never produces, so the stored "
+                "moments could belong to other parameters. Start a new run "
+                "instead."
+            )
+        offset += len(saved_params)
+    if len(saved_groups) == 2 and float(saved_groups[1]["weight_decay"]) != 0.0:
+        raise ValueError(
+            "Cannot resume: the no-decay optimizer group records "
+            f"weight_decay={saved_groups[1]['weight_decay']!r}; it must be "
+            "exactly 0.0."
+        )
+    return saved_groups
+
+
+def _validate_pretrain_optimizer_layout(
+    optimizer: torch.optim.Optimizer,
+    saved_optimizer: Any,
+    *,
+    norm_bias_weight_decay: bool,
+    label: str,
+    decay_partition_empty: bool = False,
+) -> None:
+    """Reject a saved optimizer layout this run cannot map exactly.
+
+    The rebuilt partition supplies per-group size and the meaning of a single
+    group on top of ``_validate_saved_optimizer_structure``; a historical
+    one-group checkpoint is never converted into a two-group one. The saved
+    decay coefficient itself stays authoritative and is not compared with the
+    invocation.
+    """
+    saved_groups = _validate_saved_optimizer_structure(
+        saved_optimizer,
+        norm_bias_weight_decay=norm_bias_weight_decay,
+        label=label,
+    )
+    built = optimizer.param_groups
+    if len(saved_groups) != len(built):
+        raise ValueError(
+            f"Cannot resume: the checkpoint records {len(saved_groups)} optimizer "
+            f"parameter group(s), but norm_bias_weight_decay="
+            f"{norm_bias_weight_decay} rebuilds {len(built)} group(s) from this "
+            "model. A saved decay/no-decay partition is never converted on "
+            "resume; start a new run to change the policy."
+        )
+    for index, (saved, current) in enumerate(zip(saved_groups, built)):
+        saved_count = len(saved["params"])
+        if saved_count != len(current["params"]):
+            raise ValueError(
+                f"Cannot resume: optimizer group {index} records {saved_count} "
+                f"parameter(s) but this run rebuilds {len(current['params'])} "
+                "for the same partition. The saved moments cannot be mapped "
+                "by shape; start a new run instead."
+            )
+    # A single rebuilt group is the no-decay partition only when the decay
+    # partition is empty; the group count alone cannot decide its meaning.
+    if (
+        not norm_bias_weight_decay
+        and decay_partition_empty
+        and float(saved_groups[0]["weight_decay"]) != 0.0
+    ):
+        raise ValueError(
+            "Cannot resume: the no-decay optimizer group records "
+            f"weight_decay={saved_groups[0]['weight_decay']!r}; it must be "
+            "exactly 0.0."
+        )
+
+
+def _report_restored_weight_decay(
+    optimizer: torch.optim.Optimizer,
+    *,
+    requested_weight_decay: float,
+    norm_bias_weight_decay: bool,
+    has_decay_partition: bool,
+    label: str,
+) -> None:
+    """Print the authoritative resumed WD instead of the invocation value.
+
+    Called after a successful ``load_state_dict`` so the emitted numbers are the
+    loaded ones, never the requested ones.
+    """
+    if not has_decay_partition:
+        print(
+            f"[Info] {label}: the rebuilt layout has no decay group, so the "
+            f"invocation value --weight-decay {requested_weight_decay:g} does "
+            "not apply to it. The no-decay group keeps weight decay 0.0."
+        )
+        return
+    restored = float(optimizer.param_groups[0]["weight_decay"])
+    if math.isclose(restored, requested_weight_decay, rel_tol=0.0, abs_tol=1e-12):
+        return
+    print(
+        f"[Info] {label}: resumed weight decay is {restored:g} from the "
+        f"checkpoint. The invocation value {requested_weight_decay:g} "
+        "(requested or default) is not applied to a resumed run."
+    )
+
+
+def _initialize_dino_student_projector(student: OTUFormerEncoder) -> None:
+    """Reference DINO head init for the student's projection MLP only.
+
+    Truncated-normal weights and zero biases, applied on a fresh DINO run only:
+    backbone parameters, relational projectors and resumed DINO projectors keep
+    their own initialization.
+    """
+    for module in student.projector.net:
+        if not isinstance(module, nn.Linear):
+            continue
+        nn.init.trunc_normal_(module.weight, std=0.02)
+        if module.bias is not None:
+            nn.init.zeros_(module.bias)
+
+
+def _synchronize_dino_teacher(
+    student: OTUFormerEncoder,
+    teacher: OTUFormerEncoder,
+    dino_objective: nn.Module,
+) -> None:
+    """Copy the student encoder (including registers) and prototype layers."""
+    with torch.no_grad():
+        teacher.load_state_dict(student.state_dict(), strict=True)
+        dino_objective.teacher_prototypes.load_state_dict(
+            dino_objective.student_prototypes.state_dict()
+        )
 
 
 def _cosine_scheduler(
@@ -203,6 +497,43 @@ def _cosine_scheduler(
     return schedule
 
 
+def _validate_pretrain_epoch_target(
+    requested_epochs: int | None,
+    completed_epochs: int,
+    schedule_state: dict[str, Any] | None,
+    recorded_epochs: int | None,
+) -> None:
+    """Reject targets that cannot continue the saved schedule before output."""
+    if requested_epochs is None:
+        return
+    if completed_epochs > 0 and requested_epochs <= completed_epochs:
+        raise ValueError("--max-epochs must exceed the completed checkpoint epoch.")
+    if schedule_state is None:
+        if completed_epochs > 0 and (
+            recorded_epochs is None or requested_epochs != int(recorded_epochs)
+        ):
+            raise ValueError(
+                "Cannot resume a legacy checkpoint without schedule metadata."
+            )
+        return
+    if not isinstance(schedule_state, dict):
+        return
+    original_epochs = schedule_state.get("original_max_epochs")
+    if isinstance(original_epochs, bool) or not isinstance(original_epochs, int):
+        return
+    if requested_epochs < original_epochs:
+        raise ValueError("Cannot decrease the original pretrain epoch plan.")
+    if (
+        requested_epochs == original_epochs
+        and isinstance(recorded_epochs, int)
+        and recorded_epochs > original_epochs
+    ):
+        raise ValueError(
+            "Cannot return an extended pretrain run to its original epoch plan; "
+            f"use --max-epochs > {original_epochs} to continue the extension."
+        )
+
+
 def _build_pretrain_schedules(
     args: argparse.Namespace,
     schedule_state: dict[str, Any] | None,
@@ -211,14 +542,14 @@ def _build_pretrain_schedules(
     global_step: int,
     completed_epochs: int,
     original_max_epochs: int | None = None,
+    teacher_temp_warmup_ratio: float = 0.7,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
     """Build schedules without restarting LR after a resumed pretrain run."""
+    _validate_pretrain_epoch_target(
+        args.max_epochs, completed_epochs, schedule_state, original_max_epochs
+    )
     final_lr = float(args.lr) * 0.01
     if schedule_state is None:
-        if completed_epochs > 0 and original_max_epochs != args.max_epochs:
-            raise ValueError(
-                "Cannot resume a legacy checkpoint without schedule metadata."
-            )
         total_steps = max(1, args.max_epochs * steps_per_epoch)
         warmup_steps = int(max(0, args.warmup_epochs) * steps_per_epoch)
         metadata = {
@@ -247,10 +578,6 @@ def _build_pretrain_schedules(
         original_epochs = int(schedule_state["original_max_epochs"])
         original_steps = int(schedule_state["total_steps"])
         original_spe = int(schedule_state["steps_per_epoch"])
-        if args.max_epochs <= completed_epochs:
-            raise ValueError("--max-epochs must exceed the completed checkpoint epoch.")
-        if args.max_epochs < original_epochs:
-            raise ValueError("Cannot decrease the original pretrain epoch plan.")
         if args.max_epochs == original_epochs:
             if steps_per_epoch != original_spe:
                 raise ValueError("same-plan resume requires the original DataLoader length.")
@@ -352,6 +679,136 @@ def _compute_local_loss(
             loss += _ssl_loss(lv, t, temp_student, temp_teacher)
     loss /= max(1, len(local_views_student) * len(teacher_global))
     return loss
+
+
+def _compute_dino_global_loss(
+    student_logits: list[torch.Tensor],
+    teacher_targets: list[torch.Tensor],
+    temp_student: float,
+) -> torch.Tensor:
+    """Average the two cross-view pairs: student A -> teacher B, B -> A."""
+    losses = [
+        dino_distillation_loss(student_logits[0], teacher_targets[1], temp_student),
+        dino_distillation_loss(student_logits[1], teacher_targets[0], temp_student),
+    ]
+    return torch.stack(losses).mean()
+
+
+def _compute_dino_local_loss(
+    local_logits: list[torch.Tensor],
+    teacher_targets: list[torch.Tensor],
+    temp_student: float,
+) -> torch.Tensor:
+    """Average every student-local -> teacher-global pair; zero without locals."""
+    if not local_logits:
+        return torch.zeros((), device=teacher_targets[0].device)
+    losses = [
+        dino_distillation_loss(logits, target, temp_student)
+        for logits in local_logits
+        for target in teacher_targets
+    ]
+    return torch.stack(losses).mean()
+
+
+def _compute_koleo_raw(
+    student_tokens: list[torch.Tensor],
+    koleo_config: dict[str, Any],
+) -> tuple[torch.Tensor, list[int]]:
+    """Sum the per-global-crop KoLeo losses over the unmasked backbone CLS.
+
+    Uses the existing unmasked global forwards, never locals and never a pooled
+    cross-crop neighbor set, so two augmentations of one image cannot repel each
+    other. Crops with fewer than two samples are skipped and counted.
+    """
+    device = student_tokens[0].device
+    total = torch.zeros((), device=device)
+    sizes: list[int] = []
+    for tokens in student_tokens:
+        backbone_cls = tokens[:, 0]
+        count = int(backbone_cls.shape[0])
+        sizes.append(count)
+        if count < 2:
+            continue
+        total = total + koleo_loss(
+            backbone_cls,
+            normalize_eps=float(koleo_config["koleo_normalize_eps"]),
+            distance_eps=float(koleo_config["koleo_distance_eps"]),
+            log_eps=float(koleo_config["koleo_log_eps"]),
+        )
+    return total, sizes
+
+
+def _dino_cls_diagnostics(
+    teacher_targets: list[torch.Tensor], prototypes: int
+) -> dict[str, float]:
+    """CLS-target diagnostics over the cached assignments of both globals.
+
+    Entropy and perplexity use finite-safe arithmetic: zero probabilities
+    contribute zero entropy instead of NaN. These describe the teacher targets
+    only; they are not morphology or collapse detection.
+    """
+    probabilities = torch.cat([t.detach().float() for t in teacher_targets], dim=0)
+    positive = probabilities > 0
+    log_probabilities = torch.where(
+        positive, probabilities.log(), torch.zeros_like(probabilities)
+    )
+    entropy = float(-(probabilities * log_probabilities).sum(dim=-1).mean())
+
+    marginal = probabilities.mean(dim=0)
+    total = marginal.sum().clamp_min(1e-12)
+    marginal = marginal / total
+    marginal_positive = marginal > 0
+    marginal_log = torch.where(
+        marginal_positive, marginal.log(), torch.zeros_like(marginal)
+    )
+    perplexity = float(torch.exp(-(marginal * marginal_log).sum()))
+
+    counts = torch.bincount(
+        probabilities.argmax(dim=-1), minlength=prototypes
+    ).float()
+    active_ratio = float((counts > 0).float().mean())
+    occupancy = float(counts.max() / counts.sum().clamp_min(1.0))
+    return {
+        "cls_assignment_entropy": entropy,
+        "cls_prototype_perplexity": perplexity,
+        "cls_active_prototype_ratio": active_ratio,
+        "cls_max_prototype_occupancy": occupancy,
+    }
+
+
+def _koleo_instant_metrics(
+    ssl_config: dict[str, Any],
+    enabled: bool,
+    koleo_raw: torch.Tensor,
+    sizes: list[int],
+) -> dict[str, Any]:
+    """Status and counts for the optional KoLeo term (blank when N/A)."""
+    weight = float(ssl_config["koleo_weight"])
+    if not enabled:
+        return {
+            "koleo_status": "disabled",
+            "koleo_loss_raw": None,
+            "koleo_loss_weighted": None,
+        }
+    eligible = sum(size for size in sizes if size >= 2)
+    skipped = sum(size for size in sizes if size < 2)
+    if eligible == 0:
+        # A skipped batch contributes exactly zero, still numeric.
+        return {
+            "koleo_status": "skipped",
+            "koleo_loss_raw": 0.0,
+            "koleo_loss_weighted": 0.0,
+            "koleo_eligible_samples": 0,
+            "koleo_skipped_samples": skipped,
+        }
+    raw = float(koleo_raw.item())
+    return {
+        "koleo_status": "active",
+        "koleo_loss_raw": raw,
+        "koleo_loss_weighted": weight * raw,
+        "koleo_eligible_samples": eligible,
+        "koleo_skipped_samples": skipped,
+    }
 
 
 def _update_teacher_center(
@@ -886,7 +1343,35 @@ _PRETRAIN_PATCH_FIELDS = [
     "patch_center_norm",
 ]
 _PRETRAIN_LEGACY_FIELDS = _PRETRAIN_BASE_FIELDS + _PRETRAIN_LEGACY_METRIC_FIELDS
-_PRETRAIN_CURRENT_FIELDS = _PRETRAIN_LEGACY_FIELDS + _PRETRAIN_PATCH_FIELDS
+# Frozen v0.7.0 header: the extended schema is derived from it, so "current" can
+# never silently drop a column the previous release wrote.
+_PRETRAIN_V070_FIELDS = _PRETRAIN_LEGACY_FIELDS + _PRETRAIN_PATCH_FIELDS
+_PRETRAIN_SSL_SETTING_FIELDS = ["ssl_method", "dino_centering", "koleo_weight"]
+_PRETRAIN_SSL_METRIC_FIELDS = [
+    "cls_center_norm",
+    "global_loss_weighted",
+    "local_loss_weighted",
+    "cls_assignment_entropy",
+    "cls_prototype_perplexity",
+    "cls_active_prototype_ratio",
+    "cls_max_prototype_occupancy",
+    "koleo_loss_raw",
+    "koleo_loss_weighted",
+    "koleo_status",
+    "koleo_eligible_samples",
+    "koleo_skipped_samples",
+]
+_PRETRAIN_CURRENT_FIELDS = (
+    _PRETRAIN_V070_FIELDS
+    + _PRETRAIN_SSL_SETTING_FIELDS
+    + _PRETRAIN_SSL_METRIC_FIELDS
+)
+# Numeric instant-metric columns: blank/N-A cells become missing values in plots.
+_PRETRAIN_PLOT_NUMERIC_FIELDS = (
+    _PRETRAIN_LEGACY_METRIC_FIELDS
+    + _PRETRAIN_PATCH_FIELDS
+    + _PRETRAIN_SSL_METRIC_FIELDS
+)
 _FINETUNE_FIELDS = [
     "loss",
     "lr",
@@ -950,7 +1435,10 @@ class InstantMetricsLogger:
             )
         if header == self.fieldnames:
             return
-        if self.mode == "pretrain" and header == _PRETRAIN_LEGACY_FIELDS:
+        if self.mode == "pretrain" and header in (
+            _PRETRAIN_LEGACY_FIELDS,
+            _PRETRAIN_V070_FIELDS,
+        ):
             self._migrate_pretrain_schema(header, rows)
             return
         raise ValueError(
@@ -961,7 +1449,7 @@ class InstantMetricsLogger:
     def _migrate_pretrain_schema(
         self, header: list[str], rows: list[list[str]]
     ) -> None:
-        """Atomically rewrite a recognized legacy header to the v0.7.0 schema."""
+        """Atomically rewrite a recognized prior header to the current schema."""
         import os
         import tempfile
 
@@ -1003,6 +1491,18 @@ class InstantMetricsLogger:
             writer = csv.DictWriter(f, fieldnames=self.fieldnames)
             writer.writerow(row)
 
+    @staticmethod
+    def _plottable_series(df_instant, name: str):
+        """One numeric column with blanks as missing, or ``None`` if absent.
+
+        An all-missing column returns ``None`` so callers skip it instead of
+        drawing an empty legend entry with no data.
+        """
+        if name not in df_instant.columns:
+            return None
+        values = df_instant[name]
+        return None if values.isna().all() else values
+
     def plot(self, out_dir: Path, metrics_path: Path | None = None) -> None:
         if not self.path.exists():
             return
@@ -1019,6 +1519,15 @@ class InstantMetricsLogger:
         df_instant = pd.read_csv(self.path)
         if df_instant.empty:
             return
+        # Optional metric cells can be blank (historical rows, N/A under the
+        # other method). They become missing values, never fabricated zeros, and
+        # an all-missing series is skipped instead of drawn.
+        for name in _PRETRAIN_PLOT_NUMERIC_FIELDS:
+            if name in df_instant.columns:
+                df_instant[name] = pd.to_numeric(df_instant[name], errors="coerce")
+
+        def series(name: str):
+            return self._plottable_series(df_instant, name)
 
         df_metrics = None
         if metrics_path is not None and metrics_path.exists():
@@ -1026,63 +1535,72 @@ class InstantMetricsLogger:
             if "epoch" in df_metrics.columns:
                 df_metrics = df_metrics[df_metrics["epoch"].notna()]
 
-        fig, axes = plt.subplots(3, 3, figsize=(20, 15))
+        # The panel count grew with the DINO/KoLeo diagnostics, so the grid is
+        # sized for them; unused cells are switched off at the end.
+        fig, axes = plt.subplots(4, 4, figsize=(26, 20))
         axes = axes.flatten()
         plot_idx = 0
 
-        ax = axes[plot_idx]
-        if "loss" in df_instant.columns:
-            ax.plot(
-                df_instant["iteration"],
-                df_instant["loss"],
-                label="Total loss",
-                linewidth=1.5,
-            )
-        if "global_loss" in df_instant.columns:
-            ax.plot(
-                df_instant["iteration"],
-                df_instant["global_loss"],
-                label="Global loss",
-                alpha=0.8,
-            )
-        if "local_loss" in df_instant.columns:
-            ax.plot(
-                df_instant["iteration"],
-                df_instant["local_loss"],
-                label="Local loss",
-                alpha=0.8,
-            )
-        if "patch_loss_raw" in df_instant.columns:
-            patch_series = pd.to_numeric(
-                df_instant["patch_loss_raw"], errors="coerce"
+        # Mixed history: rows written before the patch schema have no
+        # ``patch_loss_raw`` and only ``mask_loss``. Fall back per row so earlier
+        # observations are not dropped once a later row fills the new column, and
+        # keep working from a pure legacy file that has no raw column at all.
+        patch_series = self._plottable_series(df_instant, "patch_loss_raw")
+        legacy_mask = self._plottable_series(df_instant, "mask_loss")
+        if patch_series is not None:
+            patch_series = (
+                patch_series.fillna(legacy_mask)
+                if legacy_mask is not None
+                else patch_series
             )
         else:
+            patch_series = legacy_mask
+        if patch_series is not None and patch_series.isna().all():
             patch_series = None
-        if patch_series is not None and patch_series.notna().any():
+        ax = axes[plot_idx]
+        loss_lines = {
+            "Total loss": self._plottable_series(df_instant, "loss"),
+            "Global loss": self._plottable_series(df_instant, "global_loss"),
+            "Local loss": self._plottable_series(df_instant, "local_loss"),
+            "Patch loss (raw)": patch_series,
+        }
+        for label, values in loss_lines.items():
+            if values is None:
+                continue
             ax.plot(
                 df_instant["iteration"],
-                patch_series,
-                label="Patch loss (raw)",
-                alpha=0.8,
+                values,
+                label=label,
+                linewidth=1.5 if label == "Total loss" else 1.0,
+                alpha=1.0 if label == "Total loss" else 0.8,
             )
-        elif "mask_loss" in df_instant.columns:
-            ax.plot(
-                df_instant["iteration"],
-                pd.to_numeric(df_instant["mask_loss"], errors="coerce"),
-                label="Mask loss",
-                alpha=0.8,
-            )
-        ax.set_yscale("log")
+        # KoLeo is signed, so a total loss can legitimately reach non-positive
+        # values. A log axis cannot show those; keep it only when every drawn
+        # value is strictly positive.
+        drawn = [
+            value
+            for values in loss_lines.values()
+            if values is not None
+            for value in values.dropna()
+        ]
+        if drawn and all(value > 0 for value in drawn):
+            ax.set_yscale("log")
+            ax.set_ylabel("Loss (log scale)")
+        elif drawn:
+            # symlog keeps small positive values readable without clipping or
+            # hiding the sign of a negative contribution.
+            ax.set_yscale("symlog", linthresh=1e-3)
+            ax.set_ylabel("Loss (symlog scale; signed values kept)")
         ax.set_xlabel("Iteration")
-        ax.set_ylabel("Loss (log scale)")
         ax.set_title("Training Losses")
-        ax.legend(fontsize=8)
-        ax.grid(True, alpha=0.3)
+        if drawn:
+            ax.legend(fontsize=8)
+            ax.grid(True, alpha=0.3)
         plot_idx += 1
 
         ax = axes[plot_idx]
-        has_cos = "cosine_similarity" in df_instant.columns
-        has_grad = "grad_norm" in df_instant.columns
+        has_cos = series("cosine_similarity") is not None
+        has_grad = series("grad_norm") is not None
         second_panel_has_data = False
         if has_cos and has_grad:
             ax_twin = ax.twinx()
@@ -1145,18 +1663,18 @@ class InstantMetricsLogger:
 
         ax = axes[plot_idx]
         has_left = any(
-            c in df_instant.columns for c in ["feature_std", "embedding_norm_mean"]
+            series(c) is not None for c in ["feature_std", "embedding_norm_mean"]
         )
-        has_cls = "cls_token_norm_mean" in df_instant.columns
+        has_cls = series("cls_token_norm_mean") is not None
         if has_left:
-            if "feature_std" in df_instant.columns:
+            if series("feature_std") is not None:
                 ax.plot(
                     df_instant["iteration"],
                     df_instant["feature_std"],
                     label="Feature Std",
                     color="tab:green",
                 )
-            if "embedding_norm_mean" in df_instant.columns:
+            if series("embedding_norm_mean") is not None:
                 ax.plot(
                     df_instant["iteration"],
                     df_instant["embedding_norm_mean"],
@@ -1177,25 +1695,39 @@ class InstantMetricsLogger:
         ax.set_xlabel("Iteration")
         ax.set_ylabel("Feature Std / Embedding Norm")
         ax.set_title("Feature Statistics")
-        if has_cls:
+        if has_cls or has_left:
             lines_l, labels_l = ax.get_legend_handles_labels()
-            lines_r, labels_r = ax_twin.get_legend_handles_labels()
-            ax.legend(lines_l + lines_r, labels_l + labels_r, fontsize=8, loc="best")
-        else:
-            ax.legend(fontsize=8)
+            lines_r, labels_r = (
+                ax_twin.get_legend_handles_labels() if has_cls else ([], [])
+            )
+            if labels_l or labels_r:
+                ax.legend(
+                    lines_l + lines_r, labels_l + labels_r, fontsize=8, loc="best"
+                )
         ax.grid(True, alpha=0.3)
         plot_idx += 1
 
         ax = axes[plot_idx]
         fourth_panel_has_data = False
-        if "teacher_center_norm" in df_instant.columns:
+        has_teacher_center = series("teacher_center_norm") is not None
+        has_cls_center = series("cls_center_norm") is not None
+        if has_teacher_center:
             ax.plot(
                 df_instant["iteration"],
                 df_instant["teacher_center_norm"],
-                label="Teacher center",
+                label="Teacher center (D, relational)",
             )
             fourth_panel_has_data = True
-        if "lr" in df_instant.columns:
+        if has_cls_center:
+            ax.plot(
+                df_instant["iteration"],
+                df_instant["cls_center_norm"],
+                label="CLS center (K, DINO)",
+                color="tab:green",
+            )
+            fourth_panel_has_data = True
+        has_lr = series("lr") is not None
+        if has_lr:
             ax_twin = ax.twinx()
             ax_twin.plot(
                 df_instant["iteration"],
@@ -1210,16 +1742,12 @@ class InstantMetricsLogger:
             ax_twin.set_ylabel("Learning Rate", color="tab:red")
             ax_twin.tick_params(axis="y", labelcolor="tab:red")
             fourth_panel_has_data = True
-        if "teacher_center_norm" in df_instant.columns:
-            ax.set_ylabel("Teacher Center Norm", color="tab:purple")
-            ax.tick_params(axis="y", labelcolor="tab:purple")
+        if has_teacher_center or has_cls_center:
+            ax.set_ylabel("Center Norm")
         if fourth_panel_has_data:
             ax.set_xlabel("Iteration")
-            if (
-                "lr" in df_instant.columns
-                and "teacher_center_norm" in df_instant.columns
-            ):
-                ax.set_title("Teacher Center & Learning Rate")
+            if has_lr and (has_teacher_center or has_cls_center):
+                ax.set_title("Center Norms & Learning Rate")
                 lines_l, labels_l = ax.get_legend_handles_labels()
                 lines_r, labels_r = ax_twin.get_legend_handles_labels()
                 ax.legend(
@@ -1228,8 +1756,8 @@ class InstantMetricsLogger:
                     fontsize=8,
                     loc="best",
                 )
-            elif "teacher_center_norm" in df_instant.columns:
-                ax.set_title("Teacher Center Norm")
+            elif has_teacher_center or has_cls_center:
+                ax.set_title("Center Norms")
                 ax.legend(fontsize=8)
             else:
                 ax.set_title("Learning Rate")
@@ -1239,6 +1767,217 @@ class InstantMetricsLogger:
             plot_idx += 1
         else:
             ax.axis("off")
+
+        # Teacher temperature, weighted contributions and the assignment
+        # diagnostics that reveal target sharpness. Without these the DINO runs
+        # have no per-iteration view of what the CLS objective is actually doing.
+        weighted = [
+            name
+            for name in (
+                "global_loss_weighted",
+                "local_loss_weighted",
+                "patch_loss_weighted",
+                "koleo_loss_weighted",
+            )
+            if series(name) is not None
+        ]
+        teacher_temp_series = series("teacher_temp")
+        if teacher_temp_series is not None or weighted:
+            ax = axes[plot_idx]
+            left_drawn = False
+            if teacher_temp_series is not None:
+                ax.plot(
+                    df_instant["iteration"],
+                    teacher_temp_series,
+                    label="Teacher temperature",
+                    color="tab:red",
+                )
+                left_drawn = True
+                ax.set_ylabel("Teacher temperature", color="tab:red")
+                ax.tick_params(axis="y", labelcolor="tab:red")
+            if weighted:
+                ax_twin = ax.twinx()
+                for name in weighted:
+                    ax_twin.plot(
+                        df_instant["iteration"],
+                        series(name),
+                        label=name,
+                        alpha=0.8,
+                    )
+                ax_twin.set_ylabel("Weighted contribution")
+                lines_l, labels_l = ax.get_legend_handles_labels()
+                lines_r, labels_r = ax_twin.get_legend_handles_labels()
+                ax.legend(
+                    lines_l + lines_r, labels_l + labels_r, fontsize=7, loc="best"
+                )
+            elif left_drawn:
+                ax.legend(fontsize=8)
+            ax.set_xlabel("Iteration")
+            ax.set_title("Teacher Temperature & Weighted Losses")
+            ax.grid(True, alpha=0.3)
+            plot_idx += 1
+
+        # DINO CLS assignment health. The statistics pool is the cached teacher
+        # targets of both global crops (2 x batch), not the whole dataset, and
+        # the active-prototype ratio divides by K.
+        cls_entropy = series("cls_assignment_entropy")
+        cls_occupancy = series("cls_active_prototype_ratio")
+        if cls_entropy is not None or cls_occupancy is not None:
+            ax = axes[plot_idx]
+            drawn = False
+            if cls_entropy is not None:
+                ax.plot(
+                    df_instant["iteration"],
+                    cls_entropy,
+                    label="Target entropy (nats)",
+                    color="tab:blue",
+                )
+                drawn = True
+            cls_perplexity = series("cls_prototype_perplexity")
+            if cls_perplexity is not None:
+                ax.plot(
+                    df_instant["iteration"],
+                    cls_perplexity,
+                    label="Marginal perplexity",
+                    color="tab:cyan",
+                    alpha=0.8,
+                )
+                drawn = True
+            ax.set_ylabel("Entropy (nats) / Perplexity", color="tab:blue")
+            if cls_occupancy is not None:
+                ax_twin = ax.twinx()
+                ax_twin.plot(
+                    df_instant["iteration"],
+                    cls_occupancy,
+                    label="Active prototype ratio (K denominator)",
+                    color="tab:green",
+                    alpha=0.8,
+                )
+                cls_occupancy_max = series("cls_max_prototype_occupancy")
+                if cls_occupancy_max is not None:
+                    ax_twin.plot(
+                        df_instant["iteration"],
+                        cls_occupancy_max,
+                        label="Max occupancy (batch)",
+                        color="tab:olive",
+                        alpha=0.8,
+                    )
+                ax_twin.set_ylabel("Ratio", color="tab:green")
+                lines_l, labels_l = ax.get_legend_handles_labels()
+                lines_r, labels_r = ax_twin.get_legend_handles_labels()
+                ax.legend(
+                    lines_l + lines_r, labels_l + labels_r, fontsize=7, loc="best"
+                )
+            elif drawn:
+                ax.legend(fontsize=7)
+            ax.set_xlabel("Iteration")
+            ax.set_title("DINO CLS Target Health (2 x batch pool)")
+            ax.grid(True, alpha=0.3)
+            plot_idx += 1
+
+        # iBOT patch diagnostics use a different statistics pool, so they get
+        # their own panel instead of sharing the CLS numbers.
+        patch_entropy = series("assignment_entropy")
+        patch_occupancy = series("active_prototype_ratio")
+        if patch_entropy is not None or patch_occupancy is not None:
+            ax = axes[plot_idx]
+            drawn = False
+            if patch_entropy is not None:
+                ax.plot(
+                    df_instant["iteration"],
+                    patch_entropy,
+                    label="Patch target entropy (nats)",
+                    color="tab:blue",
+                )
+                drawn = True
+            patch_perplexity = series("prototype_perplexity")
+            if patch_perplexity is not None:
+                ax.plot(
+                    df_instant["iteration"],
+                    patch_perplexity,
+                    label="Patch marginal perplexity",
+                    color="tab:cyan",
+                    alpha=0.8,
+                )
+                drawn = True
+            ax.set_ylabel("Entropy (nats) / Perplexity", color="tab:blue")
+            if patch_occupancy is not None:
+                ax_twin = ax.twinx()
+                ax_twin.plot(
+                    df_instant["iteration"],
+                    patch_occupancy,
+                    label="Active prototype ratio",
+                    color="tab:green",
+                    alpha=0.8,
+                )
+                patch_occupancy_max = series("max_prototype_occupancy")
+                if patch_occupancy_max is not None:
+                    ax_twin.plot(
+                        df_instant["iteration"],
+                        patch_occupancy_max,
+                        label="Max occupancy",
+                        color="tab:olive",
+                        alpha=0.8,
+                    )
+                ax_twin.set_ylabel("Ratio", color="tab:green")
+                lines_l, labels_l = ax.get_legend_handles_labels()
+                lines_r, labels_r = ax_twin.get_legend_handles_labels()
+                ax.legend(
+                    lines_l + lines_r, labels_l + labels_r, fontsize=7, loc="best"
+                )
+            elif drawn:
+                ax.legend(fontsize=7)
+            ax.set_xlabel("Iteration")
+            ax.set_title("iBOT Patch Target Health")
+            ax.grid(True, alpha=0.3)
+            plot_idx += 1
+
+        # Signed KoLeo contribution; absent when the regularizer is disabled.
+        koleo_raw = series("koleo_loss_raw")
+        koleo_weighted = series("koleo_loss_weighted")
+        if koleo_raw is not None or koleo_weighted is not None:
+            ax = axes[plot_idx]
+            if koleo_raw is not None:
+                ax.plot(
+                    df_instant["iteration"],
+                    koleo_raw,
+                    label="KoLeo loss (raw, signed)",
+                    color="tab:purple",
+                )
+            if koleo_weighted is not None:
+                ax.plot(
+                    df_instant["iteration"],
+                    koleo_weighted,
+                    label="KoLeo loss (weighted, signed)",
+                    color="tab:pink",
+                    alpha=0.8,
+                )
+            skips = series("koleo_skipped_samples")
+            if skips is not None and (skips > 0).any():
+                # A skipped batch has no observed loss, so its count is drawn on
+                # a second axis rather than read as a loss value.
+                ax_twin = ax.twinx()
+                ax_twin.plot(
+                    df_instant["iteration"],
+                    skips,
+                    label="Skipped samples",
+                    color="tab:gray",
+                    linestyle="--",
+                )
+                ax_twin.set_ylabel("Skipped samples")
+                lines_l, labels_l = ax.get_legend_handles_labels()
+                lines_r, labels_r = ax_twin.get_legend_handles_labels()
+                ax.legend(
+                    lines_l + lines_r, labels_l + labels_r, fontsize=7, loc="best"
+                )
+            else:
+                ax.legend(fontsize=7)
+            ax.axhline(0.0, color="black", linewidth=0.6, alpha=0.4)
+            ax.set_xlabel("Iteration")
+            ax.set_ylabel("KoLeo loss (signed)")
+            ax.set_title("KoLeo Contribution")
+            ax.grid(True, alpha=0.3)
+            plot_idx += 1
 
         if df_metrics is not None and not df_metrics.empty:
             for cols, title in [
@@ -1541,12 +2280,19 @@ def _compute_instant_metrics(
     model: OTUFormerEncoder,
     sample_view: torch.Tensor,
     device: torch.device,
-) -> dict[str, float]:
+) -> dict[str, float | None]:
     tokens = _extract_tokens(model, sample_view.to(device))
     cls_token_raw = tokens[:, 0]
     proj = model.projector(cls_token_raw)
+    # A batch standard deviation needs at least two samples; a singleton batch is
+    # a legitimate input, and reporting NaN as an observed value would be wrong.
+    feature_std = (
+        float(cls_token_raw.std(dim=0).mean().item())
+        if cls_token_raw.shape[0] >= 2
+        else None
+    )
     return {
-        "feature_std": float(cls_token_raw.std(dim=0).mean().item()),
+        "feature_std": feature_std,
         "embedding_norm_mean": float(proj.norm(dim=1).mean().item()),
         "cls_token_norm_mean": float(cls_token_raw.norm(dim=1).mean().item()),
     }
@@ -2210,20 +2956,1276 @@ def _finetune_register_plan(
     return mode, actual
 
 
+def _resolve_finetune_ssl_source(
+    checkpoint: dict[str, Any],
+) -> tuple[str, str] | None:
+    """SSL identity of a fine-tune source.
+
+    An active SSL payload yields its own pair (including a historical relational
+    inference); a metric-head descendant yields only its validated, SHA-anchored
+    source pair. A hash or path alone never produces a pair.
+    """
+    from otuformer.utils.checkpoint import (
+        resolve_checkpoint_ssl_identity,
+        resolve_checkpoint_ssl_source,
+    )
+
+    state = checkpoint.get("model_state_dict")
+    if isinstance(state, dict) and state:
+        identity = resolve_checkpoint_ssl_identity(checkpoint, state)
+        if identity is not None:
+            return identity
+    return resolve_checkpoint_ssl_source(checkpoint)
+
+
 def preflight_finetune_source(
     checkpoint: dict[str, Any], model_name: str
 ) -> tuple[str, int]:
-    """Validate a fine-tune source before the CLI creates or clears output."""
+    """Validate a fine-tune source before the CLI creates or clears output.
+
+    Active/source SSL identity is validated against the payload's actual
+    ``model_state_dict``, so a valid teacher selection, a zero-register fallback
+    or a later metric-head replacement cannot hide a conflicting alias.
+    """
+    from otuformer.utils.checkpoint import (
+        preserved_rng,
+        resolve_checkpoint_ssl_identity,
+        resolve_checkpoint_ssl_source,
+        resolve_projector_out_dim,
+    )
+
     cfg = checkpoint.get("config") or {}
     resolved = cfg.get("model_name") or model_name
-    out_dim = int(cfg.get("out_dim") or cfg.get("metric_embed_dim") or 256)
-    return _finetune_register_plan(
-        checkpoint, resolved, resolve_training_image_size(checkpoint), out_dim
+    image_size = resolve_training_image_size(checkpoint)
+    state = checkpoint.get("model_state_dict")
+    declared_dim = cfg.get("out_dim") or cfg.get("metric_embed_dim")
+    state_dim = resolve_projector_out_dim(state) if isinstance(state, dict) else None
+    out_dim = int(declared_dim) if declared_dim else (state_dim or 256)
+    if isinstance(state, dict) and state:
+        identity = resolve_checkpoint_ssl_identity(checkpoint, state)
+        # A recorded source pair is provenance only, but it must be anchored and
+        # consistent even on a source that is not itself an SSL payload.
+        resolve_checkpoint_ssl_source(checkpoint)
+        if identity is not None:
+            with preserved_rng():
+                probe = OTUFormerEncoder(
+                    model_name=resolved,
+                    out_dim=out_dim,
+                    return_patch_tokens=True,
+                    img_size=image_size,
+                    pretrained=False,
+                )
+            _assert_complete_ssl_projector(
+                state, probe, out_dim, "model_state_dict"
+            )
+        else:
+            from otuformer.utils.checkpoint import (
+                assert_complete_projector,
+                resolve_checkpoint_embedding_head,
+            )
+
+            head = resolve_checkpoint_embedding_head(checkpoint, state)
+            with preserved_rng():
+                probe = OTUFormerEncoder(
+                    model_name=resolved, out_dim=out_dim, img_size=image_size,
+                    pretrained=False,
+                )
+                if head == ARCFACE_EMBEDDING_HEAD:
+                    probe.projector = ArcFaceEmbeddingHead(probe.backbone.num_features, out_dim)
+            assert_complete_projector(state, probe.projector)
+    return _finetune_register_plan(checkpoint, resolved, image_size, out_dim)
+
+
+_SSL_DINO_ONLY = ("dino_prototypes", "dino_centering", "koleo_weight")
+# The v0.12.0 relational selectors only steer the relational target bundle.
+_SSL_RELATIONAL_ONLY = (
+    "relational_teacher_views",
+    "relational_center_source",
+    "relational_pairing",
+)
+
+
+@dataclass
+class _SavedSSLState:
+    """What a resume payload records about its SSL recipe."""
+
+    identity: tuple[str, str] | None
+    config: dict[str, Any]
+    out_dim: int | None
+    weight_out_dim: int | None
+
+
+def _saved_ssl_state(resume_ckpt: dict[str, Any] | None) -> _SavedSSLState | None:
+    from otuformer.utils.checkpoint import (
+        resolve_checkpoint_ssl_identity,
+        resolve_checkpoint_state_dict,
+    )
+
+    if resume_ckpt is None:
+        return None
+    from otuformer.utils.checkpoint import resolve_projector_out_dim
+
+    state, _ = resolve_checkpoint_state_dict(resume_ckpt)
+    cfg = resume_ckpt.get("config")
+    cfg = cfg if isinstance(cfg, dict) else {}
+    return _SavedSSLState(
+        identity=resolve_checkpoint_ssl_identity(resume_ckpt, state),
+        config=cfg,
+        out_dim=_positive_int(cfg.get("out_dim")),
+        # A historical payload may record no width while its weights have one.
+        weight_out_dim=resolve_projector_out_dim(state),
     )
 
 
+def _ssl_option(args: argparse.Namespace, name: str, default: Any) -> Any:
+    value = getattr(args, name, default)
+    return default if value is None else value
+
+
+def _ssl_explicit(args: argparse.Namespace, name: str) -> bool:
+    return bool(getattr(args, f"{name}_explicit", False))
+
+
+def _resolve_inherited_ssl_value(
+    args: argparse.Namespace,
+    name: str,
+    default: Any,
+    saved: _SavedSSLState | None,
+) -> Any:
+    """Omitted values inherit a DINO checkpoint; explicit conflicts fail."""
+    requested = _ssl_option(args, name, default)
+    recorded = saved.config.get(name) if saved is not None else None
+    if _ssl_explicit(args, name):
+        if recorded is not None and requested != recorded:
+            raise ValueError(
+                f"Cannot change {name.replace('_', '-')} on resume: the checkpoint "
+                f"records {name}={recorded!r}, got {requested!r}."
+            )
+        return requested
+    if recorded is not None:
+        return recorded
+    return requested
+
+
+RECIPE_TEACHER_TEMP_WARMUP_RATIO = 0.7
+RECIPE_NORM_BIAS_WEIGHT_DECAY = True
+_COMMON_RECIPE_OPTIONS = (
+    "teacher_temp_warmup_ratio",
+    "norm_bias_weight_decay",
+)
+
+
+def _validate_recipe_ratio(value: Any) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(
+            f"teacher_temp_warmup_ratio must be a number, got {value!r}."
+        )
+    ratio = float(value)
+    if not math.isfinite(ratio) or not 0.0 <= ratio <= 1.0:
+        raise ValueError(
+            "teacher_temp_warmup_ratio must be a finite value in [0, 1], got "
+            f"{value!r}."
+        )
+    return ratio
+
+
+def _validate_recipe_wd_flag(value: Any) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError(
+            f"norm_bias_weight_decay must be a boolean, got {value!r}."
+        )
+    return value
+
+
+def _resolve_common_recipe(
+    args: argparse.Namespace, saved: _SavedSSLState | None
+) -> dict[str, Any]:
+    """Resolve the two shared pretrain recipe fields for both SSL methods.
+
+    Recorded values inherit like DINO settings. A payload that records neither
+    field predates this option, so the historical 0.7/True pair is assumed with
+    a warning, and an explicit nondefault is rejected instead of being dressed
+    up as a recorded conflict.
+    """
+    recorded = saved.config if saved is not None else {}
+    # Presence is decided by the key, never by whether its value is null: a
+    # recorded-but-null field is damaged metadata, not a historical payload.
+    missing = [name for name in _COMMON_RECIPE_OPTIONS if name not in recorded]
+    if saved is not None and len(missing) == 1:
+        raise ValueError(
+            "Cannot resume: the checkpoint records only part of the shared "
+            "pretrain recipe (missing "
+            + missing[0]
+            + "). Partial recipe metadata is not resumable; start a new run."
+        )
+    # The command line spells the weight-decay control negatively, like
+    # --disable-cross-view-loss; the persisted key stays positive.
+    no_decay_requested = bool(
+        _ssl_option(args, "no_norm_bias_weight_decay", False)
+    )
+    no_decay_explicit = _ssl_explicit(args, "no_norm_bias_weight_decay")
+    if saved is not None and len(missing) == len(_COMMON_RECIPE_OPTIONS):
+        ratio = _validate_recipe_ratio(
+            _ssl_option(
+                args, "teacher_temp_warmup_ratio", RECIPE_TEACHER_TEMP_WARMUP_RATIO
+            )
+        )
+        if _ssl_explicit(args, "teacher_temp_warmup_ratio") and not math.isclose(
+            ratio, RECIPE_TEACHER_TEMP_WARMUP_RATIO, rel_tol=0.0, abs_tol=1e-12
+        ):
+            raise ValueError(
+                "The checkpoint does not record teacher_temp_warmup_ratio; "
+                "historical behavior is assumed to be "
+                f"{RECIPE_TEACHER_TEMP_WARMUP_RATIO}. Explicit nondefault values "
+                "are conservatively rejected to avoid changing an unrecorded "
+                "temperature schedule. Start a new run to use a different ratio."
+            )
+        if no_decay_explicit and no_decay_requested:
+            raise ValueError(
+                "The checkpoint does not record norm_bias_weight_decay; "
+                "historical behavior is assumed to be True. Changing this "
+                "policy would require an unsupported optimizer-partition "
+                "conversion. Start a new run to change Norm/bias decay."
+            )
+        print(
+            "[Warning] The checkpoint records neither teacher_temp_warmup_ratio "
+            "nor norm_bias_weight_decay; assuming the historical 0.7/True pair "
+            "and its single all-parameter optimizer group. A run from the "
+            "temporary hard-coded 0.3 temperature experiment cannot be "
+            "continued exactly."
+        )
+        return {
+            "teacher_temp_warmup_ratio": RECIPE_TEACHER_TEMP_WARMUP_RATIO,
+            "norm_bias_weight_decay": RECIPE_NORM_BIAS_WEIGHT_DECAY,
+        }
+    # The recorded values are validated as stored before any comparison with the
+    # request, so a null or boolean could never be replaced by a requested value
+    # that merely compares equal (True == 1.0, False == 0.0).
+    recorded_ratio = (
+        _validate_recipe_ratio(recorded["teacher_temp_warmup_ratio"])
+        if saved is not None
+        else None
+    )
+    recorded_wd = (
+        _validate_recipe_wd_flag(recorded["norm_bias_weight_decay"])
+        if saved is not None
+        else None
+    )
+    # The shared helper is not used here: it reads the recorded value with
+    # ``.get()`` (a recorded null would look absent) and compares the request
+    # numerically (True == 1.0). The recorded ratio is already validated above,
+    # so this decision only compares strict, non-null values.
+    requested_ratio = _validate_recipe_ratio(
+        _ssl_option(
+            args, "teacher_temp_warmup_ratio", RECIPE_TEACHER_TEMP_WARMUP_RATIO
+        )
+    )
+    if not _ssl_explicit(args, "teacher_temp_warmup_ratio"):
+        ratio = requested_ratio if recorded_ratio is None else recorded_ratio
+    else:
+        if recorded_ratio is not None and requested_ratio != recorded_ratio:
+            raise ValueError(
+                "Cannot change teacher-temp-warmup-ratio on resume: the "
+                f"checkpoint records teacher_temp_warmup_ratio={recorded_ratio!r}, "
+                f"got {requested_ratio!r}."
+            )
+        ratio = requested_ratio
+    if no_decay_explicit:
+        requested_wd = not no_decay_requested
+        if recorded_wd is not None and requested_wd != recorded_wd:
+            raise ValueError(
+                "Cannot change --no-norm-bias-weight-decay on resume: the "
+                f"checkpoint records norm_bias_weight_decay={recorded_wd!r}. "
+                "Switching the policy would require converting the saved "
+                "optimizer partition; start a new run instead."
+            )
+        wd = requested_wd
+    elif recorded_wd is not None:
+        wd = recorded_wd
+    else:
+        wd = not no_decay_requested
+    return {
+        "teacher_temp_warmup_ratio": ratio,
+        "norm_bias_weight_decay": wd,
+    }
+
+
+def _validate_koleo_weight(value: Any) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"koleo_weight must be a number, got {value!r}.")
+    weight = float(value)
+    if not math.isfinite(weight) or weight < 0.0:
+        raise ValueError(
+            f"koleo_weight must be a finite value >= 0, got {value!r}."
+        )
+    return weight
+
+
+def _resolve_relational_ssl_config(
+    args: argparse.Namespace, saved: _SavedSSLState | None
+) -> dict[str, Any]:
+    for name in _SSL_DINO_ONLY:
+        if _ssl_explicit(args, name):
+            raise ValueError(
+                f"--{name.replace('_', '-')} is not applicable to "
+                "--ssl-method relational; omit it or use --ssl-method dino."
+            )
+    out_dim = _positive_int(_ssl_option(args, "out_dim", 256))
+    if out_dim is None:
+        raise ValueError(f"--out-dim must be a positive integer, got {args.out_dim!r}.")
+    if saved is not None:
+        if (
+            saved.out_dim is not None
+            and saved.weight_out_dim is not None
+            and saved.out_dim != saved.weight_out_dim
+        ):
+            raise ValueError(
+                "Cannot resume: the checkpoint config records out_dim="
+                f"{saved.out_dim} but its stored projector is "
+                f"{saved.weight_out_dim} wide. The metadata and the weights "
+                "disagree, so neither width can be trusted."
+            )
+        saved_width = saved.out_dim if saved.out_dim is not None else saved.weight_out_dim
+        if saved_width is not None and saved_width != out_dim:
+            recorded = (
+                f"records out_dim={saved.out_dim}"
+                if saved.out_dim is not None
+                else f"stores a {saved.weight_out_dim}-wide projector"
+            )
+            raise ValueError(
+                f"Cannot resume: the checkpoint {recorded} but this invocation "
+                f"requests --out-dim {out_dim}. Relational resume keeps the "
+                "requested width instead of inheriting the saved one; pass "
+                f"--out-dim {saved_width} to resume it."
+            )
+    return {
+        "ssl_method": "relational",
+        "ssl_head": SSL_HEAD_BY_METHOD["relational"],
+        "out_dim": out_dim,
+        **_resolve_common_recipe(args, saved),
+    }
+
+
+def _resolve_dino_ssl_config(
+    args: argparse.Namespace,
+    saved: _SavedSSLState | None,
+    resume_ckpt: dict[str, Any] | None,
+    model_name: str,
+) -> dict[str, Any]:
+    from otuformer.training.dino import (
+        DINO_DEFAULTS,
+        DINO_FIXED_CONFIG,
+        preflight_dino_prototypes,
+    )
+
+    for name in _SSL_RELATIONAL_ONLY:
+        if _ssl_explicit(args, name):
+            raise ValueError(
+                f"--{name.replace('_', '-')} is not applicable to "
+                "--ssl-method dino; omit it or use --ssl-method relational."
+            )
+    out_dim = _positive_int(
+        _resolve_inherited_ssl_value(args, "out_dim", 256, saved)
+    )
+    if out_dim is None:
+        raise ValueError("--out-dim must be a positive integer.")
+    values = {
+        name: _resolve_inherited_ssl_value(args, name, default, saved)
+        for name, default in DINO_DEFAULTS.items()
+    }
+    prototypes = _positive_int(values["dino_prototypes"])
+    if prototypes is None or prototypes < DINO_PROTOTYPES_MIN:
+        raise ValueError(
+            f"--dino-prototypes must be an integer >= {DINO_PROTOTYPES_MIN}, "
+            f"got {values['dino_prototypes']!r}."
+        )
+    if values["dino_centering"] not in DINO_CENTERING_MODES:
+        raise ValueError(
+            f"--dino-centering must be one of {', '.join(DINO_CENTERING_MODES)}, "
+            f"got {values['dino_centering']!r}."
+        )
+    koleo_weight = _validate_koleo_weight(values["koleo_weight"])
+
+    effective: dict[str, Any] = {
+        "ssl_method": "dino",
+        "ssl_head": SSL_HEAD_BY_METHOD["dino"],
+        "out_dim": out_dim,
+        "dino_prototypes": prototypes,
+        "dino_centering": values["dino_centering"],
+        "koleo_weight": koleo_weight,
+        **_resolve_common_recipe(args, saved),
+    }
+    if effective["dino_centering"] == "ema":
+        effective["dino_center_momentum"] = 0.9
+    else:
+        effective["dino_sinkhorn_iterations"] = 3
+    effective.update(DINO_FIXED_CONFIG)
+
+    if saved is not None and saved.identity is not None and saved.identity[0] == "dino":
+        # A DINO payload records its whole recipe; a missing field is damaged
+        # metadata, never a reason to fall back to this invocation or a default.
+        mode_field = (
+            "dino_center_momentum"
+            if saved.config.get("dino_centering") == "ema"
+            else "dino_sinkhorn_iterations"
+        )
+        required = (
+            "out_dim",
+            "dino_prototypes",
+            "dino_centering",
+            "koleo_weight",
+            mode_field,
+            *DINO_FIXED_CONFIG,
+        )
+        missing = [name for name in required if saved.config.get(name) is None]
+        if missing:
+            raise ValueError(
+                "Cannot resume DINO: the checkpoint records no "
+                + ", ".join(missing)
+                + ". A DINO payload must record its effective recipe; values are "
+                "never filled in from this invocation or from current defaults."
+            )
+
+    if saved is not None:
+        # The mode-specific constants are fixed settings too: a checkpoint that
+        # records a different momentum/iteration count cannot be resumed at this
+        # version's value without silently changing its recipe.
+        mode_fixed = {"dino_center_momentum": 0.9, "dino_sinkhorn_iterations": 3}
+        for name, value in {**DINO_FIXED_CONFIG, **mode_fixed}.items():
+            recorded = saved.config.get(name)
+            if recorded is None:
+                continue
+            # ``dino_weight_norm_api`` names a parameterisation, not an
+            # implementation: releases that recorded ``legacy`` used the same
+            # weight_g/weight_v layout this version builds directly.
+            matches = (
+                check_dino_weight_norm_api_record(recorded)
+                if name == "dino_weight_norm_api"
+                else recorded == value
+            )
+            if not matches:
+                raise ValueError(
+                    f"Checkpoint records {name}={recorded!r}, but this version "
+                    f"implements only {value!r}; fixed DINO settings are not "
+                    "migrated between versions."
+                )
+        if saved.identity is None:
+            raise ValueError(
+                "Cannot resume as DINO: the checkpoint records no recognizable "
+                "SSL identity, so its method and prototype state cannot be "
+                "validated. Start a new run instead."
+            )
+
+    preflight_dino_prototypes(out_dim, prototypes, str(effective["dino_centering"]))
+
+    if saved is not None and saved.identity is not None and saved.identity[0] == "dino":
+        # The checkpoint's recorded architecture wins over the caller default,
+        # so the validation probe cannot be built from the wrong backbone.
+        resume_model = str(saved.config.get("model_name") or model_name)
+        _validate_dino_resume_payload(
+            resume_ckpt,
+            effective,
+            resume_model,
+            getattr(args, "max_epochs", None),
+        )
+    return effective
+
+
+def _assert_complete_ssl_projector(
+    state: dict[str, Any], model: OTUFormerEncoder, out_dim: int, label: str
+) -> None:
+    expected = {
+        key: value
+        for key, value in model.state_dict().items()
+        if key.startswith("projector.")
+    }
+    missing = sorted(set(expected) - set(state))
+    if missing:
+        raise ValueError(
+            f"DINO resume state {label!r} is missing projector parameter(s) "
+            f"{missing[:2]}; a complete D-dimensional MLP is required."
+        )
+    unexpected = sorted(
+        key for key in state if key.startswith("projector.") and key not in expected
+    )
+    if unexpected:
+        raise ValueError(
+            f"DINO resume state {label!r} stores unexpected projector parameter(s) "
+            f"{unexpected[:2]}; the prototype layer belongs to dino_objective."
+        )
+    for key, value in expected.items():
+        if tuple(state[key].shape) != tuple(value.shape):
+            raise ValueError(
+                f"DINO resume state {label!r} has {key} with shape "
+                f"{tuple(state[key].shape)} instead of {tuple(value.shape)}; the "
+                f"recorded out_dim={out_dim} does not fit the saved weights."
+            )
+
+
+def _validate_dino_objective_state(
+    state: dict[str, Any], out_dim: int, prototypes: int, centering: str
+) -> None:
+    expected = {
+        "student_prototypes.weight_g": (prototypes, 1),
+        "student_prototypes.weight_v": (prototypes, out_dim),
+        "teacher_prototypes.weight_g": (prototypes, 1),
+        "teacher_prototypes.weight_v": (prototypes, out_dim),
+    }
+    missing = sorted(set(expected) - set(state))
+    if missing:
+        raise ValueError(
+            "DINO objective state is incomplete: missing " + ", ".join(missing) + "."
+        )
+    for key, shape in expected.items():
+        if tuple(state[key].shape) != shape:
+            raise ValueError(
+                f"DINO objective state {key} has shape "
+                f"{tuple(state[key].shape)} instead of {shape}."
+            )
+    for key in ("student_prototypes.weight_g", "teacher_prototypes.weight_g"):
+        if not torch.equal(state[key], torch.ones_like(state[key])):
+            raise ValueError(
+                f"DINO objective state {key} must be exactly one; the fixed "
+                "prototype scale is never inherited or migrated."
+            )
+    has_center = "cls_center" in state
+    if centering == "ema":
+        if not has_center:
+            raise ValueError(
+                "DINO EMA centering requires the 'cls_center' objective buffer."
+            )
+        if tuple(state["cls_center"].shape) != (1, prototypes):
+            raise ValueError(
+                "DINO objective 'cls_center' has shape "
+                f"{tuple(state['cls_center'].shape)} instead of (1, {prototypes})."
+            )
+    elif has_center:
+        raise ValueError(
+            "Sinkhorn-Knopp DINO checkpoints must not store an EMA 'cls_center'."
+        )
+    unexpected = sorted(set(state) - set(expected) - {"cls_center"})
+    if unexpected:
+        raise ValueError(
+            "DINO objective state stores unexpected entry " + unexpected[0] + "."
+        )
+
+
+def _validate_adamw_param_group(group: dict, label: str) -> None:
+    """Require the AdamW hyperparameter fields a resumed step() reads.
+
+    ``Optimizer.load_state_dict()`` accepts a parameter group without them and
+    training then raises ``KeyError`` on the first ``step()``.
+    """
+    if not isinstance(group, dict):
+        raise ValueError(f"{label} requires an optimizer parameter group mapping.")
+    # lr, betas, eps and weight_decay are read by AdamW.step(); the remaining
+    # flags fall back to the optimizer defaults, so only these four are required.
+    missing = [
+        name for name in ("lr", "betas", "eps", "weight_decay") if name not in group
+    ]
+    if missing:
+        raise ValueError(
+            f"{label} requires a complete AdamW parameter group; missing "
+            + ", ".join(missing)
+            + "."
+        )
+
+    def finite(name: str, minimum: float, strict: bool) -> float:
+        value = group[name]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(
+                f"{label} requires a numeric AdamW {name}, got {value!r}."
+            )
+        value = float(value)
+        lower_ok = value > minimum if strict else value >= minimum
+        if not math.isfinite(value) or not lower_ok:
+            raise ValueError(
+                f"{label} requires a finite AdamW {name} "
+                f"{'>' if strict else '>='} {minimum}, got {value!r}."
+            )
+        return value
+
+    finite("lr", 0.0, False)
+    finite("eps", 0.0, True)
+    finite("weight_decay", 0.0, False)
+    betas = group["betas"]
+    if (
+        not isinstance(betas, (list, tuple))
+        or len(betas) != 2
+        or not all(
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(float(value))
+            and 0.0 <= float(value) < 1.0
+            for value in betas
+        )
+    ):
+        raise ValueError(
+            f"{label} requires AdamW betas as two finite values in [0, 1), "
+            f"got {betas!r}."
+        )
+
+
+def _continues_recorded_plan(epoch: int, recorded_epochs: int | None) -> bool:
+    """True when the checkpoint was not produced by an extended run.
+
+    Only an unextended payload describes a rectangular ``original_max_epochs *
+    steps_per_epoch`` plan. ``epoch < original_max_epochs - 1`` proves that: an
+    extended checkpoint is saved at the original plan's final epoch, so a later
+    epoch means the loader length already changed. The unknown-``args`` case is
+    treated as a same-plan resume, matching ``_build_pretrain_schedules``.
+    """
+    if recorded_epochs is None:
+        return True
+    return epoch < int(recorded_epochs) - 1
+
+
+def _validate_saved_progress(
+    resume_ckpt: dict[str, Any], requested_max_epochs: int | None, label: str
+) -> None:
+    """Reject progress that no schedule can continue from, before any output.
+
+    Uses only values already recorded in the payload, so it can never depend on
+    the current DataLoader length. Extensions are legitimate for every
+    ``step >= current`` target: ``--max-epochs`` only chooses the target, so it
+    can neither create nor remove remaining steps.
+    """
+    epoch = resume_ckpt.get("epoch")
+    iteration = resume_ckpt.get("iteration")
+    schedule = resume_ckpt.get("schedule")
+    for name, value in (("epoch", epoch), ("iteration", iteration)):
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(
+                f"{label} requires {name} to be an integer >= 0, got {value!r}."
+            )
+    if not isinstance(epoch, int) or not isinstance(iteration, int):
+        return
+    if iteration < epoch + 1:
+        raise ValueError(
+            f"{label} requires iteration to cover the completed epochs; got "
+            f"epoch={epoch} and iteration={iteration}."
+        )
+    if not isinstance(schedule, dict):
+        return
+    counts = {}
+    for name in ("original_max_epochs", "total_steps", "steps_per_epoch"):
+        value = schedule.get(name)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value < 1
+        ):
+            # A method-specific preflight reports malformed metadata in detail.
+            return
+        counts[name] = value
+    original_epochs = counts["original_max_epochs"]
+    total_steps = counts["total_steps"]
+    steps_per_epoch = counts["steps_per_epoch"]
+    saved_args = resume_ckpt.get("args")
+    recorded_epochs = (
+        saved_args.get("max_epochs") if isinstance(saved_args, dict) else None
+    )
+    if isinstance(recorded_epochs, bool) or not isinstance(recorded_epochs, int):
+        recorded_epochs = None
+    if iteration > total_steps:
+        raise ValueError(
+            f"{label} found iteration={iteration} beyond the recorded plan of "
+            f"{total_steps} steps; the checkpoint cannot be resumed."
+        )
+    # A completed epoch only proves `steps_per_epoch` steps when the payload still
+    # describes the original rectangle. An extension keeps its earlier, possibly
+    # shorter DataLoader, so iteration counts a mixed number of steps and only
+    # the at-least-one-step-per-epoch bound above applies.
+    rectangular = (
+        recorded_epochs == original_epochs
+        and total_steps == original_epochs * steps_per_epoch
+    )
+    if rectangular and iteration < (epoch + 1) * steps_per_epoch:
+        raise ValueError(
+            f"{label} found iteration={iteration}, which does not cover the "
+            f"{epoch + 1} completed epochs of {steps_per_epoch} recorded steps "
+            "each."
+        )
+    # ``_build_pretrain_schedules`` has exactly two branches, so the progress
+    # check mirrors them instead of inventing a third rule.
+    if requested_max_epochs is None:
+        # No target chosen; only the plan-independent bounds above apply.
+        return
+    if requested_max_epochs < original_epochs:
+        # Already rejected by the schedule builder, but checked here so the
+        # failure happens before any output exists.
+        raise ValueError(
+            f"{label} cannot decrease the original plan: --max-epochs "
+            f"{requested_max_epochs} < recorded {original_epochs}."
+        )
+    if requested_max_epochs == original_epochs:
+        capacity = (epoch + 1) * steps_per_epoch
+        if iteration > capacity:
+            # The rebuilt schedule is the original rectangle, so it cannot cover
+            # both the recorded progress and the epochs that still have to train.
+            raise ValueError(
+                f"{label} found iteration={iteration} at epoch={epoch}, but a "
+                f"same-plan resume leaves only {capacity} steps for the epochs "
+                f"already completed. Use --max-epochs > {original_epochs} to "
+                "extend a run whose DataLoader length changed."
+            )
+        # Same-plan resume: the schedule is the original rectangle, so progress
+        # must sit exactly on a recorded epoch boundary. Any other value leaves
+        # too few schedule entries for the epochs that still have to train.
+        expected = (epoch + 1) * steps_per_epoch
+        if rectangular and iteration != expected:
+            raise ValueError(
+                f"{label} found iteration={iteration} at epoch={epoch}, but the "
+                f"recorded {original_epochs} x {steps_per_epoch} plan places that "
+                f"boundary at {expected}. Use --max-epochs > {original_epochs} to "
+                "extend a run whose loader length changed."
+            )
+        return
+    # Extension: the schedule is rebuilt from `iteration` onward, so any recorded
+    # iteration is resumable as long as a further epoch is requested.
+    if requested_max_epochs <= epoch + 1:
+        raise ValueError(
+            f"{label} cannot continue: the checkpoint completed epoch {epoch}, "
+            f"so --max-epochs must exceed {epoch + 1}."
+        )
+
+
+def _validate_dino_resume_payload(
+    resume_ckpt: dict[str, Any] | None,
+    effective: dict[str, Any],
+    model_name: str,
+    requested_max_epochs: int | None,
+) -> None:
+    """Strictly validate a DINO resume before any output is created."""
+    from otuformer.utils.checkpoint import preserved_rng, resolve_register_layout
+
+    if resume_ckpt is None:
+        return
+    states: dict[str, dict[str, Any]] = {}
+    for key in _REGISTER_RESUME_KEYS:
+        state = resume_ckpt.get(key)
+        if not isinstance(state, dict) or not state:
+            raise ValueError(
+                f"DINO resume requires a complete {key!r} encoder state; the "
+                "inference alias cannot substitute for a missing encoder."
+            )
+        states[key] = state
+    objective_state = resume_ckpt.get("dino_objective")
+    if not isinstance(objective_state, dict) or not objective_state:
+        raise ValueError(
+            "DINO resume requires the training-only 'dino_objective' state."
+        )
+    # Optimizer/schedule/progress must be present and structurally usable, so an
+    # incomplete payload cannot reach the training loop or append to a log.
+    for key in ("optimizer", "schedule", "epoch", "iteration", "rng_state"):
+        if resume_ckpt.get(key) is None:
+            raise ValueError(
+                f"DINO resume requires the saved {key!r} state; an incomplete "
+                "DINO payload is not resumable."
+            )
+    rng_state = resume_ckpt["rng_state"]
+    if not isinstance(rng_state, dict) or not {"python", "numpy", "torch"} <= set(
+        rng_state
+    ):
+        raise ValueError(
+            "DINO resume requires a complete rng_state (python, numpy, torch); "
+            "resuming without it would restart the mask and shuffle sequence."
+        )
+    # Reuse the actual restore rule inside an RNG-preserving guard: a null or
+    # malformed stream fails here instead of mid-training.
+    from otuformer.utils.checkpoint import preserved_rng
+
+    try:
+        with preserved_rng():
+            _restore_rng_state(rng_state)
+    except Exception as exc:
+        raise ValueError(
+            f"DINO resume requires a restorable rng_state: {exc}"
+        ) from exc
+
+    def integer(name: str, value: Any, minimum: int) -> int:
+        if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+            raise ValueError(
+                f"DINO resume requires {name} to be an integer >= {minimum}, "
+                f"got {value!r}."
+            )
+        return value
+
+    epoch = integer("epoch", resume_ckpt["epoch"], 0)
+    iteration = integer("iteration", resume_ckpt["iteration"], 0)
+    if iteration < epoch + 1:
+        raise ValueError(
+            "DINO resume requires iteration to cover the completed epochs; "
+            f"got epoch={epoch} and iteration={iteration}."
+        )
+
+    optimizer_state = resume_ckpt["optimizer"]
+    if (
+        not isinstance(optimizer_state, dict)
+        or not optimizer_state.get("param_groups")
+        or not isinstance(optimizer_state.get("state"), dict)
+        or not optimizer_state["state"]
+    ):
+        raise ValueError(
+            "DINO resume requires a complete optimizer state with parameter "
+            "groups and non-empty parameter state."
+        )
+    group_params: list[Any] = []
+    for index, group in enumerate(optimizer_state["param_groups"]):
+        # The group count, envelope and ordered ids are validated against the
+        # rebuilt partition below.
+        _validate_adamw_param_group(group, "DINO resume")
+        saved_params = group.get("params")
+        if (
+            not isinstance(saved_params, list)
+            or not saved_params
+            or len(set(map(str, saved_params))) != len(saved_params)
+        ):
+            raise ValueError(
+                f"DINO resume requires optimizer group {index} to list "
+                f"non-empty, non-duplicate parameter ids, got {saved_params!r}."
+            )
+        group_params.extend(saved_params)
+    orphaned = sorted(
+        str(key)
+        for key in optimizer_state["state"]
+        if str(key) not in {str(item) for item in group_params}
+    )
+    if orphaned:
+        # load_state_dict() would silently drop these; the run would then train
+        # with a different parameter group than the one recorded.
+        raise ValueError(
+            "DINO resume found optimizer state for parameters outside the saved "
+            f"parameter group: {', '.join(orphaned[:3])}."
+        )
+
+    schedule_state = resume_ckpt["schedule"]
+    required_schedule = (
+        "original_max_epochs",
+        "total_steps",
+        "steps_per_epoch",
+        "warmup_steps",
+        "last_lr",
+        "final_lr",
+    )
+    missing_schedule = [
+        key
+        for key in required_schedule
+        if not isinstance(schedule_state, dict) or key not in schedule_state
+    ]
+    if missing_schedule:
+        raise ValueError(
+            "DINO resume requires complete schedule metadata; missing "
+            + ", ".join(missing_schedule)
+            + "."
+        )
+
+    def schedule_count(name: str, minimum: int) -> int:
+        value = schedule_state[name]
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(
+                f"DINO resume requires schedule.{name} to be an integer, got "
+                f"{value!r}."
+            )
+        if value < minimum:
+            raise ValueError(
+                f"DINO resume requires schedule.{name} >= {minimum}, got {value!r}."
+            )
+        return value
+
+    def schedule_lr(name: str) -> float:
+        value = schedule_state[name]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(
+                f"DINO resume requires a numeric schedule.{name}, got {value!r}."
+            )
+        if not math.isfinite(float(value)) or float(value) < 0.0:
+            raise ValueError(
+                f"DINO resume requires schedule.{name} to be finite and >= 0, "
+                f"got {value!r}."
+            )
+        return float(value)
+
+    original_epochs = schedule_count("original_max_epochs", 1)
+    total_steps = schedule_count("total_steps", 1)
+    steps_per_epoch = schedule_count("steps_per_epoch", 1)
+    warmup_steps = schedule_count("warmup_steps", 0)
+    schedule_lr("last_lr")
+    schedule_lr("final_lr")
+    # Cross-field consistency: the recorded plan must be able to contain the
+    # completed epochs and the warmup it claims.
+    if total_steps < original_epochs or total_steps < steps_per_epoch:
+        raise ValueError(
+            "DINO resume requires schedule.total_steps to cover the recorded "
+            f"plan; got total_steps={total_steps}, "
+            f"original_max_epochs={original_epochs}, "
+            f"steps_per_epoch={steps_per_epoch}."
+        )
+    saved_args = resume_ckpt.get("args")
+    recorded_epochs = (
+        saved_args.get("max_epochs", original_epochs)
+        if isinstance(saved_args, dict) else original_epochs
+    )
+    # Extensions retain original_max_epochs but can change DataLoader length;
+    # only an unextended plan has the original rectangular step count.
+    if recorded_epochs == original_epochs and total_steps != original_epochs * steps_per_epoch:
+        raise ValueError(
+            "DINO resume requires schedule.total_steps to equal "
+            "original_max_epochs * steps_per_epoch for the original plan."
+        )
+    # warmup_steps describes the original rectangle; an extension keeps it while
+    # total_steps covers the new, possibly shorter plan.
+    if recorded_epochs == original_epochs and warmup_steps > total_steps:
+        raise ValueError(
+            "DINO resume requires schedule.warmup_steps <= total_steps; got "
+            f"{warmup_steps} > {total_steps}."
+        )
+    _validate_saved_progress(
+        resume_ckpt, requested_max_epochs, "DINO resume"
+    )
+    if "center" in resume_ckpt:
+        raise ValueError(
+            "DINO resume must not carry a top-level 'center'; the K-dimensional "
+            "center belongs to dino_objective."
+        )
+
+    out_dim = int(effective["out_dim"])
+    image_size = resolve_training_image_size(resume_ckpt)
+    with preserved_rng():
+        probe = OTUFormerEncoder(
+            model_name=model_name,
+            out_dim=out_dim,
+            return_patch_tokens=True,
+            img_size=image_size,
+            pretrained=False,
+        )
+    layouts = {
+        key: resolve_register_layout(resume_ckpt, state, probe.backbone)
+        for key, state in states.items()
+    }
+    if len(set(layouts.values())) != 1:
+        raise ValueError(
+            "DINO resume encoder states disagree on the register layout: "
+            + json.dumps({key: list(value) for key, value in layouts.items()})
+            + "."
+        )
+    added = layouts["model_state_dict"][1]
+    with preserved_rng():
+        expected = OTUFormerEncoder(
+            model_name=model_name,
+            out_dim=out_dim,
+            return_patch_tokens=True,
+            img_size=image_size,
+            pretrained=False,
+            **({"reg_tokens": 4} if added else {}),
+        )
+    # The restore is strict, so the envelope must match exactly: every expected
+    # tensor present, and no unknown tensor beyond the training-only normalization
+    # that masked-feature checkpoints add.
+    expected_state = expected.state_dict()
+    norm_state = {
+        f"_pretrain_final_norm.{name}": value
+        for name, value in expected.backbone.norm.state_dict().items()
+    }
+    for key, state in states.items():
+        restore_state = dict(expected_state)
+        # ``validate_pretrain_backbone()`` registers the alias, so the strict
+        # restore always expects it. Accepting a partial or absent alias here
+        # would defer a guaranteed KeyError/missing-keys failure to mid-training.
+        restore_state.update(norm_state)
+        missing = sorted(set(restore_state) - set(state))
+        unexpected = sorted(set(state) - set(restore_state))
+        mismatched = sorted(
+            name for name in set(restore_state) & set(state)
+            if not isinstance(state[name], torch.Tensor)
+            or state[name].shape != restore_state[name].shape
+        )
+        if missing or unexpected or mismatched:
+            raise ValueError(
+                f"DINO resume state {key!r} does not match a strict restore: "
+                f"{len(missing)} missing (e.g. {missing[:2]}), "
+                f"{len(unexpected)} unexpected (e.g. {unexpected[:2]}) and "
+                f"{len(mismatched)} shape mismatches (e.g. {mismatched[:2]})."
+            )
+        _assert_encoder_state_matches(state, expected, key)
+        _assert_complete_ssl_projector(state, expected, out_dim, key)
+        center = state.get("center")
+        if isinstance(center, torch.Tensor) and int(torch.count_nonzero(center)) != 0:
+            raise ValueError(
+                f"DINO resume requires a zero encoder center in {key!r}; the "
+                "K-dimensional center lives in dino_objective."
+            )
+    _validate_dino_objective_state(
+        objective_state,
+        out_dim,
+        int(effective["dino_prototypes"]),
+        str(effective["dino_centering"]),
+    )
+
+    # AdamW restores state by parameter-group position, not by shape. Rebuild
+    # the same encoder/patch/prototype order used by the training optimizer.
+    from otuformer.training.dino import DINOObjective as _ProbeObjective
+
+    patch_config = _resolve_patch_config(argparse.Namespace(), resume_ckpt)
+    with preserved_rng():
+        probe_patch = PatchObjective(
+            str(patch_config["patch_loss"]),
+            expected.backbone.num_features,
+            patch_config["ibot_prototypes"],
+        )
+        probe_objective = _ProbeObjective(
+            out_dim,
+            int(effective["dino_prototypes"]),
+            str(effective["dino_centering"]),
+        )
+    if probe_patch.trainable_parameters():
+        try:
+            probe_patch.load_state_dict(resume_ckpt.get("patch_objective", {}), strict=True)
+        except (TypeError, RuntimeError) as exc:
+            raise ValueError(f"DINO resume has invalid patch_objective state: {exc}") from exc
+    probe_groups = _pretrain_optimizer_groups(
+        expected,
+        probe_patch,
+        probe_objective,
+        weight_decay=0.05,
+        norm_bias_weight_decay=bool(effective["norm_bias_weight_decay"]),
+    )
+    # The same layout validation the trainer uses for the real optimizer runs
+    # here, so a payload it would reject never reaches output creation.
+    with preserved_rng():
+        probe_optimizer = torch.optim.AdamW(probe_groups, lr=0.0, weight_decay=0.0)
+    _validate_pretrain_optimizer_layout(
+        probe_optimizer,
+        optimizer_state,
+        norm_bias_weight_decay=bool(effective["norm_bias_weight_decay"]),
+        decay_partition_empty=_pretrain_decay_partition_empty(
+            expected, probe_patch, probe_objective
+        ),
+        label="DINO resume",
+    )
+    # AdamW indexes state across the concatenation of the built groups, so the
+    # no-decay policy changes the global order the saved ids refer to.
+    probe_parameters = [
+        parameter for group in probe_groups for parameter in group["params"]
+    ]
+    if len(group_params) != len(probe_parameters):
+        raise ValueError(
+            f"DINO resume expects {len(probe_parameters)} optimizer parameters, "
+            f"the checkpoint records {len(group_params)}."
+        )
+    frozen = probe_objective.trainable_parameters()[0]
+    for state_key, parameter in zip(group_params, probe_parameters):
+        if isinstance(state_key, bool) or not isinstance(state_key, int):
+            raise ValueError("DINO resume optimizer parameter ids must be integers.")
+        if state_key not in optimizer_state["state"]:
+            if epoch == 0 and parameter is frozen:
+                continue
+            raise ValueError(
+                f"DINO resume is missing AdamW state for optimizer parameter "
+                f"{state_key} of shape {tuple(parameter.shape)}."
+            )
+        entry = optimizer_state["state"][state_key]
+        if not isinstance(entry, dict):
+            raise ValueError(
+                f"DINO resume optimizer state {state_key!r} is not a parameter "
+                "state mapping."
+            )
+        missing_fields = [
+            field for field in ("step", "exp_avg", "exp_avg_sq") if field not in entry
+        ]
+        if missing_fields:
+            raise ValueError(
+                f"DINO resume optimizer state {state_key!r} is missing "
+                + ", ".join(missing_fields) + "."
+            )
+        step = entry["step"]
+        if (
+            not isinstance(step, torch.Tensor)
+            or step.ndim != 0
+            or not torch.isfinite(step)
+            or step.item() < 1
+            or step.item() != int(step.item())
+        ):
+            raise ValueError(f"DINO resume optimizer state {state_key} has invalid AdamW step.")
+        for name in ("exp_avg", "exp_avg_sq"):
+            value = entry[name]
+            if not isinstance(value, torch.Tensor) or value.shape != parameter.shape:
+                raise ValueError(
+                    f"DINO resume optimizer state {state_key} has {name} with "
+                    f"the wrong shape; expected {tuple(parameter.shape)}."
+                )
+
+
+def _validate_relational_optimizer_preflight(
+    resume_ckpt: dict[str, Any], model_name: str, effective: dict[str, Any]
+) -> None:
+    """Prove the saved optimizer groups map onto the rebuilt relational layout.
+
+    The trainer runs the same check before restoring, so doing it here only
+    moves an existing rejection in front of output creation.
+    """
+    from otuformer.utils.checkpoint import (
+        preserved_rng,
+        resolve_checkpoint_state_dict,
+        resolve_register_layout,
+    )
+
+    state, _ = resolve_checkpoint_state_dict(resume_ckpt)
+    image_size = resolve_training_image_size(resume_ckpt)
+    out_dim = int(effective["out_dim"])
+    policy = bool(effective["norm_bias_weight_decay"])
+    # The payload's own model name wins over an omitted invocation default.
+    resolved_name = resolve_checkpoint(resume_ckpt, model_name).model_name
+    with preserved_rng():
+        probe = OTUFormerEncoder(
+            model_name=resolved_name,
+            out_dim=out_dim,
+            return_patch_tokens=True,
+            img_size=image_size,
+            pretrained=False,
+        )
+    _, added = resolve_register_layout(resume_ckpt, state, probe.backbone)
+    with preserved_rng():
+        expected = OTUFormerEncoder(
+            model_name=resolved_name,
+            out_dim=out_dim,
+            return_patch_tokens=True,
+            img_size=image_size,
+            pretrained=False,
+            **({"reg_tokens": 4} if added else {}),
+        )
+        patch_config = _resolve_patch_config(argparse.Namespace(), resume_ckpt)
+        probe_patch = PatchObjective(
+            str(patch_config["patch_loss"]),
+            expected.backbone.num_features,
+            patch_config["ibot_prototypes"],
+        )
+    probe_groups = _pretrain_optimizer_groups(
+        expected,
+        probe_patch,
+        None,
+        weight_decay=0.05,
+        norm_bias_weight_decay=policy,
+    )
+    with preserved_rng():
+        probe_optimizer = torch.optim.AdamW(probe_groups, lr=0.0, weight_decay=0.0)
+    _validate_pretrain_optimizer_layout(
+        probe_optimizer,
+        resume_ckpt["optimizer"],
+        norm_bias_weight_decay=policy,
+        decay_partition_empty=_pretrain_decay_partition_empty(
+            expected, probe_patch, None
+        ),
+        label="pretrain resume",
+    )
+
+
+def resolve_pretrain_ssl_config(
+    args: argparse.Namespace, resume_ckpt: dict[str, Any] | None
+) -> dict[str, Any]:
+    """Resolve the effective SSL recipe before any output is created.
+
+    Returns a fresh effective-config dictionary and never mutates the requested
+    namespace. A recognized checkpoint supplies the method, and DINO resumes
+    inherit the operator-configurable DINO values they omit.
+    """
+    requested_method = _ssl_option(args, "ssl_method", "relational")
+    if requested_method not in SSL_METHODS:
+        raise ValueError(
+            f"--ssl-method must be one of {', '.join(SSL_METHODS)}, "
+            f"got {requested_method!r}."
+        )
+    saved = _saved_ssl_state(resume_ckpt)
+    saved_method = saved.identity[0] if saved is not None and saved.identity else None
+
+    method = requested_method
+    if saved_method is not None:
+        if _ssl_explicit(args, "ssl_method") and requested_method != saved_method:
+            raise ValueError(
+                "Cannot change SSL method on resume: the checkpoint records "
+                f"ssl_method={saved_method!r}, got --ssl-method "
+                f"{requested_method!r}. Start a new run instead."
+            )
+        method = requested_method if _ssl_explicit(args, "ssl_method") else saved_method
+
+    if resume_ckpt is not None:
+        epoch = resume_ckpt.get("epoch")
+        saved_args = resume_ckpt.get("args")
+        _validate_pretrain_epoch_target(
+            getattr(args, "max_epochs", None),
+            epoch + 1 if isinstance(epoch, int) and not isinstance(epoch, bool) else 0,
+            resume_ckpt.get("schedule"),
+            saved_args.get("max_epochs") if isinstance(saved_args, dict) else None,
+        )
+
+    model_name = str(_ssl_option(args, "model_name", ""))
+    if method == "relational":
+        effective = _resolve_relational_ssl_config(args, saved)
+        if resume_ckpt is not None and "optimizer" in resume_ckpt:
+            # The relational path never builds the training models here, so the
+            # saved groups are proven against a rebuilt parameter partition
+            # before any output exists.
+            _validate_relational_optimizer_preflight(
+                resume_ckpt, model_name, effective
+            )
+    else:
+        effective = _resolve_dino_ssl_config(args, saved, resume_ckpt, model_name)
+    return effective
+
+
+def _ssl_display_config(effective: dict[str, Any]) -> dict[str, Any]:
+    """Display projection: inactive DINO fields become null, never omitted."""
+    display = {
+        "ssl_method": effective["ssl_method"],
+        "ssl_head": effective["ssl_head"],
+        "out_dim": effective["out_dim"],
+        "teacher_temp_warmup_ratio": effective["teacher_temp_warmup_ratio"],
+        "norm_bias_weight_decay": effective["norm_bias_weight_decay"],
+    }
+    dino_fields = (
+        "dino_prototypes",
+        "dino_centering",
+        "koleo_weight",
+        "dino_hidden_dim",
+        "dino_mlp_init_std",
+        "dino_mlp_init_bias",
+        "dino_weight_norm_api",
+        "dino_prototype_scale",
+        "dino_freeze_last_layer_epochs",
+        "dino_target_dtype",
+        "dino_center_momentum",
+        "dino_sinkhorn_iterations",
+        "koleo_normalize_eps",
+        "koleo_distance_eps",
+        "koleo_log_eps",
+    )
+    active = effective["ssl_method"] == "dino"
+    for name in dino_fields:
+        display[name] = effective.get(name) if active else None
+    return display
+
+
+def _effective_pretrain_ssl_config(args: argparse.Namespace) -> dict[str, Any]:
+    """Reuse a supplied effective slot, else resolve once before output setup."""
+    supplied = getattr(args, "ssl_config_effective", None)
+    if isinstance(supplied, dict) and supplied:
+        return supplied
+    resume_ckpt = getattr(args, "resume_state", None)
+    if resume_ckpt is None and getattr(args, "resume", ""):
+        resume_ckpt = load_checkpoint(Path(args.resume))
+        # Direct callers: hand the loaded payload on so it is read only once.
+        args.resume_state = resume_ckpt
+    effective = resolve_pretrain_ssl_config(args, resume_ckpt)
+    args.ssl_config_effective = effective
+    return effective
+
+
 # In-memory handoff attributes; never serialized into a checkpoint's ``args``.
-_UNSAVED_ARGS = frozenset({"resume_state", "pretrain_settings"})
+_UNSAVED_ARGS = frozenset(
+    {"resume_state", "pretrain_settings", "ssl_config_effective"}
+)
 # Names that must never reach a saved ``args`` block.
 _TRANSIENT_ARGS = frozenset(
     {
@@ -2372,6 +4374,7 @@ def preflight_pretrain_resume(
             f"{architecture.model_name!r}, which conflicts with the explicit "
             f"--model-name {model_name!r}."
         )
+    _validate_saved_progress_basics(resume_ckpt, "Resume")
     image_size = resolve_training_image_size(resume_ckpt)
     mode, actual = _resume_register_plan(
         resume_ckpt, architecture.model_name, image_size, architecture.embedding_dim
@@ -2415,27 +4418,6 @@ NEW_RUN_TEACHER_TEMP_BAND = (0.001, 100.0)
 HISTORICAL_TEACHER_TEMP_START = 0.04
 HISTORICAL_TEACHER_TEMP_END = 0.07
 HISTORICAL_TEACHER_TEMP_WARMUP_RATIO = 0.7
-
-
-def _validate_pretrain_resume_source(checkpoint: dict[str, Any] | None) -> None:
-    """Reject a cross-branch (v2/DINO) training payload by key presence."""
-    if not isinstance(checkpoint, dict):
-        return
-    config = checkpoint.get("config")
-    config = config if isinstance(config, dict) else {}
-    markers = [
-        f"config.{key}" for key in ("ssl_method", "ssl_head") if key in config
-    ]
-    if "dino_objective" in checkpoint:
-        markers.append("dino_objective")
-    if markers:
-        raise ValueError(
-            "Cannot resume this training payload: it records "
-            + ", ".join(markers)
-            + ". Cross-branch pretraining resume (v2/DINO state) is unsupported; "
-            "re-run with the branch and version that produced it, or start a new "
-            "run on this branch."
-        )
 
 
 def _strict_equal(left: object, right: object) -> bool:
@@ -2500,6 +4482,61 @@ def _requested_choice(
             f"{option} must be one of: {', '.join(choices)}; got {value!r}."
         )
     return value
+
+
+def _validate_saved_progress_basics(resume_ckpt: dict[str, Any], label: str) -> None:
+    """Shape checks that no saved training plan can make valid.
+
+    Runs for every method before any output exists. Checks that depend on the
+    recorded schedule plan live in the method-specific preflight, so an unread
+    or legacy payload is not rejected here.
+    """
+    for key in ("optimizer", "schedule", "epoch", "iteration"):
+        value = resume_ckpt.get(key)
+        if value is None:
+            continue
+        if key == "optimizer":
+            if not isinstance(value, dict) or not value.get("param_groups"):
+                raise ValueError(f"{label} found a malformed optimizer state.")
+            for group in value["param_groups"]:
+                _validate_adamw_param_group(group, label)
+        elif key == "schedule":
+            if not isinstance(value, dict):
+                raise ValueError(f"{label} found a malformed schedule state.")
+        else:
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(
+                    f"{label} requires {key} to be an integer >= 0, got {value!r}."
+                )
+    epoch = resume_ckpt.get("epoch")
+    iteration = resume_ckpt.get("iteration")
+    schedule = resume_ckpt.get("schedule")
+    if not isinstance(epoch, int) or not isinstance(iteration, int):
+        return
+    if iteration < epoch + 1:
+        raise ValueError(
+            f"{label} requires iteration to cover the completed epochs; got "
+            f"epoch={epoch} and iteration={iteration}."
+        )
+    if not isinstance(schedule, dict):
+        return
+    if int(schedule.get("total_steps", iteration)) < iteration:
+        raise ValueError(
+            f"{label} found iteration={iteration} beyond the recorded plan of "
+            f"{schedule.get('total_steps')} steps."
+        )
+
+
+def _new_register_position_tensor(model: OTUFormerEncoder) -> torch.Tensor | None:
+    """The four registered prefix positional entries, or ``None`` if patch-only."""
+    backbone = model.backbone
+    prefix = int(getattr(backbone, "num_prefix_tokens", 1))
+    pos = getattr(backbone, "pos_embed", None)
+    if pos is None or pos.shape[1] <= prefix:
+        return None
+    if pos.shape[1] - prefix != int(getattr(backbone.patch_embed, "num_patches", -1)):
+        return None
+    return pos[:, 1:prefix]
 
 
 def _validate_relational_combination(views: str, center: str) -> None:
@@ -2648,7 +4685,6 @@ def _resolve_relational_target_config(
     Pure: no logging, no transform derivation, no mutation of ``args`` or the
     loaded checkpoint.
     """
-    _validate_pretrain_resume_source(checkpoint)
     saved_args: dict[str, Any] = {}
     config: dict[str, Any] = {}
     if isinstance(checkpoint, dict):
@@ -2943,7 +4979,6 @@ def run_pretrain(
     resume_ckpt: dict[str, Any] | None = getattr(args, "resume_state", None)
     if getattr(args, "resume", "") and resume_ckpt is None:
         resume_ckpt = load_checkpoint(Path(args.resume))
-    _validate_pretrain_resume_source(resume_ckpt)
     # The handoff is a one-shot input, never a cache: a caller that reuses its
     # Namespace after changing a request must be resolved again.
     settings = vars(args).pop("pretrain_settings", None)
@@ -2969,6 +5004,9 @@ def run_pretrain(
     device = _resolve_device(args.device)
     print(f"Resolved device: {device}")
 
+    # Effective SSL config must be resolved before any output mutation; the CLI
+    # usually supplies it, and a direct caller resolves it here exactly once.
+    ssl_config = _effective_pretrain_ssl_config(args)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -2997,6 +5035,7 @@ def run_pretrain(
     patch_strategy = settings.masking_strategy
     patch_ratio = patch_config["mask_ratio_resolved"]
     print("Patch config: " + json.dumps(patch_config, sort_keys=True))
+    print("SSL config: " + json.dumps(_ssl_display_config(ssl_config), sort_keys=True))
 
     # One source of truth: the recipe already resolved, validated and (on a
     # resume) drift-checked the ordinary augmentation config.
@@ -3059,6 +5098,10 @@ def run_pretrain(
             f"{', '.join(RELATIONAL_TEACHER_VIEW_CHOICES)}; got "
             f"{relational_views!r}."
         )
+    # The weak teacher views are relational-only: DINO keeps two global views.
+    include_weak_teacher_views = (
+        ssl_config["ssl_method"] == "relational" and relational_views == "weak"
+    )
     ds = MultiCropDataset(
         csv_path=Path(args.train_data) if getattr(args, "train_data", "") else None,
         images_dir=Path(args.input_images_dir),
@@ -3067,10 +5110,12 @@ def run_pretrain(
         local_crops=args.local_crops,
         augmentation_profile=profile,
         orientation_policy=policy,
-        include_weak_teacher_views=relational_views == "weak",
+        include_weak_teacher_views=include_weak_teacher_views,
         augmentation_config=pretrain_recipe.augmentation_config,
         weak_teacher_augmentation_config=(
             pretrain_recipe.weak_teacher_augmentation_config
+            if include_weak_teacher_views
+            else None
         ),
     )
     loader = DataLoader(
@@ -3082,9 +5127,16 @@ def run_pretrain(
         persistent_workers=args.num_workers > 0,
     )
 
+    ssl_method = str(ssl_config["ssl_method"])
+    effective_out_dim = int(ssl_config["out_dim"])
+    if effective_out_dim != int(args.out_dim):
+        print(
+            f"[Info] Effective SSL out_dim: {effective_out_dim} "
+            f"(requested {args.out_dim} is inherited from the checkpoint)."
+        )
     student_kwargs: dict[str, Any] = {
         "model_name": model_name,
-        "out_dim": args.out_dim,
+        "out_dim": effective_out_dim,
         "return_patch_tokens": True,
         "img_size": global_crop_size,
     }
@@ -3125,6 +5177,29 @@ def run_pretrain(
         hidden_dim=student.backbone.num_features,
         ibot_prototypes=patch_config["ibot_prototypes"],
     ).to(device)
+    dino_objective: DINOObjective | None = None
+    koleo_enabled = False
+    if ssl_method == "dino":
+        dino_objective = DINOObjective(
+            effective_out_dim,
+            int(ssl_config["dino_prototypes"]),
+            str(ssl_config["dino_centering"]),
+        ).to(device)
+        # The resolver already probed before output setup; also check the real
+        # device layers before restoring state or entering the training loop.
+        validate_dino_prototype_layer(dino_objective.student_prototypes)
+        validate_dino_prototype_layer(dino_objective.teacher_prototypes)
+        koleo_enabled = float(ssl_config["koleo_weight"]) > 0.0
+        if resume_ckpt is None:
+            # Fresh DINO only: reference head init, then teacher synchronization.
+            _initialize_dino_student_projector(student)
+            _synchronize_dino_teacher(student, teacher, dino_objective)
+        if int(args.max_epochs) <= 1 and resume_ckpt is None:
+            print(
+                "[Warning] --max-epochs 1 keeps the DINO prototype direction "
+                "frozen for the whole run (the freeze covers absolute epoch 0 "
+                "only). This is valid for a smoke run, not for real training."
+            )
     # The training loop always uses forward_pretrain (even for patch_loss=none),
     # so every mode validates the backbone before the loop starts.
     require_intermediates = patch_mode == "masked-feature"
@@ -3145,8 +5220,18 @@ def run_pretrain(
                 "--patch-loss none."
             )
 
+    wd_policy = bool(ssl_config["norm_bias_weight_decay"])
+    has_decay_partition = wd_policy or not _pretrain_decay_partition_empty(
+        student, objective, dino_objective
+    )
     optimizer = torch.optim.AdamW(
-        _student_optimizer_parameters(student, objective),
+        _pretrain_optimizer_groups(
+            student,
+            objective,
+            dino_objective,
+            weight_decay=args.weight_decay,
+            norm_bias_weight_decay=wd_policy,
+        ),
         lr=args.lr,
         weight_decay=args.weight_decay,
     )
@@ -3163,11 +5248,16 @@ def run_pretrain(
     )
 
     if resume_ckpt is not None:
-        if "student" in resume_ckpt:
+        if dino_objective is not None:
+            # DINO never leaves random state behind: the preflight already
+            # validated complete encoder states, so this load is strict.
+            student.load_state_dict(resume_ckpt["student"], strict=True)
+            teacher.load_state_dict(resume_ckpt["teacher"], strict=True)
+        elif "student" in resume_ckpt:
             student.load_state_dict(resume_ckpt["student"], strict=False)
         elif "model_state_dict" in resume_ckpt:
             student.load_state_dict(resume_ckpt["model_state_dict"], strict=False)
-        if "teacher" in resume_ckpt:
+        if dino_objective is None and "teacher" in resume_ckpt:
             teacher.load_state_dict(resume_ckpt["teacher"], strict=False)
         saved_patch_state = resume_ckpt.get("patch_objective")
         if patch_mode in ("masked-feature", "ibot") and (
@@ -3185,21 +5275,36 @@ def run_pretrain(
                     "Cannot resume: patch_objective state is malformed or "
                     f"incompatible with patch_loss={patch_mode!r}: {exc}"
                 ) from exc
+        if dino_objective is not None:
+            try:
+                dino_objective.load_state_dict(
+                    resume_ckpt["dino_objective"], strict=True
+                )
+            except (KeyError, RuntimeError) as exc:
+                raise ValueError(
+                    "Cannot resume: dino_objective state is missing or "
+                    f"incompatible with the resolved DINO config: {exc}"
+                ) from exc
         if "optimizer" in resume_ckpt:
+            _validate_pretrain_optimizer_layout(
+                optimizer,
+                resume_ckpt["optimizer"],
+                norm_bias_weight_decay=wd_policy,
+                decay_partition_empty=not has_decay_partition,
+                label="pretrain resume",
+            )
             optimizer.load_state_dict(resume_ckpt["optimizer"])
+            _report_restored_weight_decay(
+                optimizer,
+                requested_weight_decay=float(args.weight_decay),
+                norm_bias_weight_decay=wd_policy,
+                has_decay_partition=has_decay_partition,
+                label="pretrain resume",
+            )
         if "center" in resume_ckpt:
             teacher.center.copy_(resume_ckpt["center"].to(device))
         start_epoch = int(resume_ckpt.get("epoch", -1)) + 1
         global_step = int(resume_ckpt.get("iteration", start_epoch * max(1, len(loader))))
-        legacy_max_epochs = resume_ckpt.get("args", {}).get("max_epochs")
-        if (
-            resume_ckpt.get("schedule") is None
-            and legacy_max_epochs is not None
-            and args.max_epochs != int(legacy_max_epochs)
-        ):
-            raise ValueError(
-                "Cannot extend a legacy checkpoint without schedule metadata."
-            )
         print(
             f"[Info] Resume from {resume_path} at epoch {start_epoch}, iteration {global_step}"
         )
@@ -3217,6 +5322,9 @@ def run_pretrain(
             and isinstance(resume_ckpt.get("args"), dict)
             and "max_epochs" in resume_ckpt["args"]
             else None
+        ),
+        teacher_temp_warmup_ratio=float(
+            ssl_config["teacher_temp_warmup_ratio"]
         ),
     )
     total_steps = len(lr_schedule)
@@ -3270,8 +5378,10 @@ def run_pretrain(
         pbar = tqdm(loader, desc=f"Epoch {epoch + 1}/{args.max_epochs}", ncols=150)
         for step, views in enumerate(pbar):
             views = [v.to(device) for v in views]
+            # DINO keeps the two global views only; the weak relational views
+            # are relational-only.
             expected_views = (
-                (4 if relational_views == "weak" else 2) + int(args.local_crops)
+                (4 if include_weak_teacher_views else 2) + int(args.local_crops)
             )
             if len(views) != expected_views:
                 raise ValueError(
@@ -3304,7 +5414,9 @@ def run_pretrain(
                 # Ordinary forwards serve the patch objective, the ordinary
                 # center population and the ordinary-A diagnostic cosine.
                 need_ordinary_both = (
-                    patch_mode != "none" or relational_center_source == "ordinary"
+                    dino_objective is not None
+                    or patch_mode != "none"
+                    or relational_center_source == "ordinary"
                 )
                 ordinary_outputs = [
                     teacher.forward_pretrain(
@@ -3313,33 +5425,40 @@ def run_pretrain(
                     )
                     for gv in global_views[: 2 if need_ordinary_both else 1]
                 ]
-                if relational_views == "weak":
-                    relational_outputs = [
-                        teacher.forward_pretrain(wv) for wv in weak_views
-                    ]
+                if dino_objective is None:
+                    if relational_views == "weak":
+                        relational_outputs = [
+                            teacher.forward_pretrain(wv) for wv in weak_views
+                        ]
+                    else:
+                        relational_outputs = ordinary_outputs
+
+                    def _centered(
+                        outputs: list[Any],
+                    ) -> list[torch.Tensor]:
+                        return [
+                            F.normalize(out.cls - center_before, dim=-1)
+                            for out in outputs
+                        ]
+
+                    relational_teacher = _centered(relational_outputs)
+                    ordinary_teacher = _centered(ordinary_outputs)
+                    center_inputs = (
+                        ordinary_teacher
+                        if relational_center_source == "ordinary"
+                        else relational_teacher
+                    )
+                    teacher.center = _update_teacher_center(
+                        center_before, torch.cat(center_inputs, dim=0)
+                    )
+                    teacher_global = relational_teacher
                 else:
-                    relational_outputs = ordinary_outputs
-
-                def _centered(
-                    outputs: list[Any],
-                ) -> list[torch.Tensor]:
-                    return [
-                        F.normalize(out.cls - center_before, dim=-1)
-                        for out in outputs
-                    ]
-
-                relational_teacher = _centered(relational_outputs)
-                ordinary_teacher = _centered(ordinary_outputs)
-                center_inputs = (
-                    ordinary_teacher
-                    if relational_center_source == "ordinary"
-                    else relational_teacher
-                )
-                teacher.center = _update_teacher_center(
-                    center_before, torch.cat(center_inputs, dim=0)
-                )
-                teacher_global = relational_teacher
+                    teacher_global = []
                 for t_out in ordinary_outputs:
+                    if dino_objective is not None:
+                        # DINO sends the unmodified normalized bottleneck to its
+                        # prototype layer and bypasses the legacy center path.
+                        teacher_global.append(t_out.cls)
                     teacher_tokens.append(t_out.tokens)
                     teacher_final_four.append(t_out.final_four)
                     if patch_mode == "ibot":
@@ -3350,13 +5469,31 @@ def run_pretrain(
             temp_student = float(temp_student_schedule[iter_idx])
             temp_teacher = float(teacher_temp_schedule[iter_idx])
 
-            loss_global = _compute_global_loss(
-                student_global,
-                teacher_global,
-                temp_student,
-                temp_teacher,
-                relational_pairing=relational_pairing,
-            )
+            dino_teacher_logits: list[torch.Tensor] = []
+            dino_teacher_targets: list[torch.Tensor] = []
+            if dino_objective is None:
+                loss_global = _compute_global_loss(
+                    student_global,
+                    teacher_global,
+                    temp_student,
+                    temp_teacher,
+                    relational_pairing=relational_pairing,
+                )
+            else:
+                with torch.no_grad():
+                    dino_teacher_logits = [
+                        dino_objective.teacher_logits(t) for t in teacher_global
+                    ]
+                    # Built once from the cached pre-EMA logits and reused for
+                    # every global and local pair in this iteration.
+                    dino_teacher_targets = dino_objective.teacher_targets(
+                        dino_teacher_logits, temp_teacher
+                    )
+                loss_global = _compute_dino_global_loss(
+                    [dino_objective(z) for z in student_global],
+                    dino_teacher_targets,
+                    temp_student,
+                )
 
             patch_loss_raw = torch.zeros((), device=device)
             center_logits: list[torch.Tensor] = []
@@ -3433,25 +5570,61 @@ def run_pretrain(
             for lv in local_views:
                 l_proj, _ = student(lv)
                 local_student_projs.append(l_proj)
-            loss_local = _compute_local_loss(
-                local_student_projs, teacher_global, temp_student, temp_teacher
-            )
+            if dino_objective is None:
+                loss_local = _compute_local_loss(
+                    local_student_projs, teacher_global, temp_student, temp_teacher
+                )
+            else:
+                loss_local = _compute_dino_local_loss(
+                    [dino_objective(z) for z in local_student_projs],
+                    dino_teacher_targets,
+                    temp_student,
+                )
+
+            koleo_raw = torch.zeros((), device=device)
+            koleo_pool = [0, 0]
+            if dino_objective is not None and koleo_enabled:
+                koleo_raw, koleo_pool = _compute_koleo_raw(student_tokens, ssl_config)
 
             total_loss = (
                 loss_global
                 + args.lambda_local * loss_local
                 + patch_loss_weighted
             )
+            if dino_objective is not None and koleo_enabled:
+                total_loss = (
+                    total_loss + float(ssl_config["koleo_weight"]) * koleo_raw
+                )
 
             optimizer.zero_grad()
             total_loss.backward()
-            trainable_params = optimizer.param_groups[0]["params"]
+            trainable_params = [
+                parameter
+                for group in optimizer.param_groups
+                for parameter in group["params"]
+            ]
+            if dino_objective is not None and epoch == 0:
+                # Absolute zero-based epoch 0 freezes the prototype direction.
+                # Zero gradients are not enough: AdamW would still decay it.
+                for parameter in dino_objective.trainable_parameters():
+                    parameter.grad = None
             grad_norm = _compute_grad_norm_parameters(trainable_params)
             nn.utils.clip_grad_norm_(trainable_params, max_norm=3.0)
             optimizer.step()
 
             m = float(momentum_schedule[iter_idx])
             update_teacher(student, teacher, m)
+            if dino_objective is not None:
+                # Name-matched EMA keeps both prototype layers aligned; the
+                # fixed scales stay one and are absent from the optimizer.
+                update_teacher(
+                    dino_objective.student_prototypes,
+                    dino_objective.teacher_prototypes,
+                    m,
+                )
+                # EMA centering only, once per completed step, from the cached
+                # pre-EMA logits used to build this step's targets.
+                dino_objective.update_center(dino_teacher_logits)
             if patch_mode == "ibot":
                 update_teacher(
                     objective.student_ibot_head, objective.teacher_ibot_head, m
@@ -3461,11 +5634,18 @@ def run_pretrain(
                     torch.cat(center_logits, dim=0),
                 )
 
-            with torch.no_grad():
-                cosine_sim = F.cosine_similarity(
-                    student_global[0].mean(dim=0, keepdim=True),
-                    ordinary_teacher[0].mean(dim=0, keepdim=True),
-                ).item()
+            if dino_objective is None:
+                with torch.no_grad():
+                    cosine_sim = F.cosine_similarity(
+                        student_global[0].mean(dim=0, keepdim=True),
+                        ordinary_teacher[0].mean(dim=0, keepdim=True),
+                    ).item()
+            else:
+                with torch.no_grad():
+                    cosine_sim = F.cosine_similarity(
+                        student_global[0].mean(dim=0, keepdim=True),
+                        teacher_global[0].mean(dim=0, keepdim=True),
+                    ).item()
 
             if global_step % max(1, args.log_every_n_steps) == 0:
                 with torch.no_grad():
@@ -3474,11 +5654,56 @@ def run_pretrain(
                     )
                 total_value = float(total_loss.item())
                 weighted_value = float(patch_loss_weighted.item())
+                ssl_metrics: dict[str, object] = {
+                    "ssl_method": ssl_method,
+                    "dino_centering": (
+                        str(ssl_config["dino_centering"])
+                        if dino_objective is not None
+                        else None
+                    ),
+                    "koleo_weight": (
+                        float(ssl_config["koleo_weight"])
+                        if dino_objective is not None
+                        else None
+                    ),
+                    "global_loss_weighted": float(loss_global.item()),
+                    "local_loss_weighted": float(
+                        args.lambda_local * loss_local.item()
+                    ),
+                }
+                if dino_objective is None:
+                    # Relational has no K-dimensional CLS center and no KoLeo.
+                    ssl_metrics["cls_center_norm"] = None
+                    ssl_metrics["koleo_status"] = "not-applicable"
+                else:
+                    center = dino_objective.cls_center
+                    ssl_metrics["cls_center_norm"] = (
+                        float(center.norm().item()) if center is not None else None
+                    )
+                    ssl_metrics.update(
+                        _dino_cls_diagnostics(
+                            dino_teacher_targets, dino_objective.prototypes
+                        )
+                    )
+                    ssl_metrics.update(
+                        _koleo_instant_metrics(
+                            ssl_config, koleo_enabled, koleo_raw, koleo_pool
+                        )
+                    )
                 patch_metrics: dict[str, object] = {
                     "patch_loss_raw": float(patch_loss_raw.item()),
                     "patch_loss_weighted": weighted_value,
+                    # A signed KoLeo contribution has no ordinary positive-loss
+                    # fraction, so the column is retired for the whole enabled run
+                    # (including batches that skip it).
                     "patch_loss_fraction_of_total": (
-                        weighted_value / total_value if total_value != 0.0 else 0.0
+                        None
+                        if koleo_enabled
+                        else (
+                            weighted_value / total_value
+                            if total_value != 0.0
+                            else 0.0
+                        )
                     ),
                     "requested_mask_ratio": patch_config["mask_ratio_requested"],
                 }
@@ -3509,17 +5734,28 @@ def run_pretrain(
                     lr=float(optimizer.param_groups[0]["lr"]),
                     teacher_temp=float(temp_teacher),
                     grad_norm=float(grad_norm),
-                    teacher_center_norm=float(teacher.center.norm().item()),
-                    cosine_similarity=float(cosine_sim),
+                    teacher_center_norm=(
+                        None
+                        if dino_objective is not None
+                        else float(teacher.center.norm().item())
+                    ),
+                    cosine_similarity=(
+                        None if dino_objective is not None else float(cosine_sim)
+                    ),
                     **instant_metrics,
                     **patch_metrics,
+                    **ssl_metrics,
                 )
 
             if step % 10 == 0 or step == len(loader) - 1:
                 cos_display = (
-                    f"{cosine_sim:.3e}"
-                    if abs(cosine_sim) < 1e-3
-                    else f"{cosine_sim:.4f}"
+                    "N/A"
+                    if dino_objective is not None
+                    else (
+                        f"{cosine_sim:.3e}"
+                        if abs(cosine_sim) < 1e-3
+                        else f"{cosine_sim:.4f}"
+                    )
                 )
                 pbar.set_postfix(
                     L=f"{total_loss.item():.2e}",
@@ -3557,7 +5793,6 @@ def run_pretrain(
                 "student": student.state_dict(),
                 "teacher": teacher.state_dict(),
                 "optimizer": optimizer.state_dict(),
-                "center": teacher.center.detach().cpu(),
                 "patch_objective": objective.state_dict(),
                 "rng_state": _capture_rng_state(),
                 "args": {
@@ -3567,8 +5802,11 @@ def run_pretrain(
                     and key not in _TRANSIENT_ARGS
                 },
                 "config": {
+                    # Effective SSL recipe: relational records its complete
+                    # identity pair and omits every DINO-exclusive field;
+                    # ``args`` keeps the requested invocation values.
+                    **ssl_config,
                     "model_name": model_name,
-                    "out_dim": args.out_dim,
                     "image_size": global_crop_size,
                     "register_tokens": actual_register_tokens,
                     "augmentation_profile": profile,
@@ -3583,6 +5821,14 @@ def run_pretrain(
                     "last_lr": float(optimizer.param_groups[0]["lr"]),
                 },
             }
+            if dino_objective is None:
+                # Relational keeps its historical top-level encoder center and
+                # owns no prototype state.
+                ckpt["center"] = teacher.center.detach().cpu()
+            else:
+                # DINO owns the K-dimensional center inside dino_objective and
+                # writes no top-level center.
+                ckpt["dino_objective"] = dino_objective.state_dict()
             ckpt_path = out_dir / f"SSL_epoch_{epoch + 1:04d}.pth"
             save_checkpoint(ckpt, ckpt_path)
             shutil.copy(str(ckpt_path), out_dir / "SSL_latest.pth")
@@ -3845,13 +6091,34 @@ def _expert_path_identity(
     check only answers whether the expert rows can seed one pseudo round. A
     duplicate resolved identity (alias) or a reference escaping the image root
     makes the checkpoint ineligible rather than failing ordinary training.
+
+    References are resolved with the same rule :class:`MetricDataset` uses:
+    direct path first, then the recursive relative/name index. Otherwise a CSV
+    that names bare filenames for a species-subdirectory tree reads fine during
+    training yet would be reported missing here.
     """
+    from otuformer.training.dataset import (
+        _build_recursive_index,
+        _resolve_image_path,
+        _supports_recursive_lookup,
+    )
+
     root = Path(images_root).resolve()
+    refs = [str(ref) for ref in image_refs]
+    by_relative: dict[str, Path] = {}
+    by_name: dict[str, list[Path]] = {}
+    if any(
+        _supports_recursive_lookup(ref) and not (root / Path(ref)).exists()
+        for ref in refs
+    ):
+        by_relative, by_name = _build_recursive_index(root)
     seen: set[object] = set()
-    for ref in image_refs:
-        text = str(ref)
-        path = Path(text)
-        target = path if path.is_absolute() else root / path
+    for text in refs:
+        try:
+            target = _resolve_image_path(root, text, by_relative, by_name)
+        except FileNotFoundError as exc:
+            # Several files share the bare name, so no single identity exists.
+            return False, f"ambiguous expert reference {text!r}: {exc}"
         try:
             resolved = target.resolve()
         except OSError as exc:
@@ -4162,6 +6429,42 @@ def _resolve_pseudo_ssl_path(cfg: dict, checkpoint: Path | None) -> Path:
     if _sha256_file(path) != recorded_sha:
         raise ValueError("recorded SSL checkpoint file SHA-256 does not match")
     return path
+
+
+def resolve_pseudo_ssl_source(
+    ssl_checkpoint: dict[str, Any], source_config: dict[str, Any]
+) -> tuple[str, str] | None:
+    """Validate the original SSL identity for a NEW pseudo round.
+
+    The original payload's actual ``model_state_dict`` decides its identity.
+    Fine-tune#1 may record a pair, but it is provenance only: it must match the
+    original and be SHA-anchored. An unknown original identity with no recorded
+    pair stays valid legacy behaviour; a recorded pair that cannot be verified
+    is rejected instead of being inherited.
+    """
+    from otuformer.utils.checkpoint import (
+        resolve_checkpoint_ssl_identity,
+        resolve_checkpoint_ssl_source,
+    )
+
+    state = ssl_checkpoint.get("model_state_dict")
+    original = None
+    if isinstance(state, dict) and state:
+        original = resolve_checkpoint_ssl_identity(ssl_checkpoint, state)
+    recorded = resolve_checkpoint_ssl_source({"config": source_config})
+    if recorded is None:
+        return original
+    if original is None:
+        raise ValueError(
+            "the pseudo source records an SSL source pair, but the original SSL "
+            "checkpoint's identity is unknown; a SHA-256 alone cannot verify it."
+        )
+    if recorded != original:
+        raise ValueError(
+            f"the pseudo source records SSL source identity {recorded}, which "
+            f"contradicts the original SSL checkpoint identity {original}."
+        )
+    return original
 
 
 def pseudo_cli_identity(
@@ -4915,9 +7218,6 @@ def run_finetune(
     device = _resolve_device(args.device)
     print(f"Resolved device: {device}")
 
-    out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
     resume_path = (
         Path(getattr(args, "resume", "")) if getattr(args, "resume", "") else None
     )
@@ -4940,6 +7240,21 @@ def run_finetune(
     previous_centers: torch.Tensor | None = None
     if resume_path is not None:
         _validate_finetune_resume_source(ckpt)
+    # Identity/lineage validation happens before the output directory can be
+    # created or cleared, for direct callers as well as the CLI.
+    preflight_finetune_source(ckpt, str(cfg.get("model_name") or args.model_name))
+    # Resume preserves the pair recorded in its own config; a new run derives it
+    # from the loaded SSL/metric payload. Neither path reopens the SSL file.
+    ssl_source_identity = _resolve_finetune_ssl_source(ckpt)
+    if pseudo_data is not None and resume_path is None:
+        # A new pseudo round cross-checks finetune#1's optional pair against the
+        # original SSL payload this run actually initializes from.
+        ssl_source_identity = resolve_pseudo_ssl_source(
+            ckpt, pseudo_data.get("source_config") or {}
+        )
+
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
     model_name = cfg.get("model_name", args.model_name)
     # ``encoder_out_dim`` sizes the pretrained projector; the fine-tune
     # embedding width (``out_dim``) is resolved separately below so
@@ -5622,6 +7937,17 @@ def run_finetune(
                             "ssl_initialization_checkpoint_sha256": ssl_initialization_sha
                         }
                         if ssl_initialization_sha
+                        else {}
+                    ),
+                    # Source lineage only: never active ssl_method/ssl_head, and
+                    # never a pair without its SHA anchor.
+                    **(
+                        {
+                            "ssl_source_method": ssl_source_identity[0],
+                            "ssl_source_head": ssl_source_identity[1],
+                        }
+                        if ssl_source_identity is not None
+                        and ssl_initialization_sha
                         else {}
                     ),
                     "freeze_ratio": args.freeze_ratio,

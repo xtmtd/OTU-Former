@@ -68,9 +68,12 @@ Relational-specific resume errors name their own cause and are not workarounds:
 - `partial relational target metadata` — the checkpoint has one of the new-style
   keys without the complete canonical bundle. It is not a legacy payload; start a
   new run or resume from an intact checkpoint.
-- `Cross-branch` — the checkpoint records a v2/DINO training state. Cross-branch
-  pretraining resume is unsupported; return to the branch and version that wrote
-  it. Read-only and downstream consumers are unaffected.
+- `cannot change SSL method on resume` — the checkpoint records
+the other `--ssl-method`. A method switch needs a new run; resuming within the
+recorded method stays supported, including a DINO payload.
+- `Unsupported SSL head` / `Unsupported SSL method` — the checkpoint's SSL
+  identity is missing or unreadable, so neither method can claim it. Start a new
+  run or resume from an intact checkpoint.
 - `conflicts with the recorded recipe value` — an explicit relational or
   temperature option differs from the checkpoint. A changed training recipe
   requires a new run.

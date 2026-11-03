@@ -39,7 +39,13 @@ def write_csv(path: Path, header, rows) -> Path:
     return path
 
 
-def tiny_checkpoint(tmp_path: Path, out_dim: int = 2, size: int = 32) -> Path:
+def tiny_checkpoint(
+    tmp_path: Path,
+    out_dim: int = 2,
+    size: int = 32,
+    config: dict | None = None,
+    name: str = "tiny.ckpt",
+) -> Path:
     from otuformer.training.model import OTUFormerEncoder
 
     model = OTUFormerEncoder(
@@ -48,13 +54,46 @@ def tiny_checkpoint(tmp_path: Path, out_dim: int = 2, size: int = 32) -> Path:
         pretrained=False,
         img_size=size,
     )
+    recorded = {"model_name": "vit_tiny_patch16_224", "out_dim": out_dim}
+    recorded.update(config or {})
     checkpoint = {
         "model_state_dict": model.state_dict(),
-        "config": {"model_name": "vit_tiny_patch16_224", "out_dim": out_dim},
+        "config": recorded,
         "args": {"global_crop_size": size},
     }
-    path = tmp_path / "tiny.ckpt"
+    path = tmp_path / name
     torch.save(checkpoint, path)
+    return path
+
+
+def metric_checkpoint(
+    tmp_path: Path, out_dim: int = 4, size: int = 32, config: dict | None = None
+) -> Path:
+    from otuformer.training.model import ArcFaceEmbeddingHead, OTUFormerEncoder
+
+    model = OTUFormerEncoder(
+        model_name="vit_tiny_patch16_224",
+        out_dim=out_dim,
+        pretrained=False,
+        img_size=size,
+    )
+    head = ArcFaceEmbeddingHead(model.backbone.num_features, out_dim)
+    state = {
+        key: value
+        for key, value in model.state_dict().items()
+        if not key.startswith("projector.")
+    }
+    state.update({f"projector.{k}": v for k, v in head.state_dict().items()})
+    recorded = {
+        "model_name": "vit_tiny_patch16_224",
+        "out_dim": out_dim,
+        "embedding_head": "arcface_mlp_512",
+    }
+    recorded.update(config or {})
+    path = tmp_path / "metric.ckpt"
+    torch.save(
+        {"model": state, "config": recorded, "args": {"global_crop_size": size}}, path
+    )
     return path
 
 
@@ -1351,3 +1390,98 @@ def test_failed_removal_keeps_the_original_error(tmp_path, monkeypatch, capsys):
     # The leftover file is named, so an operator can remove it by hand.
     assert "could not remove the partial attention pooling checkpoint" in output
     assert str(pool_path.parent) in output
+
+
+def test_extract_provenance_preserves_ssl_identity(tmp_path):
+    images, selector = images_and_manifest(tmp_path, rows=2)
+    bundle = bundle_for(images, selector)
+    sha = "0123456789abcdef" * 4
+
+    dino = tiny_checkpoint(
+        tmp_path,
+        out_dim=4,
+        config={"ssl_method": "dino", "ssl_head": "dino_mlp_2048"},
+        name="dino.ckpt",
+    )
+    dino_effective = _extract_embeddings_result(
+        dino, images, device="cpu", records=bundle, num_workers=0
+    ).effective["checkpoint"]
+    assert dino_effective["ssl_method"] == "dino"
+    assert dino_effective["ssl_head"] == "dino_mlp_2048"
+    # The DINO bottleneck is still read through the shared MLP layout.
+    assert dino_effective["embedding_head"] == "projection_mlp_2048"
+    assert "ssl_source_method" not in dino_effective
+
+    # A historical relational payload stays internally inferable but is not
+    # emitted as recorded identity.
+    historical = tiny_checkpoint(tmp_path, out_dim=4, name="historical.ckpt")
+    historical_effective = _extract_embeddings_result(
+        historical, images, device="cpu", records=bundle, num_workers=0
+    ).effective["checkpoint"]
+    assert "ssl_method" not in historical_effective
+    assert "ssl_source_method" not in historical_effective
+
+    # A metric descendant exposes only its recorded source pair.
+    metric = metric_checkpoint(
+        tmp_path,
+        config={
+            "ssl_source_method": "dino",
+            "ssl_source_head": "dino_mlp_2048",
+            "ssl_initialization_checkpoint_sha256": sha,
+        },
+    )
+    metric_effective = _extract_embeddings_result(
+        metric, images, device="cpu", records=bundle, num_workers=0
+    ).effective["checkpoint"]
+    assert metric_effective["embedding_head"] == "arcface_mlp_512"
+    assert "ssl_method" not in metric_effective
+    assert metric_effective["ssl_source_method"] == "dino"
+    assert metric_effective["ssl_source_head"] == "dino_mlp_2048"
+
+    # Shared consumers reject an unanchored or incomplete source pair.
+    for bad_config in (
+        {"ssl_source_method": "dino", "ssl_source_head": "dino_mlp_2048"},
+        {
+            "ssl_source_method": "dino",
+            "ssl_initialization_checkpoint_sha256": sha,
+        },
+    ):
+        broken = metric_checkpoint(tmp_path, config=bad_config)
+        with pytest.raises(ValueError, match="SHA|source|identity"):
+            _extract_embeddings_result(
+                broken, images, device="cpu", records=bundle, num_workers=0
+            )
+        broken.unlink()
+
+
+def test_dino_embedding_consumers_use_bottleneck_not_prototypes(tmp_path):
+    images, selector = images_and_manifest(tmp_path, rows=2)
+    bundle = bundle_for(images, selector)
+    # Embedding-only DINO payload: extraction must not need the objective state.
+    dino = tiny_checkpoint(
+        tmp_path,
+        out_dim=4,
+        config={"ssl_method": "dino", "ssl_head": "dino_mlp_2048"},
+        name="dino.ckpt",
+    )
+
+    default = _extract_embeddings_result(
+        dino, images, device="cpu", records=bundle, num_workers=0
+    )
+    assert default.effective["checkpoint"]["ssl_method"] == "dino"
+    assert default.effective["feature_chain"]["output_dim"] == 192
+
+    projected = _extract_embeddings_result(
+        dino,
+        images,
+        device="cpu",
+        records=bundle,
+        use_projector_output=True,
+        num_workers=0,
+    )
+    dim_columns = projected.frame.filter(like="dim_")
+    # D, the bottleneck width, never K.
+    assert dim_columns.shape[1] == 4
+    norms = np.linalg.norm(dim_columns.to_numpy(), axis=1)
+    assert np.allclose(norms, 1.0, atol=1e-5)
+    assert projected.effective["checkpoint"]["embedding_head"] == "projection_mlp_2048"

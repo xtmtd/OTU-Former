@@ -50,7 +50,41 @@ otuformer pretrain \
 
 **默认值：** `256`
 
-SSL 投影头输出维度。
+SSL 投影头输出维度 D。在 relational 中它是投影宽度；在 DINO 中它是 `--use-projector-output` 提取出的瓶颈宽度，绝不是原型数量 K。
+
+DINO 原型层仅用于训练：`--use-projector-output` 返回归一化后的 D 维瓶颈，K 维 logits 从不作为提取输出。
+
+原型数量、目标机制与 KoLeo 权重都是记录下来的生效设置。`--resume` 时省略则继承、显式给出则必须一致；运行中途切换 EMA/Sinkhorn-Knopp 或修改 KoLeo 权重会被拒绝，relational 续跑保留本次请求的维度而不是继承已保存的维度。
+
+### `--ssl-method`
+
+**默认值：** `relational` · **允许值：** relational / dino
+
+全局 CLS 训练方法。`relational` 保持现有的批内相对相似度蒸馏不变，仍是新运行的默认值。`dino` 为可选方法：学生端去匹配由另一个全局裁剪构建的教师原型分布，因此同一个全局裁剪不会与自身配对。DINO 不是 relational 运行的续跑；省略该选项即继承 `--resume` 检查点中保存的方法，显式切换方法会在写入任何输出之前被拒绝。
+
+### `--dino-prototypes`
+
+**默认值：** `64` · **允许值：** 大于等于 2 的整数
+
+`--ssl-method dino` 的原型字典大小 K，与 `--ibot-prototypes`（默认 512）相互独立。两者都可调，都不从图像、物种或 OTU 数量推断：原型索引不是 OTU、不是解剖部位、也不是物种。K 远大于 batch 也是合法的，但分配内存随 K x 2B 增长、原型存储随 K x D 增长，没有自动内存预算。
+
+K 远大于 2B 也是合法的，但分配内存随 K x 2B 增长、原型存储随 K x D 增长，没有自动内存预算。原型索引不是物种、不是解剖部位、也不是 OTU。在 relational 下显式使用会被拒绝（包括显式给出默认值），省略的取值在那里不产生任何作用。
+
+### `--dino-centering`
+
+**默认值：** `ema` · **允许值：** ema / sinkhorn-knopp
+
+DINO 教师目标机制。`ema` 从教师 logits 中减去一个指数滑动平均中心。`sinkhorn-knopp` 则把两个教师全局裁剪放在一起、用固定的三次迭代做分配平衡，并且不保留 EMA CLS 中心。两者是互斥替代，不是叠加操作，该选项也从不改变独立的 iBOT patch 目标。
+
+Sinkhorn-Knopp 平衡的是软原型使用率，不是物种频率；小批量或同质批次提供的分配证据有限：完全相同的均匀预测也可能看起来“平衡”。该选项从不改变独立的 iBOT patch 目标。
+
+### `--koleo-weight`
+
+**默认值：** `0.0` · **允许值：** 大于等于 0 的有限值
+
+可选的 KoLeo 正则项权重，作用于每个全局裁剪归一化后的骨干 CLS 特征，两个裁剪的损失相加。`0` 表示禁用并跳过全部近邻搜索，没有单独的开关。任何大于 0 的取值都会启用一个实验性项：它让默认提取所用的 CLS 空间更分散，但同时也会排斥同种个体与近重复样本；批量小于 2 时会被跳过；重复记录或重合向量可能贡献很大的单裁剪正值 `-log(1e-8*sqrt(H)+1e-8)`，从而主导求和后的梯度（以及裁剪后的步长）。建议先评估默认的 `ema`/无 KoLeo 基线，再逐项改变。
+
+该设置仅适用于 DINO，续跑时不可更改；一旦其取值大于 0，整轮运行的 `patch_loss_fraction_of_total` 列都会作废，因为带符号的贡献不具备通常意义上的正损失占比。
 
 ### `--max-epochs`
 
@@ -69,6 +103,14 @@ warmup/cosine 调度之前的基础学习率。
 **默认值：** `0.05`
 
 AdamW 权重衰减系数。
+
+### `--no-norm-bias-weight-decay`
+
+**默认值：** `No`
+
+让 bias 与归一化层的 affine 参数不做权重衰减。省略该选项即保持历史行为：对所有可训练参数统一套用 `--weight-decay`。两种 SSL 方法均适用，并且仍然只做一次联合梯度裁剪。续跑时省略会继承已保存的策略；请求的其他 `--weight-decay` 不会生效，改变开关策略本身会被拒绝。
+
+参与豁免的归一化模块包括 LayerNorm、GroupNorm、BatchNorm、InstanceNorm 以及可用时的 RMSNorm。token、通用 scale 与 DINO 的 prototype 方向仍保留衰减；系数、LR/EMA 调度与裁剪阈值均不变。
 
 ### `--warmup-epochs`
 
@@ -316,6 +358,22 @@ PyTorch/MKL 使用的 CPU 线程数。
 - `logs/instant_metrics.pretrain.csv` — 每次迭代的训练指标
 - `logs/training_curves_pretrain.pdf` — 训练曲线图
 - `logs/umap.train.epoch_<N>.pdf` — 周期 UMAP 图（未禁用时）
+
+### 每次迭代的训练指标
+
+`logs/instant_metrics.pretrain.csv` 增加了每轮恒定的 `ssl_method`、`dino_centering`、`koleo_weight` 设置，以及新的 CLS 诊断、加权分量损失与 KoLeo 状态/计数。这是本次发布中唯一变更的表结构；`metrics.pretrain.csv`（每 epoch 指标）与微调即时指标保持原有列。
+
+- 迁移后行上的空白 `ssl_method` 表示未知/未记录，而不是“relational”：续跑时的调用参数不会回填到历史行。
+- 在已记录方法下，空白的不适用设置表示 N/A（例如 relational 下的 `dino_centering`，或 `koleo_weight=0` 时留空的 KoLeo 损失单元），JSON 形式记为 `null`，而不是观测到的 0。
+- `teacher_center_norm` 与 `cosine_similarity` 仅属于 relational；DINO 记录 `cls_center_norm`（仅 EMA）并显示 `COS=N/A`，启动时的 `[Info] Initial cosine similarity` 仍然打印。
+- `global_loss_weighted` 与 `global_loss` 有意相等，因为不存在全局权重；`local_loss_weighted` 则包含 `lambda_local`。
+- `cls_prototype_perplexity` 只描述教师分配边缘分布：Sinkhorn-Knopp 部分强加了平衡，完全相同的均匀预测也可能看起来“平衡”，因此它既不能证明没有塌缩，也不是学到形态结构的证据。
+
+KoLeo 数值带符号，其贡献不具备通常意义上的正损失占比；一旦 `koleo_weight > 0`，旧的 `patch_loss_fraction_of_total` 列在整轮运行中都记为 N/A，包括因批量过小跳过 KoLeo 的批次。KoLeo 禁用或处于 relational 时，保留原有的正占比含义。
+
+续跑后的即时指标文件可以同时包含历史空白身份行与当前带标签的行，绘图两者都会保留。外部合并分析必须保留这些未知分组（例如 `dropna=False`）而不能自行推断；损失量级也不可在不同方法或不同目标机制之间当作同一目标来比较。
+
+较早的 OTU-Former 版本可能忽略 DINO 身份与目标状态，通过宽松加载把 DINO 检查点当作 relational 续跑。请只用明确支持该格式的版本续跑 DINO；新的加载器无法保护被旧版本打开的文件。
 
 嵌入质量指标使用共享的 [嵌入指标](embedding-metrics.cn.md) 定义与字段名。
 

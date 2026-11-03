@@ -16,7 +16,7 @@ Turning specimen photographs into reproducible OTUs usually means stitching an e
 ## Workflow Overview
 
 1. **`doctor`** — check the environment and dependencies.
-2. **`pretrain`** — self-supervised contrastive pretraining; no labels required.
+2. **`pretrain`** — self-supervised pretraining; no labels required. Relational CLS distillation is the default, and an optional DINO-style prototype objective adds Sinkhorn-Knopp targets and a KoLeo regularizer as explicit experiments (`--ssl-method dino`).
 3. **`finetune`** — supervised metric-learning finetuning with a selectable objective.
 4. **`extract`** — extract embeddings from images.
 5. **`cluster`** — UPGMA hierarchical clustering into morphological OTUs.

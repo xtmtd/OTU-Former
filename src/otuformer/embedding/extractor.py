@@ -809,6 +809,20 @@ def _load_model(
             },
             "requested_student": bool(use_student),
         }
+        # Only identities recorded in the payload config are provenance; a
+        # historical relational inference stays internal for compatibility.
+        recorded = ckpt.get("config")
+        recorded = recorded if isinstance(recorded, dict) else {}
+        if architecture.ssl_identity is not None and recorded.get("ssl_method"):
+            effective["checkpoint"]["ssl_method"] = architecture.ssl_identity[0]
+            effective["checkpoint"]["ssl_head"] = architecture.ssl_identity[1]
+        if architecture.ssl_source_identity is not None:
+            effective["checkpoint"]["ssl_source_method"] = (
+                architecture.ssl_source_identity[0]
+            )
+            effective["checkpoint"]["ssl_source_head"] = (
+                architecture.ssl_source_identity[1]
+            )
     return model, checkpoint_size
 
 

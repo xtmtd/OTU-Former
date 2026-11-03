@@ -346,6 +346,15 @@ otuformer finetune --train-data labels.csv --input-images-dir DATA_ROOT/dorsal \
 
 A separate image-only `--visualize-data` CSV may be used for UMAP; supervised metrics require at least two label classes.
 
+**SSL lineage.** Fine-tune outputs record their own metric
+`embedding_head` and, when the source identity is known and anchored by
+`ssl_initialization_checkpoint_sha256`, the separate provenance fields
+`ssl_source_method`/`ssl_source_head` (for example a DINO-initialized ArcFace
+head). These are source lineage only: a fine-tuned checkpoint never declares an
+active `ssl_method`, never inherits the DINO prototype/bottleneck head, and never
+stores the training objective. Historical fine-tune checkpoints without the pair
+stay valid, and a resume preserves whatever its own checkpoint recorded.
+
 To add images to known classes, train with a CSV containing the union of old and
 new labeled images, keep the same `--out-dir`, resume from the latest fine-tune
 checkpoint, and increase `--finetune-epochs`:
