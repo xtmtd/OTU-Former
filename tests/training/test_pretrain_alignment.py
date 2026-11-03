@@ -72,6 +72,25 @@ def test_same_plan_pretrain_resume_rejects_changed_loader_length():
         )
 
 
+@pytest.mark.parametrize("steps_per_epoch,global_step,total_steps", [(2, 4, 12), (8, 10, 42)])
+def test_extended_schedule_rejects_return_to_original_plan(
+    steps_per_epoch, global_step, total_steps
+):
+    saved = {
+        "original_max_epochs": 4,
+        "total_steps": total_steps,
+        "steps_per_epoch": steps_per_epoch,
+        "warmup_steps": 0,
+        "last_lr": 0.0002,
+        "final_lr": 0.00001,
+    }
+    with pytest.raises(ValueError, match="extended.*original"):
+        trainer._build_pretrain_schedules(
+            _schedule_args(4), saved, steps_per_epoch=steps_per_epoch,
+            global_step=global_step, completed_epochs=2, original_max_epochs=6,
+        )
+
+
 def test_finetune_resume_rejects_different_class_mapping():
     with pytest.raises(ValueError, match="class labels differ"):
         trainer._validate_finetune_resume(
@@ -90,6 +109,11 @@ def test_legacy_pretrain_same_plan_resume_is_allowed():
     )
 
     assert len(lr) == 20
+
+
+@pytest.mark.parametrize("recorded_epochs", [5, "5"])
+def test_legacy_pretrain_same_target_remains_valid(recorded_epochs):
+    trainer._validate_pretrain_epoch_target(5, 2, None, recorded_epochs)
 
 
 def test_legacy_pretrain_resume_rejects_missing_schedule_metadata():

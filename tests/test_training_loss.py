@@ -12,8 +12,11 @@ from otuformer.training.loss import (
     LocalToGlobalLoss,
     SupConLoss,
     SubCenterArcFaceLoss,
+    dino_distillation_loss,
     ibot_patch_loss,
+    koleo_loss,
     masked_patch_cosine_loss,
+    sinkhorn_knopp_targets,
 )
 
 
@@ -482,3 +485,212 @@ def test_cb_drw_r_bar_moves_counts_to_the_weights_device():
     r_bar = _cb_drw_r_bar(mps_weights, torch.tensor([10.0, 128.0]))
 
     assert r_bar == pytest.approx(0.845792, abs=1e-4)
+
+
+# ---------------------------------------------------------------------------
+# DINO CLS objective mathematics (CLS distillation, Task 2)
+# ---------------------------------------------------------------------------
+
+
+def _reference_sinkhorn(logits, teacher_temp, iterations=3):
+    q = torch.exp(logits / teacher_temp).t()
+    q = q / q.sum()
+    prototypes, samples = q.shape
+    for _ in range(iterations):
+        q = q / q.sum(dim=1, keepdim=True)
+        q = q / prototypes
+        q = q / q.sum(dim=0, keepdim=True)
+        q = q / samples
+    return (q * samples).t()
+
+
+def test_dino_ce_uses_cached_detached_targets():
+    torch.manual_seed(0)
+    student_logits = torch.randn(6, 11, requires_grad=True)
+    teacher_logits = torch.randn(6, 11, requires_grad=True)
+    teacher_probs = torch.softmax(teacher_logits, dim=-1)
+
+    actual = dino_distillation_loss(student_logits, teacher_probs, 0.1)
+    expected = -(
+        teacher_probs.detach() * F.log_softmax(student_logits.float() / 0.1, -1)
+    ).sum(-1).mean()
+    torch.testing.assert_close(actual, expected)
+
+    actual.backward()
+    assert teacher_logits.grad is None
+    with pytest.warns(
+        UserWarning, match=r"The \.grad attribute of a Tensor that is not a leaf Tensor"
+    ):
+        assert teacher_probs.grad is None
+    assert student_logits.grad is not None
+    assert torch.isfinite(student_logits.grad).all()
+    assert student_logits.grad.abs().sum() > 0
+
+
+def test_dino_singleton_ce_has_student_gradient():
+    torch.manual_seed(1)
+    student_logits = torch.randn(1, 5, requires_grad=True)
+    teacher_probs = torch.softmax(torch.randn(1, 5), dim=-1)
+
+    loss = dino_distillation_loss(student_logits, teacher_probs, 0.1)
+    assert loss.ndim == 0
+    loss.backward()
+
+    assert student_logits.grad is not None
+    assert torch.isfinite(student_logits.grad).all()
+    # A one-sample batch must still learn: the loss is not a constant.
+    assert student_logits.grad.abs().sum() > 0
+
+
+def test_sk_matches_three_iteration_reference():
+    torch.manual_seed(2)
+    logits = torch.randn(8, 7)
+    actual = sinkhorn_knopp_targets(logits, teacher_temp=0.07)
+
+    reference = _reference_sinkhorn(logits, 0.07)
+    assert actual.shape == (8, 7)
+    assert actual.dtype == torch.float32
+    assert actual.requires_grad is False
+    torch.testing.assert_close(actual, reference, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(actual.sum(-1), torch.ones(8))
+
+    # Prototype marginals are approximately, not exactly, balanced, and the
+    # balance reachable in three iterations depends on the logit scale versus
+    # the temperature: a moderate temperature converges tightly, a sharply
+    # peaked one does not yet.
+    balanced = sinkhorn_knopp_targets(logits, teacher_temp=1.0)
+    marginal = balanced.sum(0)
+    assert (marginal - marginal.mean()).abs().max() < 0.05 * marginal.mean()
+    raw = torch.softmax(logits / 1.0, dim=-1).sum(0)
+    assert (marginal - marginal.mean()).abs().max() < (
+        raw - raw.mean()
+    ).abs().max()
+
+    # Inputs are not modified and no gradient is created.
+    assert actual.grad_fn is None
+
+
+def test_sk_extreme_and_identical_inputs_are_finite():
+    extreme = torch.tensor(
+        [[1e4, -1e4, 0.0], [-1e4, 1e4, 0.0], [0.0, 0.0, 5e3], [5e3, 0.0, -5e3]]
+    )
+    targets = sinkhorn_knopp_targets(extreme, teacher_temp=0.04)
+    assert targets.shape == (4, 3)
+    assert torch.isfinite(targets).all()
+    torch.testing.assert_close(targets.sum(-1), torch.ones(4))
+
+    identical = torch.zeros(6, 4)
+    uniform = sinkhorn_knopp_targets(identical, teacher_temp=0.07)
+    assert torch.isfinite(uniform).all()
+    torch.testing.assert_close(uniform.sum(-1), torch.ones(6))
+    # Identical inputs give uniform assignments; that is not evidence of a
+    # learned partition, only of a degenerate batch.
+    torch.testing.assert_close(uniform, torch.full((6, 4), 0.25))
+
+
+def test_sk_large_k_small_batch():
+    torch.manual_seed(3)
+    logits = torch.randn(4, 257)
+    targets = sinkhorn_knopp_targets(logits, teacher_temp=0.07)
+
+    assert targets.shape == (4, 257)
+    assert targets.dtype == torch.float32
+    assert torch.isfinite(targets).all()
+    torch.testing.assert_close(targets.sum(-1), torch.ones(4))
+
+
+def _available_accelerators():
+    devices = ["cpu"]
+    if torch.cuda.is_available():
+        devices.append("cuda")
+    if getattr(torch.backends, "mps", None) is not None and (
+        torch.backends.mps.is_available()
+    ):
+        devices.append("mps")
+    return devices
+
+
+@pytest.mark.parametrize("device", _available_accelerators())
+def test_sk_available_accelerators_preserve_float32_targets(device):
+    torch.manual_seed(4)
+    logits = torch.randn(6, 9, dtype=torch.float32, device=device)
+    targets = sinkhorn_knopp_targets(logits, teacher_temp=0.07)
+
+    assert targets.device.type == torch.device(device).type
+    assert targets.dtype == torch.float32
+    assert targets.requires_grad is False
+    assert torch.isfinite(targets).all()
+    torch.testing.assert_close(
+        targets.sum(-1),
+        torch.ones(6, device=targets.device),
+        rtol=1e-4,
+        atol=1e-5,
+    )
+
+
+def _koleo_reference(features, eps=1e-8):
+    normalized = F.normalize(features, dim=-1, eps=eps)
+    dots = normalized @ normalized.T
+    dots.fill_diagonal_(float("-inf"))
+    nearest = dots.argmax(dim=-1)
+    distances = torch.nn.PairwiseDistance(2, eps=eps)(
+        normalized, normalized[nearest]
+    )
+    return -torch.log(distances + eps).mean()
+
+
+def test_koleo_selected_pairs_match_reference():
+    torch.manual_seed(5)
+    features = torch.randn(5, 6, requires_grad=True)
+
+    actual = koleo_loss(features)
+    expected = _koleo_reference(features)
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+
+    actual.backward()
+    assert features.grad is not None
+    assert torch.isfinite(features.grad).all()
+    # Both endpoints of every selected pair receive gradient.
+    normalized = F.normalize(features.detach(), dim=-1)
+    dots = normalized @ normalized.T
+    dots.fill_diagonal_(float("-inf"))
+    touched = set(dots.argmax(dim=-1).tolist())
+    for index in range(features.shape[0]):
+        assert features.grad[index].abs().sum() > 0
+    assert len(touched) >= 2
+
+    # Self exclusion is exact: a duplicated row still pairs with another index.
+    duplicated = torch.cat([features.detach()[:1], features.detach()[:1]])
+    assert torch.isfinite(koleo_loss(duplicated))
+
+    # Orthogonal features are far apart, so the signed loss is negative.
+    orthogonal = torch.eye(4)
+    assert koleo_loss(orthogonal) < 0
+
+
+def test_koleo_coincident_vectors_match_eps_reference():
+    width = 16
+    base = torch.randn(1, width)
+    coincident = base.repeat(3, 1).requires_grad_(True)
+
+    loss = koleo_loss(coincident)
+    expected = -torch.log(torch.tensor(1e-8 * width**0.5 + 1e-8))
+    assert loss.item() == pytest.approx(expected.item(), rel=1e-6)
+    assert loss.item() > 0
+
+    loss.backward()
+    assert coincident.grad is not None
+    assert torch.isfinite(coincident.grad).all()
+
+    # Two crops are summed by the caller, so the crop-level losses add up.
+    assert koleo_loss(coincident.detach()) + koleo_loss(
+        coincident.detach()
+    ) == pytest.approx(2 * loss.item(), rel=1e-6)
+
+
+def test_koleo_singleton_batch_returns_differentiable_zero():
+    features = torch.randn(1, 8, requires_grad=True)
+    loss = koleo_loss(features)
+    assert loss.item() == 0.0
+    loss.backward()
+    assert features.grad is not None

@@ -50,6 +50,31 @@ fine-tuning or direct embedding extraction. Typical artifacts: `SSL_latest.pth`,
 directory. `--resume` is supported; combining `--resume` with `--overwrite` is
 rejected. Explain possible initial timm weight downloads before approval.
 
+The CLS method is explicit: a new run defaults to `--ssl-method relational`
+(unchanged batch-relative distillation), while `--ssl-method dino` adds a
+DINO-style prototype objective with `--dino-prototypes` (default 64,
+independent of `--ibot-prototypes`), `--dino-centering ema|sinkhorn-knopp` and
+`--koleo-weight` (default 0, experimental). Present DINO as a default-off
+experiment, recommend the EMA/no-KoLeo baseline first, and state that K x 2B
+assignments and K x D prototypes cost memory and that two crops of one image are
+not independent specimens. A cross-method resume is rejected, and DINO resumes
+only inherit the settings it omits. `--use-projector-output` returns the DINO
+bottleneck D, never K prototype logits.
+
+Two shared experiment controls apply to both SSL methods and change nothing by
+default: `--teacher-temp-warmup-ratio` (default 0.7, fraction of planned steps
+for the linear teacher-temperature ramp, counted as `int(total_steps * ratio)`;
+not LR warmup and not teacher-parameter EMA) and `--no-norm-bias-weight-decay`
+(an opt-in flag, omitted by default, which keeps the historical uniform
+`--weight-decay`). Explain that the second option only exempts biases and
+normalization affine parameters from decay while the coefficient, schedules and
+the single joint clipping stay unchanged. On resume the checkpoint's optimizer
+value is authoritative: a different `--weight-decay` is reported but not applied,
+and switching the policy is rejected. A checkpoint that records neither field
+predates these options: it is assumed to be 0.7/True with a warning, and an
+explicit nondefault is rejected, so a run from the temporary hard-coded 0.3
+temperature experiment cannot be continued exactly.
+
 ## finetune
 
 Metric-learning fine-tuning from a pretrained checkpoint. Typical artifacts:

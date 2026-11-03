@@ -59,6 +59,8 @@ Evaluation preprocessing protocol: center-crop (Resize + CenterCrop) or whole-sp
 
 Use SSL projector output for SSL checkpoints, or the ArcFace embedding for fine-tune checkpoints; useful for fine-tuned-class retrieval and closed-set clustering.
 
+For a DINO SSL checkpoint this option returns the normalized D-dimensional bottleneck; the K-dimensional prototype logits are training-only and are never an extraction output. The default remains the backbone CLS token for both SSL methods, and a fine-tuned checkpoint keeps its metric head width.
+
 ### `--use-student`
 
 **Default:** `No`

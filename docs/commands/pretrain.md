@@ -50,7 +50,41 @@ Register tokens for an eligible single-CLS timm VisionTransformer: 'none' (defau
 
 **Default:** `256`
 
-SSL projector output dimension.
+SSL projector output dimension D. In relational it is the projection width; in DINO it is the bottleneck width that `--use-projector-output` extracts, never the prototype count K.
+
+The DINO prototype layer is training-only: `--use-projector-output` returns the normalized D-dimensional bottleneck, and the K-dimensional logits are never an extraction output.
+
+Key, target mechanism and KoLeo weight are recorded effective settings. On `--resume` they are inherited when omitted and must match when supplied explicitly; switching EMA/Sinkhorn-Knopp or the KoLeo weight mid-run is rejected, and relational resume keeps the requested dimension instead of inheriting the saved one.
+
+### `--ssl-method`
+
+**Default:** `relational` · **Allowed:** relational / dino
+
+Global CLS training method: 'relational' (default; batch-relative similarity distillation, unchanged) or 'dino' (prototype distribution distillation with an explicit prototype layer). DINO is opt-in and is not a resume of a relational run. Omit to inherit the saved method on --resume; a cross-method resume is rejected.
+
+### `--dino-prototypes`
+
+**Default:** `64` · **Allowed:** integer >= 2
+
+Prototype dictionary size K for --ssl-method dino: any integer >= 2, default 64. Independent of --ibot-prototypes (default 512) and never inferred from image, species or OTU counts; prototype indices are not OTUs. DINO-only: rejected under relational. Not applicable to other methods.
+
+K much larger than 2B is valid, but assignment memory grows with K x 2B and prototype storage with K x D; no automatic memory budget exists. A prototype index is not a species, an anatomical part or an OTU. Explicit use under relational is rejected, including an explicit default value, while an omitted value has no effect there.
+
+### `--dino-centering`
+
+**Default:** `ema` · **Allowed:** ema / sinkhorn-knopp
+
+DINO teacher-target mechanism: 'ema' (default; exponential moving average center) or 'sinkhorn-knopp' (three fixed iterations of balanced assignment over both teacher global crops, no EMA CLS center). These are alternatives, never two stacked operations. DINO-only and not switchable on resume.
+
+Sinkhorn-Knopp balances soft prototype usage, not species frequencies, and small or homogeneous batches provide limited assignment evidence: uniform identical predictions can look balanced. This option never changes the independent iBOT patch target.
+
+### `--koleo-weight`
+
+**Default:** `0.0` · **Allowed:** finite value >= 0
+
+Weight for the optional KoLeo regularizer on normalized backbone CLS features. 0 (default) disables it and skips all neighbor search; any finite value > 0 enables it. Experimental: it spreads the CLS space but also repels same-species and near-duplicate specimens, batches smaller than 2 skip it, and repeated records can dominate the total. DINO-only and not changeable on resume.
+
+The setting is DINO-only, cannot be changed on resume, and retires the `patch_loss_fraction_of_total` column for the whole run once it is positive, because a signed contribution does not have an ordinary positive loss fraction.
 
 ### `--max-epochs`
 
@@ -69,6 +103,14 @@ Base learning rate before warmup/cosine scheduling.
 **Default:** `0.05`
 
 AdamW weight decay coefficient.
+
+### `--no-norm-bias-weight-decay`
+
+**Default:** `No`
+
+Skip weight decay for biases and normalization affine parameters. Omitted keeps the historical uniform `--weight-decay` on every trainable parameter. Applies to both SSL methods and keeps one joint gradient-norm clipping. Omit to inherit the saved policy on `--resume`; a different requested `--weight-decay` is not applied, and a changed policy is rejected.
+
+Recognized normalization modules are LayerNorm, GroupNorm, BatchNorm, InstanceNorm and RMSNorm where available. Tokens, generic scales and the DINO prototype direction keep decay; the coefficient, the LR and EMA schedules and the clipping threshold are unchanged.
 
 ### `--warmup-epochs`
 
@@ -171,6 +213,16 @@ Initial teacher temperature.
 **Default:** `0.07`
 
 Final teacher temperature.
+
+### `--teacher-temp-warmup-ratio`
+
+**Default:** `0.7`
+
+Fraction (0-1, default 0.7) of the planned steps used for the linear teacher-temperature ramp from `--teacher-temp-start` to `--teacher-temp-end`, counted as `int(total_steps * ratio)`; the temperature stays at the final value afterwards. This is teacher temperature only: not LR warmup, not teacher-parameter EMA, and not an absolute epoch count. Applies to both SSL methods. Omit to inherit the saved ratio on `--resume`; an extension keeps the existing final-temperature tail.
+
+The step count truncates the float product rather than an exact decimal floor (`int(90 * 0.7)` is 62), so 5050 steps give 3535 warmup steps at 0.7 and 1515 at 0.3. A same-plan resume rebuilds the original ramp from the recorded ratio.
+
+**Known limitation:** a checkpoint written by the temporary hard-coded 0.3 experiment records neither new field. It cannot be resumed with ratio 0.3: omission warns, assumes 0.7 and does not reproduce that experiment exactly, while an explicit `0.3` is rejected. Start a new run to keep recording 0.3.
 
 ### `--disable-cross-view-loss`
 
@@ -298,6 +350,22 @@ Clear an existing non-empty output directory.
 - `logs/instant_metrics.pretrain.csv` — Per-iteration training metrics
 - `logs/training_curves_pretrain.pdf` — Training-curve plot
 - `logs/umap.train.epoch_<N>.pdf` — Periodic UMAP plots (when not disabled)
+
+### Instant pretrain metrics
+
+`logs/instant_metrics.pretrain.csv` carries the constant-per-run `ssl_method`, `dino_centering` and `koleo_weight` settings plus the new CLS diagnostics, weighted component losses and KoLeo status/counts. This is the only schema that changed in this release; `metrics.pretrain.csv` (epoch metrics) and the fine-tune instant metrics keep their previous columns.
+
+- Blank `ssl_method` on a migrated row means unknown/unrecorded, not "relational": the resumed invocation is never backfilled into historical rows.
+- Under a recorded method, a blank inactive setting is N/A (for example `dino_centering` under relational, or `koleo_weight=0` with blank KoLeo loss cells), and the JSON form records `null`, never an observed zero.
+- `teacher_center_norm` and `cosine_similarity` remain relational-only; DINO records `cls_center_norm` (EMA only) and shows `COS=N/A`, while the startup `[Info] Initial cosine similarity` line is still printed for DINO.
+- `global_loss_weighted` intentionally equals `global_loss` because there is no global weight, while `local_loss_weighted` includes `lambda_local`.
+- `cls_prototype_perplexity` describes the teacher assignment marginals only: Sinkhorn-Knopp partly imposes balance and uniform identical predictions can look balanced, so it is not proof against collapse or evidence of learned morphology.
+
+KoLeo values are signed, so its contribution does not have an ordinary positive loss fraction; once `koleo_weight > 0` the legacy `patch_loss_fraction_of_total` column is recorded as N/A for the whole run, including batches that skip KoLeo as too small. With KoLeo disabled or under relational, the historical positive-fraction meaning is preserved.
+
+A resumed instant-metrics file can contain historical blank-identity rows next to current labeled rows; plots keep both. External merged analysis must retain those unknown groups (for example `dropna=False`) instead of inferring them, and loss magnitudes are not comparable across methods or target choices as if they measured the same objective.
+
+Older OTU-Former versions may ignore DINO identity and objective state and resume a DINO checkpoint as relational through permissive loading. Resume DINO only with a version that explicitly supports this format; the new loader cannot protect a file opened by older software.
 
 Embedding-quality metrics use the shared [embedding metrics](embedding-metrics.md) definitions and field names.
 

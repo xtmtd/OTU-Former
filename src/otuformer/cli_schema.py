@@ -415,8 +415,15 @@ _PRETRAIN_RESUME_INHERITED = frozenset(
         "augmentation",
         "orientation_policy",
         "weight_decay",
+        "teacher_temp_warmup_ratio",
+        "no_norm_bias_weight_decay",
+        "ssl_method",
     }
 )
+
+# DINO-only/width settings whose inheritance depends on the saved method: only
+# DINO resume inherits them, relational keeps the invocation/default value.
+_SSL_CONDITIONAL_OPTIONS = ("out_dim", "dino_prototypes", "dino_centering", "koleo_weight")
 
 _INHERITED_PARAMETERS = {
     "pretrain": _PRETRAIN_RESUME_INHERITED,
@@ -624,6 +631,11 @@ def validate_parameters(command: str, explicit: Mapping[str, Any]) -> dict[str, 
             "not confirmed effective values"
         )
 
+    if command == "pretrain" and explicit_values.get("resume"):
+        _apply_ssl_conditional_provenance(
+            explicit_values, provenance, unresolved
+        )
+
     return {
         "command": command,
         "values": values,
@@ -633,6 +645,41 @@ def validate_parameters(command: str, explicit: Mapping[str, Any]) -> dict[str, 
         "unresolved": _dedupe(unresolved),
         "runtime": runtime_identity(),
     }
+
+
+def _apply_ssl_conditional_provenance(
+    explicit_values: Mapping[str, Any],
+    provenance: dict[str, str],
+    unresolved: list[str],
+) -> None:
+    """Label omitted SSL settings against the requested/saved method.
+
+    Static generation never reads a checkpoint: an omitted method stays
+    conditional, and an explicit method labels expected resolution only.
+    """
+    method = explicit_values.get("ssl_method")
+    if method is None:
+        for name in _SSL_CONDITIONAL_OPTIONS:
+            if name not in explicit_values:
+                provenance[name] = "omitted-conditional"
+        unresolved.append(
+            "omitted out_dim/dino_prototypes/dino_centering/koleo_weight are "
+            "inherited only if the saved method matches; the resume checkpoint "
+            "is not read during static validation"
+        )
+        return
+    if method == "dino":
+        for name in _SSL_CONDITIONAL_OPTIONS:
+            if name not in explicit_values:
+                provenance[name] = "omitted-inherited"
+        unresolved.append(
+            "omitted DINO settings are inherited if the saved method matches; "
+            "they are not confirmed effective values"
+        )
+        return
+    for name in _SSL_CONDITIONAL_OPTIONS:
+        if name not in explicit_values:
+            provenance[name] = "omitted-default"
 
 
 def _dedupe(items: Sequence[str]) -> list[str]:

@@ -1900,11 +1900,21 @@ def test_legacy_pretrain_schema_is_migrated_atomically(tmp_path):
 
     migrated = pd.read_csv(path)
     assert len(migrated) == 2
-    assert list(migrated.columns) == _LEGACY_PRETRAIN_HEADER + _NEW_PRETRAIN_FIELDS
+    # The v0.7.0 columns are frozen and the CLS-distillation columns are
+    # appended after them, so historical values and order are preserved.
+    expected_fields = (
+        _LEGACY_PRETRAIN_HEADER
+        + _NEW_PRETRAIN_FIELDS
+        + trainer._PRETRAIN_SSL_SETTING_FIELDS
+        + trainer._PRETRAIN_SSL_METRIC_FIELDS
+    )
+    assert list(migrated.columns) == expected_fields
     assert migrated.iloc[0]["iteration"] == 0
     assert migrated.iloc[1]["iteration"] == 1
-    for field in _NEW_PRETRAIN_FIELDS:
-        assert migrated[field].isna().all()
+    for field in _NEW_PRETRAIN_FIELDS + trainer._PRETRAIN_SSL_SETTING_FIELDS + (
+        trainer._PRETRAIN_SSL_METRIC_FIELDS
+    ):
+        assert migrated[field].isna().all(), field
     assert list(tmp_path.glob("*.tmp")) == []
 
 

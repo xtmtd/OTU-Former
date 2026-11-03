@@ -16,7 +16,7 @@
 ## 工作流程
 
 1. **`doctor`** — 检查环境与依赖。
-2. **`pretrain`** — 自监督对比预训练，无需标签。
+2. **`pretrain`** — 自监督预训练，无需标签。默认使用 relational CLS 蒸馏；可选的 DINO 风格原型目标通过 `--ssl-method dino` 显式开启，并提供 Sinkhorn-Knopp 目标与 KoLeo 正则作为实验选项。
 3. **`finetune`** — 监督度量学习微调，目标函数可选。
 4. **`extract`** — 从图像提取嵌入向量。
 5. **`cluster`** — UPGMA 层次聚类为形态学 OTU。

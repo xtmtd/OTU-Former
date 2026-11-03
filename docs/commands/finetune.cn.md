@@ -346,6 +346,8 @@ otuformer finetune --train-data labels.csv --input-images-dir DATA_ROOT/dorsal \
 
 单独的、仅含图像的 `--visualize-data` CSV 可用于 UMAP；监督指标至少需要两个标签类别。
 
+**SSL 来源谱系。** 微调输出记录自身的度量 `embedding_head`，并在来源身份已知且有 `ssl_initialization_checkpoint_sha256` 锚定时，单独记录 `ssl_source_method`/`ssl_source_head` 来源字段（例如由 DINO 初始化的 ArcFace 头）。这些字段只表示来源谱系：微调检查点从不声明活动的 `ssl_method`，从不继承 DINO 的原型/瓶颈头，也不保存训练目标状态。缺少该字段对的历史微调检查点仍然有效，续跑会保留其自身检查点中的记录。
+
 如需为已有类别加入新图像，请使用同时包含旧图和新图标注的 CSV，保持相同的
 `--out-dir`，从最新微调 checkpoint 使用 `--resume`，并增加
 `--finetune-epochs`：

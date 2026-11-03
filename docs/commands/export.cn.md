@@ -78,4 +78,4 @@ otuformer export \
 
 ## 说明
 
-可读取 OTU 检查点与旧脚本检查点（`ref/ibot20260115.py`）。投影器优先按 `config.embedding_head` 重建，缺失时按权重中的投影器形状推断。
+可读取 OTU 检查点与旧脚本检查点（`ref/ibot20260115.py`）。投影器优先按 `config.embedding_head` 重建，缺失时按权重中的投影器形状推断。DINO 的 SSL 检查点导出归一化后的 D 维瓶颈：仅用于训练的原型层、其目标 softmax 以及 K 维 CLS 中心都不会出现在计算图中，因此导出宽度是 D（或微调后代的度量宽度），绝不会是 K。

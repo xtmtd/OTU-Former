@@ -576,6 +576,7 @@ def finetune(
         preflight_finetune_source,
         prepare_pseudo_round,
         pseudo_cli_identity,
+        resolve_pseudo_ssl_source,
     )
     from otuformer.utils.checkpoint import load_checkpoint
 
@@ -757,6 +758,13 @@ def finetune(
                         "source_class_labels"
                     ),
                 ),
+            )
+        if pseudo_round_data is not None and not resume and source_checkpoint is not None:
+            # Validate the original SSL lineage from the payload this run really
+            # initializes from, before any output directory exists. The value is
+            # re-derived (not stored) by run_finetune for direct callers.
+            resolve_pseudo_ssl_source(
+                source_checkpoint, pseudo_round_data.get("source_config") or {}
             )
         if source_checkpoint is not None:
             if resume:

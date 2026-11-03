@@ -78,4 +78,4 @@ otuformer export \
 
 ## Notes
 
-Accepts OTU checkpoints and ref-script checkpoints (`ref/ibot20260115.py`). The projector is rebuilt from `config.embedding_head`, falling back to the projector shapes in the weights.
+Accepts OTU checkpoints and ref-script checkpoints (`ref/ibot20260115.py`). The projector is rebuilt from `config.embedding_head`, falling back to the projector shapes in the weights. A DINO SSL checkpoint exports the normalized D-dimensional bottleneck: the training-only prototype layers, their target softmax and the K-dimensional CLS center are never part of the graph, so the exported width is D (or the metric width of a fine-tuned descendant), never K.

@@ -110,6 +110,33 @@ def test_expert_path_identity_missing_file_rejected(tmp_path):
     assert "missing expert image" in reason
 
 
+def test_expert_path_identity_bare_name_in_subdirectory_eligible(tmp_path):
+    """A CSV that names bare filenames for a species tree stays eligible.
+
+    ``MetricDataset`` resolves such references through its recursive name index,
+    so training reads them; the eligibility check must use the same rule instead
+    of reporting a healthy dataset as missing.
+    """
+    root = tmp_path / "images"
+    _write(root / "Epidorcus_gracilis" / "a.jpg")
+    _write(root / "Epidorcus_tonkinensis" / "b.jpg")
+
+    ok, reason = trainer._expert_path_identity(["a.jpg", "b.jpg"], root)
+    assert ok is True
+    assert reason is None
+
+
+def test_expert_path_identity_ambiguous_bare_name_rejected(tmp_path):
+    """Two files sharing a bare name have no single identity, so no pseudo source."""
+    root = tmp_path / "images"
+    _write(root / "first" / "a.jpg")
+    _write(root / "second" / "a.jpg")
+
+    ok, reason = trainer._expert_path_identity(["a.jpg"], root)
+    assert ok is False
+    assert "ambiguous expert reference" in reason
+
+
 def test_pseudo_source_status_requires_arcface_family_and_ssl_hash():
     eligible, reason = trainer._pseudo_source_status(
         loss="arcface", ssl_initialization_sha256="deadbeef", expert_reason=None

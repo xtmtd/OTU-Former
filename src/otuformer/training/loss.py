@@ -11,6 +11,108 @@ import torch.nn.functional as F
 from otuformer.training.model import ArcFaceHead, SubCenterArcFaceHead
 
 
+def dino_distillation_loss(
+    student_logits: torch.Tensor,
+    teacher_probs: torch.Tensor,
+    student_temp: float,
+) -> torch.Tensor:
+    """Cross-entropy of cached, detached teacher probabilities.
+
+    Shared by the EMA and Sinkhorn-Knopp target mechanisms so targets are built
+    once per iteration and never recomputed per pair. Computed in float32 and
+    never divided by ``log K``.
+    """
+    if student_logits.shape != teacher_probs.shape:
+        raise ValueError(
+            f"student logits and teacher probabilities must match, got "
+            f"{tuple(student_logits.shape)} and {tuple(teacher_probs.shape)}."
+        )
+    if not math.isfinite(student_temp) or student_temp <= 0.0:
+        raise ValueError(
+            f"student_temp must be a finite value > 0, got {student_temp}."
+        )
+    log_probs = F.log_softmax(student_logits.float() / student_temp, dim=-1)
+    return -(teacher_probs.detach().float() * log_probs).sum(dim=-1).mean()
+
+
+def _validate_teacher_temp(teacher_temp: float) -> float:
+    if not math.isfinite(teacher_temp) or teacher_temp <= 0.0:
+        raise ValueError(
+            f"teacher_temp must be a finite value > 0, got {teacher_temp}."
+        )
+    return float(teacher_temp)
+
+
+def sinkhorn_knopp_targets(
+    teacher_logits: torch.Tensor, teacher_temp: float, iterations: int = 3
+) -> torch.Tensor:
+    """Balanced teacher assignments from one pooled N-by-K logit matrix.
+
+    Exactly ``iterations`` normalizations of prototype rows to mass ``1/K`` and
+    sample columns to mass ``1/N``, all in float32 log-domain so extreme logits
+    cannot overflow. Assignments are detached, and sample probabilities sum to
+    one; prototype marginals are only approximately balanced.
+    """
+    if teacher_logits.ndim != 2:
+        raise ValueError(
+            f"teacher_logits must be an N-by-K matrix, got shape "
+            f"{tuple(teacher_logits.shape)}."
+        )
+    samples, prototypes = teacher_logits.shape
+    if samples < 1 or prototypes < 2:
+        raise ValueError(
+            f"Sinkhorn-Knopp needs at least one sample and two prototypes, got "
+            f"{samples} and {prototypes}."
+        )
+    temperature = _validate_teacher_temp(teacher_temp)
+    # K-by-N orientation: rows are prototypes, columns are samples.
+    log_q = teacher_logits.detach().float().t() / temperature
+    log_q = log_q - torch.logsumexp(log_q, dim=(0, 1))
+    log_prototypes = math.log(prototypes)
+    log_samples = math.log(samples)
+    for _ in range(int(iterations)):
+        log_q = log_q - torch.logsumexp(log_q, dim=1, keepdim=True) - log_prototypes
+        log_q = log_q - torch.logsumexp(log_q, dim=0, keepdim=True) - log_samples
+    targets = torch.exp(log_q + log_samples).t().contiguous()
+    if not torch.isfinite(targets).all():
+        raise ValueError(
+            "Sinkhorn-Knopp produced non-finite teacher targets; refusing to "
+            "fall back to EMA or uniform targets."
+        )
+    return targets
+
+
+def koleo_loss(
+    backbone_cls: torch.Tensor,
+    *,
+    normalize_eps: float = 1e-8,
+    distance_eps: float = 1e-8,
+    log_eps: float = 1e-8,
+) -> torch.Tensor:
+    """KoLeo on one crop's pre-head backbone CLS features.
+
+    Each sample's nearest other sample in this crop is selected by maximum
+    cosine similarity with an explicit self mask, then the loss is
+    ``-mean(log(||u_i - u_nn(i)|| + eps))`` using the DINOv2
+    ``PairwiseDistance(p=2, eps)`` convention. Gradients reach both endpoints of
+    every selected pair; the selection itself is discrete. A batch smaller than
+    two returns a differentiable zero.
+    """
+    features = backbone_cls.float()
+    if features.shape[0] < 2:
+        return features.sum() * 0.0
+    normalized = F.normalize(features, dim=-1, eps=normalize_eps)
+    dots = normalized @ normalized.T
+    self_mask = torch.eye(
+        dots.shape[0], dtype=torch.bool, device=dots.device
+    )
+    nearest = dots.masked_fill(self_mask, float("-inf")).argmax(dim=-1)
+    distances = nn.PairwiseDistance(2, eps=distance_eps)(
+        normalized, normalized[nearest]
+    )
+    return -(distances + log_eps).log().mean()
+
+
 class GlobalDistillationLoss(nn.Module):
     """Cross-entropy between student and teacher CLS distributions."""
 
@@ -26,11 +128,10 @@ class GlobalDistillationLoss(nn.Module):
         teacher_temp: float,
         student_temp: float,
     ) -> torch.Tensor:
-        student_log_probs = F.log_softmax(student_out / student_temp, dim=-1)
         teacher_probs = F.softmax(
-            (teacher_out - center) / teacher_temp, dim=-1
+            (teacher_out - center) / _validate_teacher_temp(teacher_temp), dim=-1
         ).detach()
-        return -(teacher_probs * student_log_probs).sum(dim=-1).mean()
+        return dino_distillation_loss(student_out, teacher_probs, student_temp)
 
 
 class LocalToGlobalLoss(nn.Module):
@@ -45,12 +146,13 @@ class LocalToGlobalLoss(nn.Module):
         student_temp: float,
     ) -> torch.Tensor:
         teacher_probs = F.softmax(
-            (teacher_out - center) / teacher_temp, dim=-1
+            (teacher_out - center) / _validate_teacher_temp(teacher_temp), dim=-1
         ).detach()
         total_loss = torch.tensor(0.0, device=teacher_out.device)
         for local_out in local_student_outs:
-            student_log_probs = F.log_softmax(local_out / student_temp, dim=-1)
-            total_loss += -(teacher_probs * student_log_probs).sum(dim=-1).mean()
+            total_loss += dino_distillation_loss(
+                local_out, teacher_probs, student_temp
+            )
         return total_loss / max(len(local_student_outs), 1)
 
 

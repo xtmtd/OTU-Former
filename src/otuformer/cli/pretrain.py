@@ -28,10 +28,13 @@ from otuformer.cli.constraints import (
     validate_patch_options,
 )
 from otuformer.constants import (
+    DINO_CENTERING_MODES,
+    DINO_PROTOTYPES_MIN,
     IBOT_PROTOTYPES_MIN,
     MASKING_STRATEGIES,
     PATCH_LOSS_MODES,
     REGISTER_TOKEN_CHOICES,
+    SSL_METHODS,
 )
 
 app = typer.Typer(
@@ -111,7 +114,59 @@ def pretrain(
         ),
     ),
     out_dim: int = typer.Option(
-        256, "--out-dim", help="SSL projector output dimension."
+        256,
+        "--out-dim",
+        help=(
+            "SSL projector output dimension D. In relational it is the "
+            "projection width; in DINO it is the bottleneck width that "
+            "--use-projector-output extracts, never the prototype count K."
+        ),
+    ),
+    ssl_method: str = typer.Option(
+        "relational",
+        "--ssl-method",
+        help=(
+            "Global CLS training method: 'relational' (default; batch-relative "
+            "similarity distillation, unchanged) or 'dino' (prototype "
+            "distribution distillation with an explicit prototype layer). "
+            "DINO is opt-in and is not a resume of a relational run. Omit to "
+            "inherit the saved method on --resume; a cross-method resume is "
+            "rejected."
+        ),
+    ),
+    dino_prototypes: int = typer.Option(
+        64,
+        "--dino-prototypes",
+        help=(
+            f"Prototype dictionary size K for --ssl-method dino: any integer >= "
+            f"{DINO_PROTOTYPES_MIN}, default 64. Independent of "
+            "--ibot-prototypes (default 512) and never inferred from image, "
+            "species or OTU counts; prototype indices are not OTUs. DINO-only: "
+            "rejected under relational. Not applicable to other methods."
+        ),
+    ),
+    dino_centering: str = typer.Option(
+        "ema",
+        "--dino-centering",
+        help=(
+            "DINO teacher-target mechanism: 'ema' (default; exponential moving "
+            "average center) or 'sinkhorn-knopp' (three fixed iterations of "
+            "balanced assignment over both teacher global crops, no EMA CLS "
+            "center). These are alternatives, never two stacked operations. "
+            "DINO-only and not switchable on resume."
+        ),
+    ),
+    koleo_weight: float = typer.Option(
+        0.0,
+        "--koleo-weight",
+        help=(
+            "Weight for the optional KoLeo regularizer on normalized backbone "
+            "CLS features. 0 (default) disables it and skips all neighbor "
+            "search; any finite value > 0 enables it. Experimental: it spreads "
+            "the CLS space but also repels same-species and near-duplicate "
+            "specimens, batches smaller than 2 skip it, and repeated records "
+            "can dominate the total. DINO-only and not changeable on resume."
+        ),
     ),
     max_epochs: int = typer.Option(
         50, "--max-epochs", help="Total SSL pretraining epochs."
@@ -123,6 +178,18 @@ def pretrain(
     ),
     weight_decay: float = typer.Option(
         0.05, "--weight-decay", help="AdamW weight decay coefficient."
+    ),
+    no_norm_bias_weight_decay: bool = typer.Option(
+        False,
+        "--no-norm-bias-weight-decay",
+        help=(
+            "Skip weight decay for biases and normalization affine parameters. "
+            "Omitted keeps the historical uniform --weight-decay on every "
+            "trainable parameter. Applies to both SSL methods and keeps one "
+            "joint gradient-norm clipping. Omit to inherit the saved policy on "
+            "--resume; a different requested --weight-decay is not applied, and "
+            "a changed policy is rejected."
+        ),
     ),
     warmup_epochs: int = typer.Option(
         3,
@@ -249,6 +316,20 @@ def pretrain(
     teacher_temp_end: float = typer.Option(
         0.07, "--teacher-temp-end", help="Final teacher temperature."
     ),
+    teacher_temp_warmup_ratio: float = typer.Option(
+        0.7,
+        "--teacher-temp-warmup-ratio",
+        help=(
+            "Fraction (0-1, default 0.7) of the planned steps used for the "
+            "linear teacher-temperature ramp from --teacher-temp-start to "
+            "--teacher-temp-end, counted as int(total_steps * ratio); the "
+            "temperature stays at the final value afterwards. This is teacher "
+            "temperature only: not LR warmup, not teacher-parameter EMA, and "
+            "not an absolute epoch count. Applies to both SSL methods. Omit to "
+            "inherit the saved ratio on --resume; an extension keeps the "
+            "existing final-temperature tail."
+        ),
+    ),
     disable_cross_view_loss: bool = typer.Option(
         False,
         "--disable-cross-view-loss",
@@ -366,6 +447,14 @@ def pretrain(
             "mask_ratio",
             "ibot_prototypes",
             "lambda_mask",
+            "out_dim",
+            "ssl_method",
+            "disable_cross_view_loss",
+            "dino_prototypes",
+            "dino_centering",
+            "koleo_weight",
+            "teacher_temp_warmup_ratio",
+            "no_norm_bias_weight_decay",
         )
     }
     if not resume:
@@ -426,6 +515,45 @@ def pretrain(
             )
         except (ValueError, KeyError, OSError) as exc:
             raise typer.BadParameter(str(exc)) from exc
+    # Resolve the effective SSL recipe before --overwrite can clear anything or
+    # a log file is created. The CLI owns this preflight; run_pretrain reuses
+    # the resolved slot instead of resolving a second time.
+    from otuformer.training.trainer import resolve_pretrain_ssl_config
+
+    ssl_request = argparse.Namespace(
+        ssl_method=ssl_method,
+        ssl_method_explicit=explicit_sources["ssl_method"],
+        out_dim=out_dim,
+        out_dim_explicit=explicit_sources["out_dim"],
+        dino_prototypes=dino_prototypes,
+        dino_prototypes_explicit=explicit_sources["dino_prototypes"],
+        dino_centering=dino_centering,
+        dino_centering_explicit=explicit_sources["dino_centering"],
+        koleo_weight=koleo_weight,
+        koleo_weight_explicit=explicit_sources["koleo_weight"],
+        disable_cross_view_loss=disable_cross_view_loss,
+        disable_cross_view_loss_explicit=explicit_sources[
+            "disable_cross_view_loss"
+        ],
+        teacher_temp_warmup_ratio=teacher_temp_warmup_ratio,
+        teacher_temp_warmup_ratio_explicit=explicit_sources[
+            "teacher_temp_warmup_ratio"
+        ],
+        no_norm_bias_weight_decay=no_norm_bias_weight_decay,
+        no_norm_bias_weight_decay_explicit=explicit_sources[
+            "no_norm_bias_weight_decay"
+        ],
+        model_name=model_name,
+        register_tokens=requested_register_tokens,
+        global_crop_size=requested_global_crop_size,
+        # Consumed only by the resume progress check, which must know whether the
+        # recorded plan is being extended before rejecting exhausted progress.
+        max_epochs=max_epochs,
+    )
+    try:
+        ssl_config_effective = resolve_pretrain_ssl_config(ssl_request, resume_state)
+    except (ValueError, KeyError, OSError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
     prepare_output_dir(out_dir, overwrite=overwrite, allow_existing=bool(resume))
     tee = TeeLogger(
         out_dir / "logs" / "pretrain.log",
@@ -444,6 +572,26 @@ def pretrain(
             register_tokens=requested_register_tokens,
             model_name_explicit=model_name_explicit,
             out_dim=out_dim,
+            out_dim_explicit=explicit_sources["out_dim"],
+            ssl_method=ssl_method,
+            ssl_method_explicit=explicit_sources["ssl_method"],
+            dino_prototypes=dino_prototypes,
+            dino_prototypes_explicit=explicit_sources["dino_prototypes"],
+            dino_centering=dino_centering,
+            dino_centering_explicit=explicit_sources["dino_centering"],
+            koleo_weight=koleo_weight,
+            koleo_weight_explicit=explicit_sources["koleo_weight"],
+            disable_cross_view_loss_explicit=explicit_sources[
+                "disable_cross_view_loss"
+            ],
+            teacher_temp_warmup_ratio=teacher_temp_warmup_ratio,
+            teacher_temp_warmup_ratio_explicit=explicit_sources[
+                "teacher_temp_warmup_ratio"
+            ],
+            no_norm_bias_weight_decay=no_norm_bias_weight_decay,
+            no_norm_bias_weight_decay_explicit=explicit_sources[
+                "no_norm_bias_weight_decay"
+            ],
             max_epochs=max_epochs,
             lr=lr,
             weight_decay=weight_decay,
@@ -516,6 +664,9 @@ def pretrain(
 
         if resume_state is not None:
             ns.resume_state = resume_state
+        # The internal effective slot is added after ``Parameters:`` and is
+        # excluded from serialized invocation args.
+        ns.ssl_config_effective = ssl_config_effective
         run_pretrain(ns)
     except Exception:
         traceback.print_exc(file=tee)

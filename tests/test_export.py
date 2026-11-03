@@ -508,3 +508,153 @@ def test_export_rejects_a_no_cls_native_register_checkpoint(
             imgsz=32,
             opset=17,
         )
+
+
+def make_dino_ssl_checkpoint(tmp_path: Path, out_dim: int = 24) -> Path:
+    """A DINO SSL checkpoint: bottleneck MLP plus training-only prototype state."""
+    from otuformer.training.dino import DINOObjective
+    from otuformer.training.model import OTUFormerEncoder
+
+    model = OTUFormerEncoder(
+        model_name="vit_tiny_patch16_224", out_dim=out_dim, pretrained=False
+    )
+    objective = DINOObjective(out_dim, 11, "ema")
+    p = tmp_path / "dino_ssl.pth"
+    torch.save(
+        {
+            "teacher": model.state_dict(),
+            "student": model.state_dict(),
+            "model_state_dict": model.state_dict(),
+            "dino_objective": objective.state_dict(),
+            "config": {
+                "model_name": "vit_tiny_patch16_224",
+                "out_dim": out_dim,
+                "ssl_method": "dino",
+                "ssl_head": "dino_mlp_2048",
+                "dino_prototypes": 11,
+                "dino_centering": "ema",
+                "koleo_weight": 0.0,
+            },
+        },
+        p,
+    )
+    return p
+
+
+def make_dino_source_metric_checkpoint(tmp_path: Path, out_dim: int = 32) -> Path:
+    """A fine-tune payload whose SSL lineage is DINO but whose head is metric.
+
+    This is the §3.3 combination: the active head is a metric embedding head,
+    ``ssl_source_*`` only records initialization, and no DINO objective state is
+    present because read-only consumers never need it.
+    """
+    from otuformer.training.model import ArcFaceEmbeddingHead, OTUFormerEncoder
+
+    model = OTUFormerEncoder(
+        model_name="vit_tiny_patch16_224", out_dim=out_dim, pretrained=False
+    )
+    model.projector = ArcFaceEmbeddingHead(model.backbone.num_features, out_dim)
+    p = tmp_path / "dino_source_metric.pth"
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "config": {
+                "model_name": "vit_tiny_patch16_224",
+                "out_dim": out_dim,
+                "metric_embed_dim": out_dim,
+                "embedding_head": "arcface_mlp_512",
+                "ssl_source_method": "dino",
+                "ssl_source_head": "dino_mlp_2048",
+                "ssl_initialization_checkpoint_sha256": "a" * 64,
+            },
+        },
+        p,
+    )
+    return p
+
+
+def test_dino_source_metric_head_checkpoint_exports(tmp_path: Path):
+    """A DINO-lineage fine-tune payload exports its metric head, not logits."""
+    import onnx
+
+    ckpt = make_dino_source_metric_checkpoint(tmp_path)
+    out_path = tmp_path / "dino_source.onnx"
+
+    report = export_to_onnx(
+        checkpoint_path=ckpt, out_path=out_path, imgsz=224, opset=17
+    )
+
+    assert report["out_dim"] == 32
+    graph = onnx.load(str(out_path)).graph
+    names = {tensor.name for tensor in graph.initializer} | {
+        node.name for node in graph.node
+    }
+    # Source provenance must not pull DINO training tensors into the graph.
+    assert not any("prototype" in name for name in names)
+    assert not any("cls_center" in name for name in names)
+    session = load_exported_onnx(out_path)
+    dummy = np.random.randn(1, 3, 224, 224).astype(np.float32)
+    assert session.run(None, {"input": dummy})[0].shape == (1, 32)
+
+
+def test_dino_source_identity_survives_without_dino_state():
+    """The shared resolver reads the pair as provenance, never as active DINO."""
+    from otuformer.utils.checkpoint import (
+        resolve_checkpoint_ssl_identity,
+        resolve_checkpoint_ssl_source,
+    )
+
+    payload = {
+        "config": {
+            "model_name": "vit_tiny_patch16_224",
+            "out_dim": 32,
+            "embedding_head": "arcface_mlp_512",
+            "ssl_source_method": "dino",
+            "ssl_source_head": "dino_mlp_2048",
+            "ssl_initialization_checkpoint_sha256": "b" * 64,
+        }
+    }
+
+    assert resolve_checkpoint_ssl_identity(payload, {}) is None
+    assert resolve_checkpoint_ssl_source(payload) == ("dino", "dino_mlp_2048")
+
+    unanchored = {
+        "config": {
+            "embedding_head": "arcface_mlp_512",
+            "ssl_source_method": "dino",
+            "ssl_source_head": "dino_mlp_2048",
+        }
+    }
+    with pytest.raises(ValueError, match="sha256|anchor"):
+        resolve_checkpoint_ssl_source(unanchored)
+
+
+def test_dino_export_graph_excludes_training_objective(tmp_path: Path):
+    import onnx
+
+    ckpt = make_dino_ssl_checkpoint(tmp_path)
+    out_path = tmp_path / "dino.onnx"
+    report = export_to_onnx(
+        checkpoint_path=ckpt, out_path=out_path, imgsz=224, opset=17
+    )
+
+    # The extractable value is the D-dimensional bottleneck, never K logits.
+    assert report["out_dim"] == 24
+    graph = onnx.load(str(out_path)).graph
+    initializer_names = {tensor.name for tensor in graph.initializer}
+    assert not any("prototype" in name for name in initializer_names)
+    assert not any("cls_center" in name for name in initializer_names)
+    node_names = {node.name for node in graph.node}
+    assert not any("prototype" in name for name in node_names)
+    # The graph exposes no K-wide output.
+    for value in list(graph.output) + list(graph.value_info):
+        dims = [d.dim_value for d in value.type.tensor_type.shape.dim]
+        assert 11 not in dims
+
+    session = load_exported_onnx(out_path)
+    dummy = np.random.randn(1, 3, 224, 224).astype(np.float32)
+    exported = session.run(None, {"input": dummy})[0]
+    assert exported.shape == (1, 24)
+    np.testing.assert_allclose(
+        np.linalg.norm(exported, axis=-1), np.ones(1), rtol=1e-4, atol=1e-5
+    )

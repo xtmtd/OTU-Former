@@ -309,6 +309,7 @@ def test_pretrain_resume_allows_existing_output_and_appends_log(tmp_path, monkey
         [
             "pretrain", "--resume", str(checkpoint), "--train-data", str(tmp_path / "data.csv"),
             "--input-images-dir", str(tmp_path), "--out-dir", str(out_dir),
+            "--out-dim", "64",
         ],
     )
 
@@ -2294,6 +2295,8 @@ def test_pretrain_resume_rejects_changed_input_size(tmp_path):
             str(tmp_path / "data.csv"),
             "--global-crop-size",
             "384",
+            "--out-dim",
+            "64",
         ],
     )
     assert result.exit_code != 0
@@ -2323,6 +2326,8 @@ def test_pretrain_resume_allows_equal_input_size(tmp_path, monkeypatch):
             str(tmp_path / "data.csv"),
             "--global-crop-size",
             "224",
+            "--out-dim",
+            "64",
         ],
     )
     assert result.exit_code == 0
@@ -3096,6 +3101,8 @@ def test_pretrain_resume_inherits_saved_local_views_without_explicit_flags(
             str(tmp_path),
             "--out-dir",
             str(tmp_path / "resume_out"),
+            "--out-dim",
+            "64",
         ],
     )
 
@@ -3124,6 +3131,8 @@ def test_pretrain_resume_rejects_conflicting_local_views(tmp_path):
             str(tmp_path / "resume_out"),
             "--local-crops",
             "6",
+            "--out-dim",
+            "64",
         ],
     )
 
@@ -3168,6 +3177,7 @@ def test_run_pretrain_resume_inherits_new_style_augmentation_into_dataset(
         train_data=str(tmp_path / "data.csv"),
         input_images_dir=str(tmp_path),
         model_name="vit_tiny_patch16_224",
+        out_dim=64,
         global_crop_size=None,
         augmentation=None,
         orientation_policy=None,

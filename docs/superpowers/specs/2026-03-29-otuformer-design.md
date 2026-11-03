@@ -89,6 +89,18 @@ not use as `null` — `masking_strategy` and `ibot_prototypes` under
 `consistency`, for example. That `null` means "not applicable to this mode", not
 "not supplied", and it is not a `Parameters:` value.
 
+**Optional DINO extension (implemented in the uncommitted CLS change set; formal acceptance/release not recorded):** the [CLS distillation
+design](2026-10-31-otuformer-cls-distillation-design.md) adds a resolved
+`SSL config:` record. DINO-only fields are `null` when inactive under relational;
+this does not redefine requested `Parameters:` values. Method-dependent resume
+inheritance must also be reflected as conditional rules in the static CLI schema
+and generated parameter cards, with effective values resolved at runtime.
+Requested arguments remain separate from effective SSL config. The proposal
+keeps relational `teacher_center_norm` separate from DINO EMA `cls_center_norm`
+and adds method/target/KoLeo-weight columns to instant metrics; see it for CSV migration and
+missing-value plotting requirements. Unlike persisted patch nulls, inactive
+DINO config fields are deliberately omitted from relational checkpoints.
+
 The block is display-only: the argument object handed to the core layer keeps
 the normalized form (`None` for `auto`) that resolution and `--resume`
 comparisons depend on, and the log never becomes an input to a run. What the
@@ -185,6 +197,17 @@ Parameters migrated from `ref/ibot20260115.py` `get_parser()`, mode=extract.
 **Design history:**
 [v0.7.1 metric corrections](2026-09-21-otuformer-v071-cli-metrics-corrections.md),
 [optional register tokens](2026-09-28-otuformer-optional-registers-design.md).
+
+**Optional DINO extension (implemented in the uncommitted CLS change set; formal acceptance/release not recorded):** the
+[CLS design](2026-10-31-otuformer-cls-distillation-design.md) keeps default
+backbone CLS extraction and uses the normalized bottleneck for
+`--use-projector-output`. Its prototype logits and K-dimensional center are
+training-only state. The existing projector-width inference describes the
+extractable MLP layout, not whether that MLP was trained with relational or DINO
+CLS supervision; new SSL identity uses separate `ssl_method`/`ssl_head` metadata.
+Fine-tune outputs keep their actual metric `embedding_head` and record known
+original SSL lineage in `ssl_source_method`/`ssl_source_head`, independently of
+the checkpoint directly loaded for initialization or resume.
 
 ### 3.4 `cluster`
 Compute pairwise distances, build UPGMA tree, scan partitions.
@@ -322,6 +345,23 @@ The three read-only consumers (`extract`, `export`, `cam`) share one resolver, `
 
 The embedding head is taken from `config.embedding_head` when present, otherwise inferred from the projector's first linear width (512 → `arcface_mlp_512`, 2048 → `projection_mlp_2048`); any other width is rejected rather than silently mis-loaded. Buffers that do not fit the rebuilt model (the SSL-only `center`) are dropped, and a backbone whose tensors do not fit the resolved model name is rejected with a message that distinguishes a conflict inside the checkpoint metadata (which outranks `--model-name`) from a missing recorded name that `--model-name` must supply.
 
+**Optional DINO extension (implemented in the uncommitted CLS change set; formal acceptance/release not recorded):**
+[CLS design §6](2026-10-31-otuformer-cls-distillation-design.md#6-checkpoints-and-compatibility)
+separates SSL method/head identity from `config.embedding_head`, preserving
+fine-tune source classification and original-SSL provenance. Active
+`ssl_method`/`ssl_head` belong only to SSL payloads; fine-tune outputs record
+their metric `embedding_head` and separate `ssl_source_method`/`ssl_source_head`
+provenance when known. The width-based rules above remain the legacy
+embedding-layout rules; new DINO identity is
+validated explicitly. Its normalized bottleneck retains the existing MLP weight
+layout; separate `dino_objective` prototype/CLS-center state is loaded strictly
+for pretrain resume and ignored by embedding consumers. The active K-dimensional
+center never replaces the legacy D-dimensional encoder buffer. DINO bypasses
+the legacy center-subtraction/update path and keeps that buffer zero/inactive.
+This proposal
+also requires fine-tune/pseudo-round identity regressions; it does not claim the
+new method is already supported.
+
 Resuming a ref-script checkpoint in `finetune` stays unsupported: its classifier is `loss_func.W`, which is embedding-major and not interchangeable with `ArcFaceLoss.head.weight`. Ref-script **SSL** checkpoints are self-describing (they record `args` with `model_name`/`out_dim`); ref-script **SFT** checkpoints record neither `config` nor `args`, so they require an explicit `--model-name` (`extract`, `export`, and `cam` all expose it).
 
 Finetune#2's accepted pseudo rows and provenance are additive top-level/config payload fields used only by training resume. The shared read-only consumers ignore them and continue to resolve architecture and weights from the existing keys, so `extract`, `export`, and `cam` load finetune#2 checkpoints without schema-specific handling.
@@ -355,9 +395,9 @@ implementation, analysis, version changes, or commits.
 ```toml
 [project.dependencies]
 typer >= 0.12
-torch >= 2.1
+torch >= 2.9
 timm >= 1.0
-torchvision >= 0.16
+torchvision >= 0.24
 numpy >= 1.26
 pandas >= 2.0
 scipy >= 1.12

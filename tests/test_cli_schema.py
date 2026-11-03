@@ -1624,3 +1624,77 @@ def test_unresolvable_link_chain_fails_closed(tmp_path) -> None:
         cli_schema().check_output_safety(
             out, protected_paths=[previous], overwrite=True
         )
+
+
+def test_ssl_schema_conditional_inheritance() -> None:
+    module = cli_schema()
+    base = {"train_data": "e.csv", "input_images_dir": "images", "out_dir": "runs/x"}
+    resume = "runs/x/SSL_latest.pth"
+    conditional = ("out_dim", "dino_prototypes", "dino_centering", "koleo_weight")
+
+    # Resume with an omitted method: the saved method decides, so the labels are
+    # conditional instead of assuming the new-run relational default.
+    omitted_method = module.validate_parameters(
+        "pretrain", {**base, "resume": resume}
+    )
+    for name in conditional:
+        assert omitted_method["provenance"][name] == "omitted-conditional", name
+    assert omitted_method["provenance"]["ssl_method"] == "omitted-inherited"
+    assert any("saved method matches" in note for note in omitted_method["unresolved"])
+    assert any("ssl-method dino" in note for note in omitted_method["unresolved"])
+
+    # Explicit DINO: inherited (if the saved method matches).
+    dino = module.validate_parameters(
+        "pretrain", {**base, "resume": resume, "ssl_method": "dino"}
+    )
+    for name in conditional:
+        assert dino["provenance"][name] == "omitted-inherited", name
+    card = module.render_parameter_card(
+        "pretrain", {**base, "resume": resume, "ssl_method": "dino"}
+    )
+    assert card.count("inherited if the saved method matches") >= len(conditional)
+    assert "--dino-prototypes" in card
+
+    # Explicit relational: declared defaults, and the DINO fields are inactive.
+    relational = module.validate_parameters(
+        "pretrain", {**base, "resume": resume, "ssl_method": "relational"}
+    )
+    for name in conditional:
+        assert relational["provenance"][name] == "omitted-default", name
+
+    # No resume at all: plain declared defaults.
+    fresh = module.validate_parameters("pretrain", base)
+    for name in conditional:
+        assert fresh["provenance"][name] == "omitted-default", name
+    assert fresh["provenance"]["ssl_method"] == "omitted-default"
+
+    # Explicit values always stay explicit.
+    explicit = module.validate_parameters(
+        "pretrain",
+        {
+            **base,
+            "resume": resume,
+            "ssl_method": "dino",
+            "out_dim": 64,
+            "dino_prototypes": 32,
+            "dino_centering": "sinkhorn-knopp",
+            "koleo_weight": 0.1,
+        },
+    )
+    for name in conditional:
+        assert explicit["provenance"][name] == "explicit", name
+
+    # Method-dependent applicability is enforced statically when the method is
+    # known, and deferred when only the checkpoint could decide.
+    with pytest.raises(ValueError):
+        module.validate_parameters(
+            "pretrain",
+            {**base, "ssl_method": "relational", "dino_prototypes": 32},
+        )
+    with pytest.raises(ValueError):
+        module.validate_parameters(
+            "pretrain",
+            {**base, "ssl_method": "dino", "disable_cross_view_loss": True},
+        )
+    with pytest.raises(ValueError):
+        module.validate_parameters("pretrain", {**base, "dino_prototypes": 1})

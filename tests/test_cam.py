@@ -421,6 +421,57 @@ def test_run_cam_end_to_end_on_a_registered_backbone(tmp_path, monkeypatch):
     assert list((out_dir / "arrays").glob("*.npy"))
 
 
+def test_run_cam_accepts_a_dino_source_metric_head_checkpoint(tmp_path, monkeypatch):
+    """CAM must resolve a DINO-lineage metric payload without DINO training state.
+
+    ``ssl_source_*`` is provenance only: the active head is the metric layout, so
+    CAM builds the metric model and must not look for ``dino_objective``.
+    """
+    pytest.importorskip("pytorch_grad_cam")
+    import pandas as pd
+
+    import otuformer.vision.cam as cam_module
+    from otuformer.training.model import ArcFaceEmbeddingHead
+
+    encoder = _tiny_vit_encoder(monkeypatch)
+    encoder.projector = ArcFaceEmbeddingHead(encoder.backbone.num_features, 8)
+    checkpoint = tmp_path / "dino_source_metric.pth"
+    torch.save(
+        {
+            "model_state_dict": encoder.state_dict(),
+            "config": {
+                "model_name": "tiny-vit",
+                "out_dim": 8,
+                "image_size": 48,
+                "metric_embed_dim": 8,
+                "embedding_head": "arcface_mlp_512",
+                "ssl_source_method": "dino",
+                "ssl_source_head": "dino_mlp_2048",
+                "ssl_initialization_checkpoint_sha256": "c" * 64,
+            },
+        },
+        checkpoint,
+    )
+    images_dir = tmp_path / "images"
+    images_dir.mkdir()
+    Image.new("RGB", (48, 48), color=(10, 20, 30)).save(images_dir / "img_0.jpg")
+    out_dir = tmp_path / "cam_out"
+
+    cam_module.run_cam(
+        checkpoint=checkpoint,
+        images_dir=images_dir,
+        out_dir=out_dir,
+        model_name="tiny-vit",
+        cam_method="ablationcam",
+        save_npy="normalized",
+        device="cpu",
+    )
+
+    summary = pd.read_csv(out_dir / "cam_summary.csv")
+    assert len(summary) == 1
+    assert list((out_dir / "figures").glob("*.png"))
+
+
 def test_infer_architecture_vit():
     model = make_tiny_vit()
     arch = infer_architecture("vit_tiny_patch16_224", model)
