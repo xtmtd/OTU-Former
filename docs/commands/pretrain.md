@@ -439,5 +439,6 @@ Embedding-quality metrics use the shared [embedding metrics](embedding-metrics.m
 
 ## Version Notes
 
+- **v0.11.2** — The global/local crop-size divisibility checks, the backbone-capability check and the blockwise-grid/patch-count checks now run against the model and sizes the run will actually use, and before any output directory is cleared or any log file is created; `--overwrite` no longer destroys an existing run for those configurations. The checks listed here are the guarantee: `--extract-size` divisibility and dataset/augmentation errors can still fail after output setup. Isolating those preflight probes changed the student initialization a given `--seed` produces relative to v0.11.1: reproduce bit-for-bit only within one version, and compare arms trained under the same version.
 - **v0.10.0** — `--register-tokens` accepts `none`, `0`, or `4`; the resolved count is recorded in checkpoints and must match on resume and fine-tuning.
 - **v0.7.0** — `--patch-loss` and `--masking-strategy` select the patch objective and its masking geometry; `--mask-ratio` defaults to `auto` and resolves to `0.30` on a new run (v0.6.x used `0.50`).

@@ -82,7 +82,6 @@ from otuformer.utils.size import (
     resolve_backbone_native_size,
     resolve_training_image_size,
     validate_input_size,
-    validate_model_name_size,
 )
 
 
@@ -2182,27 +2181,122 @@ def preflight_finetune_source(
     )
 
 
-def preflight_pretrain_new_run(
-    model_name: str, register_tokens: int | None, image_size: int | None
-) -> None:
-    """Reject an impossible register/model combination before output setup.
+# In-memory handoff attributes; never serialized into a checkpoint's ``args``.
+_UNSAVED_ARGS = frozenset({"resume_state", "pretrain_settings"})
 
-    Builds one RNG-isolated ``pretrained=False`` architecture probe, so the
-    caller's RNG streams are untouched and no pretrained weights are downloaded;
-    ``--overwrite`` therefore cannot clear an existing output directory for a
-    combination that is rejected anyway.
+
+@dataclass(frozen=True)
+class PretrainSettings:
+    """One resolution of the backbone, sizes and patch configuration.
+
+    ``run_pretrain`` and the CLI preflight read the same object, so preflight
+    never validates against a model or a size the trainer will not use.
+    """
+
+    model_name: str
+    global_crop_size: int
+    local_crop_size: int
+    local_crops: int
+    patch_config: dict[str, object]
+
+    @property
+    def patch_mode(self) -> str:
+        return str(self.patch_config["patch_loss"])
+
+    @property
+    def masking_strategy(self) -> str | None:
+        strategy = self.patch_config["masking_strategy"]
+        return None if strategy is None else str(strategy)
+
+
+def resolve_pretrain_settings(
+    args: argparse.Namespace, checkpoint: dict[str, Any] | None = None
+) -> PretrainSettings:
+    """Resolve the backbone, sizes and patch configuration exactly once.
+
+    Pure: the checkpoint is read, never mutated, and the ``auto`` native-size
+    lookup is RNG-isolated so preflight cannot shift the student init a given
+    ``--seed`` produces. Resume uses the checkpoint-resolved backbone and size.
     """
     from otuformer.utils.checkpoint import preserved_rng
 
-    size = 224 if image_size is None else int(image_size)
+    requested_size = getattr(args, "global_crop_size", None)
+    if checkpoint is not None:
+        model_name = resolve_checkpoint(checkpoint, args.model_name).model_name
+        recorded_size = resolve_training_image_size(checkpoint)
+        if requested_size is not None and int(requested_size) != recorded_size:
+            raise ValueError(
+                "resume cannot change the input size: checkpoint records "
+                f"{recorded_size}, got --global-crop-size {requested_size}. "
+                "Start a new run for a different input size."
+            )
+        global_crop_size = recorded_size
+    else:
+        model_name = args.model_name
+        if requested_size is not None:
+            global_crop_size = int(requested_size)
+        else:
+            with preserved_rng():
+                global_crop_size = resolve_backbone_native_size(model_name)
+    local_crop_size, local_crops = _resolve_pretrain_local_views(
+        getattr(args, "local_crop_size", None),
+        getattr(args, "local_crops", None),
+        checkpoint,
+    )
+    return PretrainSettings(
+        model_name=model_name,
+        global_crop_size=global_crop_size,
+        local_crop_size=local_crop_size,
+        local_crops=local_crops,
+        patch_config=_resolve_patch_config(args, checkpoint),
+    )
+
+
+def preflight_pretrain_run(
+    args: argparse.Namespace, settings: PretrainSettings
+) -> None:
+    """Reject an impossible pretraining configuration before output setup.
+
+    Builds one RNG-isolated ``pretrained=False`` probe of the resolved model at
+    the resolved native size and uses it for the divisibility, backbone
+    capability, blockwise-grid and patch-count checks; no pretrained weights are
+    downloaded, and ``--overwrite`` cannot clear an existing output directory
+    for a configuration that is rejected anyway.
+    """
+    from otuformer.utils.checkpoint import preserved_rng
+
+    size = settings.global_crop_size
+    register_tokens = (
+        None
+        if getattr(args, "resume", "")
+        else getattr(args, "register_tokens", None)
+    )
     with preserved_rng():
-        OTUFormerEncoder(
-            model_name=model_name,
+        probe = OTUFormerEncoder(
+            model_name=settings.model_name,
             out_dim=256,
             return_patch_tokens=True,
             img_size=size,
             pretrained=False,
             reg_tokens=register_tokens,
+        )
+    validate_input_size(size, probe, settings.model_name)
+    if settings.local_crops > 0:
+        validate_input_size(settings.local_crop_size, probe, settings.model_name)
+    probe.validate_pretrain_backbone(
+        require_intermediates=settings.patch_mode == "masked-feature"
+    )
+    if settings.patch_mode == "none":
+        return
+    grid_size = probe._patch_grid_size(torch.empty(1, 3, size, size))
+    if settings.masking_strategy in ("blockwise", "hybrid"):
+        _validate_blockwise_grid(grid_size)
+    if grid_size[0] * grid_size[1] < 2:
+        raise ValueError(
+            f"patch grid {grid_size} has fewer than two patch tokens; the "
+            "selected patch objective needs at least one masked and one "
+            "visible position. Increase the input size or use "
+            "--patch-loss none."
         )
 
 
@@ -2273,6 +2367,18 @@ def run_pretrain(args: argparse.Namespace) -> None:
         raise ValueError(
             f"--register-tokens must be 0 or 4 (got {register_option!r})."
         )
+    # Resolve and validate before any output file exists, so a doomed run never
+    # clears or pollutes an existing output directory. The CLI already did both
+    # and hands the result over.
+    resume_ckpt: dict[str, Any] | None = getattr(args, "resume_state", None)
+    if getattr(args, "resume", "") and resume_ckpt is None:
+        resume_ckpt = load_checkpoint(Path(args.resume))
+    # The handoff is a one-shot input, never a cache: a caller that reuses its
+    # Namespace after changing a request must be resolved again.
+    settings = vars(args).pop("pretrain_settings", None)
+    if settings is None:
+        settings = resolve_pretrain_settings(args, resume_ckpt)
+        preflight_pretrain_run(args, settings)
     _set_seed(args.seed)
     _set_cpus(args.cpus)
     device = _resolve_device(args.device)
@@ -2281,54 +2387,29 @@ def run_pretrain(args: argparse.Namespace) -> None:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Resolve the global crop size before dataset/model construction.
-    # ``args.global_crop_size`` is None (auto) or an explicit resolved int.
-    resume_ckpt: dict[str, Any] | None = None
     resume_path: Path | None = None
     resume_register_mode = "new"
     actual_register_tokens = 0
     start_epoch = 0
     global_step = 0
-    model_name = args.model_name
+    model_name = settings.model_name
+    global_crop_size = settings.global_crop_size
+    args.global_crop_size = global_crop_size
     if getattr(args, "resume", ""):
         resume_path = Path(args.resume)
-        # The CLI preloads and validates the checkpoint before creating any
-        # output file; direct callers still load it from the recorded path.
-        resume_ckpt = getattr(args, "resume_state", None)
-        if resume_ckpt is None:
-            resume_ckpt = load_checkpoint(resume_path)
-        checkpoint_size = resolve_training_image_size(resume_ckpt)
-        if (
-            args.global_crop_size is not None
-            and args.global_crop_size != checkpoint_size
-        ):
-            raise ValueError(
-                "resume cannot change the input size: checkpoint records "
-                f"{checkpoint_size}, got --global-crop-size {args.global_crop_size}. "
-                "Start a new run for a different input size."
-            )
-        global_crop_size = checkpoint_size
-    else:
-        global_crop_size = (
-            args.global_crop_size
-            if args.global_crop_size is not None
-            else resolve_backbone_native_size(args.model_name)
-        )
-    args.global_crop_size = global_crop_size
-    if resume_ckpt is not None:
-        architecture = resolve_checkpoint(resume_ckpt, args.model_name)
-        model_name = architecture.model_name
         resume_register_mode, actual_register_tokens = _resume_register_plan(
-            resume_ckpt, model_name, global_crop_size, architecture.embedding_dim
+            resume_ckpt,
+            model_name,
+            global_crop_size,
+            resolve_checkpoint(resume_ckpt, model_name).embedding_dim,
         )
         _check_register_option_against_resume(
             resume_register_mode, actual_register_tokens, register_option
         )
-    validate_model_name_size(model_name, global_crop_size)
 
-    patch_config = _resolve_patch_config(args, resume_ckpt)
-    patch_mode = str(patch_config["patch_loss"])
-    patch_strategy = patch_config["masking_strategy"]
+    patch_config = settings.patch_config
+    patch_mode = settings.patch_mode
+    patch_strategy = settings.masking_strategy
     patch_ratio = patch_config["mask_ratio_resolved"]
     print("Patch config: " + json.dumps(patch_config, sort_keys=True))
 
@@ -2343,13 +2424,8 @@ def run_pretrain(args: argparse.Namespace) -> None:
         stage="pretrain",
         resume=resume_ckpt is not None,
     )
-    local_crop_size, local_crops = _resolve_pretrain_local_views(
-        getattr(args, "local_crop_size", None),
-        getattr(args, "local_crops", None),
-        resume_ckpt,
-    )
-    args.local_crop_size = local_crop_size
-    args.local_crops = local_crops
+    args.local_crop_size = settings.local_crop_size
+    args.local_crops = settings.local_crops
     augmentation_config = build_pretrain_augmentation_config(
         profile,
         global_crop_size,
@@ -2367,12 +2443,6 @@ def run_pretrain(args: argparse.Namespace) -> None:
         "Augmentation config: "
         + json.dumps(augmentation_config, indent=2, sort_keys=True)
     )
-
-    # local crops are processed by the same patch embed: when used, they must
-    # satisfy the same divisibility constraint (the default 96 is invalid for
-    # patch-14). With --local-crops 0 the local size is unused, so skip it.
-    if args.local_crops > 0:
-        validate_model_name_size(args.model_name, args.local_crop_size)
 
     ds = MultiCropDataset(
         csv_path=Path(args.train_data) if getattr(args, "train_data", "") else None,
@@ -2536,7 +2606,7 @@ def run_pretrain(args: argparse.Namespace) -> None:
         if getattr(args, "extract_size", None) is not None
         else global_crop_size
     )
-    validate_input_size(eval_image_size, teacher, args.model_name)
+    validate_input_size(eval_image_size, teacher, model_name)
     if args.extract_size is None:
         print(f"[Info] Auto eval crop size from model img_size: {eval_image_size}")
 
@@ -2829,7 +2899,7 @@ def run_pretrain(args: argparse.Namespace) -> None:
                 "args": {
                     key: value
                     for key, value in vars(args).items()
-                    if key != "resume_state"
+                    if key not in _UNSAVED_ARGS
                 },
                 "config": {
                     "model_name": model_name,

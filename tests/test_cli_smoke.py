@@ -2741,6 +2741,8 @@ def _write_augmented_pretrain_checkpoint(
     profile="global-barcode",
     policy="invariant",
     image_size=224,
+    model_name="vit_tiny_patch16_224",
+    patch_config=None,
 ):
     from otuformer.training.dataset import build_pretrain_augmentation_config
     from otuformer.training.model import OTUFormerEncoder
@@ -2753,7 +2755,7 @@ def _write_augmented_pretrain_checkpoint(
         orientation_policy=policy,
     )
     encoder = OTUFormerEncoder(
-        model_name="vit_tiny_patch16_224",
+        model_name=model_name,
         out_dim=64,
         pretrained=False,
         img_size=image_size,
@@ -2763,10 +2765,11 @@ def _write_augmented_pretrain_checkpoint(
         {
             "model_state_dict": encoder.state_dict(),
             "config": {
-                "model_name": "vit_tiny_patch16_224",
+                "model_name": model_name,
                 "out_dim": 64,
                 "augmentation_profile": profile,
                 "augmentation_config": config,
+                **(patch_config or {}),
             },
             "args": {
                 "global_crop_size": image_size,
@@ -3120,8 +3123,9 @@ def test_pretrain_resume_rejects_conflicting_local_views(tmp_path):
     )
 
     assert result.exit_code != 0
-    assert isinstance(result.exception, ValueError)
-    assert "Cannot resume" in str(result.exception)
+    # The conflict is a CLI parameter error raised before any output setup.
+    assert isinstance(result.exception, (ValueError, SystemExit))
+    assert "Cannot resume" in result.output
     assert not (tmp_path / "resume_out" / "SSL_latest.pth").exists()
 
 
@@ -4480,3 +4484,432 @@ def test_finetune_pseudo_cap_options_are_forwarded(monkeypatch, tmp_path):
     assert seen["absolute_cap"] == 80
     assert seen["similarity_floor"] == 0.7
     assert seen["neighbors"] == 20
+
+
+# --- pretrain preflight consistency -----------------------------------------
+
+def _pretrain_preflight_args(tmp_path, out_dir, *extra):
+    """Minimal CPU pretrain invocation, plus test-specific options."""
+    return [
+        "pretrain",
+        "--input-images-dir", str(tmp_path),
+        "--out-dir", str(out_dir),
+        "--model-name", "vit_tiny_patch16_224",
+        "--out-dim", "16",
+        "--max-epochs", "1",
+        "--batch-size", "2",
+        "--num-workers", "0",
+        "--disable-embedding-metrics",
+        "--disable-cross-view-loss",
+        "--device", "cpu",
+        *extra,
+    ]
+
+
+def _sentinel_output_dir(tmp_path, name):
+    out_dir = tmp_path / name
+    out_dir.mkdir()
+    sentinel = out_dir / "keep.txt"
+    sentinel.write_text("keep", encoding="utf-8")
+    return out_dir, sentinel
+
+
+class _StudentCaptured(Exception):
+    """Stop run_pretrain the moment the real student is built."""
+
+
+def _capture_initial_student(monkeypatch, seen):
+    """Record the student's initial weights and abort before any training."""
+    from otuformer.training import trainer
+    from otuformer.training.model import OTUFormerEncoder
+
+    class TaggedEncoder(OTUFormerEncoder):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            # Only the preflight's throwaway probe is built while preflighting.
+            self.is_probe = bool(seen.get("in_preflight"))
+
+    real_preflight = trainer.preflight_pretrain_run
+
+    def marking_preflight(args, settings):
+        seen["in_preflight"] = True
+        try:
+            return real_preflight(args, settings)
+        finally:
+            seen["in_preflight"] = False
+
+    monkeypatch.setattr(trainer, "preflight_pretrain_run", marking_preflight)
+    real_validate = OTUFormerEncoder.validate_pretrain_backbone
+
+    def capturing_validate(self, require_intermediates=False):
+        if getattr(self, "is_probe", False):
+            return real_validate(self, require_intermediates=require_intermediates)
+        seen["model_name"] = self.model_name
+        seen["require_intermediates"] = require_intermediates
+        seen["state_dict"] = {
+            key: value.detach().clone() for key, value in self.state_dict().items()
+        }
+        raise _StudentCaptured
+
+    monkeypatch.setattr(trainer, "OTUFormerEncoder", TaggedEncoder)
+    monkeypatch.setattr(
+        OTUFormerEncoder, "validate_pretrain_backbone", capturing_validate
+    )
+
+
+def _pretrain_run_namespace(tmp_path, **overrides):
+    """Namespace for a direct run_pretrain call with the CLI's defaults."""
+    fields = {
+        "seed": 42,
+        "cpus": 1,
+        "device": "cpu",
+        "out_dir": str(tmp_path / "direct_out"),
+        "register_tokens": None,
+        "resume": "",
+        "model_name": "vit_tiny_patch16_224",
+        "global_crop_size": None,
+        "local_crop_size": None,
+        "local_crops": None,
+        "augmentation": None,
+        "orientation_policy": None,
+        "train_data": str(tmp_path / "images.csv"),
+        "input_images_dir": str(tmp_path),
+        "out_dim": 16,
+        "batch_size": 2,
+        "num_workers": 0,
+        "patch_loss": "consistency",
+        "patch_loss_explicit": False,
+        "masking_strategy": "random",
+        "masking_strategy_explicit": False,
+        "mask_ratio": "auto",
+        "mask_ratio_explicit": False,
+        "ibot_prototypes": 512,
+        "ibot_prototypes_explicit": False,
+        "lambda_mask": 1.0,
+        "lambda_mask_explicit": False,
+    }
+    fields.update(overrides)
+    return argparse.Namespace(**fields)
+
+
+def test_pretrain_preflight_probes_do_not_consume_the_seed(tmp_path, monkeypatch):
+    """auto and an explicit equal size must start from identical student weights.
+
+    Compares the CLI and a direct ``run_pretrain`` call on the weights captured
+    before training. This does not by itself prove the probes leave the RNG
+    alone: ``_set_seed`` runs after the preflight, so a probe that advanced the
+    stream would be overwritten. That property is pinned by
+    ``test_resolve_pretrain_settings_is_pure_and_single_valued``.
+    """
+    from otuformer.training import trainer
+
+    _make_tiny_pretrain_data(tmp_path)
+    seen = {}
+    _capture_initial_student(monkeypatch, seen)
+    states = {}
+
+    result = runner.invoke(
+        app,
+        _pretrain_preflight_args(
+            tmp_path, tmp_path / "seed_auto", "--seed", "7", "--local-crops", "0"
+        ),
+    )
+    assert isinstance(result.exception, _StudentCaptured), result.output
+    states["auto"] = seen.pop("state_dict")
+
+    direct = _pretrain_run_namespace(
+        tmp_path,
+        out_dir=str(tmp_path / "seed_explicit"),
+        seed=7,
+        local_crops=0,
+        global_crop_size=224,
+    )
+    with pytest.raises(_StudentCaptured):
+        trainer.run_pretrain(direct)
+    states["explicit"] = seen.pop("state_dict")
+
+    assert states["auto"].keys() == states["explicit"].keys()
+    for key, tensor in states["auto"].items():
+        assert torch.equal(tensor, states["explicit"][key]), key
+
+
+def test_pretrain_re_resolves_a_reused_namespace(tmp_path, monkeypatch):
+    """The handoff is a one-shot input: a retried Namespace is resolved again.
+
+    Notebooks and parameter sweeps reuse one Namespace. A cached resolution
+    would silently keep training the first request's sizes and patch mode.
+    """
+    from otuformer.training import trainer
+
+    real_dataset = trainer.MultiCropDataset
+    real_objective = trainer.PatchObjective
+    captured = {"datasets": []}
+    stop = {"at": "dataset"}
+
+    class _Stopped(Exception):
+        """Stop the run at the step under test."""
+
+    def capturing_dataset(**kwargs):
+        captured["datasets"].append(kwargs)
+        if stop["at"] == "dataset":
+            raise _Stopped
+        return real_dataset(**kwargs)
+
+    class RecordingObjective(real_objective):
+        def __init__(self, patch_mode, *args, **kwargs):
+            captured["patch_mode"] = patch_mode
+            raise _Stopped
+
+    monkeypatch.setattr(trainer, "MultiCropDataset", capturing_dataset)
+    monkeypatch.setattr(trainer, "PatchObjective", RecordingObjective)
+
+    args = _pretrain_run_namespace(
+        tmp_path,
+        global_crop_size=224,
+        local_crop_size=96,
+        local_crops=0,
+        patch_loss="consistency",
+    )
+    with pytest.raises(_Stopped):
+        trainer.run_pretrain(args)
+    assert captured["datasets"][-1]["global_crop_size"] == 224
+    assert captured["datasets"][-1]["local_crops"] == 0
+
+    _make_tiny_pretrain_data(tmp_path)
+    stop["at"] = "objective"
+    args.global_crop_size = 112
+    args.local_crop_size = 80
+    args.local_crops = 2
+    args.patch_loss = "none"
+    args.out_dir = str(tmp_path / "retry_out")
+
+    with pytest.raises(_Stopped):
+        trainer.run_pretrain(args)
+
+    assert captured["datasets"][-1]["global_crop_size"] == 112
+    assert captured["datasets"][-1]["local_crop_size"] == 80
+    assert captured["datasets"][-1]["local_crops"] == 2
+    assert captured["patch_mode"] == "none"
+
+
+def test_pretrain_resume_trains_the_checkpoint_backbone(tmp_path, monkeypatch):
+    """The real CLI-to-trainer path keeps the checkpoint backbone and patch mode.
+
+    A patch-14 checkpoint records a local size (98) that is illegal for the
+    invocation's default patch-16 backbone, and a masked-feature patch mode that
+    the command line never repeats.
+    """
+    from otuformer.training import trainer
+
+    _make_tiny_pretrain_data(tmp_path)
+    patch_config = trainer._resolve_patch_config(
+        argparse.Namespace(
+            patch_loss="masked-feature",
+            masking_strategy="random",
+            mask_ratio="auto",
+            ibot_prototypes=512,
+            lambda_mask=1.0,
+        ),
+        None,
+    )
+    ckpt = _write_augmented_pretrain_checkpoint(
+        tmp_path,
+        local_crop_size=98,
+        local_crops=2,
+        model_name="vit_small_patch14_dinov2",
+        patch_config=patch_config,
+    )
+    resolutions = []
+    original_resolve = trainer.resolve_pretrain_settings
+
+    def counting_resolve(*args, **kwargs):
+        resolutions.append(1)
+        return original_resolve(*args, **kwargs)
+
+    monkeypatch.setattr(trainer, "resolve_pretrain_settings", counting_resolve)
+    seen = {}
+    _capture_initial_student(monkeypatch, seen)
+
+    result = runner.invoke(
+        app,
+        [
+            "pretrain",
+            "--resume", str(ckpt),
+            "--input-images-dir", str(tmp_path),
+            "--out-dir", str(tmp_path / "resume_backbone_out"),
+            # The checkpoint records out_dim 64, so the resume must rebuild it.
+            "--out-dim", "64",
+        ],
+    )
+
+    assert isinstance(result.exception, _StudentCaptured), result.output
+    assert seen["model_name"] == "vit_small_patch14_dinov2"
+    assert seen["require_intermediates"] is True
+    assert len(resolutions) == 1
+
+
+def test_pretrain_preflight_rejects_a_bad_local_size_before_overwrite(tmp_path):
+    out_dir, sentinel = _sentinel_output_dir(tmp_path, "bad_local_out")
+
+    result = runner.invoke(
+        app,
+        _pretrain_preflight_args(
+            tmp_path,
+            out_dir,
+            "--overwrite",
+            "--local-crops", "2",
+            "--local-crop-size", "100",
+        ),
+    )
+
+    assert result.exit_code != 0
+    assert "divisible" in result.output
+    assert sentinel.read_text(encoding="utf-8") == "keep"
+
+
+def test_pretrain_preflight_rejects_an_infeasible_blockwise_grid_before_overwrite(
+    tmp_path,
+):
+    out_dir, sentinel = _sentinel_output_dir(tmp_path, "bad_grid_out")
+
+    result = runner.invoke(
+        app,
+        _pretrain_preflight_args(
+            tmp_path,
+            out_dir,
+            "--overwrite",
+            "--local-crops", "0",
+            "--global-crop-size", "32",
+            "--patch-loss", "ibot",
+            "--masking-strategy", "blockwise",
+        ),
+    )
+
+    assert result.exit_code != 0
+    assert "blockwise" in result.output
+    assert sentinel.read_text(encoding="utf-8") == "keep"
+
+
+def test_pretrain_preflight_rejects_a_short_backbone_before_overwrite(
+    tmp_path, monkeypatch
+):
+    import timm
+
+    real_create_model = timm.create_model
+
+    def three_block_model(name, **kwargs):
+        model = real_create_model(name, **kwargs)
+        model.blocks = model.blocks[:3]
+        return model
+
+    monkeypatch.setattr("timm.create_model", three_block_model)
+    out_dir, sentinel = _sentinel_output_dir(tmp_path, "short_backbone_out")
+
+    result = runner.invoke(
+        app,
+        _pretrain_preflight_args(
+            tmp_path,
+            out_dir,
+            "--overwrite",
+            "--local-crops", "0",
+            "--global-crop-size", "224",
+            "--patch-loss", "masked-feature",
+        ),
+    )
+
+    assert result.exit_code != 0
+    assert "transformer blocks" in result.output
+    assert sentinel.read_text(encoding="utf-8") == "keep"
+
+
+def test_pretrain_resume_preflight_validates_the_checkpoint_backbone_local_size(
+    tmp_path,
+):
+    """96 is divisible by 16 but not by 14: the checkpoint backbone decides."""
+    ckpt = _write_augmented_pretrain_checkpoint(
+        tmp_path,
+        local_crop_size=96,
+        local_crops=2,
+        model_name="vit_small_patch14_dinov2",
+    )
+    out_dir = tmp_path / "resume_out"
+    (out_dir / "logs").mkdir(parents=True)
+    log = out_dir / "logs" / "pretrain.log"
+    log.write_text("existing\n", encoding="utf-8")
+    existing = out_dir / "SSL_latest.pth"
+    existing.write_bytes(b"weights")
+
+    result = runner.invoke(
+        app,
+        [
+            "pretrain",
+            "--resume", str(ckpt),
+            "--input-images-dir", str(tmp_path),
+            "--out-dir", str(out_dir),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "divisible" in result.output
+    assert log.read_text(encoding="utf-8") == "existing\n"
+    assert existing.read_bytes() == b"weights"
+
+
+def test_pretrain_preflight_auto_probes_the_resolved_native_size(tmp_path, monkeypatch):
+    import timm
+
+    _make_tiny_pretrain_data(tmp_path)
+    out_dir = tmp_path / "auto_native_out"
+    real_create_model = timm.create_model
+    probes = []
+
+    def ninety_six_model(name, **kwargs):
+        model = real_create_model(name, **kwargs)
+        model.default_cfg = {**model.default_cfg, "input_size": (3, 96, 96)}
+        probes.append((out_dir.exists(), kwargs.get("img_size")))
+        return model
+
+    monkeypatch.setattr("timm.create_model", ninety_six_model)
+
+    result = runner.invoke(
+        app,
+        _pretrain_preflight_args(
+            tmp_path, out_dir, "--local-crops", "0", "--seed", "3"
+        ),
+    )
+
+    assert result.exit_code == 0, result.output
+    sizes = [size for _, size in probes if size is not None]
+    assert set(sizes) == {96}
+    # The architecture probe is built before the output directory exists.
+    assert any(not created and size == 96 for created, size in probes)
+
+    saved = torch.load(
+        out_dir / "SSL_latest.pth", map_location="cpu", weights_only=False
+    )
+    assert saved["args"]["global_crop_size"] == 96
+    assert "pretrain_settings" not in saved["args"]
+    assert "resume_state" not in saved["args"]
+    assert saved["config"]["image_size"] == 96
+    assert saved["config"]["augmentation_config"]["global_crop"]["size"] == 96
+
+
+def test_pretrain_preflight_reports_an_unbuildable_backbone_as_a_parameter_error(
+    tmp_path,
+):
+    out_dir = tmp_path / "bad_model_out"
+
+    result = runner.invoke(
+        app,
+        [
+            "pretrain",
+            "--input-images-dir", str(tmp_path),
+            "--out-dir", str(out_dir),
+            "--model-name", "vit_tiny_patch16-224",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "Could not load" in result.output or "not supported" in result.output
+    assert not isinstance(result.exception, RuntimeError)
+    assert not out_dir.exists()

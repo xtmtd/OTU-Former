@@ -368,42 +368,10 @@ def pretrain(
             "lambda_mask",
         )
     }
-    if not resume:
-        # Reject semantic patch-option conflicts before --overwrite can clear an
-        # existing output directory. Resume never clears it, and its saved mode
-        # is only known once the checkpoint is loaded in run_pretrain().
-        from otuformer.training.trainer import _resolve_patch_config
-
-        _resolve_patch_config(
-            argparse.Namespace(
-                patch_loss=patch_loss,
-                masking_strategy=masking_strategy,
-                mask_ratio=requested_mask_ratio,
-                ibot_prototypes=ibot_prototypes,
-                lambda_mask=lambda_mask,
-                patch_loss_explicit=explicit_sources["patch_loss"],
-                masking_strategy_explicit=explicit_sources["masking_strategy"],
-                mask_ratio_explicit=explicit_sources["mask_ratio"],
-                ibot_prototypes_explicit=explicit_sources["ibot_prototypes"],
-                lambda_mask_explicit=explicit_sources["lambda_mask"],
-            ),
-            None,
-        )
     requested_global_crop_size = _parse_size(
         global_crop_size, stage="--global-crop-size"
     )
     requested_extract_size = _parse_size(extract_size, stage="--extract-size")
-    if not resume:
-        # Reject an impossible register/model combination before --overwrite can
-        # clear an existing output directory.
-        from otuformer.training.trainer import preflight_pretrain_new_run
-
-        try:
-            preflight_pretrain_new_run(
-                model_name, requested_register_tokens, requested_global_crop_size
-            )
-        except (ValueError, OSError) as exc:
-            raise typer.BadParameter(str(exc)) from exc
     # Load the resume checkpoint once, before any output file exists, so a
     # broken or registered-beyond-this-option source is rejected without
     # creating or truncating logs. The object is handed to run_pretrain through
@@ -424,8 +392,73 @@ def pretrain(
             preflight_pretrain_resume(
                 resume_state, model_name, requested_register_tokens, model_name_explicit
             )
-        except (ValueError, KeyError, OSError) as exc:
+        except (ValueError, KeyError, OSError, RuntimeError) as exc:
             raise typer.BadParameter(str(exc)) from exc
+    ns = argparse.Namespace(
+        train_data=str(train_data) if train_data is not None else "",
+        input_images_dir=str(input_images_dir),
+        out_dir=str(out_dir),
+        overwrite=overwrite,
+        model_name=model_name,
+        register_tokens=requested_register_tokens,
+        model_name_explicit=model_name_explicit,
+        out_dim=out_dim,
+        max_epochs=max_epochs,
+        lr=lr,
+        weight_decay=weight_decay,
+        warmup_epochs=warmup_epochs,
+        augmentation=augmentation,
+        orientation_policy=orientation_policy,
+        global_crop_size=requested_global_crop_size,
+        local_crop_size=local_crop_size,
+        local_crops=local_crops,
+        mask_ratio=requested_mask_ratio,
+        lambda_local=lambda_local,
+        lambda_mask=lambda_mask,
+        patch_loss=patch_loss,
+        patch_loss_explicit=explicit_sources["patch_loss"],
+        masking_strategy=masking_strategy,
+        masking_strategy_explicit=explicit_sources["masking_strategy"],
+        mask_ratio_explicit=explicit_sources["mask_ratio"],
+        ibot_prototypes=ibot_prototypes,
+        ibot_prototypes_explicit=explicit_sources["ibot_prototypes"],
+        lambda_mask_explicit=explicit_sources["lambda_mask"],
+        teacher_momentum=teacher_momentum,
+        teacher_momentum_end=teacher_momentum_end,
+        student_temp=student_temp,
+        teacher_temp_start=teacher_temp_start,
+        teacher_temp_end=teacher_temp_end,
+        disable_cross_view_loss=disable_cross_view_loss,
+        resume=resume,
+        log_every_n_steps=log_every_n_steps,
+        save_every_epochs=save_every_epochs,
+        keep_last_checkpoints=keep_last_checkpoints,
+        visualize_data=str(visualize_data) if visualize_data is not None else "",
+        extract_size=requested_extract_size,
+        metrics_sample_size=metrics_sample_size,
+        umap_n_neighbors=umap_n_neighbors,
+        umap_min_dist=umap_min_dist,
+        umap_metric=umap_metric,
+        visualize_class_number=visualize_class_number,
+        compute_embedding_metrics=not disable_embedding_metrics,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        cpus=cpus,
+        device=device,
+        seed=seed,
+    )
+    from otuformer.training.trainer import (
+        preflight_pretrain_run,
+        resolve_pretrain_settings,
+        run_pretrain,
+    )
+
+    try:
+        # One resolution feeds the preflight, the run and the saved recipe.
+        settings = resolve_pretrain_settings(ns, resume_state)
+        preflight_pretrain_run(ns, settings)
+    except (ValueError, KeyError, OSError, RuntimeError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
     prepare_output_dir(out_dir, overwrite=overwrite, allow_existing=bool(resume))
     tee = TeeLogger(
         out_dir / "logs" / "pretrain.log",
@@ -435,59 +468,6 @@ def pretrain(
     sys.stdout = tee
     sys.stderr = tee
     try:
-        ns = argparse.Namespace(
-            train_data=str(train_data) if train_data is not None else "",
-            input_images_dir=str(input_images_dir),
-            out_dir=str(out_dir),
-            overwrite=overwrite,
-            model_name=model_name,
-            register_tokens=requested_register_tokens,
-            model_name_explicit=model_name_explicit,
-            out_dim=out_dim,
-            max_epochs=max_epochs,
-            lr=lr,
-            weight_decay=weight_decay,
-            warmup_epochs=warmup_epochs,
-            augmentation=augmentation,
-            orientation_policy=orientation_policy,
-            global_crop_size=requested_global_crop_size,
-            local_crop_size=local_crop_size,
-            local_crops=local_crops,
-            mask_ratio=requested_mask_ratio,
-            lambda_local=lambda_local,
-            lambda_mask=lambda_mask,
-            patch_loss=patch_loss,
-            patch_loss_explicit=explicit_sources["patch_loss"],
-            masking_strategy=masking_strategy,
-            masking_strategy_explicit=explicit_sources["masking_strategy"],
-            mask_ratio_explicit=explicit_sources["mask_ratio"],
-            ibot_prototypes=ibot_prototypes,
-            ibot_prototypes_explicit=explicit_sources["ibot_prototypes"],
-            lambda_mask_explicit=explicit_sources["lambda_mask"],
-            teacher_momentum=teacher_momentum,
-            teacher_momentum_end=teacher_momentum_end,
-            student_temp=student_temp,
-            teacher_temp_start=teacher_temp_start,
-            teacher_temp_end=teacher_temp_end,
-            disable_cross_view_loss=disable_cross_view_loss,
-            resume=resume,
-            log_every_n_steps=log_every_n_steps,
-            save_every_epochs=save_every_epochs,
-            keep_last_checkpoints=keep_last_checkpoints,
-            visualize_data=str(visualize_data) if visualize_data is not None else "",
-            extract_size=requested_extract_size,
-            metrics_sample_size=metrics_sample_size,
-            umap_n_neighbors=umap_n_neighbors,
-            umap_min_dist=umap_min_dist,
-            umap_metric=umap_metric,
-            visualize_class_number=visualize_class_number,
-            compute_embedding_metrics=not disable_embedding_metrics,
-            batch_size=batch_size,
-            num_workers=num_workers,
-            cpus=cpus,
-            device=device,
-            seed=seed,
-        )
         params = vars(ns)
         # ``Parameters:`` records the request, so an auto/none default reads as
         # the word the user used instead of the internal ``None`` placeholder.
@@ -512,10 +492,9 @@ def pretrain(
         print(json.dumps(displayed, ensure_ascii=False, indent=2, sort_keys=True))
         print("-" * 80)
 
-        from otuformer.training.trainer import run_pretrain
-
         if resume_state is not None:
             ns.resume_state = resume_state
+        ns.pretrain_settings = settings
         run_pretrain(ns)
     except Exception:
         traceback.print_exc(file=tee)

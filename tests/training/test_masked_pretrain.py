@@ -668,7 +668,11 @@ def test_registered_new_run_records_the_added_registers(tmp_path, monkeypatch):
     assert saved["args"]["register_tokens"] == 4
     assert saved["model_state_dict"]["backbone.reg_token"].shape == (1, 4, 16)
     assert "resume_state" not in saved["args"]
-    registered = [call for call in calls if call.get("reg_tokens") == 4]
+    registered = [
+        call
+        for call in calls
+        if call.get("reg_tokens") == 4 and call.get("out_dim") != 256
+    ]
     assert len(registered) == 2
     assert all(call.get("pretrained", True) is True for call in registered)
     # Pre-training equality is asserted by the dedicated synchronization test;
@@ -1144,6 +1148,10 @@ def _run_tiny_pretrain(tmp_path, monkeypatch, label="", **overrides):
     class TaggedEncoder(model_module.OTUFormerEncoder):
         def __init__(self, *a, **k):
             super().__init__(*a, **k)
+            if k.get("out_dim") == 256:
+                # Throwaway architecture probe; not a training encoder.
+                self.tag = "probe"
+                return
             self.tag = "student" if not created else "teacher"
             created.append(self)
 
@@ -1796,7 +1804,8 @@ def test_none_mode_still_validates_the_pretrain_backbone(tmp_path, monkeypatch):
 
     _run_tiny_pretrain(tmp_path, monkeypatch, patch_loss="none")
 
-    assert calls == [False, False]
+    # The architecture probe and both training encoders are validated.
+    assert calls == [False, False, False]
 
 
 def test_legacy_resume_accepts_explicit_lambda_mask(tmp_path, monkeypatch):

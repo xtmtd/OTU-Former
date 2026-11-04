@@ -3556,3 +3556,99 @@ def test_pseudo_cli_preflight_accepts_numeric_class_order(tmp_path, monkeypatch)
     )
 
     assert result.exit_code == 0, result.output
+
+
+def test_resolve_pretrain_settings_is_pure_and_single_valued():
+    """One resolution, no checkpoint mutation, no RNG consumption."""
+    args = argparse.Namespace(
+        model_name="vit_tiny_patch16_224",
+        global_crop_size=None,
+        local_crop_size=None,
+        local_crops=None,
+    )
+    torch.manual_seed(0)
+    before = torch.get_rng_state()
+
+    settings = trainer.resolve_pretrain_settings(args)
+    assert torch.equal(torch.get_rng_state(), before), "resolution advanced the RNG"
+    trainer.preflight_pretrain_run(args, settings)
+    assert torch.equal(torch.get_rng_state(), before), "preflight advanced the RNG"
+    assert vars(args) == {
+        "model_name": "vit_tiny_patch16_224",
+        "global_crop_size": None,
+        "local_crop_size": None,
+        "local_crops": None,
+    }
+    assert settings.global_crop_size == 224
+    assert (settings.local_crop_size, settings.local_crops) == (96, 6)
+    assert settings.patch_mode == "consistency"
+
+    explicit = argparse.Namespace(
+        model_name="vit_tiny_patch16_224",
+        global_crop_size=224,
+        local_crop_size=96,
+        local_crops=6,
+    )
+    auto = trainer.resolve_pretrain_settings(args)
+    assert trainer.resolve_pretrain_settings(explicit) == auto
+    assert trainer.resolve_pretrain_settings(args) == auto
+
+
+def test_run_pretrain_reuses_a_handed_over_resolution(tmp_path, monkeypatch):
+    """A handed-over resolution must not be resolved or preflighted twice."""
+    settings = trainer.PretrainSettings(
+        model_name="vit_tiny_patch16_224",
+        global_crop_size=224,
+        local_crop_size=96,
+        local_crops=0,
+        patch_config={
+            "patch_loss": "none",
+            "masking_strategy": None,
+            "mask_ratio_requested": None,
+            "mask_ratio_resolved": None,
+            "ibot_prototypes": None,
+            "patch_target_layers": None,
+            "patch_center_momentum": None,
+        },
+    )
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("the handed-over resolution was redone")
+
+    monkeypatch.setattr(trainer, "resolve_pretrain_settings", forbidden)
+    monkeypatch.setattr(trainer, "preflight_pretrain_run", forbidden)
+
+    class DatasetReached(Exception):
+        """Stop the run at the first trainer-owned step after preflight."""
+
+    monkeypatch.setattr(
+        trainer,
+        "MultiCropDataset",
+        lambda **_kwargs: (_ for _ in ()).throw(DatasetReached()),
+    )
+    args = argparse.Namespace(
+        out_dir=str(tmp_path / "handoff_out"),
+        seed=42,
+        cpus=0,
+        device="cpu",
+        register_tokens=None,
+        train_data="",
+        input_images_dir=str(tmp_path),
+        batch_size=2,
+        num_workers=0,
+        global_crop_size=None,
+        local_crop_size=None,
+        local_crops=None,
+        augmentation=None,
+        orientation_policy=None,
+        resume="",
+        out_dim=16,
+        pretrain_settings=settings,
+    )
+
+    with pytest.raises(DatasetReached):
+        trainer.run_pretrain(args)
+
+    # The resolved values still drive the trainer's own bookkeeping.
+    assert args.global_crop_size == 224
+    assert (args.local_crop_size, args.local_crops) == (96, 0)
