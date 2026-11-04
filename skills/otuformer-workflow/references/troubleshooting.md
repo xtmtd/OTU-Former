@@ -63,6 +63,28 @@ source identity are checked by the CLI preflight when the run starts. Report tho
 errors as they are; do not work around them by materializing defaults, dropping
 flags, or re-initializing from unrelated weights.
 
+Relational-specific resume errors name their own cause and are not workarounds:
+
+- `partial relational target metadata` — the checkpoint has one of the new-style
+  keys without the complete canonical bundle. It is not a legacy payload; start a
+  new run or resume from an intact checkpoint.
+- `Cross-branch` — the checkpoint records a v2/DINO training state. Cross-branch
+  pretraining resume is unsupported; return to the branch and version that wrote
+  it. Read-only and downstream consumers are unaffected.
+- `conflicts with the recorded recipe value` — an explicit relational or
+  temperature option differs from the checkpoint. A changed training recipe
+  requires a new run.
+- `weak teacher augmentation config no longer matches` — the recorded weak
+  transform is not what this code derives, including when only the recorded
+  normalization differs. Resume with the version that produced the record.
+- `overflows the float32 teacher relation reduction` — a recorded endpoint is
+  numerically unusable at this run's batch size. Increase the temperature in a
+  new run; do not bypass the guard.
+
+`--disable-cross-view-loss` was removed: use `--relational-pairing` instead. The
+internal historical `same` pairing is only ever inherited from a legacy
+checkpoint and is not a request value.
+
 ## Ambiguous scientific results
 
 Keep the distinctions the project documents: morphOTUs are not verified species,

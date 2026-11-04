@@ -615,27 +615,6 @@ def _encoder(**kwargs):
     return model_module.OTUFormerEncoder(model_name=kwargs.pop("model_name", "tiny-vit"), **kwargs)
 
 
-def test_new_register_parameters_and_positions_are_synchronized(monkeypatch):
-    import timm as timm_module
-
-    monkeypatch.setattr(timm_module, "create_model", _tiny_vit_factory)
-    student = _encoder(reg_tokens=4)
-    trainer._set_seed(99)
-    teacher = _encoder(reg_tokens=4)
-    assert not torch.equal(student.backbone.reg_token, teacher.backbone.reg_token)
-
-    trainer._synchronize_new_registers(student, teacher)
-
-    assert torch.equal(student.backbone.reg_token, teacher.backbone.reg_token)
-    assert torch.equal(
-        student.backbone.pos_embed[:, 1:5], teacher.backbone.pos_embed[:, 1:5]
-    )
-    # The independently initialized projectors must stay independent.
-    assert not torch.equal(
-        student.projector.net[0].weight, teacher.projector.net[0].weight
-    )
-
-
 def _record_encoder_constructions(monkeypatch, calls):
     """Record every encoder construction, including the helper's TaggedEncoder.
 
@@ -1106,7 +1085,7 @@ def _tiny_vit_factory(*args, **kwargs):
     )
 
 
-def _run_tiny_pretrain(tmp_path, monkeypatch, label="", **overrides):
+def _run_tiny_pretrain(tmp_path, monkeypatch, label="", on_first_step=None, **overrides):
     """Run one epoch of a tiny CPU pretrain with call tracing."""
     import pandas as pd
     import timm as timm_module
@@ -1197,6 +1176,16 @@ def _run_tiny_pretrain(tmp_path, monkeypatch, label="", **overrides):
 
     monkeypatch.setattr(trainer, "_sample_patch_masks", spy_sample)
 
+    real_teacher_center = trainer._update_teacher_center
+
+    def spy_teacher_center(center, inputs):
+        if on_first_step is not None and "first_step_done" not in observations:
+            observations["first_step_done"] = True
+            on_first_step(created[0], created[1])
+        return real_teacher_center(center, inputs)
+
+    monkeypatch.setattr(trainer, "_update_teacher_center", spy_teacher_center)
+
     real_update = _REAL_UPDATE_TEACHER
 
     def spy_update(student, teacher, momentum):
@@ -1252,6 +1241,14 @@ def _run_tiny_pretrain(tmp_path, monkeypatch, label="", **overrides):
         "max_epochs": 1,
         "save_every_epochs": 1,
         "resume": "",
+        # Keep the historical ordinary/full recipe for these orchestration
+        # assertions; the relational routing matrix owns weak/cross coverage.
+        "relational_teacher_views": "ordinary",
+        "relational_center_source": None,
+        "relational_pairing": "full",
+        "teacher_temp_warmup_ratio": 0.7,
+        "teacher_temp_start": 0.04,
+        "teacher_temp_end": 0.07,
     }
     settings.update(overrides)
     args = argparse.Namespace(
@@ -1269,9 +1266,6 @@ def _run_tiny_pretrain(tmp_path, monkeypatch, label="", **overrides):
         teacher_momentum=0.9,
         teacher_momentum_end=0.99,
         student_temp=0.1,
-        teacher_temp_start=0.04,
-        teacher_temp_end=0.07,
-        disable_cross_view_loss=False,
         log_every_n_steps=1,
         keep_last_checkpoints=1,
         visualize_data="",
@@ -1290,6 +1284,7 @@ def _run_tiny_pretrain(tmp_path, monkeypatch, label="", **overrides):
         **settings,
     )
 
+    observations["encoders"] = created
     trainer.run_pretrain(args)
     observations["out_dir"] = out_dir
     observations["args"] = args
@@ -1613,7 +1608,15 @@ def test_v07_resume_rejects_malformed_patch_objective_state(tmp_path, monkeypatc
         )
 
 
-def _make_legacy_checkpoint(tmp_path, monkeypatch, saved_ratio=0.5):
+def _make_legacy_checkpoint(
+    tmp_path, monkeypatch, saved_ratio=0.5, *, mixed_generation=False
+):
+    """A historical ``main`` payload, or a mixed-generation variant on request.
+
+    ``mixed_generation`` keeps the canonical relational bundle and the new-style
+    ``args`` fields to prove that a checkpoint written by the updated code stays
+    resumable; the default is a genuine pre-change payload.
+    """
     first = _run_tiny_pretrain(tmp_path, monkeypatch, label="_a")
     checkpoint = _load_ckpt(first)
     config = dict(checkpoint["config"])
@@ -1627,10 +1630,31 @@ def _make_legacy_checkpoint(tmp_path, monkeypatch, saved_ratio=0.5):
         "patch_center_momentum",
     ):
         config.pop(key, None)
+    if not mixed_generation:
+        config.pop(trainer.RELATIONAL_TARGET_CONFIG_KEY, None)
     checkpoint["config"] = config
     checkpoint.pop("patch_objective", None)
     checkpoint.pop("rng_state", None)
     checkpoint["args"] = dict(checkpoint.get("args") or {})
+    if not mixed_generation:
+        for key in (
+            "relational_teacher_views",
+            "relational_pairing",
+            "relational_center_source",
+            "teacher_temp_start",
+            "teacher_temp_end",
+            "teacher_temp_warmup_ratio",
+            "weak_teacher_augmentation_config",
+            "weak_relational_teacher_views",
+            "relational_teacher_views_explicit",
+            "relational_pairing_explicit",
+            "relational_center_source_explicit",
+            "teacher_temp_start_explicit",
+            "teacher_temp_end_explicit",
+            "teacher_temp_warmup_ratio_explicit",
+        ):
+            checkpoint["args"].pop(key, None)
+    checkpoint["args"]["disable_cross_view_loss"] = False
     if saved_ratio is None:
         checkpoint["args"].pop("mask_ratio", None)
     else:
@@ -2055,3 +2079,478 @@ def test_ibot_diagnostics_match_reference():
     )
     assert diagnostics["patch_center_norm"] == pytest.approx(float(center.norm()))
 
+
+
+# --- relational teacher routing --------------------------------------------
+
+def test_relational_teacher_routing(tmp_path, monkeypatch, capsys):
+    obs = _run_tiny_pretrain(
+        tmp_path,
+        monkeypatch,
+        label="_weak",
+        patch_loss="none",
+        relational_teacher_views="weak",
+    )
+    forwards = obs["forwards"]
+    teacher_forwards = [f for f in forwards if f["tag"] == "teacher"]
+    # 2 weak relational views + ordinary A for the diagnostic cosine
+    assert len(teacher_forwards) == 3
+    assert all(not f["masked"] for f in teacher_forwards)
+
+    out = capsys.readouterr().out
+    assert "Relational target config: " in out
+    assert "Teacher temperature schedule: " in out
+    assert '"warmup_ratio": 0.7' in out
+    assert "Initial ordinary-global cosine similarity:" in out
+    assert "Initial cosine similarity:" not in out
+
+    checkpoint = torch.load(
+        obs["out_dir"] / "SSL_epoch_0001.pth", map_location="cpu", weights_only=False
+    )
+    bundle = checkpoint["config"][trainer.RELATIONAL_TARGET_CONFIG_KEY]
+    assert bundle["relational_teacher_views"] == "weak"
+    assert bundle["relational_center_source"] == "weak"
+    assert bundle["relational_pairing"] == "full"
+    assert bundle["weak_teacher_augmentation_config"]["normalize"] == {
+        "mean": [0.485, 0.456, 0.406],
+        "std": [0.229, 0.224, 0.225],
+    }
+    assert set(bundle) == set(trainer.RELATIONAL_BUNDLE_KEYS)
+    saved_args = checkpoint["args"]
+    for key in trainer.RELATIONAL_ARGS_KEYS:
+        assert saved_args[key] == bundle[key]
+    assert saved_args["teacher_temp_warmup_ratio"] == 0.7
+    for key in (
+        "include_weak_teacher_views",
+        "weak_relational_teacher_views",
+        "disable_cross_view_loss",
+        "pretrain_recipe",
+    ):
+        assert key not in saved_args
+
+
+def test_relational_teacher_routing_weak_with_ordinary_center(tmp_path, monkeypatch):
+    calls = []
+    real_center = trainer._update_teacher_center
+
+    def spy_center(center, inputs):
+        calls.append((center.detach().clone(), inputs.detach().clone()))
+        return real_center(center, inputs)
+
+    monkeypatch.setattr(trainer, "_update_teacher_center", spy_center)
+
+    obs = _run_tiny_pretrain(
+        tmp_path,
+        monkeypatch,
+        label="_wc",
+        patch_loss="masked-feature",
+        masking_strategy="random",
+        relational_teacher_views="weak",
+        relational_center_source="ordinary",
+    )
+    teacher_forwards = [f for f in obs["forwards"] if f["tag"] == "teacher"]
+    # 2 weak + 2 ordinary (patch targets and the ordinary center population)
+    assert len(teacher_forwards) == 4
+    # the weak forwards never need intermediates, so patch targets cannot use them
+    assert [f["intermediates"] for f in teacher_forwards].count(True) == 2
+
+    # Exactly one center update, from two ordinary views, using c_k-centred and
+    # L2-normalized features (the historical population).
+    assert len(calls) == 1
+    before, inputs = calls[0]
+    assert inputs.shape[0] == 2 * 4
+    assert torch.allclose(inputs.norm(dim=-1), torch.ones(inputs.shape[0]), atol=1e-5)
+
+    checkpoint = torch.load(
+        obs["out_dir"] / "SSL_epoch_0001.pth", map_location="cpu", weights_only=False
+    )
+    bundle = checkpoint["config"][trainer.RELATIONAL_TARGET_CONFIG_KEY]
+    assert bundle["relational_center_source"] == "ordinary"
+    # A disabled center update would leave the saved center at its zero init.
+    assert float(checkpoint["center"].abs().sum()) > 0.0
+
+
+def test_relational_teacher_routing_ordinary_keeps_two_forwards(tmp_path, monkeypatch):
+    obs = _run_tiny_pretrain(
+        tmp_path,
+        monkeypatch,
+        label="_ord",
+        patch_loss="consistency",
+        relational_teacher_views="ordinary",
+    )
+    teacher_forwards = [f for f in obs["forwards"] if f["tag"] == "teacher"]
+    assert len(teacher_forwards) == 2
+
+
+def test_relational_teacher_preserves_fixed_patch_inputs(tmp_path, monkeypatch):
+    plain = _run_tiny_pretrain(
+        tmp_path, monkeypatch, label="_p", patch_loss="consistency"
+    )
+    weak = _run_tiny_pretrain(
+        tmp_path,
+        monkeypatch,
+        label="_w",
+        patch_loss="consistency",
+        relational_teacher_views="weak",
+    )
+    # The ordinary patch path keeps both ordinary views and their masks.
+    plain_masks = [m["mask"] for m in plain["masks"]]
+    weak_masks = [m["mask"] for m in weak["masks"]]
+    assert len(plain_masks) == len(weak_masks) == 2
+    assert all(not m["masked"] for m in plain["forwards"] if m["tag"] == "teacher")
+    assert all(not m["masked"] for m in weak["forwards"] if m["tag"] == "teacher")
+    # teacher temperature still reaches the iBOT target sharpening
+    ibot_plain = _run_tiny_pretrain(
+        tmp_path, monkeypatch, label="_ip", patch_loss="ibot"
+    )
+    ibot_warm = _run_tiny_pretrain(
+        tmp_path,
+        monkeypatch,
+        label="_iw",
+        patch_loss="ibot",
+        teacher_temp_start=0.08,
+        teacher_temp_end=0.11,
+    )
+    import pandas as pd
+
+    plain_rows = pd.read_csv(
+        ibot_plain["out_dir"] / "logs" / "instant_metrics.pretrain.csv"
+    )
+    warm_rows = pd.read_csv(
+        ibot_warm["out_dir"] / "logs" / "instant_metrics.pretrain.csv"
+    )
+    # The teacher temperature reaches iBOT target sharpening, so the patch loss
+    # must differ even at identical fixed teacher state and masks.
+    assert float(plain_rows["mask_loss"].iloc[-1]) != pytest.approx(
+        float(warm_rows["mask_loss"].iloc[-1])
+    )
+    assert float(plain_rows["teacher_temp"].iloc[-1]) == pytest.approx(0.07)
+    assert float(warm_rows["teacher_temp"].iloc[-1]) == pytest.approx(0.11)
+
+
+def test_relational_fresh_teacher_copies_student_state(tmp_path, monkeypatch):
+    """The pre-forward pair must be identical, non-aliased and frozen."""
+    snap = {}
+
+    def capture(student, teacher):
+        snap["student"] = {
+            name: tensor.detach().clone()
+            for name, tensor in student.state_dict().items()
+        }
+        snap["teacher"] = {
+            name: tensor.detach().clone()
+            for name, tensor in teacher.state_dict().items()
+        }
+        snap["student_ptr"] = {
+            name: tensor.data_ptr() for name, tensor in student.state_dict().items()
+        }
+        snap["teacher_ptr"] = {
+            name: tensor.data_ptr() for name, tensor in teacher.state_dict().items()
+        }
+        snap["teacher_frozen"] = all(
+            not parameter.requires_grad for parameter in teacher.parameters()
+        )
+        snap["student_trainable"] = any(
+            parameter.requires_grad for parameter in student.parameters()
+        )
+
+    _run_tiny_pretrain(
+        tmp_path,
+        monkeypatch,
+        label="_sync",
+        patch_loss="consistency",
+        relational_teacher_views="weak",
+        on_first_step=capture,
+    )
+
+    assert snap["student"].keys() == snap["teacher"].keys()
+    for name, tensor in snap["student"].items():
+        # Deleting the fresh-run copy makes every independently seeded value differ.
+        assert torch.equal(tensor, snap["teacher"][name]), name
+        assert snap["student_ptr"][name] != snap["teacher_ptr"][name], name
+    assert snap["teacher_frozen"] is True
+    assert snap["student_trainable"] is True
+    # the projector is copied too, unlike the replaced register-only helper
+    assert "projector" in snap["student"] or any(
+        name.startswith("projector") for name in snap["student"]
+    )
+
+
+# --- repeated relational resume chains -------------------------------------
+
+# A resume hop must omit the relational requests when the checkpoint's own
+# recipe differs from the pinned historical fixture defaults.
+_OMITTED_RECIPE = dict(
+    relational_teacher_views=None,
+    relational_center_source=None,
+    relational_pairing=None,
+    teacher_temp_start=None,
+    teacher_temp_end=None,
+)
+
+
+def _saved_epoch(out_dir, epoch):
+    return torch.load(
+        out_dir / f"SSL_epoch_{epoch:04d}.pth", map_location="cpu", weights_only=False
+    )
+
+
+def _assert_relational_hop(checkpoint, *, views, pairing, center, start, end, weak):
+    config = checkpoint["config"]
+    bundle = config[trainer.RELATIONAL_TARGET_CONFIG_KEY]
+    assert set(bundle) == set(trainer.RELATIONAL_BUNDLE_KEYS)
+    assert bundle["version"] == 1
+    assert bundle["relational_teacher_views"] == views
+    assert bundle["relational_center_source"] == center
+    assert bundle["relational_pairing"] == pairing
+    assert bundle["teacher_temp_start"] == pytest.approx(start)
+    assert bundle["teacher_temp_end"] == pytest.approx(end)
+    if weak:
+        assert bundle["weak_teacher_augmentation_config"] is not None
+        assert bundle["weak_teacher_augmentation_config"]["normalize"] == {
+            "mean": [0.485, 0.456, 0.406],
+            "std": [0.229, 0.224, 0.225],
+        }
+    else:
+        assert bundle["weak_teacher_augmentation_config"] is None
+    args = checkpoint["args"]
+    for key in trainer.RELATIONAL_ARGS_KEYS:
+        assert args[key] == bundle[key], key
+    for key in (
+        "include_weak_teacher_views",
+        "weak_relational_teacher_views",
+        "disable_cross_view_loss",
+        "pretrain_recipe",
+    ):
+        assert key not in args, key
+    return bundle
+
+
+def test_relational_legacy_checkpoint_resaves_twice(tmp_path, monkeypatch):
+    """Legacy -> resume -> save -> resume -> save keeps the historical recipe."""
+    for mixed in (False, True):
+        legacy = _make_legacy_checkpoint(
+            tmp_path, monkeypatch, mixed_generation=mixed
+        )
+        first = _run_tiny_pretrain(
+            tmp_path,
+            monkeypatch,
+            label=f"_hop1_{mixed}",
+            resume=str(legacy),
+            max_epochs=2,
+        )
+        hop1 = _saved_epoch(first["out_dir"], 2)
+        bundle1 = _assert_relational_hop(
+            hop1,
+            views="ordinary",
+            pairing="full",
+            center="ordinary",
+            start=0.04,
+            end=0.07,
+            weak=False,
+        )
+        assert bundle1 == hop1["config"][trainer.RELATIONAL_TARGET_CONFIG_KEY]
+
+        second = _run_tiny_pretrain(
+            tmp_path,
+            monkeypatch,
+            label=f"_hop2_{mixed}",
+            resume=str(first["out_dir"] / "SSL_epoch_0002.pth"),
+            max_epochs=3,
+        )
+        hop2 = _saved_epoch(second["out_dir"], 3)
+        _assert_relational_hop(
+            hop2,
+            views="ordinary",
+            pairing="full",
+            center="ordinary",
+            start=0.04,
+            end=0.07,
+            weak=False,
+        )
+        assert hop2["args"]["teacher_temp_warmup_ratio"] == pytest.approx(0.7)
+
+
+def test_relational_legacy_same_pairing_survives_two_hops(tmp_path, monkeypatch):
+    legacy = _make_legacy_checkpoint(tmp_path, monkeypatch)
+    checkpoint = _load_ckpt(
+        _run_tiny_pretrain(tmp_path, monkeypatch, label="_pre_same")
+    )
+    from otuformer.utils.checkpoint import load_checkpoint
+
+    saved = load_checkpoint(legacy)
+    saved.pop("rng_state", None)
+    saved["config"].pop(trainer.RELATIONAL_TARGET_CONFIG_KEY, None)
+    saved["args"]["disable_cross_view_loss"] = True
+    _save_ckpt(saved, legacy)
+    assert checkpoint is not None
+
+    first = _run_tiny_pretrain(
+        tmp_path,
+        monkeypatch,
+        label="_same_1",
+        resume=str(legacy),
+        max_epochs=2,
+        **_OMITTED_RECIPE,
+    )
+    _assert_relational_hop(
+        _saved_epoch(first["out_dir"], 2),
+        views="ordinary",
+        pairing="same",
+        center="ordinary",
+        start=0.04,
+        end=0.07,
+        weak=False,
+    )
+    second = _run_tiny_pretrain(
+        tmp_path,
+        monkeypatch,
+        label="_same_2",
+        resume=str(first["out_dir"] / "SSL_epoch_0002.pth"),
+        max_epochs=3,
+        **_OMITTED_RECIPE,
+    )
+    _assert_relational_hop(
+        _saved_epoch(second["out_dir"], 3),
+        views="ordinary",
+        pairing="same",
+        center="ordinary",
+        start=0.04,
+        end=0.07,
+        weak=False,
+    )
+
+
+def test_relational_nondefault_ratio_resaves_twice(tmp_path, monkeypatch):
+    """A recorded 0.3 survives two real re-saves and stays authoritative."""
+    start = _run_tiny_pretrain(
+        tmp_path,
+        monkeypatch,
+        label="_ratio_a",
+        teacher_temp_warmup_ratio=0.3,
+        teacher_temp_warmup_ratio_explicit=True,
+        relational_teacher_views="weak",
+        relational_pairing="cross",
+    )
+    first = _saved_epoch(start["out_dir"], 1)
+    assert first["args"]["teacher_temp_warmup_ratio"] == pytest.approx(0.3)
+    bundle = first["config"][trainer.RELATIONAL_TARGET_CONFIG_KEY]
+    assert "teacher_temp_warmup_ratio" not in bundle
+
+    hop1 = _run_tiny_pretrain(
+        tmp_path,
+        monkeypatch,
+        label="_ratio_b",
+        resume=str(start["out_dir"] / "SSL_epoch_0001.pth"),
+        max_epochs=2,
+        **_OMITTED_RECIPE,
+    )
+    assert _saved_epoch(hop1["out_dir"], 2)["args"][
+        "teacher_temp_warmup_ratio"
+    ] == pytest.approx(0.3)
+    hop2 = _run_tiny_pretrain(
+        tmp_path,
+        monkeypatch,
+        label="_ratio_c",
+        resume=str(hop1["out_dir"] / "SSL_epoch_0002.pth"),
+        max_epochs=3,
+        teacher_temp_warmup_ratio=0.3,
+        teacher_temp_warmup_ratio_explicit=True,
+        **_OMITTED_RECIPE,
+    )
+    assert _saved_epoch(hop2["out_dir"], 3)["args"][
+        "teacher_temp_warmup_ratio"
+    ] == pytest.approx(0.3)
+
+    with pytest.raises(ValueError, match="teacher-temp-warmup-ratio"):
+        _run_tiny_pretrain(
+            tmp_path,
+            monkeypatch,
+            label="_ratio_conflict",
+            resume=str(hop1["out_dir"] / "SSL_epoch_0002.pth"),
+            max_epochs=4,
+            teacher_temp_warmup_ratio=0.7,
+            teacher_temp_warmup_ratio_explicit=True,
+            **_OMITTED_RECIPE,
+        )
+
+
+def test_relational_resume_preserves_distinct_encoders_twice(tmp_path, monkeypatch):
+    """No hop may re-synchronize a resumed student/teacher pair."""
+    start = _run_tiny_pretrain(
+        tmp_path, monkeypatch, label="_enc_a", relational_teacher_views="weak"
+    )
+    path = start["out_dir"] / "SSL_epoch_0001.pth"
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    # Make the saved pair deliberately unequal so a copy would be visible.
+    student_state = dict(checkpoint["student"])
+    teacher_state = dict(checkpoint["teacher"])
+    key = next(iter(student_state))
+    teacher_state[key] = student_state[key] + 1.0
+    checkpoint["teacher"] = teacher_state
+    checkpoint["model_state_dict"] = teacher_state
+    checkpoint["center"] = checkpoint["center"] + 5.0
+    _save_ckpt(checkpoint, path)
+
+    hop1 = _run_tiny_pretrain(
+        tmp_path,
+        monkeypatch,
+        label="_enc_b",
+        resume=str(path),
+        max_epochs=2,
+        **_OMITTED_RECIPE,
+    )
+    first = _saved_epoch(hop1["out_dir"], 2)
+    assert not torch.equal(first["student"][key], first["teacher"][key])
+
+    hop2 = _run_tiny_pretrain(
+        tmp_path,
+        monkeypatch,
+        label="_enc_c",
+        resume=str(hop1["out_dir"] / "SSL_epoch_0002.pth"),
+        max_epochs=3,
+        **_OMITTED_RECIPE,
+    )
+    second = _saved_epoch(hop2["out_dir"], 3)
+    assert not torch.equal(second["student"][key], second["teacher"][key])
+    assert trainer.RELATIONAL_TARGET_CONFIG_KEY in second["config"]
+    assert "initialization" not in second["config"]
+
+
+def test_relational_out_of_band_endpoint_survives_two_hops(tmp_path, monkeypatch):
+    """0.0009 is format-legal: inherited, re-saved unchanged, and never banded."""
+    start = _run_tiny_pretrain(tmp_path, monkeypatch, label="_band_a")
+    path = start["out_dir"] / "SSL_epoch_0001.pth"
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    bundle = checkpoint["config"][trainer.RELATIONAL_TARGET_CONFIG_KEY]
+    bundle["teacher_temp_start"] = 0.0009
+    checkpoint["args"]["teacher_temp_start"] = 0.0009
+    _save_ckpt(checkpoint, path)
+
+    hop1 = _run_tiny_pretrain(
+        tmp_path,
+        monkeypatch,
+        label="_band_b",
+        resume=str(path),
+        max_epochs=2,
+        **_OMITTED_RECIPE,
+    )
+    first = _saved_epoch(hop1["out_dir"], 2)
+    assert first["config"][trainer.RELATIONAL_TARGET_CONFIG_KEY][
+        "teacher_temp_start"
+    ] == 0.0009
+    assert first["args"]["teacher_temp_start"] == 0.0009
+
+    hop2 = _run_tiny_pretrain(
+        tmp_path,
+        monkeypatch,
+        label="_band_c",
+        resume=str(hop1["out_dir"] / "SSL_epoch_0002.pth"),
+        max_epochs=3,
+        **_OMITTED_RECIPE,
+    )
+    second = _saved_epoch(hop2["out_dir"], 3)
+    assert second["config"][trainer.RELATIONAL_TARGET_CONFIG_KEY][
+        "teacher_temp_start"
+    ] == 0.0009
+    assert second["args"]["teacher_temp_start"] == 0.0009

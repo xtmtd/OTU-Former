@@ -421,6 +421,63 @@ def test_run_cam_end_to_end_on_a_registered_backbone(tmp_path, monkeypatch):
     assert list((out_dir / "arrays").glob("*.npy"))
 
 
+def test_run_cam_accepts_an_injected_relational_bundle(tmp_path, monkeypatch):
+    """CAM must be indifferent to the additive SSL recipe metadata."""
+    pytest.importorskip("pytorch_grad_cam")
+    import pandas as pd
+
+    import otuformer.vision.cam as cam_module
+    from otuformer.training.trainer import RELATIONAL_TARGET_CONFIG_KEY
+
+    encoder = _tiny_vit_encoder(monkeypatch, reg_tokens=4)
+    checkpoint = tmp_path / "annotated.pth"
+    torch.save(
+        {
+            "model_state_dict": encoder.state_dict(),
+            "config": {
+                "model_name": "tiny-vit",
+                "out_dim": 8,
+                "image_size": 48,
+                "register_tokens": 4,
+                RELATIONAL_TARGET_CONFIG_KEY: {
+                    "version": 1,
+                    "relational_teacher_views": "weak",
+                    "relational_pairing": "cross",
+                    "relational_center_source": "weak",
+                    "teacher_temp_start": 0.08,
+                    "teacher_temp_end": 0.11,
+                    "weak_teacher_augmentation_config": {
+                        "profile": "global-barcode",
+                        "normalize": {
+                            "mean": [0.485, 0.456, 0.406],
+                            "std": [0.229, 0.224, 0.225],
+                        },
+                    },
+                },
+            },
+        },
+        checkpoint,
+    )
+    images_dir = tmp_path / "bundle_images"
+    images_dir.mkdir()
+    Image.new("RGB", (48, 48), color=(10, 20, 30)).save(images_dir / "img_0.jpg")
+    out_dir = tmp_path / "bundle_cam_out"
+
+    cam_module.run_cam(
+        checkpoint=checkpoint,
+        images_dir=images_dir,
+        out_dir=out_dir,
+        model_name="tiny-vit",
+        cam_method="gradcam",
+        save_npy="normalized",
+        device="cpu",
+    )
+
+    summary = pd.read_csv(out_dir / "cam_summary.csv")
+    assert len(summary) == 1
+    assert list((out_dir / "figures").glob("*.png"))
+
+
 def test_infer_architecture_vit():
     model = make_tiny_vit()
     arch = infer_architecture("vit_tiny_patch16_224", model)

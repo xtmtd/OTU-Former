@@ -34,6 +34,14 @@ PRETRAIN_AUGMENTATIONS: tuple[str, ...] = ("global-barcode", "color-robust", "le
 FINETUNE_AUGMENTATIONS: tuple[str, ...] = ("none", "conservative")
 ORIENTATION_POLICIES: tuple[str, ...] = ("invariant", "sensitive")
 
+# Relational target selectors. ``LEGACY_RELATIONAL_PAIRING`` is decode-only: it
+# carries a historical ``--disable-cross-view-loss=true`` checkpoint forward and
+# is never a request choice.
+RELATIONAL_TEACHER_VIEW_CHOICES: tuple[str, ...] = ("weak", "ordinary")
+RELATIONAL_CENTER_SOURCE_CHOICES: tuple[str, ...] = ("weak", "ordinary")
+RELATIONAL_PAIRING_CHOICES: tuple[str, ...] = ("cross", "full")
+LEGACY_RELATIONAL_PAIRING = "same"
+
 EVAL_TRANSFORM_CHOICES = ("center-crop", "whole-specimen-pad")
 TOKEN_MODES = ("cls", "patch-topk", "attention-pool")
 ATTENTION_POOLING_TYPES = ("lightweight", "multihead", "gated")

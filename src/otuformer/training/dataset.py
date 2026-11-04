@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import math
 from pathlib import Path
 from typing import Any
@@ -220,6 +221,74 @@ def build_pretrain_augmentation_config(
     }
 
 
+def _normalize_record(record: object) -> tuple[list[float], list[float]]:
+    """Validate a weak-record ``normalize`` mapping and return its mean/std."""
+    if not isinstance(record, dict):
+        raise ValueError(
+            f"weak teacher augmentation normalize must be a mapping, got {record!r}"
+        )
+    mean = _normalize_vector(record.get("mean"), "mean")
+    std = _normalize_vector(record.get("std"), "std")
+    if any(value <= 0.0 for value in std):
+        raise ValueError(
+            f"weak teacher augmentation normalize.std must be positive, got {std!r}"
+        )
+    return mean, std
+
+
+def _normalize_vector(value: object, name: str) -> list[float]:
+    if not isinstance(value, list) or len(value) != 3:
+        raise ValueError(
+            "weak teacher augmentation normalize."
+            f"{name} must be an ordered list of three numbers, got {value!r}"
+        )
+    resolved: list[float] = []
+    for entry in value:
+        if isinstance(entry, bool) or not isinstance(entry, (int, float)):
+            raise ValueError(
+                "weak teacher augmentation normalize."
+                f"{name} must hold numbers, got {entry!r}"
+            )
+        number = float(entry)
+        if not math.isfinite(number):
+            raise ValueError(
+                "weak teacher augmentation normalize."
+                f"{name} must be finite, got {entry!r}"
+            )
+        resolved.append(number)
+    return resolved
+
+
+def build_weak_teacher_augmentation_config(
+    augmentation_config: dict[str, object],
+) -> dict[str, object]:
+    """Derive the weak teacher global transform from a resolved ordinary config.
+
+    Mirrors the ordinary geometry and normalization so photometric augmentation
+    is the only difference. ``local_crop``, ``local_crops``,
+    ``blur.local_kernel`` and ``blur.probabilities[2]`` are provenance only: no
+    weak global view consumes them, but they stay in the record because the
+    whole record is locked for resume drift detection.
+    """
+    weak = copy.deepcopy(augmentation_config)
+    weak["color_jitter"] = {
+        "probability": 0.0,
+        "brightness": 0.0,
+        "contrast": 0.0,
+        "saturation": 0.0,
+        "hue": 0.0,
+    }
+    weak["grayscale_probability"] = 0.0
+    blur = dict(weak["blur"])
+    probabilities = list(blur["probabilities"])
+    probabilities[0] = 0.0
+    probabilities[1] = 0.0
+    blur["probabilities"] = probabilities
+    weak["blur"] = blur
+    weak["normalize"] = {"mean": list(_IMAGENET_MEAN), "std": list(_IMAGENET_STD)}
+    return weak
+
+
 def build_finetune_augmentation_config(
     profile: str,
     image_size: int,
@@ -382,6 +451,8 @@ class _PretrainViewTransform:
         blur_kernel: int,
         blur_sigma: tuple[float, float],
         post_rotation_resize: bool,
+        normalize_mean: list[float] | None = None,
+        normalize_std: list[float] | None = None,
     ) -> None:
         self._crop_size = int(crop_size)
         self._scale = tuple(float(v) for v in scale)
@@ -437,7 +508,8 @@ class _PretrainViewTransform:
         )
         self._to_tensor = transforms.ToTensor()
         self._normalize = transforms.Normalize(
-            mean=_IMAGENET_MEAN, std=_IMAGENET_STD
+            mean=_IMAGENET_MEAN if normalize_mean is None else normalize_mean,
+            std=_IMAGENET_STD if normalize_std is None else normalize_std,
         )
 
     @property
@@ -519,11 +591,20 @@ class _PretrainViewTransform:
 
 
 def _build_pretrain_view_transform(
-    config: dict[str, object], view: str, blur_probability: float
+    config: dict[str, object],
+    view: str,
+    blur_probability: float,
+    *,
+    use_recorded_normalize: bool = False,
 ) -> _PretrainViewTransform:
     crop = config[f"{view}_crop"]
     rotation = config["rotation"]
     blur = config["blur"]
+    normalize_mean: list[float] | None = None
+    normalize_std: list[float] | None = None
+    if use_recorded_normalize:
+        # The weak record's normalization is binding: no module-constant fallback.
+        normalize_mean, normalize_std = _normalize_record(config["normalize"])
     return _PretrainViewTransform(
         crop_size=int(crop["size"]),
         scale=tuple(float(v) for v in crop["scale"]),
@@ -539,6 +620,8 @@ def _build_pretrain_view_transform(
         blur_kernel=int(blur[f"{view}_kernel"]),
         blur_sigma=tuple(float(v) for v in blur["sigma"]),
         post_rotation_resize="resize" in config["transform_order"],
+        normalize_mean=normalize_mean,
+        normalize_std=normalize_std,
     )
 
 
@@ -760,6 +843,83 @@ def build_eval_transform(name: str, size: int) -> transforms.Compose:
     return builder(size)
 
 
+_GEOMETRY_KEYS = (
+    "crop_ratio",
+    "transform_order",
+    "rotation",
+    "fallback_fill",
+    "horizontal_flip_probability",
+    "vertical_flip_probability",
+)
+
+
+def _validated_supplied_config(
+    config: dict[str, object],
+    *,
+    profile: str,
+    orientation_policy: str,
+    global_crop_size: int,
+    local_crop_size: int,
+    local_crops: int,
+) -> dict[str, object]:
+    """Reject a supplied config that contradicts the constructor arguments."""
+    expected = {
+        "profile": profile,
+        "orientation_policy": orientation_policy,
+        "global_crop.size": global_crop_size,
+        "local_crop.size": local_crop_size,
+        "local_crops": local_crops,
+    }
+    actual = {
+        "profile": config.get("profile"),
+        "orientation_policy": config.get("orientation_policy"),
+        "global_crop.size": config["global_crop"]["size"],
+        "local_crop.size": config["local_crop"]["size"],
+        "local_crops": config.get("local_crops"),
+    }
+    for name, value in expected.items():
+        if actual[name] != value:
+            raise ValueError(
+                f"supplied augmentation_config.{name} is {actual[name]!r} but the "
+                f"constructor requests {value!r}; supplied configs are not overrides"
+            )
+    return config
+
+
+def _validated_weak_config(
+    weak: dict[str, object], ordinary: dict[str, object]
+) -> dict[str, object]:
+    """Reject a supplied weak config that is not a photometric-only derivative."""
+    for key in ("global_crop",) + _GEOMETRY_KEYS:
+        if weak.get(key) != ordinary.get(key):
+            raise ValueError(
+                f"weak teacher augmentation {key!r} must mirror the ordinary "
+                "config; only photometric settings may differ"
+            )
+    _normalize_record(weak.get("normalize"))
+    jitter = weak.get("color_jitter") or {}
+    if float(jitter.get("probability", 0.0)) != 0.0 or any(
+        float(jitter[name]) != 0.0
+        for name in ("brightness", "contrast", "saturation", "hue")
+    ):
+        raise ValueError(
+            "weak teacher augmentation must disable color jitter, got "
+            f"{weak.get('color_jitter')!r}"
+        )
+    if float(weak.get("grayscale_probability", 0.0)) != 0.0:
+        raise ValueError(
+            "weak teacher augmentation must disable grayscale, got "
+            f"{weak.get('grayscale_probability')!r}"
+        )
+    probabilities = weak["blur"]["probabilities"]
+    if float(probabilities[0]) != 0.0 or float(probabilities[1]) != 0.0:
+        raise ValueError(
+            "weak teacher augmentation must disable both global blur "
+            f"probabilities, got {list(probabilities)!r}"
+        )
+    return weak
+
+
 class MultiCropDataset(Dataset):
     """SSL pretraining dataset with multi-crop augmentation."""
 
@@ -772,6 +932,10 @@ class MultiCropDataset(Dataset):
         local_crops: int = 6,
         augmentation_profile: str = "global-barcode",
         orientation_policy: str = "sensitive",
+        *,
+        include_weak_teacher_views: bool = False,
+        augmentation_config: dict[str, object] | None = None,
+        weak_teacher_augmentation_config: dict[str, object] | None = None,
     ) -> None:
         images_root = Path(images_dir)
         if csv_path is None:
@@ -801,12 +965,23 @@ class MultiCropDataset(Dataset):
         self.local_crops = int(local_crops)
         self.augmentation_profile = augmentation_profile
         self.orientation_policy = orientation_policy
-        self.augmentation_config = build_pretrain_augmentation_config(
-            augmentation_profile,
-            self.global_crop_size,
-            self.local_crop_size,
-            self.local_crops,
-            orientation_policy,
+        self.augmentation_config = (
+            build_pretrain_augmentation_config(
+                augmentation_profile,
+                self.global_crop_size,
+                self.local_crop_size,
+                self.local_crops,
+                orientation_policy,
+            )
+            if augmentation_config is None
+            else _validated_supplied_config(
+                augmentation_config,
+                profile=augmentation_profile,
+                orientation_policy=orientation_policy,
+                global_crop_size=self.global_crop_size,
+                local_crop_size=self.local_crop_size,
+                local_crops=self.local_crops,
+            )
         )
         blur_probabilities = self.augmentation_config["blur"]["probabilities"]
         self.global_tf1 = _build_pretrain_view_transform(
@@ -818,6 +993,30 @@ class MultiCropDataset(Dataset):
         self.local_tf = _build_pretrain_view_transform(
             self.augmentation_config, "local", blur_probabilities[2]
         )
+        self.weak_teacher_tf1: _PretrainViewTransform | None = None
+        self.weak_teacher_tf2: _PretrainViewTransform | None = None
+        self.weak_teacher_augmentation_config: dict[str, object] | None = None
+        if include_weak_teacher_views:
+            weak_config = (
+                build_weak_teacher_augmentation_config(self.augmentation_config)
+                if weak_teacher_augmentation_config is None
+                else _validated_weak_config(
+                    weak_teacher_augmentation_config, self.augmentation_config
+                )
+            )
+            self.weak_teacher_augmentation_config = weak_config
+            weak_blur = weak_config["blur"]["probabilities"]
+            self.weak_teacher_tf1 = _build_pretrain_view_transform(
+                weak_config, "global", weak_blur[0], use_recorded_normalize=True
+            )
+            self.weak_teacher_tf2 = _build_pretrain_view_transform(
+                weak_config, "global", weak_blur[1], use_recorded_normalize=True
+            )
+        elif weak_teacher_augmentation_config is not None:
+            raise ValueError(
+                "weak_teacher_augmentation_config requires "
+                "include_weak_teacher_views=True"
+            )
         # Legacy profiles use a fixed fill, so the per-item edge-median estimate
         # is skipped entirely when no view consumes it.
         self._estimate_edge_fill = any(
@@ -860,6 +1059,25 @@ class MultiCropDataset(Dataset):
             views.append(
                 self._apply_view(
                     self.local_tf, img, fill, self.local_crop_size, "local_tf"
+                )
+            )
+        if self.weak_teacher_tf1 is not None and self.weak_teacher_tf2 is not None:
+            views.append(
+                self._apply_view(
+                    self.weak_teacher_tf1,
+                    img,
+                    fill,
+                    self.global_crop_size,
+                    "weak_teacher_A",
+                )
+            )
+            views.append(
+                self._apply_view(
+                    self.weak_teacher_tf2,
+                    img,
+                    fill,
+                    self.global_crop_size,
+                    "weak_teacher_B",
                 )
             )
         return views

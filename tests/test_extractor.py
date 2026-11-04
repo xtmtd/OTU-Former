@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
 import torch
@@ -15,17 +16,66 @@ from otuformer.embedding.extractor import (
 from otuformer.utils.size import resolve_onnx_input_size
 
 
-def make_checkpoint(tmp_path: Path, out_dim: int = 64) -> Path:
+def relational_bundle() -> dict:
+    """A canonical SSL relational recipe, as a pretrain checkpoint records it."""
+    return {
+        "version": 1,
+        "relational_teacher_views": "weak",
+        "relational_pairing": "cross",
+        "relational_center_source": "weak",
+        "teacher_temp_start": 0.08,
+        "teacher_temp_end": 0.11,
+        "weak_teacher_augmentation_config": {
+            "profile": "global-barcode",
+            "normalize": {
+                "mean": [0.485, 0.456, 0.406],
+                "std": [0.229, 0.224, 0.225],
+            },
+        },
+    }
+
+
+def make_checkpoint(
+    tmp_path: Path,
+    out_dim: int = 64,
+    *,
+    annotated: bool = False,
+    name: str = "ckpt.pt",
+) -> Path:
     from otuformer.training.model import OTUFormerEncoder
+    from otuformer.training.trainer import RELATIONAL_TARGET_CONFIG_KEY
 
     model = OTUFormerEncoder(model_name="vit_tiny_patch16_224", out_dim=out_dim)
-    ckpt = {
-        "model_state_dict": model.state_dict(),
-        "config": {"model_name": "vit_tiny_patch16_224", "out_dim": out_dim},
-    }
-    p = tmp_path / "ckpt.pt"
+    config = {"model_name": "vit_tiny_patch16_224", "out_dim": out_dim}
+    if annotated:
+        config[RELATIONAL_TARGET_CONFIG_KEY] = relational_bundle()
+    ckpt = {"model_state_dict": model.state_dict(), "config": config}
+    p = tmp_path / name
     torch.save(ckpt, p)
     return p
+
+
+def test_extract_ignores_an_injected_relational_bundle(tmp_path):
+    """Additive SSL recipe metadata must not change extraction output."""
+    plain = make_checkpoint(tmp_path, name="plain.pt")
+    annotated = make_checkpoint(tmp_path, annotated=True, name="annotated.pt")
+    img_dir = tmp_path / "bundle_images"
+    make_images(img_dir, n=2)
+    left = extract_embeddings(
+        checkpoint_path=plain,
+        images_dir=img_dir,
+        device="cpu",
+        batch_size=2,
+        token_mode="cls",
+    )
+    right = extract_embeddings(
+        checkpoint_path=annotated,
+        images_dir=img_dir,
+        device="cpu",
+        batch_size=2,
+        token_mode="cls",
+    )
+    assert np.array_equal(np.asarray(left), np.asarray(right))
 
 
 def make_images(directory: Path, n: int = 3) -> None:

@@ -20,6 +20,9 @@ from otuformer.cli import (
     format_user_command,
     orientation_policy_choices,
     pretrain_augmentation_choices,
+    relational_center_source_choices,
+    relational_pairing_choices,
+    relational_teacher_view_choices,
     requested_display,
     source_is_commandline as _source_is_commandline,
 )
@@ -243,19 +246,62 @@ def pretrain(
     student_temp: float = typer.Option(
         0.1, "--student-temp", help="Student temperature."
     ),
-    teacher_temp_start: float = typer.Option(
-        0.04, "--teacher-temp-start", help="Initial teacher temperature."
-    ),
-    teacher_temp_end: float = typer.Option(
-        0.07, "--teacher-temp-end", help="Final teacher temperature."
-    ),
-    disable_cross_view_loss: bool = typer.Option(
-        False,
-        "--disable-cross-view-loss",
+    teacher_temp_start: float | None = typer.Option(
+        None,
+        "--teacher-temp-start",
         help=(
-            "Disable cross-view global loss pairing. "
-            "Default keeps full cross-view matching between global crops."
+            "Initial teacher temperature. Effective default for a new run: 0.08. "
+            "Omit to inherit the saved value on --resume. Shared by the global "
+            "and local relational losses and by ibot target sharpening."
         ),
+    ),
+    teacher_temp_end: float | None = typer.Option(
+        None,
+        "--teacher-temp-end",
+        help=(
+            "Final teacher temperature. Effective default for a new run: 0.11. "
+            "Omit to inherit the saved value on --resume."
+        ),
+    ),
+    teacher_temp_warmup_ratio: float = typer.Option(
+        0.7,
+        "--teacher-temp-warmup-ratio",
+        help=(
+            "Fraction of the planned steps spent ramping the teacher temperature "
+            "from start to end, in the closed range [0, 1]. 0 disables the ramp "
+            "and 1 leaves no plateau. Omit to inherit the saved value on --resume."
+        ),
+    ),
+    relational_teacher_views: str | None = typer.Option(
+        None,
+        "--relational-teacher-views",
+        help=(
+            "Teacher images used for relational target features: weak or "
+            "ordinary. Effective default for a new run: weak. Omit to inherit "
+            "the saved value on --resume."
+        ),
+        autocompletion=relational_teacher_view_choices,
+    ),
+    relational_center_source: str | None = typer.Option(
+        None,
+        "--relational-center-source",
+        help=(
+            "Teacher feature population that updates the running CLS center: "
+            "weak or ordinary. Omit to inherit the saved value on --resume; a "
+            "new run defaults to the teacher-view source, and ordinary teacher "
+            "views require an ordinary center."
+        ),
+        autocompletion=relational_center_source_choices,
+    ),
+    relational_pairing: str | None = typer.Option(
+        None,
+        "--relational-pairing",
+        help=(
+            "Global student/teacher view pairs averaged in the relational loss: "
+            "cross (A-to-B and B-to-A) or full (all four). Effective default for "
+            "a new run: cross. Replaces the removed disable-cross-view-loss switch."
+        ),
+        autocompletion=relational_pairing_choices,
     ),
     log_every_n_steps: int = typer.Option(
         50, "--log-every-n-steps", help="Log metrics every N iterations."
@@ -366,6 +412,12 @@ def pretrain(
             "mask_ratio",
             "ibot_prototypes",
             "lambda_mask",
+            "relational_teacher_views",
+            "relational_center_source",
+            "relational_pairing",
+            "teacher_temp_start",
+            "teacher_temp_end",
+            "teacher_temp_warmup_ratio",
         )
     }
     requested_global_crop_size = _parse_size(
@@ -428,7 +480,22 @@ def pretrain(
         student_temp=student_temp,
         teacher_temp_start=teacher_temp_start,
         teacher_temp_end=teacher_temp_end,
-        disable_cross_view_loss=disable_cross_view_loss,
+        teacher_temp_warmup_ratio=teacher_temp_warmup_ratio,
+        teacher_temp_start_explicit=explicit_sources["teacher_temp_start"],
+        teacher_temp_end_explicit=explicit_sources["teacher_temp_end"],
+        teacher_temp_warmup_ratio_explicit=explicit_sources[
+            "teacher_temp_warmup_ratio"
+        ],
+        relational_teacher_views=relational_teacher_views,
+        relational_center_source=relational_center_source,
+        relational_pairing=relational_pairing,
+        relational_teacher_views_explicit=explicit_sources[
+            "relational_teacher_views"
+        ],
+        relational_center_source_explicit=explicit_sources[
+            "relational_center_source"
+        ],
+        relational_pairing_explicit=explicit_sources["relational_pairing"],
         resume=resume,
         log_every_n_steps=log_every_n_steps,
         save_every_epochs=save_every_epochs,
@@ -448,6 +515,7 @@ def pretrain(
         seed=seed,
     )
     from otuformer.training.trainer import (
+        _resolve_pretrain_recipe,
         preflight_pretrain_run,
         resolve_pretrain_settings,
         run_pretrain,
@@ -457,6 +525,7 @@ def pretrain(
         # One resolution feeds the preflight, the run and the saved recipe.
         settings = resolve_pretrain_settings(ns, resume_state)
         preflight_pretrain_run(ns, settings)
+        recipe = _resolve_pretrain_recipe(ns, resume_state, settings=settings)
     except (ValueError, KeyError, OSError, RuntimeError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     prepare_output_dir(out_dir, overwrite=overwrite, allow_existing=bool(resume))
@@ -495,7 +564,7 @@ def pretrain(
         if resume_state is not None:
             ns.resume_state = resume_state
         ns.pretrain_settings = settings
-        run_pretrain(ns)
+        run_pretrain(ns, pretrain_recipe=recipe)
     except Exception:
         traceback.print_exc(file=tee)
         raise

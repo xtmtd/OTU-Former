@@ -83,6 +83,20 @@ augmentation encourages but does not guarantee embedding invariance.
 **Input size.** Both fine-tuning profiles use the checkpoint-recorded training
 input size, with a `224` fallback for old checkpoints that do not record one.
 
+**Weak relational teacher record.** `config.relational_target_config.weak_teacher_augmentation_config`
+locks the two weak teacher global views. It mirrors the resolved ordinary
+geometry (crop size/scale, aspect ratio, rotation degrees/interpolation/expand/fill,
+post-rotation resize and order, flips) and adds its own
+`normalize.mean`/`normalize.std`, so the recorded normalization controls pixels
+instead of inheriting a module constant. Color jitter, grayscale and both global
+blur probabilities are recorded as disabled. The `legacy` profile is the
+exception: it ignores `--orientation-policy` for transforms, so its weak record
+keeps the historical broad rotation, both flips, fixed black fill, no expanded
+rotation and no post-rotation resize. The ordinary student, local and patch
+teacher views keep the selected profile unchanged. A change to the recorded weak
+transform, including a serialization-only difference, blocks resume: resume with
+a code version that reproduces the saved record.
+
 Checkpoint metadata (`config.augmentation_profile`, `config.augmentation_config`)
 provides configuration traceability, not bitwise deterministic replay. Full
 transform-level definitions are in

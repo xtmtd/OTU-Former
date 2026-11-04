@@ -12,7 +12,7 @@ import random
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, NamedTuple
 
 import numpy as np
 import torch
@@ -24,10 +24,14 @@ from tqdm import tqdm
 from otuformer.constants import (
     ARCFACE_FAMILY_LOSSES,
     IBOT_PROTOTYPES_MIN,
+    LEGACY_RELATIONAL_PAIRING,
     MASKING_STRATEGIES,
     MAX_SUBCENTERS,
     MIN_SUBCENTERS,
     PATCH_LOSS_MODES,
+    RELATIONAL_CENTER_SOURCE_CHOICES,
+    RELATIONAL_PAIRING_CHOICES,
+    RELATIONAL_TEACHER_VIEW_CHOICES,
 )
 from otuformer.embedding.evaluator import (
     compute_clustering_metrics,
@@ -49,6 +53,7 @@ from otuformer.training.dataset import (
     _supports_recursive_lookup,
     build_finetune_augmentation_config,
     build_pretrain_augmentation_config,
+    build_weak_teacher_augmentation_config,
     center_crop_eval_transform,
 )
 from otuformer.training.loss import (
@@ -233,7 +238,10 @@ def _build_pretrain_schedules(
             args.max_epochs, steps_per_epoch,
         )
         teacher_temp = _build_teacher_temp_schedule(
-            total_steps, args.teacher_temp_start, args.teacher_temp_end
+            total_steps,
+            args.teacher_temp_start,
+            args.teacher_temp_end,
+            _teacher_temp_warmup_ratio(args),
         )
     else:
         original_epochs = int(schedule_state["original_max_epochs"])
@@ -255,7 +263,10 @@ def _build_pretrain_schedules(
                 args.teacher_momentum, args.teacher_momentum_end, original_epochs, original_spe
             )
             teacher_temp = _build_teacher_temp_schedule(
-                original_steps, args.teacher_temp_start, args.teacher_temp_end
+                original_steps,
+                args.teacher_temp_start,
+                args.teacher_temp_end,
+                _teacher_temp_warmup_ratio(args),
             )
             metadata = dict(schedule_state)
         else:
@@ -279,30 +290,47 @@ def _build_pretrain_schedules(
     return lr, momentum, student_temp, teacher_temp, metadata
 
 
+_RELATIONAL_PAIR_SETS: dict[str, tuple[tuple[int, int], ...]] = {
+    "cross": ((0, 1), (1, 0)),
+    "full": ((0, 0), (0, 1), (1, 0), (1, 1)),
+    "same": ((0, 0), (1, 1)),
+}
+
+
 def _compute_global_loss(
     student_global: list[torch.Tensor],
     teacher_global: list[torch.Tensor],
     temp_student: float,
     temp_teacher: float,
-    disable_cross_view_loss: bool = False,
+    *,
+    relational_pairing: str,
 ) -> torch.Tensor:
-    """Compute global distillation loss following ref/ibot20260115.py.
+    """Average the selected global student/teacher view pairs.
 
-    When disable_cross_view_loss=False (default): full Cartesian product.
-    When disable_cross_view_loss=True: matching-pair zip only.
+    ``cross`` averages A-to-B and B-to-A, ``full`` averages the whole Cartesian
+    product, and the internal ``same`` pairing keeps the historical
+    matching-index terms for legacy checkpoints.
     """
-    device = student_global[0].device
-    loss = torch.tensor(0.0, device=device)
-    if disable_cross_view_loss:
-        for s, t in zip(student_global, teacher_global):
-            loss += _ssl_loss(s, t, temp_student, temp_teacher)
-        loss /= max(1, len(student_global))
-    else:
-        for s in student_global:
-            for t in teacher_global:
-                loss += _ssl_loss(s, t, temp_student, temp_teacher)
-        loss /= max(1, len(student_global) * len(teacher_global))
-    return loss
+    pairs = _RELATIONAL_PAIR_SETS.get(relational_pairing)
+    if pairs is None:
+        raise ValueError(
+            f"Unsupported relational_pairing {relational_pairing!r}; expected one "
+            f"of: {', '.join(_RELATIONAL_PAIR_SETS)}."
+        )
+    if len(student_global) != 2 or len(teacher_global) != 2:
+        raise ValueError(
+            "global relational loss needs exactly two student and two teacher "
+            f"features, got {len(student_global)} and {len(teacher_global)}."
+        )
+    loss = torch.tensor(0.0, device=student_global[0].device)
+    for student_index, teacher_index in pairs:
+        loss = loss + _ssl_loss(
+            student_global[student_index],
+            teacher_global[teacher_index],
+            temp_student,
+            temp_teacher,
+        )
+    return loss / len(pairs)
 
 
 def _compute_local_loss(
@@ -338,12 +366,25 @@ def _update_teacher_center(
     return center * 0.9 + batch_mean * 0.1
 
 
+def _teacher_temp_warmup_ratio(args: argparse.Namespace) -> float:
+    """The effective ramp fraction.
+
+    Only a missing or ``None`` attribute falls back to the historical constant;
+    an explicit ``0.0`` is a legal "no ramp at all" and must reach the schedule.
+    """
+    value = getattr(args, "teacher_temp_warmup_ratio", None)
+    if value is None:
+        return HISTORICAL_TEACHER_TEMP_WARMUP_RATIO
+    return float(value)
+
+
 def _build_teacher_temp_schedule(
     total_iters: int,
     teacher_temp_start: float,
     teacher_temp_end: float,
+    teacher_temp_warmup_ratio: float = 0.7,
 ) -> np.ndarray:
-    warmup_iters = int(total_iters * 0.7)
+    warmup_iters = int(total_iters * float(teacher_temp_warmup_ratio))
     if warmup_iters > 0:
         return np.concatenate(
             [
@@ -2183,6 +2224,15 @@ def preflight_finetune_source(
 
 # In-memory handoff attributes; never serialized into a checkpoint's ``args``.
 _UNSAVED_ARGS = frozenset({"resume_state", "pretrain_settings"})
+# Names that must never reach a saved ``args`` block.
+_TRANSIENT_ARGS = frozenset(
+    {
+        "pretrain_recipe",
+        "include_weak_teacher_views",
+        "weak_relational_teacher_views",
+        "weak_teacher_augmentation_config",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -2330,42 +2380,562 @@ def preflight_pretrain_resume(
     return mode, actual
 
 
-def _new_register_position_tensor(model: OTUFormerEncoder) -> torch.Tensor | None:
-    """The four registered prefix positional entries, or ``None`` if patch-only."""
-    backbone = model.backbone
-    prefix = int(getattr(backbone, "num_prefix_tokens", 1))
-    pos = getattr(backbone, "pos_embed", None)
-    if pos is None or pos.shape[1] <= prefix:
+# --- relational target recipe ------------------------------------------------
+
+RELATIONAL_TARGET_CONFIG_KEY = "relational_target_config"
+RELATIONAL_BUNDLE_KEYS = (
+    "version",
+    "relational_teacher_views",
+    "relational_pairing",
+    "relational_center_source",
+    "teacher_temp_start",
+    "teacher_temp_end",
+    "weak_teacher_augmentation_config",
+)
+RELATIONAL_ARGS_KEYS = (
+    "relational_teacher_views",
+    "relational_pairing",
+    "relational_center_source",
+    "teacher_temp_start",
+    "teacher_temp_end",
+)
+# Any of these outside a complete bundle is a partial new-style record.
+RELATIONAL_MARKER_KEYS = (
+    "relational_teacher_views",
+    "relational_pairing",
+    "relational_center_source",
+    "teacher_center_source",
+    "weak_teacher_augmentation_config",
+    "weak_relational_teacher_views",
+)
+NEW_RUN_TEACHER_TEMP_START = 0.08
+NEW_RUN_TEACHER_TEMP_END = 0.11
+# Project policy band for fresh requests only; no part of numerical safety.
+NEW_RUN_TEACHER_TEMP_BAND = (0.001, 100.0)
+HISTORICAL_TEACHER_TEMP_START = 0.04
+HISTORICAL_TEACHER_TEMP_END = 0.07
+HISTORICAL_TEACHER_TEMP_WARMUP_RATIO = 0.7
+
+
+def _validate_pretrain_resume_source(checkpoint: dict[str, Any] | None) -> None:
+    """Reject a cross-branch (v2/DINO) training payload by key presence."""
+    if not isinstance(checkpoint, dict):
+        return
+    config = checkpoint.get("config")
+    config = config if isinstance(config, dict) else {}
+    markers = [
+        f"config.{key}" for key in ("ssl_method", "ssl_head") if key in config
+    ]
+    if "dino_objective" in checkpoint:
+        markers.append("dino_objective")
+    if markers:
+        raise ValueError(
+            "Cannot resume this training payload: it records "
+            + ", ".join(markers)
+            + ". Cross-branch pretraining resume (v2/DINO state) is unsupported; "
+            "re-run with the branch and version that produced it, or start a new "
+            "run on this branch."
+        )
+
+
+def _strict_equal(left: object, right: object) -> bool:
+    """Type-strict structural equality: ``True`` never equals ``1``."""
+    if isinstance(left, bool) or isinstance(right, bool):
+        return isinstance(left, bool) and isinstance(right, bool) and left == right
+    if isinstance(left, dict) and isinstance(right, dict):
+        if set(left) != set(right):
+            return False
+        return all(_strict_equal(left[key], right[key]) for key in left)
+    if isinstance(left, list) and isinstance(right, list):
+        if len(left) != len(right):
+            return False
+        return all(_strict_equal(a, b) for a, b in zip(left, right))
+    if type(left) is not type(right):
+        return False
+    return left == right
+
+
+def _requested_float(value: object, option: str) -> float:
+    """Normalize an explicit numeric request; booleans and junk are rejected."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{option} expects a number, got {value!r}.")
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f"{option} must be finite, got {value!r}.")
+    return number
+
+
+def _admissible_temperature(value: float, batch_size: int, option: str) -> float:
+    """Reject a temperature whose float32 reduction bound overflows."""
+    f32 = np.finfo(np.float32)
+    tau32 = float(np.float32(value))
+    if not (math.isfinite(tau32) and tau32 > 0.0):
+        # A value that underflows to 0.0 in float32 must fail as a parameter
+        # error, not as a ZeroDivisionError from the bound below.
+        raise ValueError(
+            f"{option} {value!r} is not a usable float32 temperature: it becomes "
+            f"{tau32!r} at schedule precision."
+        )
+    limit = float(f32.max) * (1.0 - 4.0 * float(f32.eps))
+    bound = float(max(int(batch_size), 2)) / tau32
+    if not math.isfinite(bound):
+        raise ValueError(
+            f"{option} {value!r} is not a usable float32 temperature."
+        )
+    if bound > limit:
+        raise ValueError(
+            f"{option} {value!r} overflows the float32 teacher relation "
+            f"reduction at batch size {batch_size}; increase the temperature."
+        )
+    return value
+
+
+def _requested_choice(
+    value: object, choices: tuple[str, ...], option: str
+) -> str | None:
+    if value is None:
         return None
-    if pos.shape[1] - prefix != int(getattr(backbone.patch_embed, "num_patches", -1)):
-        return None
-    return pos[:, 1:prefix]
+    if not isinstance(value, str) or value not in choices:
+        raise ValueError(
+            f"{option} must be one of: {', '.join(choices)}; got {value!r}."
+        )
+    return value
 
 
-def _synchronize_new_registers(
-    student: OTUFormerEncoder, teacher: OTUFormerEncoder
-) -> None:
-    """Copy the student's freshly initialized registers into the teacher.
+def _validate_relational_combination(views: str, center: str) -> None:
+    if views not in RELATIONAL_TEACHER_VIEW_CHOICES:
+        raise ValueError(
+            "relational_teacher_views must be one of: "
+            f"{', '.join(RELATIONAL_TEACHER_VIEW_CHOICES)}; got {views!r}."
+        )
+    if center not in RELATIONAL_CENTER_SOURCE_CHOICES:
+        raise ValueError(
+            "relational_center_source must be one of: "
+            f"{', '.join(RELATIONAL_CENTER_SOURCE_CHOICES)}; got {center!r}."
+        )
+    if views == "ordinary" and center != "ordinary":
+        raise ValueError(
+            "relational_teacher_views='ordinary' requires "
+            "relational_center_source='ordinary': ordinary teacher views have no "
+            "weak features to populate the center."
+        )
 
-    The teacher is initialized independently under a different seed, so the new
-    register parameters (and their positional entries) would otherwise disagree
-    before the first EMA update. Existing independent projector initialization
-    is left untouched.
+
+def _validated_bundle(
+    payload: object, saved_args: dict[str, Any]
+) -> dict[str, Any]:
+    """Validate a complete version-1 canonical bundle."""
+    if not isinstance(payload, dict):
+        raise ValueError(
+            f"config.{RELATIONAL_TARGET_CONFIG_KEY} must be a mapping, got "
+            f"{type(payload).__name__}."
+        )
+    missing = [key for key in RELATIONAL_BUNDLE_KEYS if key not in payload]
+    if missing:
+        raise ValueError(
+            f"config.{RELATIONAL_TARGET_CONFIG_KEY} is incomplete; missing: "
+            + ", ".join(missing)
+        )
+    extra = sorted(set(payload) - set(RELATIONAL_BUNDLE_KEYS))
+    if extra:
+        raise ValueError(
+            f"config.{RELATIONAL_TARGET_CONFIG_KEY} has unknown keys: "
+            + ", ".join(extra)
+        )
+    version = payload["version"]
+    if isinstance(version, bool) or not isinstance(version, int) or version != 1:
+        raise ValueError(
+            f"config.{RELATIONAL_TARGET_CONFIG_KEY}.version must be the integer "
+            f"1, got {version!r}."
+        )
+    views = payload["relational_teacher_views"]
+    center = payload["relational_center_source"]
+    pairing = payload["relational_pairing"]
+    _validate_relational_combination(views, center)
+    if pairing == LEGACY_RELATIONAL_PAIRING:
+        if views != "ordinary":
+            raise ValueError(
+                "A relational target bundle records the historical 'same' pairing "
+                "together with weak teacher views; those are contradictory."
+            )
+    elif pairing not in RELATIONAL_PAIRING_CHOICES:
+        raise ValueError(
+            "relational_pairing must be one of: "
+            f"{', '.join(RELATIONAL_PAIRING_CHOICES + (LEGACY_RELATIONAL_PAIRING,))}"
+            f"; got {pairing!r}."
+        )
+    for key in ("teacher_temp_start", "teacher_temp_end"):
+        value = payload[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(
+                f"config.{RELATIONAL_TARGET_CONFIG_KEY}.{key} must be a number, "
+                f"got {value!r}."
+            )
+        if not math.isfinite(float(value)) or float(value) <= 0.0:
+            raise ValueError(
+                f"config.{RELATIONAL_TARGET_CONFIG_KEY}.{key} must be finite and "
+                f"positive, got {value!r}."
+            )
+    weak = payload["weak_teacher_augmentation_config"]
+    if views == "ordinary":
+        if weak is not None:
+            raise ValueError(
+                "A relational target bundle records ordinary teacher views with a "
+                "weak augmentation config; those are contradictory."
+            )
+    elif not isinstance(weak, dict):
+        # Weak views must attest the transform they used; null would silently
+        # fall back to a freshly derived record and bypass the drift lock.
+        raise ValueError(
+            f"config.{RELATIONAL_TARGET_CONFIG_KEY}.weak_teacher_augmentation_config "
+            f"must be a mapping for weak teacher views, got {type(weak).__name__}."
+        )
+    for key in RELATIONAL_ARGS_KEYS:
+        if key in saved_args and not _strict_equal(saved_args[key], payload[key]):
+            raise ValueError(
+                f"Cannot resume: saved args.{key}={saved_args[key]!r} disagrees "
+                f"with config.{RELATIONAL_TARGET_CONFIG_KEY}.{key}="
+                f"{payload[key]!r}."
+            )
+    return dict(payload)
+
+
+def _resolve_saved_warmup_ratio(
+    saved_args: dict[str, Any],
+    ratio_request: float,
+    ratio_explicit: bool,
+    warnings: list[str],
+) -> float:
+    """Resolve the inherited warmup ratio by key presence, not truthiness.
+
+    An absent key is the only case that may assume the historical constant; a
+    present ``null`` is damaged provenance and must fail instead of being
+    rewritten to the default on the next save.
     """
-    with torch.no_grad():
-        teacher.backbone.reg_token.copy_(student.backbone.reg_token)
-        student_positions = _new_register_position_tensor(student)
-        if student_positions is not None:
-            teacher_positions = _new_register_position_tensor(teacher)
-            if teacher_positions is not None:
-                teacher_positions.copy_(student_positions)
+    if "teacher_temp_warmup_ratio" not in saved_args:
+        warnings.append(
+            "teacher_temp_warmup_ratio is not recorded; assuming the historical "
+            f"{HISTORICAL_TEACHER_TEMP_WARMUP_RATIO}."
+        )
+        if ratio_explicit and ratio_request != HISTORICAL_TEACHER_TEMP_WARMUP_RATIO:
+            raise ValueError(
+                "Cannot resume with --teacher-temp-warmup-ratio "
+                f"{ratio_request!r}: the checkpoint records no warmup ratio, so "
+                f"only the historical {HISTORICAL_TEACHER_TEMP_WARMUP_RATIO} can be "
+                "assumed. Start a new run to change it."
+            )
+        return HISTORICAL_TEACHER_TEMP_WARMUP_RATIO
+    saved_ratio = saved_args["teacher_temp_warmup_ratio"]
+    ratio = _requested_float(saved_ratio, "args.teacher_temp_warmup_ratio")
+    if not 0.0 <= ratio <= 1.0:
+        raise ValueError(
+            "The checkpoint records an out-of-range "
+            f"teacher_temp_warmup_ratio {saved_ratio!r}."
+        )
+    if ratio_explicit and ratio_request != ratio:
+        raise ValueError(
+            "Cannot resume with --teacher-temp-warmup-ratio "
+            f"{ratio_request!r}: the checkpoint records {ratio!r}."
+        )
+    return ratio
 
 
-def run_pretrain(args: argparse.Namespace) -> None:
+def _resolve_relational_target_config(
+    args: argparse.Namespace, checkpoint: dict[str, Any] | None
+) -> tuple[dict[str, Any], float, tuple[str, ...]]:
+    """Resolve the relational target bundle, the warmup ratio and warnings.
+
+    Pure: no logging, no transform derivation, no mutation of ``args`` or the
+    loaded checkpoint.
+    """
+    _validate_pretrain_resume_source(checkpoint)
+    saved_args: dict[str, Any] = {}
+    config: dict[str, Any] = {}
+    if isinstance(checkpoint, dict):
+        raw_args = checkpoint.get("args")
+        saved_args = raw_args if isinstance(raw_args, dict) else {}
+        raw_config = checkpoint.get("config")
+        config = raw_config if isinstance(raw_config, dict) else {}
+
+    warnings: list[str] = []
+    bundle_present = RELATIONAL_TARGET_CONFIG_KEY in config
+    saved_bundle = (
+        _validated_bundle(config[RELATIONAL_TARGET_CONFIG_KEY], saved_args)
+        if bundle_present
+        else None
+    )
+    if not bundle_present:
+        markers = [
+            key
+            for key in RELATIONAL_MARKER_KEYS
+            if key in saved_args or key in config
+        ]
+        if markers:
+            raise ValueError(
+                "Cannot resume: the checkpoint carries partial relational target "
+                "metadata ("
+                + ", ".join(sorted(markers))
+                + ") without a complete config."
+                + RELATIONAL_TARGET_CONFIG_KEY
+                + ". Start a new run or resume from an intact checkpoint."
+            )
+
+    views_request = _requested_choice(
+        getattr(args, "relational_teacher_views", None),
+        RELATIONAL_TEACHER_VIEW_CHOICES,
+        "--relational-teacher-views",
+    )
+    center_request = _requested_choice(
+        getattr(args, "relational_center_source", None),
+        RELATIONAL_CENTER_SOURCE_CHOICES,
+        "--relational-center-source",
+    )
+    pairing_request = _requested_choice(
+        getattr(args, "relational_pairing", None),
+        RELATIONAL_PAIRING_CHOICES,
+        "--relational-pairing",
+    )
+    start_request = getattr(args, "teacher_temp_start", None)
+    end_request = getattr(args, "teacher_temp_end", None)
+    start_request = (
+        None
+        if start_request is None
+        else _requested_float(start_request, "--teacher-temp-start")
+    )
+    end_request = (
+        None
+        if end_request is None
+        else _requested_float(end_request, "--teacher-temp-end")
+    )
+    raw_ratio = getattr(args, "teacher_temp_warmup_ratio", None)
+    if raw_ratio is None:
+        raw_ratio = HISTORICAL_TEACHER_TEMP_WARMUP_RATIO
+    ratio_request = _requested_float(raw_ratio, "--teacher-temp-warmup-ratio")
+    if not 0.0 <= ratio_request <= 1.0:
+        raise ValueError(
+            "--teacher-temp-warmup-ratio must be in the closed range [0, 1], got "
+            f"{ratio_request!r}."
+        )
+    ratio_explicit = bool(
+        getattr(args, "teacher_temp_warmup_ratio_explicit", False)
+    ) or ratio_request != HISTORICAL_TEACHER_TEMP_WARMUP_RATIO
+    batch_size = int(getattr(args, "batch_size", 1) or 1)
+
+    if checkpoint is None:
+        views = views_request or "weak"
+        center = center_request or views
+        pairing = pairing_request or "cross"
+        start = NEW_RUN_TEACHER_TEMP_START if start_request is None else start_request
+        end = NEW_RUN_TEACHER_TEMP_END if end_request is None else end_request
+        low, high = NEW_RUN_TEACHER_TEMP_BAND
+        for option, value in (
+            ("--teacher-temp-start", start),
+            ("--teacher-temp-end", end),
+        ):
+            if not low <= value <= high:
+                raise ValueError(
+                    f"{option} must be inside the new-run policy band "
+                    f"[{low}, {high}], got {value!r}. A checkpoint may record a "
+                    "value outside this band; a fresh request may not."
+                )
+        _validate_relational_combination(views, center)
+        start = _admissible_temperature(start, batch_size, "--teacher-temp-start")
+        end = _admissible_temperature(end, batch_size, "--teacher-temp-end")
+        weak_config: dict[str, Any] | None = None
+        ratio = ratio_request
+    elif saved_bundle is not None:
+        views = str(saved_bundle["relational_teacher_views"])
+        center = str(saved_bundle["relational_center_source"])
+        pairing = str(saved_bundle["relational_pairing"])
+        start = float(saved_bundle["teacher_temp_start"])
+        end = float(saved_bundle["teacher_temp_end"])
+        for option, requested, effective in (
+            ("--relational-teacher-views", views_request, views),
+            ("--relational-center-source", center_request, center),
+            ("--relational-pairing", pairing_request, pairing),
+            ("--teacher-temp-start", start_request, start),
+            ("--teacher-temp-end", end_request, end),
+        ):
+            if requested is not None and not _strict_equal(requested, effective):
+                raise ValueError(
+                    f"Cannot resume: {option}={requested!r} conflicts with the "
+                    f"recorded recipe value {effective!r}. A changed training "
+                    "recipe requires a new run."
+                )
+        _validate_relational_combination(views, center)
+        start = _admissible_temperature(start, batch_size, "teacher_temp_start")
+        end = _admissible_temperature(end, batch_size, "teacher_temp_end")
+        ratio = _resolve_saved_warmup_ratio(
+            saved_args, ratio_request, ratio_explicit, warnings
+        )
+        weak_config = saved_bundle["weak_teacher_augmentation_config"]
+    else:
+        views = "ordinary"
+        center = "ordinary"
+        if "disable_cross_view_loss" not in saved_args:
+            warnings.append(
+                "disable_cross_view_loss is not recorded; assuming the historical "
+                "False, which selects the 'full' pairing."
+            )
+            pairing = "full"
+        else:
+            raw_disable = saved_args["disable_cross_view_loss"]
+            if not isinstance(raw_disable, bool):
+                raise ValueError(
+                    "The checkpoint records a non-boolean disable_cross_view_loss "
+                    f"{raw_disable!r}; the legacy pairing cannot be decoded."
+                )
+            pairing = LEGACY_RELATIONAL_PAIRING if raw_disable else "full"
+        for option, requested, effective in (
+            ("--relational-teacher-views", views_request, views),
+            ("--relational-center-source", center_request, center),
+            ("--relational-pairing", pairing_request, pairing),
+        ):
+            if requested is not None and not _strict_equal(requested, effective):
+                raise ValueError(
+                    f"Cannot resume: {option}={requested!r} conflicts with the "
+                    f"legacy recipe value {effective!r}. Start a new run to change "
+                    "the recipe."
+                )
+        start, end = _resolve_legacy_temperatures(
+            saved_args, start_request, end_request, warnings
+        )
+        ratio = _resolve_saved_warmup_ratio(
+            saved_args, ratio_request, ratio_explicit, warnings
+        )
+        start = _admissible_temperature(start, batch_size, "teacher_temp_start")
+        end = _admissible_temperature(end, batch_size, "teacher_temp_end")
+        weak_config = None
+
+    bundle: dict[str, Any] = {
+        "version": 1,
+        "relational_teacher_views": views,
+        "relational_pairing": pairing,
+        "relational_center_source": center,
+        "teacher_temp_start": start,
+        "teacher_temp_end": end,
+        "weak_teacher_augmentation_config": weak_config,
+    }
+    return bundle, ratio, tuple(warnings)
+
+
+def _resolve_legacy_temperatures(
+    saved_args: dict[str, Any],
+    start_request: float | None,
+    end_request: float | None,
+    warnings: list[str],
+) -> tuple[float, float]:
+    """Resolve legacy teacher temperatures, warning about assumed fields."""
+    resolved: list[float] = []
+    for key, requested, assumed in (
+        ("teacher_temp_start", start_request, HISTORICAL_TEACHER_TEMP_START),
+        ("teacher_temp_end", end_request, HISTORICAL_TEACHER_TEMP_END),
+    ):
+        if key not in saved_args:
+            warnings.append(
+                f"{key} is not recorded; assuming the historical {assumed}."
+            )
+            if requested is not None and requested != assumed:
+                raise ValueError(
+                    f"Cannot resume with --{key.replace('_', '-')}={requested!r}: "
+                    f"the checkpoint records no value, so only the historical "
+                    f"{assumed} can be assumed. Start a new run to change it."
+                )
+            resolved.append(assumed)
+            continue
+        saved = saved_args[key]
+        value = _requested_float(saved, f"args.{key}")
+        if value <= 0.0:
+            raise ValueError(
+                f"The checkpoint records a non-positive {key} {saved!r}."
+            )
+        if requested is not None and requested != value:
+            raise ValueError(
+                f"Cannot resume: --{key.replace('_', '-')}={requested!r} conflicts "
+                f"with the recorded value {value!r}. A changed training recipe "
+                "requires a new run."
+            )
+        resolved.append(value)
+    return resolved[0], resolved[1]
+
+
+class _ResolvedPretrainRecipe(NamedTuple):
+    settings: PretrainSettings
+    relational_target_config: dict[str, Any]
+    teacher_temp_warmup_ratio: float
+    augmentation_config: dict[str, object]
+    warnings: tuple[str, ...]
+
+    @property
+    def weak_teacher_augmentation_config(self) -> dict[str, object] | None:
+        return self.relational_target_config["weak_teacher_augmentation_config"]
+
+
+def _resolve_pretrain_recipe(
+    args: argparse.Namespace,
+    checkpoint: dict[str, Any] | None,
+    *,
+    settings: PretrainSettings,
+) -> _ResolvedPretrainRecipe:
+    """Resolve and validate the whole pretraining recipe without building a model."""
+    bundle, ratio, warnings = _resolve_relational_target_config(args, checkpoint)
+    profile = _select_augmentation_profile(
+        getattr(args, "augmentation", None), checkpoint, stage="pretrain"
+    )
+    policy = _select_orientation_policy(
+        getattr(args, "orientation_policy", None),
+        checkpoint,
+        stage="pretrain",
+        resume=checkpoint is not None,
+    )
+    augmentation_config = build_pretrain_augmentation_config(
+        profile,
+        settings.global_crop_size,
+        settings.local_crop_size,
+        settings.local_crops,
+        orientation_policy=policy,
+    )
+    augmentation_config = _validate_augmentation_config(
+        profile, augmentation_config, checkpoint, stage="pretrain"
+    )
+    saved_weak = bundle["weak_teacher_augmentation_config"]
+    if bundle["relational_teacher_views"] == "weak":
+        derived_weak = build_weak_teacher_augmentation_config(augmentation_config)
+        if saved_weak is not None and not _strict_equal(derived_weak, saved_weak):
+            raise ValueError(
+                "Cannot resume: the recorded weak teacher augmentation config no "
+                "longer matches the config this code derives. Resume with a code "
+                "version that reproduces the saved transform, or start a new run."
+            )
+        bundle["weak_teacher_augmentation_config"] = derived_weak
+    elif saved_weak is not None:
+        raise ValueError(
+            "Cannot resume: ordinary teacher views cannot carry a weak "
+            "augmentation config."
+        )
+    return _ResolvedPretrainRecipe(
+        settings=settings,
+        relational_target_config=bundle,
+        teacher_temp_warmup_ratio=ratio,
+        augmentation_config=augmentation_config,
+        warnings=tuple(warnings),
+    )
+
+
+def run_pretrain(
+    args: argparse.Namespace,
+    *,
+    pretrain_recipe: _ResolvedPretrainRecipe | None = None,
+) -> None:
     register_option = getattr(args, "register_tokens", None)
     if register_option not in (None, 0, 4):
         raise ValueError(
             f"--register-tokens must be 0 or 4 (got {register_option!r})."
+        )
+    if hasattr(args, "disable_cross_view_loss"):
+        raise ValueError(
+            "--disable-cross-view-loss was removed; use --relational-pairing "
+            "{cross,full} instead."
         )
     # Resolve and validate before any output file exists, so a doomed run never
     # clears or pollutes an existing output directory. The CLI already did both
@@ -2373,12 +2943,27 @@ def run_pretrain(args: argparse.Namespace) -> None:
     resume_ckpt: dict[str, Any] | None = getattr(args, "resume_state", None)
     if getattr(args, "resume", "") and resume_ckpt is None:
         resume_ckpt = load_checkpoint(Path(args.resume))
+    _validate_pretrain_resume_source(resume_ckpt)
     # The handoff is a one-shot input, never a cache: a caller that reuses its
     # Namespace after changing a request must be resolved again.
     settings = vars(args).pop("pretrain_settings", None)
+    if pretrain_recipe is not None and settings is None:
+        raise ValueError(
+            "pretrain_recipe requires the matching pretrain_settings handoff; "
+            "pass both or neither."
+        )
     if settings is None:
         settings = resolve_pretrain_settings(args, resume_ckpt)
         preflight_pretrain_run(args, settings)
+    if pretrain_recipe is None:
+        pretrain_recipe = _resolve_pretrain_recipe(
+            args, resume_ckpt, settings=settings
+        )
+    elif pretrain_recipe.settings is not settings:
+        raise ValueError(
+            "pretrain_recipe was resolved from a different PretrainSettings "
+            "object; resolve the recipe once and pass both."
+        )
     _set_seed(args.seed)
     _set_cpus(args.cpus)
     device = _resolve_device(args.device)
@@ -2413,29 +2998,13 @@ def run_pretrain(args: argparse.Namespace) -> None:
     patch_ratio = patch_config["mask_ratio_resolved"]
     print("Patch config: " + json.dumps(patch_config, sort_keys=True))
 
-    requested_profile = getattr(args, "augmentation", None)
-    requested_policy = getattr(args, "orientation_policy", None)
-    profile = _select_augmentation_profile(
-        requested_profile, resume_ckpt, stage="pretrain"
-    )
-    policy = _select_orientation_policy(
-        requested_policy,
-        resume_ckpt,
-        stage="pretrain",
-        resume=resume_ckpt is not None,
-    )
+    # One source of truth: the recipe already resolved, validated and (on a
+    # resume) drift-checked the ordinary augmentation config.
+    augmentation_config = pretrain_recipe.augmentation_config
+    profile = str(augmentation_config["profile"])
+    policy = str(augmentation_config["orientation_policy"])
     args.local_crop_size = settings.local_crop_size
     args.local_crops = settings.local_crops
-    augmentation_config = build_pretrain_augmentation_config(
-        profile,
-        global_crop_size,
-        args.local_crop_size,
-        args.local_crops,
-        orientation_policy=policy,
-    )
-    augmentation_config = _validate_augmentation_config(
-        profile, augmentation_config, resume_ckpt, stage="pretrain"
-    )
     args.augmentation = profile
     args.orientation_policy = policy
     print(f"Augmentation profile: {profile}")
@@ -2444,6 +3013,52 @@ def run_pretrain(args: argparse.Namespace) -> None:
         + json.dumps(augmentation_config, indent=2, sort_keys=True)
     )
 
+    relational_views = str(
+        pretrain_recipe.relational_target_config["relational_teacher_views"]
+    )
+    relational_center_source = str(
+        pretrain_recipe.relational_target_config["relational_center_source"]
+    )
+    relational_pairing = str(
+        pretrain_recipe.relational_target_config["relational_pairing"]
+    )
+    for warning in pretrain_recipe.warnings:
+        print(f"[Warning] {warning}")
+    print(
+        "Relational target config: "
+        + json.dumps(pretrain_recipe.relational_target_config, sort_keys=True)
+    )
+    print(
+        "Teacher temperature schedule: "
+        + json.dumps(
+            {
+                "start": pretrain_recipe.relational_target_config[
+                    "teacher_temp_start"
+                ],
+                "end": pretrain_recipe.relational_target_config["teacher_temp_end"],
+                "warmup_ratio": pretrain_recipe.teacher_temp_warmup_ratio,
+            },
+            sort_keys=True,
+        )
+    )
+    # The schedules and the saved checkpoint read effective values, while the
+    # CLI already logged the raw requests.
+    args.relational_teacher_views = relational_views
+    args.relational_pairing = relational_pairing
+    args.relational_center_source = relational_center_source
+    args.teacher_temp_start = pretrain_recipe.relational_target_config[
+        "teacher_temp_start"
+    ]
+    args.teacher_temp_end = pretrain_recipe.relational_target_config[
+        "teacher_temp_end"
+    ]
+    args.teacher_temp_warmup_ratio = pretrain_recipe.teacher_temp_warmup_ratio
+    if relational_views not in RELATIONAL_TEACHER_VIEW_CHOICES:
+        raise ValueError(
+            "Resolved relational_teacher_views must be one of: "
+            f"{', '.join(RELATIONAL_TEACHER_VIEW_CHOICES)}; got "
+            f"{relational_views!r}."
+        )
     ds = MultiCropDataset(
         csv_path=Path(args.train_data) if getattr(args, "train_data", "") else None,
         images_dir=Path(args.input_images_dir),
@@ -2452,6 +3067,11 @@ def run_pretrain(args: argparse.Namespace) -> None:
         local_crops=args.local_crops,
         augmentation_profile=profile,
         orientation_policy=policy,
+        include_weak_teacher_views=relational_views == "weak",
+        augmentation_config=pretrain_recipe.augmentation_config,
+        weak_teacher_augmentation_config=(
+            pretrain_recipe.weak_teacher_augmentation_config
+        ),
     )
     loader = DataLoader(
         ds,
@@ -2489,10 +3109,11 @@ def run_pretrain(args: argparse.Namespace) -> None:
     if cuda_rng_state is not None:
         torch.cuda.set_rng_state(cuda_rng_state)
 
-    if resume_register_mode == "new" and register_option == 4:
-        # The teacher's independently seeded register init must match the
-        # student's before the first forward/EMA update.
-        _synchronize_new_registers(student, teacher)
+    if resume_ckpt is None:
+        # A fresh run starts the EMA pair from the same encoder state. Resumes
+        # keep their saved, deliberately distinct student/teacher pair.
+        with torch.no_grad():
+            teacher.load_state_dict(student.state_dict(), strict=True)
     if resume_ckpt is None:
         actual_register_tokens = native_register_count(student.backbone)
 
@@ -2619,7 +3240,10 @@ def run_pretrain(args: argparse.Namespace) -> None:
             s_out.mean(dim=0, keepdim=True),
             t_out.mean(dim=0, keepdim=True),
         ).item()
-        print(f"[Info] Initial cosine similarity: {init_cosine:.4f}")
+        print(
+            "[Info] Initial ordinary-global cosine similarity: "
+            f"{init_cosine:.4f}"
+        )
         print(
             f"[Info] Starting/Resuming with learning rate: {float(lr_schedule[min(global_step, total_steps - 1)]):.6f}"
         )
@@ -2646,8 +3270,19 @@ def run_pretrain(args: argparse.Namespace) -> None:
         pbar = tqdm(loader, desc=f"Epoch {epoch + 1}/{args.max_epochs}", ncols=150)
         for step, views in enumerate(pbar):
             views = [v.to(device) for v in views]
+            expected_views = (
+                (4 if relational_views == "weak" else 2) + int(args.local_crops)
+            )
+            if len(views) != expected_views:
+                raise ValueError(
+                    f"the loader produced {len(views)} views but the resolved "
+                    f"recipe needs {expected_views} "
+                    f"(relational_teacher_views={relational_views!r}, "
+                    f"local_crops={args.local_crops})."
+                )
             global_views = views[:2]
-            local_views = views[2:]
+            local_views = views[2 : 2 + int(args.local_crops)]
+            weak_views = views[2 + int(args.local_crops) : 4 + int(args.local_crops)]
 
             iter_idx = global_step
             for group in optimizer.param_groups:
@@ -2660,28 +3295,57 @@ def run_pretrain(args: argparse.Namespace) -> None:
                 student_global.append(s_out.cls)
                 student_tokens.append(s_out.tokens)
 
-            teacher_global: list[torch.Tensor] = []
             teacher_tokens: list[torch.Tensor] = []
             teacher_final_four: list[list[torch.Tensor] | None] = []
             teacher_logits: list[torch.Tensor] = []
             prefix = student.backbone.num_prefix_tokens
+            center_before = teacher.center
             with torch.no_grad():
-                for gv in global_views:
-                    t_out = teacher.forward_pretrain(
+                # Ordinary forwards serve the patch objective, the ordinary
+                # center population and the ordinary-A diagnostic cosine.
+                need_ordinary_both = (
+                    patch_mode != "none" or relational_center_source == "ordinary"
+                )
+                ordinary_outputs = [
+                    teacher.forward_pretrain(
                         gv,
                         return_intermediates=patch_mode == "masked-feature",
                     )
-                    t_proj = t_out.cls - teacher.center
-                    t_proj = F.normalize(t_proj, dim=-1)
-                    teacher_global.append(t_proj)
+                    for gv in global_views[: 2 if need_ordinary_both else 1]
+                ]
+                if relational_views == "weak":
+                    relational_outputs = [
+                        teacher.forward_pretrain(wv) for wv in weak_views
+                    ]
+                else:
+                    relational_outputs = ordinary_outputs
+
+                def _centered(
+                    outputs: list[Any],
+                ) -> list[torch.Tensor]:
+                    return [
+                        F.normalize(out.cls - center_before, dim=-1)
+                        for out in outputs
+                    ]
+
+                relational_teacher = _centered(relational_outputs)
+                ordinary_teacher = _centered(ordinary_outputs)
+                center_inputs = (
+                    ordinary_teacher
+                    if relational_center_source == "ordinary"
+                    else relational_teacher
+                )
+                teacher.center = _update_teacher_center(
+                    center_before, torch.cat(center_inputs, dim=0)
+                )
+                teacher_global = relational_teacher
+                for t_out in ordinary_outputs:
                     teacher_tokens.append(t_out.tokens)
                     teacher_final_four.append(t_out.final_four)
                     if patch_mode == "ibot":
                         teacher_logits.append(
                             objective.teacher_ibot_head(t_out.tokens[:, prefix:])
                         )
-                all_teacher = torch.cat(teacher_global, dim=0)
-                teacher.center = _update_teacher_center(teacher.center, all_teacher)
 
             temp_student = float(temp_student_schedule[iter_idx])
             temp_teacher = float(teacher_temp_schedule[iter_idx])
@@ -2691,7 +3355,7 @@ def run_pretrain(args: argparse.Namespace) -> None:
                 teacher_global,
                 temp_student,
                 temp_teacher,
-                disable_cross_view_loss=args.disable_cross_view_loss,
+                relational_pairing=relational_pairing,
             )
 
             patch_loss_raw = torch.zeros((), device=device)
@@ -2800,7 +3464,7 @@ def run_pretrain(args: argparse.Namespace) -> None:
             with torch.no_grad():
                 cosine_sim = F.cosine_similarity(
                     student_global[0].mean(dim=0, keepdim=True),
-                    teacher_global[0].mean(dim=0, keepdim=True),
+                    ordinary_teacher[0].mean(dim=0, keepdim=True),
                 ).item()
 
             if global_step % max(1, args.log_every_n_steps) == 0:
@@ -2900,6 +3564,7 @@ def run_pretrain(args: argparse.Namespace) -> None:
                     key: value
                     for key, value in vars(args).items()
                     if key not in _UNSAVED_ARGS
+                    and key not in _TRANSIENT_ARGS
                 },
                 "config": {
                     "model_name": model_name,
@@ -2909,6 +3574,9 @@ def run_pretrain(args: argparse.Namespace) -> None:
                     "augmentation_profile": profile,
                     "augmentation_config": augmentation_config,
                     **patch_config,
+                    RELATIONAL_TARGET_CONFIG_KEY: (
+                        pretrain_recipe.relational_target_config
+                    ),
                 },
                 "schedule": {
                     **schedule_state,

@@ -162,21 +162,39 @@ Student temperature.
 
 ### `--teacher-temp-start`
 
-**Default:** `0.04`
+**Default:** unset (`null`); effective new-run default `0.08`
 
-Initial teacher temperature.
+Initial teacher temperature. Effective default for a new run: 0.08. Omit to inherit the saved value on --resume. Shared by the global and local relational losses and by ibot target sharpening.
 
 ### `--teacher-temp-end`
 
-**Default:** `0.07`
+**Default:** unset (`null`); effective new-run default `0.11`
 
-Final teacher temperature.
+Final teacher temperature. Effective default for a new run: 0.11. Omit to inherit the saved value on --resume.
 
-### `--disable-cross-view-loss`
+### `--teacher-temp-warmup-ratio`
 
-**Default:** `No`
+**Default:** `0.7`
 
-Disable cross-view global loss pairing. Default keeps full cross-view matching between global crops.
+Fraction of the planned steps spent ramping the teacher temperature from start to end, in the closed range [0, 1]. 0 disables the ramp and 1 leaves no plateau. Omit to inherit the saved value on --resume.
+
+### `--relational-teacher-views`
+
+**Default:** unset (`null`); effective new-run default `weak`
+
+Teacher images used for relational target features: weak or ordinary. Effective default for a new run: weak. Omit to inherit the saved value on --resume.
+
+### `--relational-center-source`
+
+**Default:** unset (`null`); effective new-run default: the teacher-view source
+
+Teacher feature population that updates the running CLS center: weak or ordinary. Omit to inherit the saved value on --resume; a new run defaults to the teacher-view source, and ordinary teacher views require an ordinary center.
+
+### `--relational-pairing`
+
+**Default:** unset (`null`); effective new-run default `cross`
+
+Global student/teacher view pairs averaged in the relational loss: cross (A-to-B and B-to-A) or full (all four). Effective default for a new run: cross. Replaces the removed disable-cross-view-loss switch.
 
 ### `--log-every-n-steps`
 
@@ -433,12 +451,36 @@ can forget previously learned data.
 
 **Local-view resume inheritance.** On `--resume`, omitted `--local-crop-size` and `--local-crops` inherit the checkpoint's saved values; explicit conflicting values fail, and changing them requires a new run.
 
-Augmentation and orientation policy follow the shared [training augmentation contract](training-augmentation.md).
+Compatibility is one-directional: this code resumes older checkpoints, but an older trainer reading a new checkpoint ignores `config.relational_target_config` and therefore does not restore the weak/cross recipe. Accepting the file is not evidence the recipe was preserved.
+
+A same-plan resume after an interrupted extension rebuilds the teacher ramp from the rewritten plan length rather than the original one, so the step-wise schedule can differ even though endpoints and recipe are unchanged. Extending a run keeps the inherited final temperature without a new warmup.
+
+**Relational target recipe.** A new run starts from a synchronized student/teacher pair and, by default, uses two independently sampled weak teacher globals for the relational target features, `cross`-only global pairing, and teacher temperatures `0.08` to `0.11`. Resumes restore the saved student/teacher pair without re-synchronizing and inherit the recorded recipe; a changed recipe requires a new run.
+
+Three independent controls select the teacher images that build the targets (`--relational-teacher-views`), the teacher feature population that updates the running CLS center (`--relational-center-source`), and the global view pairs averaged in the loss (`--relational-pairing`). `--relational-teacher-views ordinary` requires `--relational-center-source ordinary`. Omitted values inherit the checkpoint recipe on `--resume`; explicit values that conflict with it fail.
+
+The patch objective keeps the ordinary global views as inputs: at fixed teacher state, ordinary views and masks, the `--patch-loss consistency` and `--patch-loss masked-feature` targets are unchanged by the weak teacher views. That is input-path isolation, not an invariance guarantee — the extra weak crops consume from the same random stream and the shared backbone still updates, so whole training trajectories and patch losses differ. The teacher temperature is shared, so `--patch-loss ibot` target sharpening and the local relational loss follow it too. With weak views enabled and a patch objective active, a step runs four teacher forwards instead of two and one extra weak crop pair per sample, which raises training time and activation memory; `--relational-teacher-views ordinary` keeps the historical two. The `cosine_similarity` instant metric stays the ordinary student-A versus centered ordinary teacher-A cosine.
+
+Staged evaluation: compare the historical target recipe against the combined new default first. The other four combinations are optional diagnostics, not automatic follow-up work; all six use the same synchronized initial encoder pair and therefore cannot measure the initialization change.
+
+| Arm | Options |
+| --- | --- |
+| Historical target-recipe baseline | `--relational-teacher-views ordinary --relational-pairing full --teacher-temp-start 0.04 --teacher-temp-end 0.07` |
+| Combined new recipe | `--relational-teacher-views weak --relational-pairing cross --teacher-temp-start 0.08 --teacher-temp-end 0.11` |
+| Weak targets, ordinary center | `--relational-teacher-views weak --relational-center-source ordinary --relational-pairing full --teacher-temp-start 0.04 --teacher-temp-end 0.07` |
+| Weak targets and weak center | `--relational-teacher-views weak --relational-center-source weak --relational-pairing full --teacher-temp-start 0.04 --teacher-temp-end 0.07` |
+| Pairing only | `--relational-teacher-views ordinary --relational-pairing cross --teacher-temp-start 0.04 --teacher-temp-end 0.07` |
+| Shared temperature only | `--relational-teacher-views ordinary --relational-pairing full --teacher-temp-start 0.08 --teacher-temp-end 0.11` |
+
+The `0.001..100` band is acceptance policy for a fresh request, not a numerical guarantee and not a resume rule: a checkpoint may record a value outside it (for example `0.0009`), and that value is inherited, re-saved unchanged and accepted as an explicit matching request. What always applies is numerical safety — a positive finite endpoint whose float32 relation-reduction bound fits the run's effective batch. That per-run check can only be confirmed at execution.
+
+Augmentation and orientation policy follow the shared [training augmentation contract](training-augmentation.md). The weakly augmented teacher record keeps the ordinary geometry, disables color jitter, grayscale and Gaussian blur, and records its own normalization, so the recorded transform controls pixels.
 
 Embedding-quality metrics use the shared [embedding metrics](embedding-metrics.md) definitions and field names.
 
 ## Version Notes
 
+- **v0.12.0** — **Breaking new-run recipe.** A fresh run now copies the complete student encoder state into the independently constructed teacher before the first forward, builds relational targets from two weak teacher global views by default, averages `cross`-only global pairs, and ramps the shared teacher temperature `0.08` to `0.11`. `--disable-cross-view-loss` is removed; use `--relational-pairing {cross,full}`. New options: `--relational-teacher-views`, `--relational-center-source`, `--teacher-temp-warmup-ratio` (closed `[0, 1]`, default `0.7`). The five relational/temperature requests default to `null` and resolve to effective new-run values, so `Parameters:` records the request while the resolved recipe is logged separately. Resumes inherit the recorded recipe and reject an explicit conflict; a legacy checkpoint keeps its historical ordinary/full recipe with its own temperatures. Checkpoints gain `config.relational_target_config`; older trainers ignore it, so compatibility is one-directional. The default costs two extra weak crops per sample and, with a patch objective, four teacher forwards per step instead of two. Marked v2/DINO training payloads are rejected before output setup. The historical target recipe remains expressible for comparison, but the previous independent teacher-projector initialization is no longer reachable.
 - **v0.11.2** — The global/local crop-size divisibility checks, the backbone-capability check and the blockwise-grid/patch-count checks now run against the model and sizes the run will actually use, and before any output directory is cleared or any log file is created; `--overwrite` no longer destroys an existing run for those configurations. The checks listed here are the guarantee: `--extract-size` divisibility and dataset/augmentation errors can still fail after output setup. Isolating those preflight probes changed the student initialization a given `--seed` produces relative to v0.11.1: reproduce bit-for-bit only within one version, and compare arms trained under the same version.
 - **v0.10.0** — `--register-tokens` accepts `none`, `0`, or `4`; the resolved count is recorded in checkpoints and must match on resume and fine-tuning.
 - **v0.7.0** — `--patch-loss` and `--masking-strategy` select the patch objective and its masking geometry; `--mask-ratio` defaults to `auto` and resolves to `0.30` on a new run (v0.6.x used `0.50`).

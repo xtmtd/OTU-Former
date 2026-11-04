@@ -142,7 +142,7 @@ Supported shells: bash, zsh, fish
 
 ### Version
 
-Current version: `0.11.2`.
+Current version: `0.12.0`.
 
 Show installed version:
 
@@ -172,7 +172,7 @@ architectural responsibilities.
 | `otuformer cam` | Generate GradCAM and other heatmaps. | [docs/commands/cam.md](docs/commands/cam.md) |
 | `otuformer export` | Export model to ONNX format. | [docs/commands/export.md](docs/commands/export.md) |
 
-Two cross-command contracts have their own documents: [Training Augmentation](docs/commands/training-augmentation.md) for the `--augmentation` and `--orientation-policy` behaviour shared by `pretrain` and `finetune`, and [Embedding Metrics](docs/commands/embedding-metrics.md) for the metrics shared by `pretrain`, `finetune`, and `extract`.
+Two cross-command contracts have their own documents: [Training Augmentation](docs/commands/training-augmentation.md) for the `--augmentation` and `--orientation-policy` behaviour shared by `pretrain` and `finetune`, and [Embedding Metrics](docs/commands/embedding-metrics.md) for the metrics shared by `pretrain`, `finetune`, and `extract`. A new `pretrain` run also starts from a synchronized student/teacher encoder pair and, by default, uses weak teacher global views, `cross` pairing and `0.08`–`0.11` teacher temperatures. That default adds two weak crops per sample and, with a patch objective active, four teacher forwards per step instead of two; `--relational-teacher-views ordinary` restores the historical cost. Resumes inherit the recorded recipe, so changing it needs a new run.
 
 ## License
 

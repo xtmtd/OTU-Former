@@ -1368,6 +1368,157 @@ def test_pretrain_resume_provenance_is_not_blanket() -> None:
     assert provenance["train_data"] == "explicit"
     for name in ("patch_loss", "augmentation", "orientation_policy", "weight_decay"):
         assert provenance[name] == "omitted-inherited", name
+    # All six relational recipe fields inherit on resume; the removed pairing
+    # boolean is not part of the inherited set any more.
+    for name in (
+        "relational_teacher_views",
+        "relational_center_source",
+        "relational_pairing",
+        "teacher_temp_start",
+        "teacher_temp_end",
+        "teacher_temp_warmup_ratio",
+    ):
+        assert provenance[name] == "omitted-inherited", name
+    assert "disable_cross_view_loss" not in provenance
+
+    fresh = module.validate_parameters(
+        "pretrain",
+        {
+            "train_data": "e.csv",
+            "input_images_dir": "images",
+            "out_dir": "runs/x",
+        },
+    )
+    for name in (
+        "relational_teacher_views",
+        "relational_center_source",
+        "relational_pairing",
+        "teacher_temp_start",
+        "teacher_temp_end",
+        "teacher_temp_warmup_ratio",
+    ):
+        assert fresh["provenance"][name] == "omitted-default", name
+        # A null declared default is absent from ``values`` rather than None.
+        if name == "teacher_temp_warmup_ratio":
+            assert fresh["values"][name] == 0.7
+        else:
+            assert name not in fresh["values"], name
+
+    explicit = module.validate_parameters(
+        "pretrain",
+        {
+            "train_data": "e.csv",
+            "input_images_dir": "images",
+            "out_dir": "runs/x",
+            "resume": "runs/x/SSL_latest.pth",
+            "relational_pairing": "cross",
+            "teacher_temp_warmup_ratio": 0.3,
+        },
+    )
+    assert explicit["provenance"]["relational_pairing"] == "explicit"
+    assert explicit["provenance"]["teacher_temp_warmup_ratio"] == "explicit"
+    assert explicit["provenance"]["relational_teacher_views"] == "omitted-inherited"
+
+
+def test_pretrain_relational_endpoint_policy_dual_track() -> None:
+    """0.0009 is rejected fresh, accepted on resume, and marked unresolved."""
+    module = cli_schema()
+    base = {
+        "train_data": "e.csv",
+        "input_images_dir": "images",
+        "out_dir": "runs/x",
+    }
+    with pytest.raises(ValueError, match="policy band"):
+        module.validate_parameters(
+            "pretrain", {**base, "teacher_temp_start": 0.0009}
+        )
+    resume = module.validate_parameters(
+        "pretrain",
+        {
+            **base,
+            "resume": "runs/x/SSL_latest.pth",
+            "teacher_temp_start": 0.0009,
+        },
+    )
+    assert resume["provenance"]["teacher_temp_start"] == "explicit"
+    assert any(
+        "read from the checkpoint at execution" in note
+        for note in resume["unresolved"]
+    )
+    assert any(
+        "effective batch size" in note for note in resume["unresolved"]
+    )
+    # an out-of-range warmup ratio is rejected in both tracks
+    for extra in ({}, {"resume": "runs/x/SSL_latest.pth"}):
+        with pytest.raises(ValueError):
+            module.validate_parameters(
+                "pretrain",
+                {**base, **extra, "teacher_temp_warmup_ratio": 1.5},
+            )
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        (
+            ["--relational-teacher-views", "ordinary", "--relational-pairing", "full",
+             "--teacher-temp-start", "0.04", "--teacher-temp-end", "0.07"],
+            ("ordinary", "ordinary", "full", 0.04, 0.07),
+        ),
+        (
+            ["--relational-teacher-views", "weak", "--relational-pairing", "cross",
+             "--teacher-temp-start", "0.08", "--teacher-temp-end", "0.11"],
+            ("weak", "weak", "cross", 0.08, 0.11),
+        ),
+        (
+            ["--relational-teacher-views", "weak",
+             "--relational-center-source", "ordinary", "--relational-pairing", "full",
+             "--teacher-temp-start", "0.04", "--teacher-temp-end", "0.07"],
+            ("weak", "ordinary", "full", 0.04, 0.07),
+        ),
+        (
+            ["--relational-teacher-views", "weak",
+             "--relational-center-source", "weak", "--relational-pairing", "full",
+             "--teacher-temp-start", "0.04", "--teacher-temp-end", "0.07"],
+            ("weak", "weak", "full", 0.04, 0.07),
+        ),
+        (
+            ["--relational-teacher-views", "ordinary", "--relational-pairing", "cross",
+             "--teacher-temp-start", "0.04", "--teacher-temp-end", "0.07"],
+            ("ordinary", "ordinary", "cross", 0.04, 0.07),
+        ),
+        (
+            ["--relational-teacher-views", "ordinary", "--relational-pairing", "full",
+             "--teacher-temp-start", "0.08", "--teacher-temp-end", "0.11"],
+            ("ordinary", "ordinary", "full", 0.08, 0.11),
+        ),
+    ],
+)
+def test_pretrain_ablation_recipes_parse(argv, expected) -> None:
+    """All six documented fresh-run arms stay expressible without training."""
+    module = cli_schema()
+    values = {"train_data": "e.csv", "input_images_dir": "images", "out_dir": "runs/x"}
+    names = {
+        "--relational-teacher-views": "relational_teacher_views",
+        "--relational-center-source": "relational_center_source",
+        "--relational-pairing": "relational_pairing",
+        "--teacher-temp-start": "teacher_temp_start",
+        "--teacher-temp-end": "teacher_temp_end",
+    }
+    for flag, value in zip(argv[::2], argv[1::2]):
+        values[names[flag]] = value
+    validation = module.validate_parameters("pretrain", values)
+    recipe = validation["values"]
+    center = recipe.get("relational_center_source") or recipe[
+        "relational_teacher_views"
+    ]
+    assert (
+        recipe["relational_teacher_views"],
+        center,
+        recipe["relational_pairing"],
+        recipe["teacher_temp_start"],
+        recipe["teacher_temp_end"],
+    ) == expected
 
 
 def test_default_protected_paths_cover_source_and_examples() -> None:

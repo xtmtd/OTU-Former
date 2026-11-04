@@ -71,6 +71,15 @@ otuformer finetune --checkpoint runs/pretrain/SSL_latest.pth \
 **输入尺寸。** 两种微调配置都使用 checkpoint 记录的训练输入尺寸；对于未记录尺寸的旧
 checkpoint，回退到 `224`。
 
+**弱增强关系教师记录。** `config.relational_target_config.weak_teacher_augmentation_config`
+锁定两个弱增强教师全局视图。它沿用已解析的普通几何（裁剪尺寸/比例、长宽比、旋转角度/
+插值/扩边/填充、旋转后缩放与顺序、翻转），并新增自己的 `normalize.mean`/`normalize.std`，
+使记录中的归一化参数真正控制像素，而不是继承模块常量。颜色抖动、灰度与两个全局模糊
+概率都记录为关闭。`legacy` 配置是例外：它的变换忽略 `--orientation-policy`，因此弱记录
+保留历史上的大角度旋转、水平与垂直翻转、固定黑边填充、不扩边且旋转后不缩放。普通学生
+视图、局部视图与补丁教师视图仍使用所选配置不变。记录中的弱变换一旦变化（包括仅序列化
+层面的差异）就会阻止续训：请用能复现所保存记录的代码版本续训。
+
 checkpoint 元数据（`config.augmentation_profile`、`config.augmentation_config`）用于配置
 溯源，并不提供逐位确定性的复现。完整的变换级定义见
 [训练数据增强设计](../superpowers/specs/2026-09-07-otuformer-training-augmentation-design.md)。

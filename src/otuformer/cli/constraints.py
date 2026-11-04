@@ -24,6 +24,9 @@ from typing import Any, Mapping
 
 from otuformer.constants import (
     ATTENTION_POOLING_TYPES,
+    RELATIONAL_CENTER_SOURCE_CHOICES,
+    RELATIONAL_PAIRING_CHOICES,
+    RELATIONAL_TEACHER_VIEW_CHOICES,
     CAM_ARCH_CHOICES,
     CAM_DEVICE_CHOICES,
     CAM_FIG_FORMAT_CHOICES,
@@ -66,6 +69,15 @@ _CONSTRAINTS: dict[str, dict[str, dict[str, Any]]] = {
         },
         "augmentation": {"choices": list(PRETRAIN_AUGMENTATIONS)},
         "orientation_policy": {"choices": list(ORIENTATION_POLICIES)},
+        "relational_teacher_views": {"choices": list(RELATIONAL_TEACHER_VIEW_CHOICES)},
+        "relational_center_source": {
+            "choices": list(RELATIONAL_CENTER_SOURCE_CHOICES)
+        },
+        "relational_pairing": {"choices": list(RELATIONAL_PAIRING_CHOICES)},
+        "teacher_temp_warmup_ratio": {
+            "numeric": "float",
+            "bounds": {"min": 0.0, "max": 1.0},
+        },
         "patch_loss": {"choices": list(PATCH_LOSS_MODES)},
         "masking_strategy": {"choices": list(MASKING_STRATEGIES)},
         "register_tokens": {"choices": list(REGISTER_TOKEN_CHOICES)},
@@ -613,6 +625,55 @@ def _check_rule(option: str, value: Any, rule: Mapping[str, Any]) -> None:
         _check_bounds(option, parsed, bounds)
 
 
+# New-run policy band for the teacher temperature endpoints. It is project
+# policy about plannable signal, not part of the numerical safety argument, and
+# it never applies to a checkpoint-recorded value.
+TEACHER_TEMP_POLICY_BAND = (0.001, 100.0)
+
+
+def validate_relational_endpoints(
+    values: Mapping[str, object], explicit_options: frozenset[str] | set[str]
+) -> None:
+    """Reject unusable teacher temperatures, then the fresh-only policy band.
+
+    Finite positive is a numerical requirement and applies in every track; the
+    ``0.001..100`` band is project policy for a fresh request only, so a resume
+    proposal carrying ``0.0009`` stays acceptable pending checkpoint matching.
+    """
+    low, high = TEACHER_TEMP_POLICY_BAND
+    fresh = values.get("resume") in (None, "", False)
+    for name in ("teacher_temp_start", "teacher_temp_end"):
+        if name not in explicit_options:
+            continue
+        value = values.get(name)
+        if value is None:
+            continue
+        option = f"--{name.replace('_', '-')}"
+        number = _coerce_numeric(name.replace("_", "-"), value, "float")
+        if not math.isfinite(number) or number <= 0.0:
+            raise ValueError(
+                f"{option} must be finite and positive, got {value!r}"
+            )
+        if fresh and not low <= number <= high:
+            raise ValueError(
+                f"{option} must be inside the new-run policy band [{low}, {high}], "
+                f"got {value!r}; a checkpoint may record a value outside this band, "
+                "a fresh request may not"
+            )
+
+
+def validate_relational_combination(values: Mapping[str, object]) -> None:
+    """Reject a request combination that can never resolve."""
+    views = values.get("relational_teacher_views")
+    center = values.get("relational_center_source")
+    if views == "ordinary" and center == "weak":
+        raise ValueError(
+            "--relational-center-source weak needs ordinary teacher views to have "
+            "weak features; use --relational-teacher-views weak or an ordinary "
+            "center"
+        )
+
+
 def validate_constraints(
     command: str,
     values: Mapping[str, object],
@@ -659,6 +720,8 @@ def validate_constraints(
             )
 
     if command == "pretrain":
+        validate_relational_endpoints(values, explicit_options)
+        validate_relational_combination(values)
         if given("resume"):
             unresolved.append(
                 "patch-option applicability follows the resumed checkpoint's saved "

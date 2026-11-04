@@ -383,6 +383,21 @@ The README may carry the full explanation; CLI help must remain detailed enough 
 
 ## 8. Checkpoint, Logging, and Resume Contract
 
+> **Weak relational teacher record (added 2026-11-04).** The pretraining
+> relational target design
+> (`docs/superpowers/specs/2026-11-03-relational-pretrain-targets-design.md`)
+> adds a second, separate record at
+> `config.relational_target_config.weak_teacher_augmentation_config`. It is a
+> deep copy of the resolved ordinary config with color jitter (probability and
+> amplitudes), grayscale and both global blur probabilities zeroed, plus its own
+> `normalize.mean` / `normalize.std` lists; ordinary configs gain no
+> normalization keys and the ordinary/patch transform path is unchanged. The
+> record is locked as a whole, so any difference — including a change confined
+> to a field no weak global view consumes (`local_crop`, `local_crops`,
+> `blur.local_kernel`, `blur.probabilities[2]`) or to the recorded
+> normalization — is drift and blocks resume. `legacy` keeps its historical
+> transforms, which ignore `--orientation-policy`.
+
 ### 8.1 New checkpoint metadata
 
 New pretrain and finetune checkpoints add JSON-serializable augmentation metadata under `config`:

@@ -50,6 +50,18 @@ fine-tuning or direct embedding extraction. Typical artifacts: `SSL_latest.pth`,
 directory. `--resume` is supported; combining `--resume` with `--overwrite` is
 rejected. Explain possible initial timm weight downloads before approval.
 
+A new run synchronizes the student encoder state into the teacher and, by
+default, builds relational targets from two weak teacher global views with
+`cross` pairing and `0.08` to `0.11` teacher temperatures. `--resume` restores
+the saved student/teacher pair without re-synchronizing and inherits the recorded
+relational recipe, patch settings and temperature schedule: omitted options are
+inherited, and an explicit value that conflicts with the recorded one fails
+instead of applying the new-run default. Changing the recipe requires a new run.
+The `--relational-teacher-views`, `--relational-center-source` and
+`--relational-pairing` selectors are independent of the patch objective, which
+keeps ordinary global views as its inputs. Use the runtime-derived parameter
+cards for the accepted values and declared defaults instead of quoting them here.
+
 ## finetune
 
 Metric-learning fine-tuning from a pretrained checkpoint. Typical artifacts:

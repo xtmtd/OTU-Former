@@ -49,17 +49,52 @@ def test_export_checkpoint_loader_disables_pretrained_weights(monkeypatch, tmp_p
     assert seen["pretrained"] is False
 
 
-def make_checkpoint(tmp_path: Path, out_dim: int = 64) -> Path:
+def make_checkpoint(
+    tmp_path: Path, out_dim: int = 64, *, annotated: bool = False, name: str = "ckpt.pt"
+) -> Path:
     from otuformer.training.model import OTUFormerEncoder
+    from otuformer.training.trainer import RELATIONAL_TARGET_CONFIG_KEY
 
     model = OTUFormerEncoder(model_name="vit_tiny_patch16_224", out_dim=out_dim)
-    ckpt = {
-        "model_state_dict": model.state_dict(),
-        "config": {"model_name": "vit_tiny_patch16_224", "out_dim": out_dim},
-    }
-    p = tmp_path / "ckpt.pt"
+    config = {"model_name": "vit_tiny_patch16_224", "out_dim": out_dim}
+    if annotated:
+        config[RELATIONAL_TARGET_CONFIG_KEY] = {
+            "version": 1,
+            "relational_teacher_views": "weak",
+            "relational_pairing": "cross",
+            "relational_center_source": "weak",
+            "teacher_temp_start": 0.08,
+            "teacher_temp_end": 0.11,
+            "weak_teacher_augmentation_config": {
+                "profile": "global-barcode",
+                "normalize": {
+                    "mean": [0.485, 0.456, 0.406],
+                    "std": [0.229, 0.224, 0.225],
+                },
+            },
+        }
+    ckpt = {"model_state_dict": model.state_dict(), "config": config}
+    p = tmp_path / name
     torch.save(ckpt, p)
     return p
+
+
+def test_export_accepts_an_injected_relational_bundle(tmp_path: Path):
+    """The additive SSL recipe metadata must not disturb export.
+
+    One export per test: the ONNX version converter is not reliable twice in a
+    process, which is unrelated to this metadata.
+    """
+    annotated = make_checkpoint(tmp_path, annotated=True, name="annotated.pt")
+    report = export_to_onnx(
+        checkpoint_path=annotated,
+        out_path=tmp_path / "annotated.onnx",
+        imgsz=224,
+        opset=17,
+    )
+    assert (tmp_path / "annotated.onnx").exists()
+    assert report["out_dim"] == 64
+    assert report["model_name"] == "vit_tiny_patch16_224"
 
 
 def test_export_creates_onnx_file(tmp_path: Path):

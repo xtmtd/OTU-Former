@@ -10,6 +10,9 @@ from otuformer.constants import (
     FINETUNE_AUGMENTATIONS,
     ORIENTATION_POLICIES,
     PRETRAIN_AUGMENTATIONS,
+    RELATIONAL_CENTER_SOURCE_CHOICES,
+    RELATIONAL_PAIRING_CHOICES,
+    RELATIONAL_TEACHER_VIEW_CHOICES,
 )
 from otuformer.cli.constraints import (
     validate_augmentation_profile,
@@ -36,6 +39,9 @@ def docs_url(name: str) -> str:
 _PRETRAIN_AUGMENTATION_CHOICES = PRETRAIN_AUGMENTATIONS
 _FINETUNE_AUGMENTATION_CHOICES = FINETUNE_AUGMENTATIONS
 _ORIENTATION_POLICY_CHOICES = ORIENTATION_POLICIES
+_RELATIONAL_TEACHER_VIEW_CHOICES = RELATIONAL_TEACHER_VIEW_CHOICES
+_RELATIONAL_CENTER_SOURCE_CHOICES = RELATIONAL_CENTER_SOURCE_CHOICES
+_RELATIONAL_PAIRING_CHOICES = RELATIONAL_PAIRING_CHOICES
 
 
 def pretrain_augmentation_choices() -> list[str]:
@@ -51,6 +57,21 @@ def finetune_augmentation_choices() -> list[str]:
 def orientation_policy_choices() -> list[str]:
     """Shell-completion choices for ``--orientation-policy``."""
     return list(_ORIENTATION_POLICY_CHOICES)
+
+
+def relational_teacher_view_choices() -> list[str]:
+    """Shell-completion choices for ``pretrain --relational-teacher-views``."""
+    return list(_RELATIONAL_TEACHER_VIEW_CHOICES)
+
+
+def relational_center_source_choices() -> list[str]:
+    """Shell-completion choices for ``pretrain --relational-center-source``."""
+    return list(_RELATIONAL_CENTER_SOURCE_CHOICES)
+
+
+def relational_pairing_choices() -> list[str]:
+    """Shell-completion choices for ``pretrain --relational-pairing``."""
+    return list(_RELATIONAL_PAIRING_CHOICES)
 
 
 def _parse_size(value: str, *, stage: str) -> int | None:

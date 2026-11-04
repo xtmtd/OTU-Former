@@ -862,3 +862,285 @@ def test_pretrain_view_transform_is_picklable(tmp_path):
     )
     for view in (ds.global_tf1, ds.global_tf2, ds.local_tf):
         pickle.loads(pickle.dumps(view))
+
+
+# --- weak relational teacher views -----------------------------------------
+
+_GEOMETRY_KEYS = (
+    "global_crop",
+    "crop_ratio",
+    "transform_order",
+    "rotation",
+    "fallback_fill",
+    "horizontal_flip_probability",
+    "vertical_flip_probability",
+)
+
+
+@pytest.mark.parametrize("profile", PRETRAIN_AUGMENTATIONS)
+@pytest.mark.parametrize("policy", ORIENTATION_POLICIES)
+def test_weak_teacher_config_preserves_geometry(profile, policy):
+    import copy
+
+    from otuformer.training.dataset import build_weak_teacher_augmentation_config
+
+    ordinary = build_pretrain_augmentation_config(profile, 32, 16, 2, policy)
+    snapshot = copy.deepcopy(ordinary)
+    weak = build_weak_teacher_augmentation_config(ordinary)
+
+    assert ordinary == snapshot
+    assert "normalize" not in ordinary
+    for key in _GEOMETRY_KEYS:
+        assert weak[key] == ordinary[key], key
+        if isinstance(ordinary[key], (dict, list)):
+            assert weak[key] is not ordinary[key], key
+    # legacy ignores the orientation policy for transforms; the weak record
+    # must mirror that instead of applying modern sensitive geometry.
+    if profile == "legacy":
+        assert weak["rotation"]["expand"] is False
+        assert weak["rotation"]["fill"] == [0, 0, 0]
+        assert "resize" not in weak["transform_order"]
+        assert weak["vertical_flip_probability"] == 0.5
+    assert weak["global_crop"]["scale"] == [0.4, 1.0]
+
+    assert weak["color_jitter"] == {
+        "probability": 0.0,
+        "brightness": 0.0,
+        "contrast": 0.0,
+        "saturation": 0.0,
+        "hue": 0.0,
+    }
+    assert weak["grayscale_probability"] == 0.0
+    assert list(weak["blur"]["probabilities"])[:2] == [0.0, 0.0]
+    assert weak["solarization_probability"] == 0.0
+    assert weak["normalize"]["mean"] == [0.485, 0.456, 0.406]
+    assert weak["normalize"]["std"] == [0.229, 0.224, 0.225]
+    assert weak["normalize"]["mean"] is not ordinary.get("normalize")
+
+    # The weak record is a fresh structure, not an alias of the ordinary one.
+    weak["color_jitter"]["probability"] = 1.0
+    weak["blur"]["probabilities"][0] = 1.0
+    assert ordinary == snapshot
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        None,
+        {},
+        {"mean": [0.5, 0.5], "std": [1.0, 1.0, 1.0]},
+        {"mean": [0.5, 0.5, 0.5], "std": [1.0, 1.0, True]},
+        {"mean": [0.5, 0.5, float("nan")], "std": [1.0, 1.0, 1.0]},
+        {"mean": [0.5, 0.5, 0.5], "std": [1.0, 0.0, 1.0]},
+    ],
+)
+def test_weak_normalize_record_rejects_malformed(record):
+    from otuformer.training.dataset import (
+        _build_pretrain_view_transform,
+        build_weak_teacher_augmentation_config,
+    )
+
+    weak = build_weak_teacher_augmentation_config(
+        build_pretrain_augmentation_config("global-barcode", 32, 16, 0)
+    )
+    weak["normalize"] = record
+    with pytest.raises(ValueError, match="normalize"):
+        _build_pretrain_view_transform(
+            weak, "global", 0.0, use_recorded_normalize=True
+        )
+
+
+def test_weak_teacher_config_consumes_recorded_normalization(tmp_path):
+    from otuformer.training.dataset import build_weak_teacher_augmentation_config
+
+    csv_path = make_dummy_images(tmp_path, n=1)
+    Image.new("RGB", (64, 64), color=(255, 255, 255)).save(tmp_path / "img_0.jpg")
+    base = MultiCropDataset(
+        csv_path=csv_path,
+        images_dir=tmp_path,
+        global_crop_size=32,
+        local_crop_size=16,
+        local_crops=0,
+    )
+    ordinary_views = base[0]
+
+    weak = build_weak_teacher_augmentation_config(base.augmentation_config)
+    weak["normalize"] = {"mean": [0.0, 0.0, 0.0], "std": [1.0, 1.0, 1.0]}
+    ds = MultiCropDataset(
+        csv_path=csv_path,
+        images_dir=tmp_path,
+        global_crop_size=32,
+        local_crop_size=16,
+        local_crops=0,
+        include_weak_teacher_views=True,
+        weak_teacher_augmentation_config=weak,
+    )
+    weak_views = ds[0][2:]
+    assert len(weak_views) == 2
+    # A zero mean / unit std must change the executed normalization: a white
+    # crop reaches 1.0 instead of the ImageNet-normalized sub-1.0 value.
+    for view in weak_views:
+        assert float(view.max()) == pytest.approx(1.0)
+
+    default_weak = MultiCropDataset(
+        csv_path=csv_path,
+        images_dir=tmp_path,
+        global_crop_size=32,
+        local_crop_size=16,
+        local_crops=0,
+        include_weak_teacher_views=True,
+    )[0][2:]
+    for view in default_weak:
+        assert float(view.max()) > 2.0
+    # the ordinary record gains no normalization keys
+    assert "normalize" not in base.augmentation_config
+    assert "normalize" not in ordinary_views
+
+
+@pytest.mark.parametrize("local_crops", [0, 2])
+def test_multicrop_weak_views_are_appended(tmp_path, local_crops):
+    csv_path = make_dummy_images(tmp_path, n=1)
+    plain = MultiCropDataset(
+        csv_path=csv_path,
+        images_dir=tmp_path,
+        global_crop_size=32,
+        local_crop_size=16,
+        local_crops=local_crops,
+    )
+    weak = MultiCropDataset(
+        csv_path=csv_path,
+        images_dir=tmp_path,
+        global_crop_size=32,
+        local_crop_size=16,
+        local_crops=local_crops,
+        include_weak_teacher_views=True,
+    )
+    assert len(plain[0]) == 2 + local_crops
+    views = weak[0]
+    assert len(views) == 4 + local_crops
+    for view in views[:2] + views[2 + local_crops :]:
+        assert view.shape == (3, 32, 32)
+    for view in views[2 : 2 + local_crops]:
+        assert view.shape == (3, 16, 16)
+    assert weak.weak_teacher_tf1 is not weak.weak_teacher_tf2
+    assert weak.weak_teacher_tf1.blur_probability == 0.0
+    assert weak.weak_teacher_tf2.blur_probability == 0.0
+    assert weak.weak_teacher_tf1.grayscale_probability == 0.0
+    for transform in (weak.weak_teacher_tf1, weak.weak_teacher_tf2):
+        pickle.loads(pickle.dumps(transform))
+    assert plain.weak_teacher_augmentation_config is None
+
+
+def test_multicrop_weak_view_call_order_is_deterministic(tmp_path):
+    csv_path = make_dummy_images(tmp_path, n=1)
+    ds = MultiCropDataset(
+        csv_path=csv_path,
+        images_dir=tmp_path,
+        global_crop_size=32,
+        local_crop_size=16,
+        local_crops=2,
+        include_weak_teacher_views=True,
+    )
+    calls: list[str] = []
+
+    def marker(name: str, size: int):
+        def transform(image, fill):
+            calls.append(name)
+            return torch.full((3, size, size), float(len(calls)))
+
+        return transform
+
+    ds.global_tf1 = marker("global_A", 32)
+    ds.global_tf2 = marker("global_B", 32)
+    ds.local_tf = marker("local", 16)
+    ds.weak_teacher_tf1 = marker("weak_A", 32)
+    ds.weak_teacher_tf2 = marker("weak_B", 32)
+
+    views = ds[0]
+    assert calls == ["global_A", "global_B", "local", "local", "weak_A", "weak_B"]
+    assert float(views[4].flatten()[0]) == 5.0
+    assert float(views[5].flatten()[0]) == 6.0
+
+
+def test_multicrop_weak_views_keep_legacy_fixed_fill(tmp_path):
+    csv_path = make_dummy_images(tmp_path, n=1)
+    ds = MultiCropDataset(
+        csv_path=csv_path,
+        images_dir=tmp_path,
+        global_crop_size=32,
+        local_crop_size=16,
+        local_crops=0,
+        augmentation_profile="legacy",
+        include_weak_teacher_views=True,
+    )
+    assert ds._estimate_edge_fill is False
+    assert ds.weak_teacher_tf1.uses_edge_fill is False
+    assert ds.weak_teacher_tf1.rotation_fill == (0, 0, 0)
+    assert len(ds[0]) == 4
+
+
+def test_multicrop_weak_view_shape_error_names_the_slot(tmp_path):
+    csv_path = make_dummy_images(tmp_path, n=1)
+    ds = MultiCropDataset(
+        csv_path=csv_path,
+        images_dir=tmp_path,
+        global_crop_size=32,
+        local_crop_size=16,
+        local_crops=0,
+        include_weak_teacher_views=True,
+    )
+    ds.weak_teacher_tf2 = lambda image, fill: torch.zeros(3, 16, 16)
+    with pytest.raises(ValueError, match="weak_teacher_B"):
+        ds[0]
+
+
+def test_weak_teacher_dataset_config_authority(tmp_path):
+    from otuformer.training.dataset import build_weak_teacher_augmentation_config
+
+    csv_path = make_dummy_images(tmp_path, n=1)
+    ordinary = build_pretrain_augmentation_config("global-barcode", 32, 16, 2)
+    kwargs = dict(
+        csv_path=csv_path,
+        images_dir=tmp_path,
+        global_crop_size=32,
+        local_crop_size=16,
+        local_crops=2,
+        augmentation_profile="global-barcode",
+        orientation_policy="sensitive",
+    )
+    snapshot = pickle.dumps(ordinary)
+    ds = MultiCropDataset(**kwargs, augmentation_config=ordinary)
+    assert ds.augmentation_config is ordinary
+    assert pickle.dumps(ordinary) == snapshot
+    assert len(ds[0]) == 4
+
+    for conflict in (
+        {"augmentation_profile": "color-robust"},
+        {"orientation_policy": "invariant"},
+        {"global_crop_size": 64},
+        {"local_crop_size": 8},
+        {"local_crops": 0},
+    ):
+        with pytest.raises(ValueError, match="supplied augmentation_config"):
+            MultiCropDataset(**{**kwargs, **conflict}, augmentation_config=ordinary)
+
+    # a supplied weak config must mirror geometry and disable photometrics
+    weak = build_weak_teacher_augmentation_config(ordinary)
+    broken = dict(weak)
+    broken["rotation"] = {**weak["rotation"], "degrees": [-180.0, 180.0]}
+    with pytest.raises(ValueError, match="weak teacher augmentation"):
+        MultiCropDataset(
+            **kwargs, include_weak_teacher_views=True,
+            weak_teacher_augmentation_config=broken,
+        )
+
+    jittered = build_weak_teacher_augmentation_config(ordinary)
+    jittered["color_jitter"] = {**jittered["color_jitter"], "probability": 0.5}
+    with pytest.raises(ValueError, match="color jitter"):
+        MultiCropDataset(
+            **kwargs, include_weak_teacher_views=True,
+            weak_teacher_augmentation_config=jittered,
+        )
+
+    with pytest.raises(ValueError, match="include_weak_teacher_views"):
+        MultiCropDataset(**kwargs, weak_teacher_augmentation_config=weak)

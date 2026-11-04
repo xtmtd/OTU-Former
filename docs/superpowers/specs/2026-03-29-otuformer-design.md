@@ -80,8 +80,11 @@ which settings were requested from which were derived from a checkpoint, a
 backbone, or the local machine. The resolved records are `Patch config:`
 (`mask_ratio_requested` / `mask_ratio_resolved`), `Augmentation profile:` plus
 `Augmentation config:` (resolved sizes, crops, and orientation policy),
-`[Info] Auto ... size ...` lines, and `Resolved device:` for the compute device
-actually used. The ONNX extraction path has no torch device, so it records the
+`Relational target config:` (the canonical relational bundle, display-only and
+never parsed as a training input), `Teacher temperature schedule:` (effective
+start, end and warmup ratio — the ratio is schedule provenance and not a bundle
+key), `[Info] Auto ... size ...` lines, and `Resolved device:` for the compute
+device actually used. The ONNX extraction path has no torch device, so it records the
 provider it runs on: `cpu (onnxruntime CPUExecutionProvider)`.
 
 A `Patch config:` line reports every patch option the selected `patch_loss` does
@@ -124,12 +127,25 @@ exists.
 SSL self-supervised pre-training (teacher-student self-distillation + patch-level objective).
 All parameters migrated from `ref/ibot20260115.py` `get_parser()`, mode=pretrain.
 
-**Outputs:** `SSL_latest.pth` (and epoch checkpoints `SSL_epoch_*.pth`), `metrics.pretrain.csv`, `instant_metrics.csv`, training curves PDF, log file. When labels are absent or contain fewer than two classes, supervised metric fields remain empty while the epoch row is retained; an image-only visualization CSV still produces UMAP. `--metrics-sample-size` limits both supervised metric and UMAP inputs when positive.
+**Outputs:** `SSL_latest.pth` (and epoch checkpoints `SSL_epoch_*.pth`), `metrics.pretrain.csv` (periodic embedding evaluation), `logs/instant_metrics.pretrain.csv` (per-step instant metrics), training curves PDF, log file. When labels are absent or contain fewer than two classes, supervised metric fields remain empty while the epoch row is retained; an image-only visualization CSV still produces UMAP. `--metrics-sample-size` limits both supervised metric and UMAP inputs when positive.
 
 **Key constraints:**
 - `--global-crop-size` : `auto` resolves to the backbone's native `default_cfg["input_size"]` on a new run or the checkpoint's recorded size on `--resume`
 - On `--resume`, omitted `--local-crop-size` and `--local-crops` inherit the checkpoint's saved values; explicit conflicting values fail, and changing them requires a new run.
 - `--mask-ratio` : `auto` resolves to 0.30 on a new run, while v0.6.x defaulted to 0.50; a legacy `--resume` keeps its recorded value or falls back to 0.50
+- A new run copies the complete student encoder state into the independently
+  constructed teacher before the first forward; resumes restore the saved
+  student/teacher pair without re-synchronizing. Marked v2 relational/DINO
+  training payloads are rejected before output setup; read-only and downstream
+  checkpoint consumers are unaffected.
+- `--relational-teacher-views`, `--relational-center-source`,
+  `--relational-pairing`, `--teacher-temp-start`, `--teacher-temp-end` and
+  `--teacher-temp-warmup-ratio` follow the relational-target contract in
+  [the relational pretraining targets design](2026-11-03-relational-pretrain-targets-design.md):
+  omitted requests inherit the checkpoint recipe on `--resume`, a new run
+  resolves documented defaults, and an explicit value that conflicts with the
+  recorded one fails. `cosine_similarity` stays the ordinary student-A versus
+  centered ordinary teacher-A cosine.
 - `--patch-loss` : patch-level objective — `none`, `consistency` (default; visible same-position cosine consistency, not input masking), `masked-feature` (A+; continuous masked feature prediction), or `ibot` (experimental prototype prediction)
 - `--masking-strategy` : real-masking geometry for `masked-feature`/`ibot` — `random` (default), `blockwise`, or `hybrid`
 - `--model-name` : a `vit_*` name alone does not establish compatibility (see Section 4.9)

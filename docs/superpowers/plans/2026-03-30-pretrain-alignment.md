@@ -7,6 +7,21 @@
 > and plan (`docs/superpowers/plans/2026-09-20-otuformer-masked-pretrain-v070.md`).
 > Its global/local SSL alignment work and evaluation wiring remain in force.
 
+> **Relational-target supersession note (added 2026-11-04, not a rewrite of the
+> historical decisions/steps below).** The relational CLS objective's new-run
+> recipe changed in the relational pretraining targets work
+> (`docs/superpowers/specs/2026-11-03-relational-pretrain-targets-design.md`
+> and `docs/superpowers/plans/2026-11-04-relational-pretrain-targets.md`):
+> fresh runs now start from a synchronized student/teacher encoder pair, build
+> the relational target from two weak teacher global views by default, average
+> `cross`-only global pairs, and ramp the shared teacher temperature `0.08` to
+> `0.11`. The `full` pairing, the `0.04`/`0.07` endpoints, the ordinary
+> teacher views and the historical independent teacher-projector initialization
+> remain expressible only as the pre-change reference recipe — the last of them
+> not at all, since a fresh run always synchronizes. Legacy checkpoints keep
+> their recorded recipe on resume. The historical commands below are not
+> rewritten to the new defaults.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Align `otuformer pretrain` with the reference SSL workflow in `ref/ibot20260115.py`, while fixing the train-only UMAP labeling issue and preserving the current package structure.

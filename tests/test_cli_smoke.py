@@ -1,6 +1,7 @@
 import argparse
 import functools
 import inspect
+import json
 import re
 import pytest
 import pandas as pd
@@ -214,7 +215,6 @@ def test_pretrain_runs_one_epoch(tmp_path):
             "--local-crops",
             "2",
             "--disable-embedding-metrics",
-            "--disable-cross-view-loss",
             "--device",
             "cpu",
         ],
@@ -266,7 +266,6 @@ def test_pretrain_runs_one_epoch_without_train_data(tmp_path):
             "--local-crops",
             "2",
             "--disable-embedding-metrics",
-            "--disable-cross-view-loss",
             "--device",
             "cpu",
         ],
@@ -302,7 +301,8 @@ def test_pretrain_resume_allows_existing_output_and_appends_log(tmp_path, monkey
     log_path = out_dir / "logs" / "pretrain.log"
     log_path.parent.mkdir(parents=True)
     log_path.write_text("old run\n", encoding="utf-8")
-    monkeypatch.setattr("otuformer.training.trainer.run_pretrain", lambda _args: None)
+    monkeypatch.setattr("otuformer.training.trainer.run_pretrain",
+        lambda _args, **kwargs: None,)
 
     result = runner.invoke(
         app,
@@ -334,7 +334,8 @@ def test_pretrain_register_tokens_rejects_invalid_value(tmp_path):
 def test_pretrain_register_tokens_none_matches_omission(tmp_path, monkeypatch):
     seen: dict = {}
     monkeypatch.setattr(
-        "otuformer.training.trainer.run_pretrain", lambda args: seen.update(vars(args))
+        "otuformer.training.trainer.run_pretrain",
+        lambda args, **kwargs: seen.update(vars(args)),
     )
 
     result = runner.invoke(
@@ -352,7 +353,8 @@ def test_pretrain_register_tokens_none_matches_omission(tmp_path, monkeypatch):
 def test_pretrain_register_option_provenance_reaches_the_trainer(tmp_path, monkeypatch):
     seen: dict = {}
     monkeypatch.setattr(
-        "otuformer.training.trainer.run_pretrain", lambda args: seen.update(vars(args))
+        "otuformer.training.trainer.run_pretrain",
+        lambda args, **kwargs: seen.update(vars(args)),
     )
     out_dir = tmp_path / "pretrain_out"
 
@@ -397,7 +399,8 @@ def test_pretrain_new_run_rejects_an_impossible_register_option_before_overwrite
     out_dir.mkdir()
     sentinel = out_dir / "keep.txt"
     sentinel.write_text("keep", encoding="utf-8")
-    monkeypatch.setattr("otuformer.training.trainer.run_pretrain", lambda _args: None)
+    monkeypatch.setattr("otuformer.training.trainer.run_pretrain",
+        lambda _args, **kwargs: None,)
 
     result = runner.invoke(
         app,
@@ -462,7 +465,8 @@ def test_pretrain_registered_resume_preflight_preserves_existing_output(tmp_path
     (out_dir / "logs").mkdir(parents=True)
     sentinel = out_dir / "keep.txt"
     sentinel.write_text("keep", encoding="utf-8")
-    monkeypatch.setattr("otuformer.training.trainer.run_pretrain", lambda _args: None)
+    monkeypatch.setattr("otuformer.training.trainer.run_pretrain",
+        lambda _args, **kwargs: None,)
 
     result = runner.invoke(
         app,
@@ -662,7 +666,6 @@ def test_finetune_runs_one_epoch(tmp_path):
             "--local-crops",
             "2",
             "--disable-embedding-metrics",
-            "--disable-cross-view-loss",
             "--device",
             "cpu",
         ],
@@ -1631,7 +1634,7 @@ def test_cam_command_does_not_leave_closed_logging_stream(monkeypatch, tmp_path)
 def test_pretrain_default_model_name_and_device_auto(tmp_path, monkeypatch):
     seen = {}
 
-    def fake_run_pretrain(args):
+    def fake_run_pretrain(args, *, pretrain_recipe=None):
         seen["model_name"] = args.model_name
         seen["device"] = args.device
         seen["extract_size"] = args.extract_size
@@ -1667,7 +1670,7 @@ def test_pretrain_default_model_name_and_device_auto(tmp_path, monkeypatch):
 def test_pretrain_forwards_patch_defaults_and_implicit_sources(tmp_path, monkeypatch):
     seen = {}
 
-    def fake_run_pretrain(args):
+    def fake_run_pretrain(args, *, pretrain_recipe=None):
         seen.update(vars(args))
 
     monkeypatch.setattr("otuformer.training.trainer.run_pretrain", fake_run_pretrain)
@@ -1696,7 +1699,7 @@ def test_pretrain_forwards_patch_defaults_and_implicit_sources(tmp_path, monkeyp
 def test_pretrain_records_commandline_patch_sources(tmp_path, monkeypatch):
     seen = {}
 
-    def fake_run_pretrain(args):
+    def fake_run_pretrain(args, *, pretrain_recipe=None):
         seen.update(vars(args))
 
     monkeypatch.setattr("otuformer.training.trainer.run_pretrain", fake_run_pretrain)
@@ -1758,7 +1761,7 @@ def test_pretrain_mask_ratio_rejects_invalid_values_before_output_dir(tmp_path, 
 def test_pretrain_forwards_large_ibot_prototype_counts(tmp_path, monkeypatch):
     seen = {}
 
-    def fake_run_pretrain(args):
+    def fake_run_pretrain(args, *, pretrain_recipe=None):
         seen.update(vars(args))
 
     monkeypatch.setattr("otuformer.training.trainer.run_pretrain", fake_run_pretrain)
@@ -1941,7 +1944,6 @@ def test_pretrain_save_every_epochs_and_console_progress(tmp_path):
             "--local-crops",
             "2",
             "--disable-embedding-metrics",
-            "--disable-cross-view-loss",
             "--device",
             "cpu",
         ],
@@ -1994,7 +1996,6 @@ def test_pretrain_embedding_metrics_and_umap_toggle(tmp_path):
             "96",
             "--local-crops",
             "2",
-            "--disable-cross-view-loss",
             "--device",
             "cpu",
         ],
@@ -2040,7 +2041,6 @@ def test_pretrain_embedding_metrics_and_umap_toggle(tmp_path):
             "--local-crops",
             "2",
             "--disable-embedding-metrics",
-            "--disable-cross-view-loss",
             "--device",
             "cpu",
         ],
@@ -2052,7 +2052,7 @@ def test_pretrain_embedding_metrics_and_umap_toggle(tmp_path):
 def test_pretrain_log_contains_command_params_and_stderr_on_error(
     tmp_path, monkeypatch
 ):
-    def fake_run_pretrain(_args):
+    def fake_run_pretrain(_args, *, pretrain_recipe=None):
         print("stdout-line")
         import sys
 
@@ -2097,7 +2097,7 @@ def test_pretrain_enables_mps_fallback_env_for_auto(tmp_path, monkeypatch):
     monkeypatch.delenv("PYTORCH_ENABLE_MPS_FALLBACK", raising=False)
     seen = {}
 
-    def fake_run_pretrain(_args):
+    def fake_run_pretrain(_args, *, pretrain_recipe=None):
         seen["fallback"] = os.environ.get("PYTORCH_ENABLE_MPS_FALLBACK")
 
     monkeypatch.setattr("otuformer.training.trainer.run_pretrain", fake_run_pretrain)
@@ -2262,7 +2262,6 @@ def test_global_crop_size_rejects_non_divisible_patch16(tmp_path):
             "--device",
             "cpu",
             "--disable-embedding-metrics",
-            "--disable-cross-view-loss",
         ],
     )
     assert result.exit_code != 0
@@ -2296,7 +2295,7 @@ def test_pretrain_resume_allows_equal_input_size(tmp_path, monkeypatch):
     ckpt = _make_ckpt(tmp_path)  # 224 checkpoint
     seen = {}
 
-    def fake_run_pretrain(args):
+    def fake_run_pretrain(args, *, pretrain_recipe=None):
         seen["global_crop_size"] = args.global_crop_size
 
     monkeypatch.setattr("otuformer.training.trainer.run_pretrain", fake_run_pretrain)
@@ -2324,7 +2323,7 @@ def test_pretrain_resume_allows_equal_input_size(tmp_path, monkeypatch):
 def test_pretrain_auto_global_crop_size_forwards_none(tmp_path, monkeypatch):
     seen = {}
 
-    def fake_run_pretrain(args):
+    def fake_run_pretrain(args, *, pretrain_recipe=None):
         seen["global_crop_size"] = args.global_crop_size
         seen["extract_size"] = args.extract_size
 
@@ -2606,7 +2605,6 @@ def test_pretrain_local_crop_size_validated_against_patch(tmp_path):
             "--device",
             "cpu",
             "--disable-embedding-metrics",
-            "--disable-cross-view-loss",
         ],
     )
     assert result.exit_code != 0
@@ -2643,7 +2641,6 @@ def test_pretrain_local_crops_zero_skips_local_size_validation(tmp_path):
             "--device",
             "cpu",
             "--disable-embedding-metrics",
-            "--disable-cross-view-loss",
         ],
     )
     assert result.exit_code == 0
@@ -2787,7 +2784,7 @@ def test_pretrain_augmentation_argument_forwarding_defaults_to_none(
 ):
     seen = {}
 
-    def fake_run_pretrain(args):
+    def fake_run_pretrain(args, *, pretrain_recipe=None):
         seen["augmentation"] = args.augmentation
         seen["orientation_policy"] = args.orientation_policy
         seen["local_crop_size"] = args.local_crop_size
@@ -2822,7 +2819,7 @@ def test_pretrain_augmentation_argument_forwarding_explicit_values(
 ):
     seen = {}
 
-    def fake_run_pretrain(args):
+    def fake_run_pretrain(args, *, pretrain_recipe=None):
         seen["augmentation"] = args.augmentation
         seen["orientation_policy"] = args.orientation_policy
         seen["local_crop_size"] = args.local_crop_size
@@ -2861,7 +2858,8 @@ def test_pretrain_augmentation_argument_forwarding_explicit_values(
 
 
 def test_format_user_command_omits_unset_augmentation_flags(tmp_path, monkeypatch):
-    monkeypatch.setattr("otuformer.training.trainer.run_pretrain", lambda _args: None)
+    monkeypatch.setattr("otuformer.training.trainer.run_pretrain",
+        lambda _args, **kwargs: None,)
 
     def command_line(out_dir):
         log_text = (out_dir / "logs" / "pretrain.log").read_text(encoding="utf-8")
@@ -3069,7 +3067,7 @@ def test_pretrain_resume_inherits_saved_local_views_without_explicit_flags(
     )
     seen = {}
 
-    def fake_run_pretrain(args):
+    def fake_run_pretrain(args, *, pretrain_recipe=None):
         loaded = torch.load(ckpt, map_location="cpu", weights_only=False)
         seen["local_crop_size"] = args.local_crop_size
         seen["local_crops"] = args.local_crops
@@ -3736,7 +3734,7 @@ def test_pretrain_log_records_requested_auto_and_none_keywords(tmp_path, monkeyp
     """An auto/none default must read as its keyword, not as the internal None."""
     seen = {}
 
-    def fake_run_pretrain(ns):
+    def fake_run_pretrain(ns, *, pretrain_recipe=None):
         seen.update(vars(ns))
 
     monkeypatch.setattr("otuformer.training.trainer.run_pretrain", fake_run_pretrain)
@@ -3783,7 +3781,8 @@ def test_finetune_loss_mode_defaults_to_no_explicit_options(tmp_path, monkeypatc
 
 def test_pretrain_command_replay_keeps_the_disable_metrics_switch(tmp_path, monkeypatch):
     """The replay line must show the CLI switch, not its inverted core argument."""
-    monkeypatch.setattr("otuformer.training.trainer.run_pretrain", lambda _ns: None)
+    monkeypatch.setattr("otuformer.training.trainer.run_pretrain",
+        lambda _ns, **kwargs: None,)
 
     result = runner.invoke(
         app,
@@ -4500,7 +4499,6 @@ def _pretrain_preflight_args(tmp_path, out_dir, *extra):
         "--batch-size", "2",
         "--num-workers", "0",
         "--disable-embedding-metrics",
-        "--disable-cross-view-loss",
         "--device", "cpu",
         *extra,
     ]
@@ -4913,3 +4911,435 @@ def test_pretrain_preflight_reports_an_unbuildable_backbone_as_a_parameter_error
     assert "Could not load" in result.output or "not supported" in result.output
     assert not isinstance(result.exception, RuntimeError)
     assert not out_dir.exists()
+
+
+# --- relational recipe CLI contract ----------------------------------------
+
+def _relational_resume_checkpoint(tmp_path, *, bundle=None, drift_weak=False):
+    """A versioned pretrain checkpoint carrying a canonical relational bundle."""
+    from otuformer.training.dataset import (
+        build_pretrain_augmentation_config,
+        build_weak_teacher_augmentation_config,
+    )
+    from otuformer.training.model import OTUFormerEncoder
+    from otuformer.training.trainer import RELATIONAL_TARGET_CONFIG_KEY
+
+    ordinary = build_pretrain_augmentation_config("global-barcode", 224, 96, 2)
+    weak = build_weak_teacher_augmentation_config(ordinary)
+    if drift_weak:
+        weak["normalize"] = {"mean": [0.0, 0.0, 0.0], "std": [1.0, 1.0, 1.0]}
+    resolved = bundle or {
+        "version": 1,
+        "relational_teacher_views": "weak",
+        "relational_pairing": "cross",
+        "relational_center_source": "weak",
+        "teacher_temp_start": 0.08,
+        "teacher_temp_end": 0.11,
+        "weak_teacher_augmentation_config": weak,
+    }
+    encoder = OTUFormerEncoder(
+        model_name="vit_tiny_patch16_224",
+        out_dim=64,
+        pretrained=False,
+        img_size=224,
+    )
+    path = tmp_path / "relational_resume.pth"
+    torch.save(
+        {
+            "epoch": 0,
+            "iteration": 1,
+            "model_state_dict": encoder.state_dict(),
+            "config": {
+                "model_name": "vit_tiny_patch16_224",
+                "out_dim": 64,
+                "image_size": 224,
+                "augmentation_profile": "global-barcode",
+                "augmentation_config": ordinary,
+                "patch_loss": "none",
+                "masking_strategy": None,
+                "mask_ratio_requested": None,
+                "mask_ratio_resolved": None,
+                "ibot_prototypes": None,
+                "patch_target_layers": None,
+                "patch_center_momentum": None,
+                RELATIONAL_TARGET_CONFIG_KEY: resolved,
+            },
+            "args": {
+                "global_crop_size": 224,
+                "local_crop_size": 96,
+                "local_crops": 2,
+                "max_epochs": 1,
+                "relational_teacher_views": resolved["relational_teacher_views"],
+                "relational_pairing": resolved["relational_pairing"],
+                "relational_center_source": resolved["relational_center_source"],
+                "teacher_temp_start": resolved["teacher_temp_start"],
+                "teacher_temp_end": resolved["teacher_temp_end"],
+                "teacher_temp_warmup_ratio": 0.7,
+            },
+        },
+        path,
+    )
+    return path
+
+
+def test_pretrain_relational_public_choices():
+    result = runner.invoke(app, ["pretrain", "--help"])
+    assert result.exit_code == 0
+    for flag in (
+        "--relational-teacher-views",
+        "--relational-center-source",
+        "--relational-pairing",
+        "--teacher-temp-warmup-ratio",
+    ):
+        assert flag in result.output
+    assert "--disable-cross-view-loss" not in result.output
+
+    from otuformer.cli import (
+        relational_center_source_choices,
+        relational_pairing_choices,
+        relational_teacher_view_choices,
+    )
+    from otuformer.cli.constraints import _CONSTRAINTS
+
+    assert relational_teacher_view_choices() == ["weak", "ordinary"]
+    assert relational_center_source_choices() == ["weak", "ordinary"]
+    assert relational_pairing_choices() == ["cross", "full"]
+    rules = _CONSTRAINTS["pretrain"]
+    assert rules["relational_pairing"]["choices"] == ["cross", "full"]
+    assert rules["relational_teacher_views"]["choices"] == ["weak", "ordinary"]
+    assert rules["relational_center_source"]["choices"] == ["weak", "ordinary"]
+    # the internal historical pairing is never advertised
+    assert "same" not in rules["relational_pairing"]["choices"]
+
+    from otuformer.cli_schema import _PRETRAIN_RESUME_INHERITED
+
+    for name in (
+        "relational_pairing",
+        "relational_teacher_views",
+        "relational_center_source",
+        "teacher_temp_start",
+        "teacher_temp_end",
+        "teacher_temp_warmup_ratio",
+    ):
+        assert name in _PRETRAIN_RESUME_INHERITED
+    assert "disable_cross_view_loss" not in _PRETRAIN_RESUME_INHERITED
+
+
+def test_pretrain_relational_rejects_unknown_choices(tmp_path):
+    for flag, value in (
+        ("--relational-pairing", "same"),
+        ("--relational-pairing", "zip"),
+        ("--relational-teacher-views", "strong"),
+        ("--relational-center-source", "mixed"),
+    ):
+        result = runner.invoke(
+            app,
+            [
+                "pretrain",
+                "--train-data", str(tmp_path / "images.csv"),
+                "--input-images-dir", str(tmp_path),
+                "--out-dir", str(tmp_path / "out"),
+                flag, value,
+                "--device", "cpu",
+            ],
+        )
+        assert result.exit_code != 0, (flag, value)
+
+    # the removed flag is an unknown option now
+    removed = runner.invoke(
+        app,
+        [
+            "pretrain",
+            "--train-data", str(tmp_path / "images.csv"),
+            "--input-images-dir", str(tmp_path),
+            "--out-dir", str(tmp_path / "out"),
+            "--disable-cross-view-loss",
+            "--device", "cpu",
+        ],
+    )
+    assert removed.exit_code != 0
+    assert "No such option" in removed.output or "no such option" in removed.output.lower()
+
+
+def test_pretrain_invalid_relational_recipe_preserves_overwrite_output(tmp_path):
+    out_dir, sentinel = _sentinel_output_dir(tmp_path, "protected")
+    result = runner.invoke(
+        app,
+        [
+            "pretrain",
+            "--train-data", str(tmp_path / "images.csv"),
+            "--input-images-dir", str(tmp_path),
+            "--out-dir", str(out_dir),
+            "--overwrite",
+            "--relational-teacher-views", "ordinary",
+            "--relational-center-source", "weak",
+            "--device", "cpu",
+        ],
+    )
+    assert result.exit_code != 0
+    assert sentinel.read_text(encoding="utf-8") == "keep"
+    assert sorted(p.name for p in out_dir.iterdir()) == ["keep.txt"]
+
+    endpoint = runner.invoke(
+        app,
+        [
+            "pretrain",
+            "--train-data", str(tmp_path / "images.csv"),
+            "--input-images-dir", str(tmp_path),
+            "--out-dir", str(out_dir),
+            "--overwrite",
+            "--teacher-temp-start", "0.0009",
+            "--device", "cpu",
+        ],
+    )
+    assert endpoint.exit_code != 0
+    assert sentinel.read_text(encoding="utf-8") == "keep"
+
+
+def test_pretrain_relational_drift_preserves_resume_outputs(tmp_path):
+    checkpoint = _relational_resume_checkpoint(tmp_path, drift_weak=True)
+    out_dir = tmp_path / "drift_out"
+    (out_dir / "logs").mkdir(parents=True)
+    log = out_dir / "logs" / "pretrain.log"
+    log.write_text("existing log\n", encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        [
+            "pretrain",
+            "--train-data", str(tmp_path / "images.csv"),
+            "--input-images-dir", str(tmp_path),
+            "--out-dir", str(out_dir),
+            "--resume", str(checkpoint),
+            "--device", "cpu",
+        ],
+    )
+    assert result.exit_code != 0
+    assert "weak teacher augmentation" in result.output
+    assert log.read_text(encoding="utf-8") == "existing log\n"
+
+
+def test_pretrain_marked_v2_resume_preserves_outputs(tmp_path):
+    from otuformer.training.model import OTUFormerEncoder
+
+    encoder = OTUFormerEncoder(
+        model_name="vit_tiny_patch16_224", out_dim=64, pretrained=False, img_size=224
+    )
+    out_dir, sentinel = _sentinel_output_dir(tmp_path, "v2_out")
+    for markers in (
+        {"ssl_method": "dino"},
+        {"ssl_head": "dino"},
+    ):
+        path = tmp_path / "v2.pth"
+        torch.save(
+            {
+                "model_state_dict": encoder.state_dict(),
+                "config": {
+                    "model_name": "vit_tiny_patch16_224",
+                    "out_dim": 64,
+                    "image_size": 224,
+                    **markers,
+                },
+                "args": {"max_epochs": 1},
+            },
+            path,
+        )
+        result = runner.invoke(
+            app,
+            [
+                "pretrain",
+                "--train-data", str(tmp_path / "images.csv"),
+                "--input-images-dir", str(tmp_path),
+                "--out-dir", str(out_dir),
+                "--resume", str(path),
+                "--device", "cpu",
+            ],
+        )
+        assert result.exit_code != 0
+        assert "Cross-branch" in result.output
+        assert sentinel.read_text(encoding="utf-8") == "keep"
+
+
+def test_pretrain_relational_preflight_handoff(tmp_path, monkeypatch):
+    from otuformer.training import trainer
+    from otuformer.training.dataset import MultiCropDataset
+
+    calls = {"settings": 0, "patch": 0, "recipe": 0, "preflight": 0, "dataset": 0}
+    real_settings = trainer.resolve_pretrain_settings
+    real_patch = trainer._resolve_patch_config
+    real_recipe = trainer._resolve_pretrain_recipe
+    real_preflight = trainer.preflight_pretrain_run
+    real_dataset = MultiCropDataset.__init__
+    seen = {}
+
+    def counting_settings(*a, **k):
+        calls["settings"] += 1
+        return real_settings(*a, **k)
+
+    def counting_patch(*a, **k):
+        calls["patch"] += 1
+        return real_patch(*a, **k)
+
+    def counting_recipe(*a, **k):
+        calls["recipe"] += 1
+        seen["recipe"] = real_recipe(*a, **k)
+        return seen["recipe"]
+
+    def counting_preflight(*a, **k):
+        calls["preflight"] += 1
+        return real_preflight(*a, **k)
+
+    def counting_dataset(self, *a, **k):
+        calls["dataset"] += 1
+        seen["dataset_kwargs"] = k
+        return real_dataset(self, *a, **k)
+
+    def fake_run_pretrain(args, *, pretrain_recipe=None):
+        seen["handoff"] = pretrain_recipe
+        seen["settings"] = args.pretrain_settings
+        seen["prepared"] = calls["recipe"] == 1
+
+    monkeypatch.setattr(trainer, "resolve_pretrain_settings", counting_settings)
+    monkeypatch.setattr(trainer, "_resolve_patch_config", counting_patch)
+    monkeypatch.setattr(trainer, "_resolve_pretrain_recipe", counting_recipe)
+    monkeypatch.setattr(trainer, "preflight_pretrain_run", counting_preflight)
+    monkeypatch.setattr(MultiCropDataset, "__init__", counting_dataset)
+    monkeypatch.setattr(trainer, "run_pretrain", fake_run_pretrain)
+
+    csv_path = tmp_path / "images.csv"
+    pd.DataFrame({"image": ["img_0.jpg"]}).to_csv(csv_path, index=False)
+    Image.new("RGB", (64, 64), color=(10, 20, 30)).save(tmp_path / "img_0.jpg")
+
+    result = runner.invoke(
+        app,
+        [
+            "pretrain",
+            "--train-data", str(csv_path),
+            "--input-images-dir", str(tmp_path),
+            "--out-dir", str(tmp_path / "out"),
+            "--model-name", "vit_tiny_patch16_224",
+            "--global-crop-size", "auto",
+            "--local-crops", "0",
+            "--device", "cpu",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert calls == {"settings": 1, "patch": 1, "recipe": 1, "preflight": 1, "dataset": 0}
+    assert seen["handoff"] is seen["recipe"]
+    assert seen["handoff"].settings is seen["settings"]
+    assert seen["handoff"].relational_target_config["relational_teacher_views"] == "weak"
+
+
+def test_pretrain_relational_saved_recipe_matches_preflight_and_log(tmp_path, monkeypatch):
+    """The preflight bundle, the log line and the saved payload agree."""
+    from otuformer.training import trainer
+
+    csv_path = tmp_path / "images.csv"
+    names = [f"img_{i}.jpg" for i in range(4)]
+    pd.DataFrame({"image": names}).to_csv(csv_path, index=False)
+    for index, name in enumerate(names):
+        Image.new("RGB", (64, 64), color=(30, 60, 90 + index)).save(tmp_path / name)
+    out_dir = tmp_path / "recipe_out"
+    seen = {}
+    real = trainer._resolve_pretrain_recipe
+
+    def capture(*a, **k):
+        seen["recipe"] = real(*a, **k)
+        return seen["recipe"]
+
+    monkeypatch.setattr(trainer, "_resolve_pretrain_recipe", capture)
+    result = runner.invoke(
+        app,
+        [
+            "pretrain",
+            "--train-data", str(csv_path),
+            "--input-images-dir", str(tmp_path),
+            "--out-dir", str(out_dir),
+            "--model-name", "vit_tiny_patch16_224",
+            "--global-crop-size", "64",
+            "--local-crop-size", "16",
+            "--local-crops", "0",
+            "--max-epochs", "1",
+            "--batch-size", "2",
+            "--num-workers", "0",
+            "--disable-embedding-metrics",
+            "--device", "cpu",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    bundle = seen["recipe"].relational_target_config
+    saved = torch.load(
+        out_dir / "SSL_epoch_0001.pth", map_location="cpu", weights_only=False
+    )
+    assert saved["config"][trainer.RELATIONAL_TARGET_CONFIG_KEY] == bundle
+
+    log = (out_dir / "logs" / "pretrain.log").read_text(encoding="utf-8")
+    lines = [line for line in log.splitlines() if "Relational target config: " in line]
+    assert len(lines) == 1
+    payload = lines[0].split("Relational target config: ", 1)[1]
+    assert json.loads(payload) == bundle
+    schedule_lines = [
+        line for line in log.splitlines() if "Teacher temperature schedule: " in line
+    ]
+    assert len(schedule_lines) == 1
+    schedule = json.loads(
+        schedule_lines[0].split("Teacher temperature schedule: ", 1)[1]
+    )
+    assert schedule == {
+        "start": bundle["teacher_temp_start"],
+        "end": bundle["teacher_temp_end"],
+        "warmup_ratio": seen["recipe"].teacher_temp_warmup_ratio,
+    }
+    # provenance stays in args, not in the bundle
+    assert "teacher_temp_warmup_ratio" not in bundle
+    assert saved["args"]["teacher_temp_warmup_ratio"] == pytest.approx(0.7)
+
+
+def test_pretrain_relational_log_separates_requests_and_resolved_recipe(tmp_path):
+    from otuformer.training import trainer
+
+    csv_path = tmp_path / "images.csv"
+    pd.DataFrame({"image": ["img_0.jpg"]}).to_csv(csv_path, index=False)
+    Image.new("RGB", (64, 64), color=(10, 20, 30)).save(tmp_path / "img_0.jpg")
+
+    monkeypatch_env = {}
+    from unittest import mock
+
+    def fake_preflight(*a, **k):
+        return None
+
+    out_dir = tmp_path / "logged"
+    with mock.patch.object(trainer, "preflight_pretrain_run", fake_preflight):
+        with mock.patch.object(
+            trainer,
+            "run_pretrain",
+            lambda args, *, pretrain_recipe=None: None,
+        ):
+            result = runner.invoke(
+                app,
+                [
+                    "pretrain",
+                    "--train-data", str(csv_path),
+                    "--input-images-dir", str(tmp_path),
+                    "--out-dir", str(out_dir),
+                    "--local-crops", "0",
+                    "--device", "cpu",
+                ],
+            )
+    assert result.exit_code == 0, result.output
+    log = (out_dir / "logs" / "pretrain.log").read_text(encoding="utf-8")
+    assert "Relational target config: " not in log  # the trainer prints it
+
+    # Log lines carry a timestamp prefix, so assert on the rendered JSON fields.
+    for name in (
+        "relational_teacher_views",
+        "relational_center_source",
+        "relational_pairing",
+        "teacher_temp_start",
+        "teacher_temp_end",
+    ):
+        assert f'"{name}": null' in log, name
+    # the ratio is a declared default, not a null request
+    assert '"teacher_temp_warmup_ratio": 0.7' in log
+    assert '"include_weak_teacher_views"' not in log
+    assert '"pretrain_recipe"' not in log

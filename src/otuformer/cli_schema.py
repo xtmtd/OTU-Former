@@ -415,6 +415,12 @@ _PRETRAIN_RESUME_INHERITED = frozenset(
         "augmentation",
         "orientation_policy",
         "weight_decay",
+        "relational_teacher_views",
+        "relational_center_source",
+        "relational_pairing",
+        "teacher_temp_start",
+        "teacher_temp_end",
+        "teacher_temp_warmup_ratio",
     }
 )
 
@@ -623,6 +629,20 @@ def validate_parameters(command: str, explicit: Mapping[str, Any]) -> dict[str, 
             "pseudo-label source checkpoint unless explicitly overridden; they are "
             "not confirmed effective values"
         )
+        if command == "pretrain":
+            unresolved.append(
+                "the six inherited relational settings (relational_teacher_views, "
+                "relational_center_source, relational_pairing, teacher_temp_start, "
+                "teacher_temp_end, teacher_temp_warmup_ratio) are read from the "
+                "checkpoint at execution: an omitted value inherits the recorded "
+                "one, a fresh-run default is never substituted, and an explicit "
+                "value that conflicts with the recorded one is rejected rather "
+                "than applied"
+            )
+            unresolved.append(
+                "teacher temperature numerical admission depends on the run's "
+                "effective batch size, so it can only be confirmed at execution"
+            )
 
     return {
         "command": command,

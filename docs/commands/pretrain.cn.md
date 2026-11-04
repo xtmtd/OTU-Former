@@ -162,21 +162,39 @@ cosine 学习率衰减前的 warmup epoch 数。
 
 ### `--teacher-temp-start`
 
-**默认值：** `0.04`
+**默认值：** 未设置（`null`）；新跑的有效默认值 `0.08`
 
-初始教师温度。
+初始教师温度。新跑的有效默认值为 0.08；`--resume` 时省略表示沿用检查点记录的值。该温度由全局关系损失、局部关系损失以及 ibot 目标锐化共享。
 
 ### `--teacher-temp-end`
 
-**默认值：** `0.07`
+**默认值：** 未设置（`null`）；新跑的有效默认值 `0.11`
 
-最终教师温度。
+最终教师温度。新跑的有效默认值为 0.11；`--resume` 时省略表示沿用检查点记录的值。
 
-### `--disable-cross-view-loss`
+### `--teacher-temp-warmup-ratio`
 
-**默认值：** `No`
+**默认值：** `0.7`
 
-关闭跨视图全局损失配对。默认保持全局裁剪之间的完整跨视图匹配。
+教师温度从起始值爬到结束值所占的计划步数比例，闭区间 [0, 1]。取 0 表示完全不做爬升，取 1 表示没有平台期。`--resume` 时省略表示沿用检查点记录的值。
+
+### `--relational-teacher-views`
+
+**默认值：** 未设置（`null`）；新跑的有效默认值 `weak`
+
+用于构造关系目标特征的教师图像来源：`weak` 或 `ordinary`。新跑的有效默认值为 `weak`；`--resume` 时省略表示沿用检查点记录的值。
+
+### `--relational-center-source`
+
+**默认值：** 未设置（`null`）；新跑的有效默认值为教师视图来源
+
+更新运行中 CLS 中心所使用的教师特征人群：`weak` 或 `ordinary`。`--resume` 时省略表示沿用检查点记录的值；新跑默认取教师视图来源，而 `ordinary` 教师视图只允许 `ordinary` 中心。
+
+### `--relational-pairing`
+
+**默认值：** 未设置（`null`）；新跑的有效默认值 `cross`
+
+关系损失中求平均的全局学生/教师视图配对方式：`cross`（A 对 B、B 对 A）或 `full`（四组全取）。新跑的有效默认值为 `cross`。用于替代已移除的 disable-cross-view-loss 开关。
 
 ### `--log-every-n-steps`
 
@@ -411,12 +429,36 @@ DataLoader 长度。只用新增图像训练虽然可行，但可能遗忘已有
 
 **局部视图的续训继承。** `--resume` 时，省略的 `--local-crop-size` 与 `--local-crops` 继承 checkpoint 已保存的值；显式指定冲突值会报错，修改这些值需要开启新运行。
 
-数据增强与方向策略遵循共享的 [训练数据增强契约](training-augmentation.cn.md)。
+兼容性是单向的：本代码可以续训更早的检查点，但更早的训练器读取新检查点时会忽略 `config.relational_target_config`，因此不会恢复弱视图/`cross` 配方。接受该文件并不等于配方被保留。
+
+扩展被中断后回到原 `--max-epochs`，教师温度爬升会按重写后的计划长度重建，而不是原计划长度，因此即使端点与配方不变，逐步 schedule 也可能不同。扩展运行时沿用继承的最终温度，不重新爬升。
+
+**关系目标配方。** 新跑从同步的学生/教师配对出发，默认使用两个独立采样的弱增强教师全局视图构造关系目标特征、`cross` 全局配对，以及 `0.08` 到 `0.11` 的教师温度。断点续训会恢复保存的学生/教师配对而不重新同步，并沿用记录中的配方；改变配方需要重新开跑。
+
+三个独立控制项分别选择构造目标的教师图像（`--relational-teacher-views`）、更新运行中 CLS 中心的教师特征人群（`--relational-center-source`）以及损失中求平均的全局视图配对（`--relational-pairing`）。`--relational-teacher-views ordinary` 要求 `--relational-center-source ordinary`。`--resume` 时省略的选项沿用检查点配方，显式给出且冲突的值会报错。
+
+补丁目标仍以普通全局视图为输入：在固定教师状态、普通视图与掩码的前提下，`--patch-loss consistency` 与 `--patch-loss masked-feature` 的目标不受弱增强教师视图影响。这是输入路径隔离，不是不变性保证——额外的弱增强裁剪会共用同一条随机流，共享骨干也仍在更新，因此整体训练轨迹与块级损失都会变化。教师温度是共享的，`--patch-loss ibot` 的目标锐化和局部关系损失同样跟随它。启用弱视图且补丁目标激活时，每步执行四次教师前向而不是两次，并且每个样本多一组弱增强裁剪，训练时间与激活显存随之上升；`--relational-teacher-views ordinary` 保持历史上的两次。`cosine_similarity` 即时指标仍然是普通学生 A 与中心化后的普通教师 A 的余弦。
+
+分阶段评估：先比较历史目标配方与合并后的新默认值；其余四种组合为按需诊断，不自动跟做；六种组合都使用同一初始同步配对，因此无法衡量初始化改动的影响。
+
+| 组 | 选项 |
+| --- | --- |
+| 历史目标配方基线 | `--relational-teacher-views ordinary --relational-pairing full --teacher-temp-start 0.04 --teacher-temp-end 0.07` |
+| 合并后的新配方 | `--relational-teacher-views weak --relational-pairing cross --teacher-temp-start 0.08 --teacher-temp-end 0.11` |
+| 弱目标 + 普通中心 | `--relational-teacher-views weak --relational-center-source ordinary --relational-pairing full --teacher-temp-start 0.04 --teacher-temp-end 0.07` |
+| 弱目标 + 弱中心 | `--relational-teacher-views weak --relational-center-source weak --relational-pairing full --teacher-temp-start 0.04 --teacher-temp-end 0.07` |
+| 仅配对 | `--relational-teacher-views ordinary --relational-pairing cross --teacher-temp-start 0.04 --teacher-temp-end 0.07` |
+| 仅共享温度 | `--relational-teacher-views ordinary --relational-pairing full --teacher-temp-start 0.08 --teacher-temp-end 0.11` |
+
+`0.001..100` 区间是新跑请求的验收策略，既不是数值保证，也不是续训规则：检查点可以记录区间外的值（例如 `0.0009`），该值会被继承、原样重存，并接受与之相等的显式请求。始终生效的是数值安全——正的有限端点，其 float32 关系归约上界要能容纳本次运行的实际 batch；这一按运行的检查只能在执行时确认。
+
+数据增强与方向策略遵循共享的 [训练数据增强契约](training-augmentation.cn.md)。弱增强教师记录沿用普通几何、关闭颜色抖动、灰度与高斯模糊，并记录自己的归一化参数，使记录中的变换真正控制像素。
 
 嵌入质量指标使用共享的 [嵌入指标](embedding-metrics.cn.md) 定义与字段名。
 
 ## 版本注记
 
+- **v0.12.0** — **新运行配方有破坏性变更。** 新运行会在首次前向之前，把完整的学生编码器状态拷入独立构造的教师网络；关系目标默认由两个弱增强教师全局视图构造；全局配对默认只取 `cross`；共享教师温度从 `0.08` 爬到 `0.11`。`--disable-cross-view-loss` 已移除，改用 `--relational-pairing {cross,full}`。新增选项：`--relational-teacher-views`、`--relational-center-source`、`--teacher-temp-warmup-ratio`（闭区间 `[0, 1]`，默认 `0.7`）。五个关系/温度请求的声明默认为 `null`，新运行解析为有效值，因此 `Parameters:` 记录的是请求，解析后的配方另行记录。续训继承检查点记录的配方，显式冲突会被拒绝；旧检查点保留其历史的 ordinary/full 配方与自身温度。检查点新增 `config.relational_target_config`；更早的训练器会忽略它，因此兼容性是单向的。默认配方每个样本多两组弱增强裁剪，且在补丁目标激活时每步执行四次教师前向而不是两次。带 v2/DINO 标记的训练载荷会在输出设置之前被拒绝。历史目标配方仍可表达用于对比，但此前"教师投影器独立初始化"的做法已无法复现。
 - **v0.11.2** — 全局/局部裁剪尺寸的整除检查、骨干能力检查以及 blockwise 网格与 patch 数量检查，改为针对本次实际训练的模型与已解析尺寸执行，并且在清空输出目录或创建日志之前完成；针对这些配置，`--overwrite` 不会再删除已有结果。此处列出的检查即为承诺范围：`--extract-size` 的整除检查以及数据集/增强错误仍可能在输出设置之后失败。隔离这些预检探针改变了同一 `--seed` 相对于 v0.11.1 产生的学生网络初始化：逐位复现只在同一版本内成立，不同实验分支须在同一版本下对比。
 - **v0.10.0** — `--register-tokens` 接受 `none`、`0` 或 `4`；解析后的数量记录进检查点，续训与微调时必须一致。
 - **v0.7.0** — `--patch-loss` 与 `--masking-strategy` 选择块级目标及其掩码几何；`--mask-ratio` 默认 `auto`，新运行解析为 `0.30`（v0.6.x 为 `0.50`）。

@@ -133,20 +133,67 @@ def test_teacher_center_update_uses_current_iteration_global_outputs():
     assert updated[0, 1] == pytest.approx(0.05)
 
 
-def test_global_loss_uses_cartesian_pairing_when_cross_view_enabled(monkeypatch):
+@pytest.mark.parametrize(
+    ("pairing", "expected"),
+    [
+        ("cross", {(1.0, 4.0), (2.0, 3.0)}),
+        ("full", {(1.0, 3.0), (1.0, 4.0), (2.0, 3.0), (2.0, 4.0)}),
+        ("same", {(1.0, 3.0), (2.0, 4.0)}),
+    ],
+)
+def test_relational_global_pair_sets(monkeypatch, pairing, expected):
     student = [torch.tensor([[1.0]]), torch.tensor([[2.0]])]
     teacher = [torch.tensor([[3.0]]), torch.tensor([[4.0]])]
     calls = []
 
     def fake_ssl_loss(s, t, *_):
         calls.append((float(s.item()), float(t.item())))
-        return torch.tensor(0.0)
+        return torch.tensor(1.0)
 
     monkeypatch.setattr(trainer, "_ssl_loss", fake_ssl_loss)
-    trainer._compute_global_loss(
-        student, teacher, 0.1, 0.04, disable_cross_view_loss=False
+    loss = trainer._compute_global_loss(
+        student, teacher, 0.1, 0.04, relational_pairing=pairing
     )
-    assert set(calls) == {(1.0, 3.0), (1.0, 4.0), (2.0, 3.0), (2.0, 4.0)}
+    assert set(calls) == expected
+    # every policy averages over the pairs it actually selected
+    assert float(loss) == pytest.approx(1.0)
+    assert len(calls) == len(expected)
+
+
+def test_relational_global_pair_sets_reject_unknown_or_wrong_arity():
+    student = [torch.tensor([[1.0]]), torch.tensor([[2.0]])]
+    teacher = [torch.tensor([[3.0]]), torch.tensor([[4.0]])]
+    with pytest.raises(ValueError, match="relational_pairing"):
+        trainer._compute_global_loss(
+            student, teacher, 0.1, 0.04, relational_pairing="zip"
+        )
+    with pytest.raises(ValueError, match="exactly two"):
+        trainer._compute_global_loss(
+            student + student, teacher, 0.1, 0.04, relational_pairing="cross"
+        )
+
+
+def test_relational_loss_keeps_candidate_diagonal():
+    torch.manual_seed(0)
+    teacher = torch.nn.functional.normalize(torch.randn(4, 6), dim=-1)
+    student = torch.nn.functional.normalize(torch.randn(4, 6), dim=-1)
+    student.requires_grad_(True)
+    loss = trainer._ssl_loss(student, teacher, 0.1, 0.04)
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert torch.isfinite(student.grad).all()
+
+    # manual full-batch softmax including the same-image diagonal
+    teacher_sim = teacher @ teacher.T / 0.04
+    teacher_sim = teacher_sim - teacher_sim.mean(dim=1, keepdim=True)
+    probs = torch.softmax(teacher_sim, dim=1)
+    student_sim = student.detach() @ teacher.T / 0.1
+    manual = -(probs * torch.log_softmax(student_sim, dim=1)).sum(dim=1).mean()
+    assert float(loss.detach()) == pytest.approx(float(manual), rel=1e-6)
+
+    # subtracting each row's mean leaves the softmax unchanged
+    shifted = torch.softmax(teacher_sim + 3.5, dim=1)
+    assert torch.allclose(probs, shifted, atol=1e-6)
 
 
 def test_local_loss_averages_all_local_to_teacher_global_pairs(monkeypatch):
@@ -3652,3 +3699,684 @@ def test_run_pretrain_reuses_a_handed_over_resolution(tmp_path, monkeypatch):
     # The resolved values still drive the trainer's own bookkeeping.
     assert args.global_crop_size == 224
     assert (args.local_crop_size, args.local_crops) == (96, 0)
+
+
+# --- relational target recipe resolution ------------------------------------
+
+def _recipe_args(**overrides):
+    base = {
+        "batch_size": 8,
+        "augmentation": None,
+        "orientation_policy": None,
+        "relational_teacher_views": None,
+        "relational_center_source": None,
+        "relational_pairing": None,
+        "teacher_temp_start": None,
+        "teacher_temp_end": None,
+        "teacher_temp_warmup_ratio": 0.7,
+        "teacher_temp_warmup_ratio_explicit": False,
+    }
+    base.update(overrides)
+    return argparse.Namespace(**base)
+
+
+def _recipe_settings(global_crop_size=32, local_crop_size=16, local_crops=0):
+    return trainer.PretrainSettings(
+        model_name="vit_tiny_patch16_224",
+        global_crop_size=global_crop_size,
+        local_crop_size=local_crop_size,
+        local_crops=local_crops,
+        patch_config={
+            "patch_loss": "none",
+            "masking_strategy": None,
+            "mask_ratio_requested": None,
+            "mask_ratio_resolved": None,
+            "ibot_prototypes": None,
+            "patch_target_layers": None,
+            "patch_center_momentum": None,
+        },
+    )
+
+
+def _recipe(overrides=None, checkpoint=None, settings=None):
+    return trainer._resolve_pretrain_recipe(
+        _recipe_args(**(overrides or {})),
+        checkpoint,
+        settings=settings or _recipe_settings(),
+    )
+
+
+def _bundle(**overrides):
+    bundle = {
+        "version": 1,
+        "relational_teacher_views": "ordinary",
+        "relational_pairing": "full",
+        "relational_center_source": "ordinary",
+        "teacher_temp_start": 0.04,
+        "teacher_temp_end": 0.07,
+        "weak_teacher_augmentation_config": None,
+    }
+    bundle.update(overrides)
+    return bundle
+
+
+_DEFAULT_BUNDLE = object()
+
+
+def _versioned_checkpoint(bundle=_DEFAULT_BUNDLE, args_extra=None):
+    saved_args = {
+        "relational_teacher_views": "ordinary",
+        "relational_pairing": "full",
+        "relational_center_source": "ordinary",
+        "teacher_temp_start": 0.04,
+        "teacher_temp_end": 0.07,
+        "teacher_temp_warmup_ratio": 0.7,
+    }
+    saved_args.update(args_extra or {})
+    resolved_bundle = _bundle() if bundle is _DEFAULT_BUNDLE else bundle
+    return {
+        "config": {
+            "augmentation_profile": "global-barcode",
+            "augmentation_config": build_pretrain_augmentation_config(
+                "global-barcode", 32, 16, 0
+            ),
+            trainer.RELATIONAL_TARGET_CONFIG_KEY: resolved_bundle,
+        },
+        "args": saved_args,
+    }
+
+
+def _legacy_checkpoint(args_extra=None):
+    saved_args = {
+        "augmentation": "global-barcode",
+        "disable_cross_view_loss": False,
+        "teacher_temp_start": 0.04,
+        "teacher_temp_end": 0.07,
+    }
+    saved_args.update(args_extra or {})
+    return {"config": {}, "args": saved_args}
+
+
+def test_relational_recipe_resolves_requests_and_history():
+    recipe = _recipe()
+    assert recipe.relational_target_config == {
+        "version": 1,
+        "relational_teacher_views": "weak",
+        "relational_pairing": "cross",
+        "relational_center_source": "weak",
+        "teacher_temp_start": 0.08,
+        "teacher_temp_end": 0.11,
+        "weak_teacher_augmentation_config": recipe.weak_teacher_augmentation_config,
+    }
+    assert recipe.weak_teacher_augmentation_config is not None
+    assert recipe.teacher_temp_warmup_ratio == 0.7
+
+    ordinary = _recipe({"relational_teacher_views": "ordinary"})
+    assert ordinary.relational_target_config["relational_center_source"] == "ordinary"
+    assert ordinary.weak_teacher_augmentation_config is None
+
+    both = _recipe(
+        {
+            "relational_teacher_views": "weak",
+            "relational_center_source": "ordinary",
+            "relational_pairing": "full",
+            "teacher_temp_start": 0.05,
+            "teacher_temp_end": 0.09,
+        }
+    )
+    assert both.relational_target_config["relational_center_source"] == "ordinary"
+    assert both.relational_target_config["relational_pairing"] == "full"
+    assert both.relational_target_config["teacher_temp_start"] == 0.05
+
+    # the ordinary config is never mutated and never gains normalize keys
+    assert "normalize" not in both.augmentation_config
+
+    for bad in (
+        {"relational_teacher_views": "ordinary", "relational_center_source": "weak"},
+        {"relational_pairing": "same"},
+        {"relational_pairing": "zip"},
+        {"relational_teacher_views": "strong"},
+        {"teacher_temp_start": True},
+        {"teacher_temp_start": float("inf")},
+        {"teacher_temp_start": -0.04},
+        {"teacher_temp_start": 0.0},
+        {"teacher_temp_start": 0.0009},
+        {"teacher_temp_end": 101.0},
+    ):
+        with pytest.raises(ValueError):
+            _recipe(bad)
+
+    # deterministic conservative admission bound at 2e-38: fresh requests are
+    # banded, so admission is exercised through an inherited saved endpoint
+    for batch_size, should_pass in ((6, True), (7, False)):
+        checkpoint = _versioned_checkpoint(
+            _bundle(teacher_temp_start=2e-38),
+            {"teacher_temp_start": 2e-38},
+        )
+        if should_pass:
+            assert _recipe(
+                {"batch_size": batch_size}, checkpoint=checkpoint
+            ).relational_target_config["teacher_temp_start"] == 2e-38
+        else:
+            with pytest.raises(ValueError, match="overflows"):
+                _recipe({"batch_size": batch_size}, checkpoint=checkpoint)
+    # 2/tau alone is finite at 6e-39 and B=6, but the mean reduction overflows
+    six = _versioned_checkpoint(
+        _bundle(teacher_temp_start=6e-39), {"teacher_temp_start": 6e-39}
+    )
+    with pytest.raises(ValueError, match="overflows"):
+        _recipe({"batch_size": 6}, checkpoint=six)
+    # a double-precision quotient that is finite but float32-infinite
+    assert math.isfinite(7 / 2e-38)
+
+
+def test_relational_recipe_legacy_and_versioned_resolution():
+    legacy = _recipe(checkpoint=_legacy_checkpoint())
+    assert legacy.relational_target_config["relational_teacher_views"] == "ordinary"
+    assert legacy.relational_target_config["relational_center_source"] == "ordinary"
+    assert legacy.relational_target_config["relational_pairing"] == "full"
+    assert legacy.relational_target_config["teacher_temp_start"] == 0.04
+    assert legacy.relational_target_config["teacher_temp_end"] == 0.07
+    assert legacy.teacher_temp_warmup_ratio == 0.7
+
+    same = _recipe(
+        checkpoint=_legacy_checkpoint({"disable_cross_view_loss": True})
+    )
+    assert same.relational_target_config["relational_pairing"] == "same"
+
+    assumed = _recipe(checkpoint={"config": {}, "args": {}})
+    assert assumed.relational_target_config["relational_pairing"] == "full"
+    assert any("disable_cross_view_loss" in w for w in assumed.warnings)
+    assert any("teacher_temp_start" in w for w in assumed.warnings)
+
+    # explicit requests equal to the effective values are accepted
+    accepted = _recipe(
+        {"teacher_temp_start": 0.04, "teacher_temp_end": 0.07, "relational_pairing": "full"},
+        checkpoint=_legacy_checkpoint(),
+    )
+    assert accepted.relational_target_config["teacher_temp_start"] == 0.04
+
+    # explicit numeric 1 matches a saved integer 1 after normalization
+    integer_saved = _legacy_checkpoint(
+        {"teacher_temp_start": 1, "teacher_temp_end": 0.07}
+    )
+    matched = _recipe({"teacher_temp_start": 1}, checkpoint=integer_saved)
+    assert matched.relational_target_config["teacher_temp_start"] == 1.0
+
+    # exact numeric matching, not an absolute tolerance
+    tiny = _legacy_checkpoint(
+        {"teacher_temp_start": 2e-20, "teacher_temp_end": 0.07}
+    )
+    with pytest.raises(ValueError, match="conflicts"):
+        _recipe({"teacher_temp_start": 2e-13}, checkpoint=tiny)
+    assert _recipe({"teacher_temp_start": 2e-20}, checkpoint=tiny).relational_target_config[
+        "teacher_temp_start"
+    ] == 2e-20
+
+    # versioned bundle wins; explicit conflicts fail, including new-run defaults
+    versioned = _recipe(checkpoint=_versioned_checkpoint())
+    assert versioned.relational_target_config["relational_pairing"] == "full"
+    for conflict in (
+        {"relational_teacher_views": "weak"},
+        {"relational_pairing": "cross"},
+        {"teacher_temp_start": 0.08},
+    ):
+        with pytest.raises(ValueError, match="conflicts"):
+            _recipe(conflict, checkpoint=_versioned_checkpoint())
+
+    # a non-default recorded ratio is inherited, and an equal request passes
+    ratio_ckpt = _versioned_checkpoint(
+        args_extra={"teacher_temp_warmup_ratio": 0.3}
+    )
+    assert _recipe(checkpoint=ratio_ckpt).teacher_temp_warmup_ratio == 0.3
+    assert _recipe(
+        {"teacher_temp_warmup_ratio": 0.3}, checkpoint=ratio_ckpt
+    ).teacher_temp_warmup_ratio == 0.3
+    with pytest.raises(ValueError, match="0.3"):
+        _recipe(
+            {
+                "teacher_temp_warmup_ratio": 0.7,
+                "teacher_temp_warmup_ratio_explicit": True,
+            },
+            checkpoint=ratio_ckpt,
+        )
+
+    # an unrecorded ratio warns and rejects an explicit non-default
+    missing = _versioned_checkpoint()
+    missing["args"].pop("teacher_temp_warmup_ratio")
+    assert _recipe(checkpoint=missing).teacher_temp_warmup_ratio == 0.7
+    assert any("teacher_temp_warmup_ratio" in w for w in _recipe(checkpoint=missing).warnings)
+    with pytest.raises(ValueError, match="warmup ratio|records no"):
+        _recipe({"teacher_temp_warmup_ratio": 0.3}, checkpoint=missing)
+
+    # a format-legal saved endpoint outside the band is inherited, and an
+    # explicit request equal to it is accepted
+    outside = _versioned_checkpoint(
+        _bundle(teacher_temp_start=0.0009, teacher_temp_end=0.07),
+        {"teacher_temp_start": 0.0009},
+    )
+    assert _recipe(checkpoint=outside).relational_target_config[
+        "teacher_temp_start"
+    ] == 0.0009
+    assert _recipe(
+        {"teacher_temp_start": 0.0009}, checkpoint=outside
+    ).relational_target_config["teacher_temp_start"] == 0.0009
+
+    # requests and the checkpoint are not mutated
+    args = _recipe_args()
+    checkpoint = _versioned_checkpoint()
+    snapshot = json.dumps(checkpoint, sort_keys=True)
+    trainer._resolve_relational_target_config(args, checkpoint)
+    assert args.relational_teacher_views is None
+    assert json.dumps(checkpoint, sort_keys=True) == snapshot
+
+
+def test_relational_recipe_rejects_bad_metadata():
+    for bad_bundle in (
+        None,
+        {},
+        {"version": True},
+        {"version": 2},
+        _bundle(relational_center_source="weak"),
+        _bundle(relational_pairing="same", relational_teacher_views="weak"),
+        _bundle(teacher_temp_start=True),
+        _bundle(teacher_temp_start=0.0),
+        _bundle(teacher_temp_start=float("nan")),
+        _bundle(weak_teacher_augmentation_config={"profile": "legacy"}),
+    ):
+        checkpoint = _versioned_checkpoint(bad_bundle)
+        with pytest.raises(ValueError):
+            _recipe(checkpoint=checkpoint)
+
+    # the retired spelling is not an alias
+    retired = _versioned_checkpoint()
+    del retired["config"][trainer.RELATIONAL_TARGET_CONFIG_KEY][
+        "relational_center_source"
+    ]
+    retired["config"][trainer.RELATIONAL_TARGET_CONFIG_KEY][
+        "teacher_center_source"
+    ] = "ordinary"
+    with pytest.raises(ValueError, match="incomplete"):
+        _recipe(checkpoint=retired)
+
+    # duplicate disagreement between bundle and saved args
+    disagreeing = _versioned_checkpoint()
+    disagreeing["args"]["relational_pairing"] = "cross"
+    with pytest.raises(ValueError, match="disagrees"):
+        _recipe(checkpoint=disagreeing)
+
+    # type confusion: args true must not equal bundle 1.0
+    typed = _versioned_checkpoint(
+        _bundle(teacher_temp_start=1.0), {"teacher_temp_start": True}
+    )
+    with pytest.raises(ValueError, match="disagrees"):
+        _recipe(checkpoint=typed)
+
+    # partial new-style markers without a bundle
+    for marker, value in (
+        ("relational_teacher_views", "weak"),
+        ("relational_pairing", "cross"),
+        ("relational_center_source", "weak"),
+        ("teacher_center_source", "weak"),
+        ("weak_teacher_augmentation_config", None),
+        ("weak_relational_teacher_views", False),
+    ):
+        partial = {"config": {}, "args": {marker: value}}
+        with pytest.raises(ValueError, match="partial"):
+            _recipe(checkpoint=partial)
+
+    # weak-config drift is detected against the current derivation
+    weak_bundle = _bundle(
+        relational_teacher_views="weak",
+        relational_center_source="weak",
+        relational_pairing="cross",
+        weak_teacher_augmentation_config={
+            **build_pretrain_augmentation_config("global-barcode", 32, 16, 0),
+            "color_jitter": {
+                "probability": 0.0,
+                "brightness": 0.0,
+                "contrast": 0.0,
+                "saturation": 0.0,
+                "hue": 0.0,
+            },
+            "grayscale_probability": 0.0,
+            "blur": {
+                **build_pretrain_augmentation_config("global-barcode", 32, 16, 0)["blur"],
+                "probabilities": [0.0, 0.0, 0.5],
+            },
+            "normalize": {"mean": [0.0, 0.0, 0.0], "std": [1.0, 1.0, 1.0]},
+        },
+    )
+    weak_ckpt = _versioned_checkpoint(
+        weak_bundle,
+        {
+            "relational_teacher_views": "weak",
+            "relational_center_source": "weak",
+            "relational_pairing": "cross",
+        },
+    )
+    with pytest.raises(ValueError, match="weak teacher augmentation"):
+        _recipe(checkpoint=weak_ckpt)
+
+
+def test_relational_recipe_rejects_marked_v2_resume():
+    for payload in (
+        {"config": {"ssl_method": "dino"}},
+        {"config": {"ssl_head": "dino"}},
+        {"dino_objective": {}},
+        {"config": {"ssl_method": None}},
+        {"dino_objective": None},
+        {
+            "config": {
+                "ssl_method": "relational",
+                trainer.RELATIONAL_TARGET_CONFIG_KEY: _bundle(),
+            },
+            "args": {},
+        },
+    ):
+        with pytest.raises(ValueError, match="Cross-branch"):
+            _recipe(checkpoint=payload)
+    # marker-free legacy main still passes
+    assert _recipe(checkpoint=_legacy_checkpoint()) is not None
+
+
+# --- teacher temperature schedule after the ratio option -------------------
+
+def test_relational_resume_teacher_schedule():
+    """Ratio boundaries, one-step ramp semantics and the extension tail."""
+    base = dict(
+        teacher_temp_start=0.08,
+        teacher_temp_end=0.11,
+    )
+    assert trainer._build_teacher_temp_schedule(4, **base, teacher_temp_warmup_ratio=0.0) == pytest.approx(
+        [0.11] * 4
+    )
+    full_ramp = trainer._build_teacher_temp_schedule(
+        4, **base, teacher_temp_warmup_ratio=1.0
+    )
+    assert full_ramp == pytest.approx([0.08, 0.09, 0.10, 0.11])
+    # one planned step at ratio 1 keeps the start value, not the end
+    assert trainer._build_teacher_temp_schedule(
+        1, **base, teacher_temp_warmup_ratio=1.0
+    ) == pytest.approx([0.08])
+    # a multi-step plan whose ramp truncates to one step also keeps the start
+    assert trainer._build_teacher_temp_schedule(
+        10, **base, teacher_temp_warmup_ratio=0.1
+    )[0] == pytest.approx(0.08)
+    # truncation to zero ramp steps uses the end temperature throughout
+    assert trainer._build_teacher_temp_schedule(
+        9, **base, teacher_temp_warmup_ratio=0.1
+    ) == pytest.approx([0.11] * 9)
+    # the default reproduces the pre-change 0.7 schedule bit for bit
+    assert trainer._build_teacher_temp_schedule(
+        10, 0.04, 0.07
+    ) == pytest.approx(
+        trainer._build_teacher_temp_schedule(
+            10, 0.04, 0.07, teacher_temp_warmup_ratio=0.7
+        )
+    )
+
+
+def test_relational_same_plan_schedule_uses_the_inherited_ratio():
+    saved = {
+        "original_max_epochs": 2,
+        "total_steps": 4,
+        "steps_per_epoch": 2,
+        "warmup_steps": 0,
+        "last_lr": 0.0005,
+        "final_lr": 0.00001,
+    }
+    args = argparse.Namespace(
+        max_epochs=2,
+        lr=0.001,
+        warmup_epochs=0,
+        teacher_momentum=0.995,
+        teacher_momentum_end=0.999,
+        student_temp=0.1,
+        teacher_temp_start=0.08,
+        teacher_temp_end=0.11,
+        teacher_temp_warmup_ratio=1.0,
+    )
+    _, _, _, teacher_temp, _ = trainer._build_pretrain_schedules(
+        args, saved, steps_per_epoch=2, global_step=2, completed_epochs=1
+    )
+    assert teacher_temp == pytest.approx([0.08, 0.09, 0.10, 0.11])
+
+    extended = argparse.Namespace(**{**vars(args), "max_epochs": 3})
+    _, _, _, tail, _ = trainer._build_pretrain_schedules(
+        extended, saved, steps_per_epoch=2, global_step=4, completed_epochs=2
+    )
+    assert tail[4:] == pytest.approx([0.11] * len(tail[4:]))
+
+
+def test_relational_zero_ratio_reaches_the_real_schedule():
+    """A legal zero ratio must not be replaced by the 0.7 fallback."""
+    args = argparse.Namespace(
+        max_epochs=5,
+        lr=0.001,
+        warmup_epochs=0,
+        teacher_momentum=0.995,
+        teacher_momentum_end=0.999,
+        student_temp=0.1,
+        teacher_temp_start=0.08,
+        teacher_temp_end=0.11,
+        teacher_temp_warmup_ratio=0.0,
+    )
+    _, _, _, fresh, _ = trainer._build_pretrain_schedules(
+        args, None, steps_per_epoch=2, global_step=0, completed_epochs=0
+    )
+    assert fresh == pytest.approx([0.11] * len(fresh))
+
+    saved = {
+        "original_max_epochs": 5,
+        "total_steps": 10,
+        "steps_per_epoch": 2,
+        "warmup_steps": 0,
+        "last_lr": 0.0005,
+        "final_lr": 0.00001,
+    }
+    _, _, _, same_plan, _ = trainer._build_pretrain_schedules(
+        args, saved, steps_per_epoch=2, global_step=4, completed_epochs=2
+    )
+    assert same_plan == pytest.approx([0.11] * len(same_plan))
+
+    # a missing attribute still falls back to the historical ramp
+    legacy_args = argparse.Namespace(**vars(args))
+    del legacy_args.teacher_temp_warmup_ratio
+    ramped = trainer._build_teacher_temp_schedule(
+        10, 0.08, 0.11, trainer._teacher_temp_warmup_ratio(legacy_args)
+    )
+    assert ramped[0] == pytest.approx(0.08)
+    assert ramped[7] == pytest.approx(0.11)
+
+
+def test_relational_interrupted_extension_diverges_without_reproducing():
+    """The documented limitation: a rewritten plan is not the original plan."""
+    # 5 epochs x 10 steps, extended to a total of 10 epochs at completed 2/step 20
+    # rewrites total_steps to 100 while original_max_epochs stays 5.
+    saved = {
+        "original_max_epochs": 5,
+        "total_steps": 100,
+        "steps_per_epoch": 10,
+        "warmup_steps": 0,
+        "last_lr": 0.0005,
+        "final_lr": 0.00001,
+    }
+
+    def args(max_epochs):
+        return argparse.Namespace(
+            max_epochs=max_epochs,
+            lr=0.001,
+            warmup_epochs=0,
+            teacher_momentum=0.995,
+            teacher_momentum_end=0.999,
+            student_temp=0.1,
+            teacher_temp_start=0.04,
+            teacher_temp_end=0.07,
+            teacher_temp_warmup_ratio=0.7,
+        )
+
+    # An interrupted extension saved at completed epoch 3 / step 30 can return
+    # to --max-epochs 5, but rebuilds the ramp over 100 steps.
+    _, _, _, diverged, _ = trainer._build_pretrain_schedules(
+        args(5), saved, steps_per_epoch=10, global_step=30, completed_epochs=3
+    )
+    assert float(diverged[40]) == pytest.approx(0.0573913045, abs=1e-9)
+    # the original 50-step plan plateaued at the end temperature
+    original = trainer._build_teacher_temp_schedule(50, 0.04, 0.07)
+    assert float(original[40]) == pytest.approx(0.07)
+    # endpoints and recipe are unchanged; only the step-wise schedule differs
+    assert float(diverged[-1]) == pytest.approx(0.07, abs=1e-6)
+
+    # A completed 10-epoch extension rejects the return outright.
+    with pytest.raises(ValueError, match="must exceed the completed checkpoint epoch"):
+        trainer._build_pretrain_schedules(
+            args(5), saved, steps_per_epoch=10, global_step=100, completed_epochs=10
+        )
+
+
+def test_relational_checkpoint_metadata_is_additive(tmp_path):
+    """Downstream loaders tolerate the extra config bundle."""
+    from otuformer.training.model import OTUFormerEncoder
+    from otuformer.utils.checkpoint import load_checkpoint
+
+    encoder = OTUFormerEncoder(
+        model_name="vit_tiny_patch16_224", out_dim=16, pretrained=False, img_size=224
+    )
+    base = {
+        "model_state_dict": encoder.state_dict(),
+        "config": {"model_name": "vit_tiny_patch16_224", "out_dim": 16},
+        "args": {"max_epochs": 1},
+    }
+    plain = tmp_path / "plain.pth"
+    torch.save(base, plain)
+    annotated = tmp_path / "annotated.pth"
+    torch.save(
+        {
+            **base,
+            "config": {
+                **base["config"],
+                trainer.RELATIONAL_TARGET_CONFIG_KEY: _bundle(),
+            },
+        },
+        annotated,
+    )
+    left = load_checkpoint(plain)
+    right = load_checkpoint(annotated)
+    assert set(left["model_state_dict"]) == set(right["model_state_dict"])
+    for key, value in left["model_state_dict"].items():
+        assert torch.equal(value, right["model_state_dict"][key])
+    # the additive bundle is inert metadata, not a weight or architecture change
+    assert right["config"][trainer.RELATIONAL_TARGET_CONFIG_KEY] == _bundle()
+
+
+def test_relational_recipe_rejects_present_null_metadata():
+    """Only an absent key may fall back; a stored null is damaged provenance."""
+    for extra in (
+        {"teacher_temp_start": None},
+        {"teacher_temp_end": None},
+        {"disable_cross_view_loss": None},
+        {"teacher_temp_warmup_ratio": None},
+    ):
+        with pytest.raises(ValueError):
+            _recipe(checkpoint=_legacy_checkpoint(extra))
+
+    # the same rule on the versioned path
+    for extra in ({"teacher_temp_start": None}, {"teacher_temp_warmup_ratio": None}):
+        with pytest.raises(ValueError):
+            _recipe(checkpoint=_versioned_checkpoint(args_extra=extra))
+
+    # an absent key still assumes the historical value with a warning
+    absent = _legacy_checkpoint()
+    for key in ("teacher_temp_start", "teacher_temp_end", "disable_cross_view_loss"):
+        absent["args"].pop(key)
+    resolved = _recipe(checkpoint=absent)
+    assert resolved.relational_target_config["teacher_temp_start"] == 0.04
+    assert resolved.relational_target_config["relational_pairing"] == "full"
+    assert len(resolved.warnings) >= 3
+
+
+def test_relational_recipe_rejects_null_weak_record():
+    """A weak version-1 bundle must attest its transform record."""
+    weak_bundle = _bundle(
+        relational_teacher_views="weak",
+        relational_center_source="weak",
+        relational_pairing="cross",
+        weak_teacher_augmentation_config=None,
+    )
+    with pytest.raises(ValueError, match="must be a mapping for weak"):
+        _recipe(
+            checkpoint=_versioned_checkpoint(
+                weak_bundle,
+                {
+                    "relational_teacher_views": "weak",
+                    "relational_center_source": "weak",
+                    "relational_pairing": "cross",
+                },
+            )
+        )
+
+
+def test_relational_recipe_rejects_underflowing_temperature():
+    """1e-50 casts to float32 0.0 and must not raise ZeroDivisionError."""
+    checkpoint = _versioned_checkpoint(
+        _bundle(teacher_temp_start=1e-50), {"teacher_temp_start": 1e-50}
+    )
+    with pytest.raises(ValueError, match="usable float32 temperature"):
+        _recipe(checkpoint=checkpoint)
+
+
+def test_relational_admission_boundary_is_adjacent():
+    """The admission limit is inclusive and the neighbouring value flips it."""
+    f32 = np.finfo(np.float32)
+    limit = float(f32.max) * (1.0 - 4.0 * float(f32.eps))
+    for batch_size in (6, 7):
+        exact = float(max(batch_size, 2)) / limit
+        # a temperature that sits just inside the bound is admitted
+        assert (
+            trainer._admissible_temperature(
+                np.nextafter(np.float32(exact), np.float32(np.inf)).item(),
+                batch_size,
+                "--teacher-temp-start",
+            )
+            is not None
+        )
+        # one float32 step smaller crosses the bound and is rejected
+        with pytest.raises(ValueError, match="overflows"):
+            trainer._admissible_temperature(
+                np.nextafter(np.float32(exact), np.float32(0.0)).item(),
+                batch_size,
+                "--teacher-temp-start",
+            )
+
+
+def test_finetune_does_not_copy_the_ssl_relational_bundle(tmp_path):
+    """Finetune builds its own config; the SSL recipe must not leak in."""
+    source = _write_legacy_finetune_checkpoint(
+        tmp_path / "annotated_sft.pth", groups=2
+    )
+    checkpoint = torch.load(source, map_location="cpu", weights_only=False)
+    checkpoint["config"][trainer.RELATIONAL_TARGET_CONFIG_KEY] = _bundle(
+        relational_teacher_views="weak",
+        relational_center_source="weak",
+        relational_pairing="cross",
+        weak_teacher_augmentation_config=build_pretrain_augmentation_config(
+            "global-barcode", 32, 16, 0
+        ),
+    )
+    torch.save(checkpoint, source)
+
+    args = _finetune_args(
+        tmp_path,
+        source,
+        finetune_epochs=1,
+        **_finetune_overrides(tmp_path, "annotated_ft", batch_size=4),
+    )
+    trainer.run_finetune(args)
+    saved = torch.load(
+        tmp_path / "annotated_ft" / "finetune_latest.pth",
+        map_location="cpu",
+        weights_only=False,
+    )
+    assert trainer.RELATIONAL_TARGET_CONFIG_KEY not in saved["config"]
+    assert saved["config"]["loss"] == "arcface"
