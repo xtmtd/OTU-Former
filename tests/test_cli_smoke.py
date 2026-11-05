@@ -1882,6 +1882,26 @@ def test_pretrain_help_documents_patch_modes_and_mask_migration():
         assert flag in output
 
 
+def test_pretrain_help_distinguishes_cls_and_patch_objectives():
+    from typer.main import get_command
+
+    command = get_command(app).commands["pretrain"]
+    options = {parameter.name: parameter for parameter in command.params}
+    cls_help = options["ssl_method"].help
+    patch_help = options["patch_loss"].help
+
+    assert options["ssl_method"].opts == ["--ssl-method"]
+    assert options["ssl_method"].default == "relational"
+    assert "global-to-global and local-to-global" in cls_help
+    assert "not a complete training recipe" in cls_help
+    assert "--patch-loss" in cls_help
+    assert "selected independently" in cls_help
+    assert "share the encoder and teacher temperature" in cls_help
+    assert "--ssl-method" in patch_help
+    assert "selected independently" in patch_help
+    assert "share the encoder and teacher temperature" in patch_help
+
+
 def test_pretrain_help_links_the_full_contract_document():
     result = runner.invoke(app, ["pretrain", "--help"])
     assert result.exit_code == 0
