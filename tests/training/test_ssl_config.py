@@ -983,6 +983,12 @@ def test_pretrain_recipe_rejects_recorded_null_fields(capsys):
 
 
 def _legacy_recipe_checkpoint(relational: bool) -> dict:
+    """A payload written before the shared recipe keys existed at all.
+
+    ``0.12.0`` recorded the warmup ratio in ``args``, so a genuine pre-``0.12.0``
+    payload carries the key in neither place; removing it from both is what
+    separates this fixture from a ``0.12.0`` payload.
+    """
     checkpoint = (
         {
             "student": _encoder(256).state_dict(),
@@ -999,6 +1005,7 @@ def _legacy_recipe_checkpoint(relational: bool) -> dict:
     )
     for name in ("teacher_temp_warmup_ratio", "norm_bias_weight_decay"):
         checkpoint["config"].pop(name, None)
+        checkpoint["args"].pop(name, None)
     return checkpoint
 
 
@@ -1428,3 +1435,61 @@ def test_cross_method_resume_is_rejected():
             ssl_args(ssl_method="dino", ssl_method_explicit=True),
             relational,
         )
+
+
+def test_warmup_ratio_recorded_in_args_stays_authoritative():
+    """``0.12.0`` recorded the ratio in ``args``; the shared key moved to config.
+
+    Reading only ``config`` made such a payload look unrecorded: a matching
+    explicit request was rejected and an omitted one re-saved a ``config`` that
+    contradicted the ``args`` it had just resumed from.
+    """
+    checkpoint = _recipe_checkpoint()
+    checkpoint["config"].pop("teacher_temp_warmup_ratio")
+    checkpoint["config"].pop("norm_bias_weight_decay")
+    checkpoint["args"]["teacher_temp_warmup_ratio"] = 0.3
+
+    inherited = resolve_pretrain_ssl_config(ssl_args(), checkpoint)
+    assert inherited["teacher_temp_warmup_ratio"] == 0.3
+
+    matching = resolve_pretrain_ssl_config(
+        ssl_args(
+            teacher_temp_warmup_ratio=0.3, teacher_temp_warmup_ratio_explicit=True
+        ),
+        checkpoint,
+    )
+    assert matching["teacher_temp_warmup_ratio"] == 0.3
+
+    with pytest.raises(ValueError, match="Cannot change teacher-temp-warmup-ratio"):
+        resolve_pretrain_ssl_config(
+            ssl_args(
+                teacher_temp_warmup_ratio=0.5, teacher_temp_warmup_ratio_explicit=True
+            ),
+            checkpoint,
+        )
+
+    # The weight-decay policy still predates the payload, so it cannot be switched.
+    assert inherited["norm_bias_weight_decay"] is True
+    with pytest.raises(ValueError, match="does not record norm_bias_weight_decay"):
+        resolve_pretrain_ssl_config(
+            ssl_args(
+                no_norm_bias_weight_decay=True,
+                no_norm_bias_weight_decay_explicit=True,
+            ),
+            checkpoint,
+        )
+
+
+@pytest.mark.parametrize("method", ["relational", "dino"])
+def test_non_positive_student_temperature_is_rejected(method):
+    """Both methods divide by the student temperature; refuse it before setup."""
+    for value in (0.0, -0.5, float("inf"), float("nan")):
+        with pytest.raises(ValueError, match="student-temp"):
+            resolve_pretrain_ssl_config(
+                ssl_args(
+                    ssl_method=method,
+                    ssl_method_explicit=True,
+                    student_temp=value,
+                ),
+                None,
+            )

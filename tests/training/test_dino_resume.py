@@ -1024,6 +1024,9 @@ def test_legacy_recipe_checkpoint_resumes_for_real(tmp_path, capsys):
     checkpoint = _saved(tmp_path)
     for name in ("teacher_temp_warmup_ratio", "norm_bias_weight_decay"):
         checkpoint["config"].pop(name)
+        # A pre-0.12.0 payload records the ratio in neither place; keeping the
+        # args entry would make this a 0.12.0 payload with a damaged config.
+        checkpoint["args"].pop(name, None)
     legacy = tmp_path / "legacy.pth"
     torch.save(checkpoint, legacy)
     capsys.readouterr()

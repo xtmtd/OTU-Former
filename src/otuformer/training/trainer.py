@@ -3051,6 +3051,7 @@ class _SavedSSLState:
 
     identity: tuple[str, str] | None
     config: dict[str, Any]
+    saved_args: dict[str, Any]
     out_dim: int | None
     weight_out_dim: int | None
 
@@ -3068,9 +3069,12 @@ def _saved_ssl_state(resume_ckpt: dict[str, Any] | None) -> _SavedSSLState | Non
     state, _ = resolve_checkpoint_state_dict(resume_ckpt)
     cfg = resume_ckpt.get("config")
     cfg = cfg if isinstance(cfg, dict) else {}
+    saved_args = resume_ckpt.get("args")
+    saved_args = saved_args if isinstance(saved_args, dict) else {}
     return _SavedSSLState(
         identity=resolve_checkpoint_ssl_identity(resume_ckpt, state),
         config=cfg,
+        saved_args=saved_args,
         out_dim=_positive_int(cfg.get("out_dim")),
         # A historical payload may record no width while its weights have one.
         weight_out_dim=resolve_projector_out_dim(state),
@@ -3147,15 +3151,28 @@ def _resolve_common_recipe(
     a warning, and an explicit nondefault is rejected instead of being dressed
     up as a recorded conflict.
     """
-    recorded = saved.config if saved is not None else {}
+    recorded = dict(saved.config) if saved is not None else {}
+    # ``0.12.0`` recorded the ratio in ``args``; the v2 delivery moved it into
+    # ``config`` next to the weight-decay policy. A payload taken before the move
+    # records it exactly once, there, and that record is authoritative: treating
+    # it as absent rejected a matching request and re-saved a ``config`` that
+    # contradicted the ``args`` it had just resumed from.
+    if saved is not None and "teacher_temp_warmup_ratio" not in recorded:
+        legacy_ratio = saved.saved_args.get("teacher_temp_warmup_ratio")
+        if legacy_ratio is not None:
+            recorded["teacher_temp_warmup_ratio"] = legacy_ratio
     # Presence is decided by the key, never by whether its value is null: a
     # recorded-but-null field is damaged metadata, not a historical payload.
     missing = [name for name in _COMMON_RECIPE_OPTIONS if name not in recorded]
-    if saved is not None and len(missing) == 1:
+    # A ``config`` carrying exactly one of the two keys is damaged v2 metadata.
+    # One carrying neither predates both fields and is handled below.
+    if saved is not None and (
+        len([name for name in _COMMON_RECIPE_OPTIONS if name in saved.config]) == 1
+    ):
         raise ValueError(
             "Cannot resume: the checkpoint records only part of the shared "
             "pretrain recipe (missing "
-            + missing[0]
+            + next(name for name in _COMMON_RECIPE_OPTIONS if name not in saved.config)
             + "). Partial recipe metadata is not resumable; start a new run."
         )
     # The command line spells the weight-decay control negatively, like
@@ -3203,12 +3220,12 @@ def _resolve_common_recipe(
     # that merely compares equal (True == 1.0, False == 0.0).
     recorded_ratio = (
         _validate_recipe_ratio(recorded["teacher_temp_warmup_ratio"])
-        if saved is not None
+        if "teacher_temp_warmup_ratio" in recorded
         else None
     )
     recorded_wd = (
         _validate_recipe_wd_flag(recorded["norm_bias_weight_decay"])
-        if saved is not None
+        if "norm_bias_weight_decay" in recorded
         else None
     )
     # The shared helper is not used here: it reads the recorded value with
@@ -3232,6 +3249,19 @@ def _resolve_common_recipe(
         ratio = requested_ratio
     if no_decay_explicit:
         requested_wd = not no_decay_requested
+        if (
+            saved is not None
+            and recorded_wd is None
+            and requested_wd != RECIPE_NORM_BIAS_WEIGHT_DECAY
+        ):
+            # A payload without the key predates the policy, so its single
+            # all-parameter optimizer group is the only partition it can have.
+            raise ValueError(
+                "The checkpoint does not record norm_bias_weight_decay; "
+                "historical behavior is assumed to be True. Changing this "
+                "policy would require an unsupported optimizer-partition "
+                "conversion. Start a new run to change Norm/bias decay."
+            )
         if recorded_wd is not None and requested_wd != recorded_wd:
             raise ValueError(
                 "Cannot change --no-norm-bias-weight-decay on resume: the "
@@ -4137,6 +4167,16 @@ def resolve_pretrain_ssl_config(
             f"--ssl-method must be one of {', '.join(SSL_METHODS)}, "
             f"got {requested_method!r}."
         )
+    # Shared by both methods and checked before any output is cleared: a zero or
+    # non-finite student temperature reaches a division, not a validation error.
+    requested_student_temp = getattr(args, "student_temp", None)
+    if requested_student_temp is not None:
+        student_temp_value = _requested_float(requested_student_temp, "--student-temp")
+        if student_temp_value <= 0.0:
+            raise ValueError(
+                "--student-temp must be finite and greater than 0, got "
+                f"{requested_student_temp!r}."
+            )
     saved = _saved_ssl_state(resume_ckpt)
     saved_method = saved.identity[0] if saved is not None and saved.identity else None
 
@@ -5594,6 +5634,13 @@ def run_pretrain(
             if dino_objective is not None and koleo_enabled:
                 total_loss = (
                     total_loss + float(ssl_config["koleo_weight"]) * koleo_raw
+                )
+
+            if not torch.isfinite(total_loss):
+                raise ValueError(
+                    "The pretraining loss became non-finite at iteration "
+                    f"{global_step}; refusing to update the parameters. Check the "
+                    "temperatures, learning rate and inputs."
                 )
 
             optimizer.zero_grad()
