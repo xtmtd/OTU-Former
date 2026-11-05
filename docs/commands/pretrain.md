@@ -60,7 +60,7 @@ Key, target mechanism and KoLeo weight are recorded effective settings. On `--re
 
 **Default:** `relational` · **Allowed:** relational / dino
 
-Global CLS training method: 'relational' (default; the relational target recipe — a synchronized student/teacher pair with weak teacher views and cross/full pairing) or 'dino' (prototype distribution distillation with an explicit prototype layer). DINO is opt-in and is not a resume of a relational run. Omit to inherit the saved method on --resume; a cross-method resume is rejected. The methods are mutually exclusive: a DINO run keeps the two global views and no relational center update, and the `--relational-teacher-views`, `--relational-center-source` and `--relational-pairing` selectors are rejected under `--ssl-method dino`.
+CLS distillation objective: 'relational' (default; the relational target recipe — a synchronized student/teacher pair with weak teacher views and cross/full pairing) or 'dino' (prototype distribution distillation with an explicit prototype layer). Applies to global-to-global and local-to-global pairs, not a complete training recipe. The patch objective is selected independently by --patch-loss; both objectives share the encoder and teacher temperature (used by ibot). DINO is opt-in and is not a resume of a relational run. Omit to inherit the saved method on --resume; a cross-method resume is rejected. The methods are mutually exclusive: a DINO run keeps the two global views and no relational center update, and the `--relational-teacher-views`, `--relational-center-source` and `--relational-pairing` selectors are rejected under `--ssl-method dino`.
 
 ### `--dino-prototypes`
 
@@ -152,7 +152,7 @@ Number of local crops. Omit to use 6 for a new run or inherit the checkpoint val
 
 **Default:** `consistency` · **Allowed:** none / consistency / masked-feature / ibot
 
-Patch-level objective. 'none', 'consistency' (default; selects visible same-position patches for normalized cosine regression, i.e. masked-position consistency, never input masking), 'masked-feature' (true continuous masked feature prediction of the teacher's final-four-block patch target) or 'ibot' (experimental prototype-distribution prediction).
+Patch-level objective. 'none', 'consistency' (default; selects visible same-position patches for normalized cosine regression, i.e. masked-position consistency, never input masking), 'masked-feature' (true continuous masked feature prediction of the teacher's final-four-block patch target) or 'ibot' (experimental prototype-distribution prediction). The CLS distillation objective is selected independently by --ssl-method; both objectives share the encoder and teacher temperature (used by ibot).
 
 ### `--masking-strategy`
 

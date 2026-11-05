@@ -60,7 +60,7 @@ DINO 原型层仅用于训练：`--use-projector-output` 返回归一化后的 D
 
 **默认值：** `relational` · **允许值：** relational / dino
 
-全局 CLS 训练方法。`relational` 是本页描述的关系目标配方（同步的学生/教师配对、弱增强或普通教师视图、中心来源与 cross/full 配对），仍是新运行的默认值。`dino` 为可选方法：学生端去匹配由另一个全局裁剪构建的教师原型分布，因此同一个全局裁剪不会与自身配对。DINO 不是 relational 运行的续跑；省略该选项即继承 `--resume` 检查点中保存的方法，显式切换方法会在写入任何输出之前被拒绝。两种方法互斥：DINO 运行只保留两个全局视图、不更新关系中心，且在 `--ssl-method dino` 下传入 `--relational-teacher-views`、`--relational-center-source` 或 `--relational-pairing` 会报错。
+CLS 蒸馏目标，同时作用于全局→全局与局部→全局配对，而不是选择整套训练配方。补丁目标由 `--patch-loss` 独立选择，但两者共享编码器和教师温度（iBOT 使用该温度）。`relational` 是本页描述的关系目标配方（同步的学生/教师配对、弱增强或普通教师视图、中心来源与 cross/full 配对），仍是新运行的默认值。`dino` 为可选方法：学生端去匹配由另一个全局裁剪构建的教师原型分布，因此同一个全局裁剪不会与自身配对。DINO 不是 relational 运行的续跑；省略该选项即继承 `--resume` 检查点中保存的方法，显式切换方法会在写入任何输出之前被拒绝。两种方法互斥：DINO 运行只保留两个全局视图、不更新关系中心，且在 `--ssl-method dino` 下传入 `--relational-teacher-views`、`--relational-center-source` 或 `--relational-pairing` 会报错。
 
 ### `--dino-prototypes`
 
@@ -152,7 +152,7 @@ cosine 学习率衰减前的 warmup epoch 数。
 
 **默认值：** `consistency` · **允许值：** none / consistency / masked-feature / ibot
 
-块级目标。'none'；'consistency'（默认；选取可见的同位置 patch 做归一化余弦回归，即掩码位置一致性，绝不做输入掩码）；'masked-feature'（对教师最后四个块的 patch 目标做真正的连续掩码特征预测）；'ibot'（实验性的原型分布预测）。
+块级目标。'none'；'consistency'（默认；选取可见的同位置 patch 做归一化余弦回归，即掩码位置一致性，绝不做输入掩码）；'masked-feature'（对教师最后四个块的 patch 目标做真正的连续掩码特征预测）；'ibot'（实验性的原型分布预测）。CLS 蒸馏目标由 `--ssl-method` 独立选择，但两者共享编码器和教师温度（iBOT 使用该温度）。
 
 ### `--masking-strategy`
 
