@@ -6,6 +6,15 @@
 
 **Revision record:** this draft was revised through several source-level audit rounds. The change log is kept by topic in the appendix rather than by external finding identifiers, which a reader cannot resolve here.
 
+**Superseded (branch `OTU-Former-dense`):** v2's data path and its DINO CLS
+method were rebased onto `0.12.0`, so two claims below no longer hold. Marked
+v2/DINO payloads are no longer rejected as cross-branch: the SSL method is what
+a resume may not change, and same-method v2 payloads resume normally
+(`resolve_pretrain_ssl_config`). The "no new SSL method" non-goal applied to the
+`0.12.0` branch only; `--ssl-method dino` now exists and is mutually exclusive
+with the relational targets described here. Everything else in this document
+still describes the shipped relational recipe.
+
 ## Intent
 
 Improve the reliability and cross-view consistency of the existing batch-relative relational CLS objective on the current `main` branch. The change is motivated by small-data experiments and ReSSL literature, but does not claim established gains for OTU delineation.
@@ -16,15 +25,15 @@ Improve the reliability and cross-view consistency of the existing batch-relativ
 - Give the relational teacher a weak global view by default for new runs.
 - Compute the relational CLS loss using cross-view pairs only: student view A against teacher view B, and student view B against teacher view A.
 - Resolve omitted temperature endpoints to effective new-run defaults `0.08` and `0.11`; their declared CLI/request defaults are `None`, so omission can inherit on resume.
-- Preserve historical main checkpoint resume behavior and downstream checkpoint compatibility; reject marked cross-branch training resumes before output mutation.
+- Preserve historical main checkpoint resume behavior and downstream checkpoint compatibility; reject a cross-method resume before output mutation (a marked payload of the same method resumes normally — see the superseded note above).
 - Keep the weak teacher transform and its resolved settings traceable in logs/checkpoints.
 
 ## Non-goals
 
 - No FIFO relation queue, queue-size option, or queued features.
 - No Adaptive Similarity Bootstrapping (AdaSim).
-- No new SSL method or command, and no import of v2's DINO prototype mode or other v2 changes. Main already has the batch-relative relational `_ssl_loss`; adapt it in place.
-- No initialization selector, independent-initialization fresh-run compatibility mode, backbone-source change, or DINO-style projector reinitialization. Cross-branch pretrain resume is unsupported; read-only/downstream checkpoint consumers are not restricted by this training-only boundary.
+- No new SSL method or command on the `0.12.0` branch, and no import of v2's DINO prototype mode there. Main already has the batch-relative relational `_ssl_loss`; adapt it in place. (The v2 rebase later added `--ssl-method dino` as a separate, mutually exclusive method.)
+- No initialization selector, independent-initialization fresh-run compatibility mode, backbone-source change, or DINO-style projector reinitialization. A cross-method pretrain resume is unsupported; same-method resumes stay supported, including DINO payloads after the v2 rebase. Read-only/downstream checkpoint consumers are not restricted by this training-only boundary.
 - Weak views do not supply patch teacher inputs, patch tokens, or patch centers. This is a control-variable choice, not a patch-loss result established by ReSSL.
 - Do not claim all patch targets are unchanged: the shared teacher temperature change affects `ibot_patch_loss` sharpening. `consistency` and `masked-feature` do not consume this temperature. Shared-backbone training can change all branches indirectly.
 - Keep the batch candidate set, self-similarity entries, relational softmax formula, and existing center update formula. Center input population is an explicit ablation choice as specified below. No separate local/patch temperature, diagonal masking, or loss-weight retuning.
