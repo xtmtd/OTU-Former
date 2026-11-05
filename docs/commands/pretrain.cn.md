@@ -60,7 +60,7 @@ DINO 原型层仅用于训练：`--use-projector-output` 返回归一化后的 D
 
 **默认值：** `relational` · **允许值：** relational / dino
 
-全局 CLS 训练方法。`relational` 保持现有的批内相对相似度蒸馏不变，仍是新运行的默认值。`dino` 为可选方法：学生端去匹配由另一个全局裁剪构建的教师原型分布，因此同一个全局裁剪不会与自身配对。DINO 不是 relational 运行的续跑；省略该选项即继承 `--resume` 检查点中保存的方法，显式切换方法会在写入任何输出之前被拒绝。
+全局 CLS 训练方法。`relational` 是本页描述的关系目标配方（同步的学生/教师配对、弱增强或普通教师视图、中心来源与 cross/full 配对），仍是新运行的默认值。`dino` 为可选方法：学生端去匹配由另一个全局裁剪构建的教师原型分布，因此同一个全局裁剪不会与自身配对。DINO 不是 relational 运行的续跑；省略该选项即继承 `--resume` 检查点中保存的方法，显式切换方法会在写入任何输出之前被拒绝。两种方法互斥：DINO 运行只保留两个全局视图、不更新关系中心，且在 `--ssl-method dino` 下传入 `--relational-teacher-views`、`--relational-center-source` 或 `--relational-pairing` 会报错。
 
 ### `--dino-prototypes`
 

@@ -60,7 +60,7 @@ Key, target mechanism and KoLeo weight are recorded effective settings. On `--re
 
 **Default:** `relational` · **Allowed:** relational / dino
 
-Global CLS training method: 'relational' (default; batch-relative similarity distillation, unchanged) or 'dino' (prototype distribution distillation with an explicit prototype layer). DINO is opt-in and is not a resume of a relational run. Omit to inherit the saved method on --resume; a cross-method resume is rejected.
+Global CLS training method: 'relational' (default; the relational target recipe — a synchronized student/teacher pair with weak teacher views and cross/full pairing) or 'dino' (prototype distribution distillation with an explicit prototype layer). DINO is opt-in and is not a resume of a relational run. Omit to inherit the saved method on --resume; a cross-method resume is rejected. The methods are mutually exclusive: a DINO run keeps the two global views and no relational center update, and the `--relational-teacher-views`, `--relational-center-source` and `--relational-pairing` selectors are rejected under `--ssl-method dino`.
 
 ### `--dino-prototypes`
 

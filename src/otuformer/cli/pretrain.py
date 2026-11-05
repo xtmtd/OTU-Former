@@ -129,8 +129,9 @@ def pretrain(
         "relational",
         "--ssl-method",
         help=(
-            "Global CLS training method: 'relational' (default; batch-relative "
-            "similarity distillation, unchanged) or 'dino' (prototype "
+            "Global CLS training method: 'relational' (default; the relational "
+            "target recipe — a synchronized student/teacher pair with weak "
+            "teacher views and cross/full pairing) or 'dino' (prototype "
             "distribution distillation with an explicit prototype layer). "
             "DINO is opt-in and is not a resume of a relational run. Omit to "
             "inherit the saved method on --resume; a cross-method resume is "

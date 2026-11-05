@@ -1,7 +1,7 @@
 # OTU-Former v2 Data and Provenance Foundation — Design
 
 Date: 2026-10-29
-Status: Proposed — awaiting review and approval of this document.
+Status: Implemented on branch `OTU-Former-dense` as commit `8dd825e`, rebased onto `0.12.0`; no tag or release. Original record: proposed — awaiting review and approval of this document.
 Branch: `otuformer-v2`.
 Target release: not assigned; “v2” names the development track, not an approved package-version bump.
 Authorization: create and revise this design and its contract/link in the master

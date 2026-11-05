@@ -10,9 +10,9 @@
 
 **Spec:** [CLS distillation design](../specs/2026-10-31-otuformer-cls-distillation-design.md). Also read its linked [master design](../specs/2026-03-29-otuformer-design.md) and the unmasked-CLS contract in [masked-pretrain design §5](../specs/2026-09-20-otuformer-masked-pretrain-v070-design.md#5-high-level-architecture).
 
-**Status:** Implemented in the uncommitted working tree; this review-driven remediation and current-environment engineering gates are verified (2026-11-03). Historical formal execution approval and operator acceptance are not established by this record; not released.
+**Status:** Implemented on branch `OTU-Former-dense` as commit `ae6bde5`, rebased onto `0.12.0`; no tag or release. Original record: implemented in the then-uncommitted working tree; this review-driven remediation and current-environment engineering gates are verified (2026-11-03). Historical formal execution approval and operator acceptance are not established by this record; not released.
 **Authorization:** The initial authorization covered writing/revising this plan, not implementation. Subsequent operator instructions explicitly authorize audit-driven code/test/doc fixes and self-review, including synthetic regression runs and correction of reasonable audit findings. Do not infer historical plan approval or formal acceptance from those instructions or from passing tests. This document grants no dependency/environment changes, real-data analysis, commit, push or release.
-**Delivery:** The current result is one uncommitted change set. Remediation executes inline with the operator’s authorization; task gates are technical checks, not automatic Git commits or acceptance. No delegation, commit, push or release is authorized.
+**Delivery:** The result is one change set, committed as `ae6bde5` on `OTU-Former-dense`. Remediation executes inline with the operator’s authorization; task gates are technical checks, not automatic Git commits or acceptance. No delegation, commit, push or release is authorized.
 
 ## Evidence and checkbox meaning
 
@@ -62,7 +62,7 @@ Checked steps below mean a present implementation/document artifact or an observ
 
 ## Global Constraints
 
-- New runs default to `--ssl-method relational`; preserve its initialization, batch-relative loss, view pairs, center, schedules and extraction behavior. DINO is explicit; cross-method resume is rejected.
+- New runs default to `--ssl-method relational`. The relational recipe is `0.12.0`'s — synchronized student/teacher pair, weak teacher views, center source, cross/full pairing and `0.08`–`0.11` teacher temperatures — not the pre-`0.12.0` batch-relative pairing this plan was written against. DINO is explicit; cross-method resume is rejected.
 - D=`out_dim` defaults to 256; DINO K defaults to 64, K>=2. Existing iBOT K defaults to 512 and remains independent. D and K are not OTU counts.
 - DINO uses the normalized 2048-hidden MLP, then a separate bias-free legacy-weight-normalized prototype layer. Canonical keys are `weight_g`/`weight_v`; scales stay one, have `requires_grad=False`, and are absent from the optimizer. No deepcopy of weight-normalized modules.
 - EMA centering is default; optional SK uses exactly three iterations on both teacher globals together (N=2B), float32 stable normalization, no CLS EMA center. KoLeo weight defaults to 0, is finite/nonnegative and DINO-only.

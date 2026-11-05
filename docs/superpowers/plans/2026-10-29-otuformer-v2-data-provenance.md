@@ -10,9 +10,9 @@
 
 **Spec:** [Data and provenance design](../specs/2026-10-29-otuformer-v2-data-provenance-design.md), including its §2 approval distinctions and §9 acceptance groups. Also read [master §4.10](../specs/2026-03-29-otuformer-design.md#410-proposed-v2-data-and-provenance-foundation), [output safety](../specs/2026-07-18-output-safety-and-resume-design.md) and [documentation conventions](../specs/2026-09-29-otuformer-documentation-conventions-design.md).
 
-**Status:** Proposed — awaiting plan review and explicit execution approval.
+**Status:** Implemented on branch `OTU-Former-dense` as commit `8dd825e`, rebased onto `0.12.0`; no tag or release. Original record: proposed — awaiting plan review and explicit execution approval.
 **Authorization:** The operator requested this plan document after the design revisions. That request authorizes drafting this plan, not product changes, dependency installation, analyses, commits or publication. The source design still carries Proposed status; this plan does not silently change it or claim an audit pass. Confirm approval of the governing design and this plan before implementation.
-**Delivery:** One uncommitted change set after execution approval; no automatic task commits. Commit, push, tag, release and version assignment remain separate decisions. No execution method has been selected. Execution also requires resolving the pending test-environment prerequisite under Global Constraints below.
+**Delivery:** One change set, committed as `8dd825e` after execution approval; no automatic task commits. Commit, push, tag, release and version assignment remain separate decisions. No execution method has been selected. Execution also requires resolving the pending test-environment prerequisite under Global Constraints below.
 
 ## Global Constraints
 

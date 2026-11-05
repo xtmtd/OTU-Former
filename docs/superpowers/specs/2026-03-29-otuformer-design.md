@@ -92,7 +92,7 @@ not use as `null` — `masking_strategy` and `ibot_prototypes` under
 `consistency`, for example. That `null` means "not applicable to this mode", not
 "not supplied", and it is not a `Parameters:` value.
 
-**Optional DINO extension (implemented in the uncommitted CLS change set; formal acceptance/release not recorded):** the [CLS distillation
+**Optional DINO extension (implemented on branch `OTU-Former-dense`, commit `ae6bde5`; formal acceptance/release not recorded):** the [CLS distillation
 design](2026-10-31-otuformer-cls-distillation-design.md) adds a resolved
 `SSL config:` record. DINO-only fields are `null` when inactive under relational;
 this does not redefine requested `Parameters:` values. Method-dependent resume
@@ -214,7 +214,7 @@ Parameters migrated from `ref/ibot20260115.py` `get_parser()`, mode=extract.
 [v0.7.1 metric corrections](2026-09-21-otuformer-v071-cli-metrics-corrections.md),
 [optional register tokens](2026-09-28-otuformer-optional-registers-design.md).
 
-**Optional DINO extension (implemented in the uncommitted CLS change set; formal acceptance/release not recorded):** the
+**Optional DINO extension (implemented on branch `OTU-Former-dense`, commit `ae6bde5`; formal acceptance/release not recorded):** the
 [CLS design](2026-10-31-otuformer-cls-distillation-design.md) keeps default
 backbone CLS extraction and uses the normalized bottleneck for
 `--use-projector-output`. Its prototype logits and K-dimensional center are
@@ -361,7 +361,7 @@ The three read-only consumers (`extract`, `export`, `cam`) share one resolver, `
 
 The embedding head is taken from `config.embedding_head` when present, otherwise inferred from the projector's first linear width (512 → `arcface_mlp_512`, 2048 → `projection_mlp_2048`); any other width is rejected rather than silently mis-loaded. Buffers that do not fit the rebuilt model (the SSL-only `center`) are dropped, and a backbone whose tensors do not fit the resolved model name is rejected with a message that distinguishes a conflict inside the checkpoint metadata (which outranks `--model-name`) from a missing recorded name that `--model-name` must supply.
 
-**Optional DINO extension (implemented in the uncommitted CLS change set; formal acceptance/release not recorded):**
+**Optional DINO extension (implemented on branch `OTU-Former-dense`, commit `ae6bde5`; formal acceptance/release not recorded):**
 [CLS design §6](2026-10-31-otuformer-cls-distillation-design.md#6-checkpoints-and-compatibility)
 separates SSL method/head identity from `config.embedding_head`, preserving
 fine-tune source classification and original-SSL provenance. Active
