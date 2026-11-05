@@ -1849,3 +1849,33 @@ def test_ssl_schema_conditional_inheritance() -> None:
         )
     with pytest.raises(ValueError):
         module.validate_parameters("pretrain", {**base, "dino_prototypes": 1})
+
+
+def test_cli_surface_check_ignores_ansi_colour(tmp_path):
+    """Rich colours command names; a hidden SGR sequence must not hide the name.
+
+    ``\\x1b[1;36mannotate`` puts a word character immediately before the name, so
+    the whole-token boundary used to reject a launcher that works.
+    """
+    from otuformer import cli_schema as module
+
+    names = list(module.command_names())
+    pieces = {name: f"\x1b[1;36m{name} \x1b[0m" for name in names}
+    launcher = tmp_path / "otuformer-colour"
+    launcher.write_text(
+        f"#!{sys.executable}\nimport sys\n"
+        f"print({' '.join(pieces.values())!r} if '--help' in sys.argv else 'x')\n",
+        encoding="utf-8",
+    )
+    launcher.chmod(0o755)
+    module._verify_cli_surface([str(launcher)])
+
+    without_first = " ".join(pieces[name] for name in names[1:])
+    launcher.write_text(
+        f"#!{sys.executable}\nimport sys\n"
+        f"print({without_first!r} if '--help' in sys.argv else 'x')\n",
+        encoding="utf-8",
+    )
+    launcher.chmod(0o755)
+    with pytest.raises(ValueError, match="does not expose"):
+        module._verify_cli_surface([str(launcher)])

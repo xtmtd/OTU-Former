@@ -618,7 +618,15 @@ def pretrain(
         ssl_config_effective = resolve_pretrain_ssl_config(ns, resume_state)
     except (ValueError, KeyError, OSError, RuntimeError) as exc:
         raise typer.BadParameter(str(exc)) from exc
-    prepare_output_dir(out_dir, overwrite=overwrite, allow_existing=bool(resume))
+    try:
+        prepare_output_dir(
+            out_dir,
+            overwrite=overwrite,
+            allow_existing=bool(resume),
+            protected_paths=(train_data, input_images_dir, visualize_data, resume),
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
     tee = TeeLogger(
         out_dir / "logs" / "pretrain.log",
         append=bool(resume),

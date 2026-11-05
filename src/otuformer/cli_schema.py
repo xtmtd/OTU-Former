@@ -1420,6 +1420,10 @@ def _verify_console_script(path: Path, module: str, attribute: str) -> None:
         fail("does not import and call the declared entry point")
 
 
+# CSI escape sequences (SGR colours and cursor control) as emitted by Rich.
+_ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+
+
 def _verify_cli_surface(prefix: Sequence[str]) -> None:
     """Prove the launcher really runs this CLI, not just version-like output.
 
@@ -1431,7 +1435,10 @@ def _verify_cli_surface(prefix: Sequence[str]) -> None:
     completed = subprocess.run(
         [*prefix, "--help"], capture_output=True, text=True, check=False
     )
-    reported = completed.stdout + completed.stderr
+    # Rich colours the command names when the launcher writes to a terminal, so
+    # an SGR sequence such as ``\x1b[1;36mannotate`` would hide the name from the
+    # token boundary below and report a working launcher as broken.
+    reported = _ANSI_ESCAPE.sub("", completed.stdout + completed.stderr)
     if completed.returncode != 0:
         raise ValueError(
             f"launcher {prefix[0]!r} --help failed: {reported.strip()[:200]}"
