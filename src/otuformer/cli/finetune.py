@@ -779,7 +779,21 @@ def finetune(
     except (ValueError, OSError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     requested_extract_size = _parse_size(extract_size, stage="--extract-size")
-    prepare_output_dir(out_dir, overwrite=overwrite, allow_existing=bool(resume))
+    try:
+        prepare_output_dir(
+            out_dir,
+            overwrite=overwrite,
+            allow_existing=bool(resume),
+            protected_paths=(
+                train_data,
+                input_images_dir,
+                visualize_data,
+                pseudo_label_from,
+                resume,
+            ),
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
     tee = TeeLogger(
         out_dir / "logs" / "finetune.log",
         append=bool(resume),

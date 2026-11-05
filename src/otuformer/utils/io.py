@@ -6,16 +6,27 @@ import json
 import os
 import shutil
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import pandas as pd
 
 
 def prepare_output_dir(
-    out_dir: Path, *, overwrite: bool = False, allow_existing: bool = False
+    out_dir: Path,
+    *,
+    overwrite: bool = False,
+    allow_existing: bool = False,
+    protected_paths: Sequence[object] = (),
 ) -> Path:
-    """Create an output directory without silently replacing existing results."""
+    """Create an output directory without silently replacing existing results.
+
+    ``protected_paths`` are this run's inputs. Clearing a directory that holds
+    one of them would delete the data the run is about to read, so that overlap
+    is refused before ``rmtree`` runs. Symlinks are compared resolved, because
+    ``rmtree`` follows the directory it is given.
+    """
     if out_dir.exists() and overwrite:
+        _refuse_clearing_inputs(out_dir, protected_paths)
         shutil.rmtree(out_dir)
     elif out_dir.exists() and not allow_existing and any(out_dir.iterdir()):
         raise FileExistsError(
@@ -24,6 +35,22 @@ def prepare_output_dir(
         )
     out_dir.mkdir(parents=True, exist_ok=True)
     return out_dir
+
+
+def _refuse_clearing_inputs(out_dir: Path, protected_paths: Sequence[object]) -> None:
+    """Reject an --overwrite target that is, or holds, one of the inputs."""
+    targets = {out_dir, out_dir.expanduser().resolve()}
+    for value in protected_paths:
+        if not value:
+            continue
+        path = Path(str(value))
+        for candidate in {path, path.expanduser().resolve()}:
+            for target in targets:
+                if candidate == target or target in candidate.parents:
+                    raise ValueError(
+                        f"--overwrite would clear {target}, which holds the input "
+                        f"{candidate}; choose another --out-dir or drop --overwrite."
+                    )
 
 
 def read_csv(path: Path, **kwargs: Any) -> pd.DataFrame:

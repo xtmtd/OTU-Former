@@ -154,3 +154,33 @@ def test_prepare_output_dir_allows_existing_resume_directory(tmp_path):
     (out_dir / "SSL_latest.pth").write_text("checkpoint", encoding="utf-8")
 
     assert prepare_output_dir(out_dir, allow_existing=True) == out_dir
+
+
+def test_prepare_output_dir_overwrite_refuses_to_clear_its_inputs(tmp_path):
+    """``--overwrite`` must never delete a directory that holds the run's data."""
+    images = tmp_path / "images"
+    images.mkdir()
+    (images / "img_0.jpg").write_text("pixels", encoding="utf-8")
+    csv_path = tmp_path / "images.csv"
+    csv_path.write_text("image\nimg_0.jpg\n", encoding="utf-8")
+
+    for out_dir, inputs in (
+        (images, (images,)),
+        (tmp_path, (csv_path,)),
+        (tmp_path, (images / "img_0.jpg",)),
+    ):
+        with pytest.raises(ValueError, match="holds the input"):
+            prepare_output_dir(out_dir, overwrite=True, protected_paths=inputs)
+        assert (images / "img_0.jpg").exists(), "an input was deleted"
+        assert csv_path.exists(), "an input was deleted"
+
+
+def test_prepare_output_dir_overwrite_allows_an_unrelated_target(tmp_path):
+    images = tmp_path / "images"
+    images.mkdir()
+    out_dir = tmp_path / "images" / "run"
+
+    assert (
+        prepare_output_dir(out_dir, overwrite=True, protected_paths=(images,))
+        == out_dir
+    )

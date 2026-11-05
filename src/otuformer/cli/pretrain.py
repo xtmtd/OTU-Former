@@ -129,13 +129,16 @@ def pretrain(
         "relational",
         "--ssl-method",
         help=(
-            "Global CLS training method: 'relational' (default; the relational "
+            "CLS distillation objective: 'relational' (default; the relational "
             "target recipe — a synchronized student/teacher pair with weak "
             "teacher views and cross/full pairing) or 'dino' (prototype "
             "distribution distillation with an explicit prototype layer). "
-            "DINO is opt-in and is not a resume of a relational run. Omit to "
-            "inherit the saved method on --resume; a cross-method resume is "
-            "rejected."
+            "Applies to global-to-global and local-to-global pairs, not a "
+            "complete training recipe. The patch objective is selected "
+            "independently by --patch-loss; both objectives share the encoder "
+            "and teacher temperature (used by ibot). DINO is opt-in and is not "
+            "a resume of a relational run. Omit to inherit the saved method "
+            "on --resume; a cross-method resume is rejected."
         ),
     ),
     dino_prototypes: int = typer.Option(
@@ -257,7 +260,10 @@ def pretrain(
             "i.e. masked-position consistency, never input masking), "
             "'masked-feature' (true continuous masked feature prediction "
             "of the teacher's final-four-block patch target) or 'ibot' "
-            "(experimental prototype-distribution prediction)."
+            "(experimental prototype-distribution prediction). The CLS "
+            "distillation objective is selected independently by --ssl-method; "
+            "both objectives share the encoder and teacher temperature "
+            "(used by ibot)."
         ),
     ),
     masking_strategy: str = typer.Option(
