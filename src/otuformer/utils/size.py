@@ -61,17 +61,18 @@ def resolve_training_image_size(checkpoint: dict | None) -> int:
 
 
 def resolve_backbone_native_size(model_name: str) -> int:
-    """Read the backbone's native ``default_cfg["input_size"]``.
+    """Read the backbone's native input size from the timm config.
 
-    Uses a ``pretrained=False`` timm instantiation so no weights are
-    downloaded.
+    Reads the registered ``pretrained_cfg`` instead of instantiating the model:
+    building even a ``pretrained=False`` backbone initialises its weights, which
+    advances the global torch RNG and would make ``--global-crop-size auto``
+    shift the student init a given ``--seed`` produces.
     """
     try:
-        model = timm.create_model(model_name, pretrained=False)
+        cfg = timm.get_pretrained_cfg(model_name, allow_unregistered=True)
     except Exception:
         return 224
-    cfg = getattr(model, "default_cfg", None) or {}
-    input_size = cfg.get("input_size")
+    input_size = getattr(cfg, "input_size", None)
     if isinstance(input_size, (tuple, list)) and len(input_size) >= 3:
         return int(input_size[1])
     return 224

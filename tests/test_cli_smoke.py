@@ -9,6 +9,7 @@ from PIL import Image
 import torch
 import os
 import logging
+import types
 from pathlib import Path
 import typer
 from typer.testing import CliRunner
@@ -4882,11 +4883,15 @@ def test_pretrain_preflight_auto_probes_the_resolved_native_size(tmp_path, monke
 
     def ninety_six_model(name, **kwargs):
         model = real_create_model(name, **kwargs)
-        model.default_cfg = {**model.default_cfg, "input_size": (3, 96, 96)}
         probes.append((out_dir.exists(), kwargs.get("img_size")))
         return model
 
+    def ninety_six_cfg(name, **kwargs):
+        # The native size comes from the registered config, not a built model.
+        return types.SimpleNamespace(input_size=(3, 96, 96))
+
     monkeypatch.setattr("timm.create_model", ninety_six_model)
+    monkeypatch.setattr("timm.get_pretrained_cfg", ninety_six_cfg)
 
     result = runner.invoke(
         app,
