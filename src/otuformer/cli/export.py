@@ -65,7 +65,7 @@ def export(
         prepare_output_dir(
             out_dir, overwrite=overwrite, protected_paths=[checkpoint],
         )
-    except ValueError as exc:
+    except (ValueError, OSError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     from otuformer.utils.logging import TeeLogger
 

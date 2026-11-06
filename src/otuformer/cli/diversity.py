@@ -135,11 +135,19 @@ def diversity(
     )
     from otuformer.utils.io import prepare_output_dir, read_csv
 
+    # Phylogenetic metrics read embeddings even when NJ files are not saved.
+    # Embeddings take precedence over the legacy tree input.
+    protected = [
+        assignments,
+        otu_table_csv,
+        embeddings if phylo else None,
+        tree if phylo and embeddings is None else None,
+    ]
     try:
         prepare_output_dir(
-            out_dir, overwrite=overwrite, protected_paths=[assignments, otu_table_csv, embeddings if phylo else None, tree if phylo and embeddings is None else None],
+            out_dir, overwrite=overwrite, protected_paths=protected,
         )
-    except ValueError as exc:
+    except (ValueError, OSError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     from otuformer.utils.logging import TeeLogger
 

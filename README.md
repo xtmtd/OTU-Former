@@ -142,7 +142,7 @@ Supported shells: bash, zsh, fish
 
 ### Version
 
-Current version: `0.12.0`.
+Current version: `0.12.1`.
 
 Show installed version:
 

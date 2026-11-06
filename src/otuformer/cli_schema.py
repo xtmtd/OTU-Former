@@ -26,6 +26,8 @@ import sys
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from otuformer.utils.paths import input_dependency_positions
+
 SCHEMA_VERSION = 1
 BUILTIN_HELP_OPTION = "--help"
 
@@ -746,7 +748,10 @@ def check_output_safety(
     resume: bool = False,
     allow_inside: Sequence[Path] = (),
 ) -> list[str]:
-    """Read-only output-safety check; raises for unsafe overlap.
+    """Read-only non-overlap policy: output and inputs cannot contain each other.
+
+    This is stricter than a deletion-only cleanup guard: an output below an
+    input root is rejected even without overwrite.
 
     ``allow_inside`` names paths that may legitimately live inside the output
     directory as long as no overwrite is requested (for example the checkpoint of
@@ -755,14 +760,12 @@ def check_output_safety(
     """
     target = _resolve_for_safety(Path(out_dir))
     if overwrite:
-        from otuformer.utils.paths import input_dependency_positions
-
         for protected in protected_paths:
             for position in input_dependency_positions(Path(protected)):
                 if _is_within(position, target):
                     raise ValueError(
-                        f"clearing {target} would remove {position}, which the "
-                        f"protected input {protected} is reached through"
+                        f"output directory {target} contains protected input "
+                        f"dependency {position}, which {protected} is reached through"
                     )
     permitted = [_resolve_for_safety(Path(path)) for path in allow_inside]
     conditions: list[str] = []

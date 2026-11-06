@@ -1273,9 +1273,14 @@ def test_cluster_rejects_old_outputs_without_overwrite(tmp_path):
             "0.5",
         ],
     )
-    assert result.exit_code != 0
-    assert "--overwrite" in str(result.exception)
-    assert stale.exists()
+    assert result.exit_code == 2, (result.output, repr(result.exception))
+    assert isinstance(result.exception, SystemExit)
+    output = " ".join(result.output.replace("│", " ").split())
+    assert "Output directory already contains files" in output
+    assert "pass --overwrite" in output
+    assert "Traceback" not in output
+    assert stale.read_text(encoding="utf-8") == "stale"
+    assert set(out_dir.iterdir()) == {stale}
 
 
 def test_cluster_overwrite_cleans_old_outputs_before_writing(tmp_path):
