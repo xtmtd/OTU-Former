@@ -754,6 +754,16 @@ def check_output_safety(
     not-yet-created directories. Never creates, deletes, or writes anything.
     """
     target = _resolve_for_safety(Path(out_dir))
+    if overwrite:
+        from otuformer.utils.paths import input_dependency_positions
+
+        for protected in protected_paths:
+            for position in input_dependency_positions(Path(protected)):
+                if _is_within(position, target):
+                    raise ValueError(
+                        f"clearing {target} would remove {position}, which the "
+                        f"protected input {protected} is reached through"
+                    )
     permitted = [_resolve_for_safety(Path(path)) for path in allow_inside]
     conditions: list[str] = []
     for protected in protected_paths:

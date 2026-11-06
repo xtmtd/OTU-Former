@@ -2203,6 +2203,7 @@ def test_extract_size_auto_and_explicit_parse(tmp_path, monkeypatch):
     monkeypatch.setattr("otuformer.embedding.extractor.extract_embeddings", fake_extract)
 
     _make_tiny_pretrain_data(tmp_path)
+    checkpoint = _write_init_checkpoint(tmp_path / "source.pth")
     for flag in ["auto", "224"]:
         result = runner.invoke(
             app,
@@ -2212,6 +2213,8 @@ def test_extract_size_auto_and_explicit_parse(tmp_path, monkeypatch):
                 str(tmp_path),
                 "--out-dir",
                 str(tmp_path / f"out_{flag}"),
+                "--checkpoint",
+                str(checkpoint),
                 "--extract-size",
                 flag,
             ],
@@ -2435,6 +2438,7 @@ def test_cam_rejects_invalid_eval_transform(tmp_path):
 
 def test_extract_forwards_eval_transform(monkeypatch, tmp_path):
     seen = {}
+    _write_init_checkpoint(tmp_path / "source.pth")
 
     def fake_extract(**kwargs):
         seen["eval_transform"] = kwargs["eval_transform"]
@@ -2453,6 +2457,8 @@ def test_extract_forwards_eval_transform(monkeypatch, tmp_path):
             str(tmp_path / "out"),
             "--eval-transform",
             "whole-specimen-pad",
+            "--checkpoint",
+            str(tmp_path / "source.pth"),
         ],
     )
     assert result.exit_code == 0
@@ -2477,6 +2483,8 @@ def test_extract_default_eval_transform_is_center_crop(monkeypatch, tmp_path):
             str(tmp_path),
             "--out-dir",
             str(tmp_path / "out"),
+            "--checkpoint",
+            str(_write_init_checkpoint(tmp_path / "source.pth")),
         ],
     )
     assert result.exit_code == 0

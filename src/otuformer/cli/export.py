@@ -61,7 +61,12 @@ def export(
     from otuformer.vision.export import export_to_onnx
     from otuformer.utils.io import prepare_output_dir
 
-    prepare_output_dir(out_dir, overwrite=overwrite)
+    try:
+        prepare_output_dir(
+            out_dir, overwrite=overwrite, protected_paths=[checkpoint],
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
     from otuformer.utils.logging import TeeLogger
 
     tee = TeeLogger(out_dir / "logs" / "export.log")

@@ -12,6 +12,44 @@ from pathlib import Path
 
 INODE_MODE = "inode"
 REALPATH_MODE = "normalized-realpath"
+_MAX_LINK_HOPS = 40
+
+
+def input_dependency_positions(path: Path) -> list[Path]:
+    """Entries needed to read an input, following links before applying ``..``."""
+    entry = Path(path).expanduser()
+    if not entry.is_absolute():
+        entry = Path.cwd() / entry
+    positions: list[Path] = []
+    parts = list(entry.parts[1:])
+    current = Path(entry.anchor)
+    hops = 0
+    while parts:
+        part = parts.pop(0)
+        if part in ("", "."):
+            continue
+        if part == "..":
+            current = current.parent
+            continue
+        candidate = current / part
+        if candidate not in positions:
+            positions.append(candidate)
+        if candidate.is_symlink():
+            hops += 1
+            if hops > _MAX_LINK_HOPS:
+                raise ValueError(
+                    f"cannot verify output safety: {path} passes through more than "
+                    f"{_MAX_LINK_HOPS} symbolic links"
+                )
+            target = Path(os.readlink(candidate))
+            current = Path(target.anchor) if target.is_absolute() else candidate.parent
+            target_parts = target.parts[1:] if target.is_absolute() else target.parts
+            parts = list(target_parts) + parts
+        else:
+            current = candidate
+    if current not in positions:
+        positions.append(current)
+    return positions
 
 
 def canonical_image_ref(ref: object, images_root: Path) -> str:

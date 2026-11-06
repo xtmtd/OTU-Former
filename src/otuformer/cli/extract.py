@@ -198,10 +198,68 @@ def extract(
         attention_pooling_epochs=attention_pooling_epochs,
     )
 
-    from otuformer.embedding.extractor import extract_embeddings
+    from otuformer.embedding.extractor import (
+        LabelCSVImageDataset,
+        _attention_pooling_checkpoint_candidates,
+        extract_embeddings,
+        extraction_image_paths,
+    )
+    from otuformer.constants import ATTENTION_POOLING_TYPES, TOKEN_MODES
     from otuformer.utils.io import prepare_output_dir, write_csv
 
-    prepare_output_dir(out_dir, overwrite=overwrite)
+    pool_stem = checkpoint.stem if checkpoint is not None else "model"
+    attention_pooling_checkpoint = (
+        out_dir / "checkpoints" / f"{pool_stem}.{attention_pooling_type}_pooling.pth"
+    )
+    try:
+        requested_size = _parse_size(extract_size, stage="--extract-size")
+        if token_mode not in TOKEN_MODES:
+            raise ValueError(f"Unsupported --token-mode: {token_mode}")
+        if attention_pooling_type not in ATTENTION_POOLING_TYPES:
+            raise ValueError(f"Unsupported --attention-pooling-type: {attention_pooling_type}")
+        protected = [input_images_dir, label_csv]
+        if onnx_path is not None:
+            from otuformer.utils.onnx import onnx_input_paths
+            from otuformer.utils.size import resolve_onnx_input_size
+
+            if token_mode != "cls":
+                raise ValueError("ONNX inference only supports token-mode 'cls'")
+            protected.extend(onnx_input_paths(onnx_path))
+            onnx_size = resolve_onnx_input_size(onnx_path)
+            if requested_size is not None and requested_size != onnx_size:
+                raise ValueError("--extract-size does not match ONNX input size")
+        elif checkpoint is None:
+            raise ValueError("--checkpoint is required when --onnx-path is not provided.")
+        elif not checkpoint.is_file():
+            raise FileNotFoundError(f"Checkpoint not found: {checkpoint}")
+        else:
+            protected.append(checkpoint)
+        protected.extend(extraction_image_paths(input_images_dir, label_csv))
+        if onnx_path is None and token_mode == "attention-pool":
+            bases = _attention_pooling_checkpoint_candidates(
+                checkpoint, attention_pooling_type, attention_pooling_checkpoint
+            )
+            suffix = f".{attention_pooling_type}_pooling.pth"
+            for base in bases:
+                if base.is_file():
+                    protected.append(base)
+                stem = base.name[:-len(suffix)] if base.name.endswith(suffix) else base.stem
+                if base.parent.is_dir():
+                    protected.extend(
+                        p for p in base.parent.iterdir()
+                        if p.name.startswith(f"{stem}.prefix")
+                        and p.name.endswith(f"-{attention_pooling_type}_pooling.pth")
+                        and p.is_file()
+                    )
+            if label_csv is not None:
+                import pandas as pd
+
+                if "label" in pd.read_csv(label_csv, nrows=0).columns:
+                    dataset = LabelCSVImageDataset(input_images_dir, label_csv)
+                    protected.extend(path for path, _ in dataset.samples)
+        prepare_output_dir(out_dir, overwrite=overwrite, protected_paths=protected)
+    except (ValueError, OSError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
 
     from otuformer.utils.logging import TeeLogger
 
@@ -237,16 +295,6 @@ def extract(
             seed=seed,
             onnx_path=str(onnx_path) if onnx_path is not None else "",
         )
-        if checkpoint is not None:
-            attention_pooling_checkpoint = (
-                out_dir
-                / "checkpoints"
-                / f"{checkpoint.stem}.{attention_pooling_type}_pooling.pth"
-            )
-        else:
-            attention_pooling_checkpoint = (
-                out_dir / "checkpoints" / f"model.{attention_pooling_type}_pooling.pth"
-            )
         params["attention_pooling_checkpoint"] = str(attention_pooling_checkpoint)
         cli_command = format_user_command(ctx, params, "extract")
         print(f"Command: {cli_command}")
@@ -262,7 +310,7 @@ def extract(
             checkpoint_path=checkpoint,
             images_dir=input_images_dir,
             model_name=model_name,
-            extract_size=_parse_size(extract_size, stage="--extract-size"),
+            extract_size=requested_size,
             batch_size=batch_size,
             device=device,
             num_workers=num_workers,

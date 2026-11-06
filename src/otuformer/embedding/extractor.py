@@ -15,10 +15,8 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 from otuformer.training.dataset import (
-    _build_recursive_index,
-    _resolve_image_path,
-    _supports_recursive_lookup,
     build_eval_transform,
+    resolve_dataset_image_paths,
 )
 from otuformer.training.model import OTUFormerEncoder, native_register_count
 from otuformer.utils.checkpoint import (
@@ -49,11 +47,7 @@ class ImageFolderDataset(Dataset):
         extract_size: int = 224,
         eval_transform: str = "center-crop",
     ) -> None:
-        self.paths = sorted(
-            p
-            for p in images_dir.rglob("*")
-            if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
-        )
+        self.paths = resolve_dataset_image_paths(None, images_dir)
         # Use the same eval transform as pretrain/finetune: direct BICUBIC resize
         self.transform = build_eval_transform(eval_transform, extract_size)
 
@@ -136,18 +130,7 @@ class CSVImageDataset(Dataset):
             raise ValueError("CSV must contain an 'image' column")
 
         refs = [str(x) for x in df["image"].tolist()]
-        missing_direct = [
-            ref
-            for ref in refs
-            if _supports_recursive_lookup(ref) and not (images_dir / Path(ref)).exists()
-        ]
-        by_relative, by_name = ({}, {})
-        if missing_direct:
-            by_relative, by_name = _build_recursive_index(images_dir)
-
-        paths = [
-            _resolve_image_path(images_dir, ref, by_relative, by_name) for ref in refs
-        ]
+        paths = resolve_dataset_image_paths(None, images_dir, refs=refs)
         missing = [str(p) for p in paths if not p.exists()]
         if missing:
             sample = ", ".join(missing[:3])
@@ -511,6 +494,17 @@ def _apply_patch_topk_pca_to_df(df: pd.DataFrame, topk_patches: int) -> pd.DataF
     out = df[fixed_cols].copy()
     reduced_df = pd.DataFrame(reduced, columns=reduced_cols, index=out.index)
     return pd.concat([out, reduced_df], axis=1)
+
+
+def extraction_image_paths(images_dir: Path, csv_path: Path | None) -> list[Path]:
+    """Inputs selected by both the PyTorch and ONNX extraction routes."""
+    if csv_path is not None:
+        return resolve_dataset_image_paths(csv_path, images_dir)
+    roots = (
+        sorted(p for p in images_dir.iterdir() if p.is_dir())
+        if detect_batch_mode(images_dir) else [images_dir]
+    )
+    return [path for root in roots for path in resolve_dataset_image_paths(None, root)]
 
 
 def detect_batch_mode(images_dir: Path) -> bool:

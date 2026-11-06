@@ -528,7 +528,24 @@ def pretrain(
         recipe = _resolve_pretrain_recipe(ns, resume_state, settings=settings)
     except (ValueError, KeyError, OSError, RuntimeError) as exc:
         raise typer.BadParameter(str(exc)) from exc
-    prepare_output_dir(out_dir, overwrite=overwrite, allow_existing=bool(resume))
+    try:
+        from otuformer.training.dataset import resolve_dataset_image_paths
+
+        protected = [input_images_dir, train_data, resume]
+        if overwrite and out_dir.exists() and (train_data is None or train_data.exists()):
+            protected.extend(resolve_dataset_image_paths(train_data, input_images_dir))
+        if (
+            overwrite and out_dir.exists() and not disable_embedding_metrics
+            and visualize_data is not None and visualize_data.exists()
+        ):
+            protected.append(visualize_data)
+            protected.extend(resolve_dataset_image_paths(visualize_data, input_images_dir))
+        prepare_output_dir(
+            out_dir, overwrite=overwrite, allow_existing=bool(resume),
+            protected_paths=protected,
+        )
+    except (ValueError, OSError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
     tee = TeeLogger(
         out_dir / "logs" / "pretrain.log",
         append=bool(resume),

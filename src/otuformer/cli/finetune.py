@@ -771,7 +771,28 @@ def finetune(
     except (ValueError, OSError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     requested_extract_size = _parse_size(extract_size, stage="--extract-size")
-    prepare_output_dir(out_dir, overwrite=overwrite, allow_existing=bool(resume))
+    try:
+        from otuformer.training.dataset import resolve_dataset_image_paths
+
+        protected = [input_images_dir, train_data, source_path, pseudo_label_from]
+        if overwrite and out_dir.exists():
+            if pseudo_round_data is not None:
+                refs = [str(row["image"]) for row in pseudo_round_data["rows"]]
+                protected.extend(resolve_dataset_image_paths(None, input_images_dir, refs=refs))
+            elif train_data.exists():
+                protected.extend(resolve_dataset_image_paths(train_data, input_images_dir))
+        if (
+            overwrite and out_dir.exists() and not disable_embedding_metrics
+            and visualize_data is not None and visualize_data.exists()
+        ):
+            protected.append(visualize_data)
+            protected.extend(resolve_dataset_image_paths(visualize_data, input_images_dir))
+        prepare_output_dir(
+            out_dir, overwrite=overwrite, allow_existing=bool(resume),
+            protected_paths=protected,
+        )
+    except (ValueError, OSError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
     tee = TeeLogger(
         out_dir / "logs" / "finetune.log",
         append=bool(resume),

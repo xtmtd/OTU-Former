@@ -412,6 +412,30 @@ def _resolve_image_path(
     return direct
 
 
+def resolve_dataset_image_paths(
+    csv_path: Path | None, images_dir: Path, *, refs: list[str] | None = None
+) -> list[Path]:
+    """Resolve exactly the paths the CSV and training datasets open."""
+    images_root = Path(images_dir)
+    if refs is None:
+        if csv_path is None:
+            return sorted(
+                p for p in images_root.rglob("*")
+                if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
+            )
+        frame = pd.read_csv(csv_path)
+        if "image" not in frame.columns:
+            raise ValueError(f"CSV {csv_path} missing required 'image' column")
+        refs = [str(value) for value in frame["image"]]
+    by_relative, by_name = ({}, {})
+    if any(
+        _supports_recursive_lookup(ref) and not (images_root / Path(ref)).exists()
+        for ref in refs
+    ):
+        by_relative, by_name = _build_recursive_index(images_root)
+    return [_resolve_image_path(images_root, ref, by_relative, by_name) for ref in refs]
+
+
 def _random_apply(transform: Any, probability: float) -> Any:
     """Wrap ``transform`` in RandomApply, or return it directly when always applied.
 
@@ -938,28 +962,7 @@ class MultiCropDataset(Dataset):
         weak_teacher_augmentation_config: dict[str, object] | None = None,
     ) -> None:
         images_root = Path(images_dir)
-        if csv_path is None:
-            self.image_paths = sorted(
-                path
-                for path in images_root.rglob("*")
-                if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
-            )
-        else:
-            df = pd.read_csv(csv_path)
-            refs = [str(row) for row in df["image"]]
-            missing_direct = [
-                ref
-                for ref in refs
-                if _supports_recursive_lookup(ref)
-                and not (images_root / Path(ref)).exists()
-            ]
-            by_relative, by_name = ({}, {})
-            if missing_direct:
-                by_relative, by_name = _build_recursive_index(images_root)
-            self.image_paths = [
-                _resolve_image_path(images_root, ref, by_relative, by_name)
-                for ref in refs
-            ]
+        self.image_paths = resolve_dataset_image_paths(csv_path, images_root)
         self.global_crop_size = int(global_crop_size)
         self.local_crop_size = int(local_crop_size)
         self.local_crops = int(local_crops)
@@ -1113,18 +1116,7 @@ class MetricDataset(Dataset):
             )
         images_root = Path(images_dir)
         refs = [str(row) for row in df["image"]]
-        missing_direct = [
-            ref
-            for ref in refs
-            if _supports_recursive_lookup(ref)
-            and not (images_root / Path(ref)).exists()
-        ]
-        by_relative, by_name = ({}, {})
-        if missing_direct:
-            by_relative, by_name = _build_recursive_index(images_root)
-        self.image_paths = [
-            _resolve_image_path(images_root, ref, by_relative, by_name) for ref in refs
-        ]
+        self.image_paths = resolve_dataset_image_paths(None, images_root, refs=refs)
         if class_labels is None:
             classes = sorted(df["label"].unique())
             self.class_to_idx = {c: i for i, c in enumerate(classes)}
