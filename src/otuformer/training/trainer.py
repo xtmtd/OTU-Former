@@ -3161,6 +3161,30 @@ def _resolve_common_recipe(
         legacy_ratio = saved.saved_args.get("teacher_temp_warmup_ratio")
         if legacy_ratio is not None:
             recorded["teacher_temp_warmup_ratio"] = legacy_ratio
+    # A build between ``0.12.0`` and this one read only one location and could
+    # write ``config`` from the assumed default while ``args`` kept the resumed
+    # value. Two resolvers would then train at one ratio and record the other, so
+    # the contradiction is refused instead of being carried forward again.
+    if saved is not None:
+        recorded_config_ratio = saved.config.get("teacher_temp_warmup_ratio")
+        recorded_args_ratio = saved.saved_args.get("teacher_temp_warmup_ratio")
+        if (
+            recorded_config_ratio is not None
+            and recorded_args_ratio is not None
+            and not math.isclose(
+                float(recorded_config_ratio),
+                float(recorded_args_ratio),
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
+        ):
+            raise ValueError(
+                "Cannot resume: the checkpoint records contradictory teacher "
+                f"temperatures (config.teacher_temp_warmup_ratio="
+                f"{recorded_config_ratio!r}, args.teacher_temp_warmup_ratio="
+                f"{recorded_args_ratio!r}). One of them did not drive training, "
+                "so neither can be trusted; start a new run."
+            )
     # Presence is decided by the key, never by whether its value is null: a
     # recorded-but-null field is damaged metadata, not a historical payload.
     missing = [name for name in _COMMON_RECIPE_OPTIONS if name not in recorded]
@@ -4171,7 +4195,11 @@ def resolve_pretrain_ssl_config(
     # non-finite student temperature reaches a division, not a validation error.
     requested_student_temp = getattr(args, "student_temp", None)
     if requested_student_temp is not None:
-        student_temp_value = _requested_float(requested_student_temp, "--student-temp")
+        student_temp_value = _admissible_temperature(
+            _requested_float(requested_student_temp, "--student-temp"),
+            int(getattr(args, "batch_size", 2) or 2),
+            "--student-temp",
+        )
         if student_temp_value <= 0.0:
             raise ValueError(
                 "--student-temp must be finite and greater than 0, got "
@@ -5656,6 +5684,12 @@ def run_pretrain(
                 for parameter in dino_objective.trainable_parameters():
                     parameter.grad = None
             grad_norm = _compute_grad_norm_parameters(trainable_params)
+            if not math.isfinite(grad_norm):
+                raise ValueError(
+                    "The pretraining gradient norm became non-finite at iteration "
+                    f"{global_step}; refusing to update the parameters. A finite "
+                    "loss is not enough: the backward pass can still overflow."
+                )
             nn.utils.clip_grad_norm_(trainable_params, max_norm=3.0)
             optimizer.step()
 

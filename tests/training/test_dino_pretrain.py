@@ -705,3 +705,14 @@ def test_dino_ce_only_backward_reaches_backbone_projector_and_prototypes(
     assert all(g is None for g in observed["teacher_encoder"])
     assert all(g is None for g in observed["teacher_prototype"])
     assert all(g is None for g in observed["fixed_scales"])
+
+
+def test_non_finite_gradient_norm_stops_the_step(tmp_path, monkeypatch):
+    """A finite loss is not enough: the backward pass can still overflow."""
+    _images(tmp_path)
+    monkeypatch.setattr(
+        trainer, "_compute_grad_norm_parameters", lambda params: float("inf")
+    )
+    with pytest.raises(ValueError, match="gradient norm became non-finite"):
+        trainer.run_pretrain(_args(tmp_path))
+    assert not (tmp_path / "out" / "SSL_latest.pth").exists()

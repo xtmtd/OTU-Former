@@ -1483,13 +1483,37 @@ def test_warmup_ratio_recorded_in_args_stays_authoritative():
 @pytest.mark.parametrize("method", ["relational", "dino"])
 def test_non_positive_student_temperature_is_rejected(method):
     """Both methods divide by the student temperature; refuse it before setup."""
-    for value in (0.0, -0.5, float("inf"), float("nan")):
+    for value in (0.0, -0.5, float("inf"), float("nan"), 1e-38, 1e-50):
         with pytest.raises(ValueError, match="student-temp"):
             resolve_pretrain_ssl_config(
                 ssl_args(
                     ssl_method=method,
                     ssl_method_explicit=True,
                     student_temp=value,
+                    # The float32 reduction bound depends on the batch size; 1e-38
+                    # is only unusable at the batch this project trains with.
+                    batch_size=32,
                 ),
                 None,
             )
+
+
+def test_contradictory_warmup_record_is_rejected():
+    """A build between 0.12.0 and the fix could record two different ratios.
+
+    Serving either one would train at one ratio and record the other, so the
+    contradiction is refused before any output is touched.
+    """
+    checkpoint = _recipe_checkpoint()
+    checkpoint["config"]["teacher_temp_warmup_ratio"] = 0.7
+    checkpoint["args"]["teacher_temp_warmup_ratio"] = 0.3
+
+    for request in (
+        ssl_args(resume="ckpt.pth"),
+        ssl_args(resume="ckpt.pth", teacher_temp_warmup_ratio=0.3,
+                 teacher_temp_warmup_ratio_explicit=True),
+        ssl_args(resume="ckpt.pth", teacher_temp_warmup_ratio=0.7,
+                 teacher_temp_warmup_ratio_explicit=True),
+    ):
+        with pytest.raises(ValueError, match="contradictory teacher"):
+            resolve_pretrain_ssl_config(request, checkpoint)
