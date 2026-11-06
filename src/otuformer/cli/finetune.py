@@ -780,17 +780,33 @@ def finetune(
         raise typer.BadParameter(str(exc)) from exc
     requested_extract_size = _parse_size(extract_size, stage="--extract-size")
     try:
+        protected = [
+            train_data,
+            input_images_dir,
+            visualize_data,
+            pseudo_label_from,
+            resume,
+            # The initialization file actually used, including a pseudo round's
+            # original SSL checkpoint, not only the options typed by hand.
+            source_path,
+        ]
+        if overwrite:
+            # An absolute CSV reference or a symlinked image can put the pixels
+            # this run reads inside the directory about to be cleared, so the
+            # files themselves are protected, not only their root.
+            from otuformer.training.dataset import resolve_dataset_image_paths
+
+            # A missing CSV is reported by the run itself; the guard must not
+            # turn it into a different error before the manifest is read.
+            if train_data is None or Path(train_data).is_file():
+                protected.extend(
+                    resolve_dataset_image_paths(train_data, input_images_dir)
+                )
         prepare_output_dir(
             out_dir,
             overwrite=overwrite,
             allow_existing=bool(resume),
-            protected_paths=(
-                train_data,
-                input_images_dir,
-                visualize_data,
-                pseudo_label_from,
-                resume,
-            ),
+            protected_paths=protected,
         )
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc

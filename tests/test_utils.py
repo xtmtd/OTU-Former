@@ -184,3 +184,17 @@ def test_prepare_output_dir_overwrite_allows_an_unrelated_target(tmp_path):
         prepare_output_dir(out_dir, overwrite=True, protected_paths=(images,))
         == out_dir
     )
+
+
+def test_prepare_output_dir_refuses_a_symlinked_input(tmp_path):
+    """A symlink inside the output directory hides where the pixels really live."""
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    real = out_dir / "real.jpg"
+    real.write_text("pixels", encoding="utf-8")
+    link = tmp_path / "link.jpg"
+    link.symlink_to(real)
+
+    with pytest.raises(ValueError, match="holds the input"):
+        prepare_output_dir(out_dir, overwrite=True, protected_paths=(link,))
+    assert real.exists()

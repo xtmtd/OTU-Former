@@ -1144,3 +1144,36 @@ def test_weak_teacher_dataset_config_authority(tmp_path):
 
     with pytest.raises(ValueError, match="include_weak_teacher_views"):
         MultiCropDataset(**kwargs, weak_teacher_augmentation_config=weak)
+
+
+def test_resolve_dataset_image_paths_matches_the_loader(tmp_path):
+    """The cleanup guard must see the paths the dataset actually opens.
+
+    An absolute CSV reference and a symlinked image both escape the images root,
+    so protecting the root alone leaves the pixels exposed to --overwrite.
+    """
+    from otuformer.training.dataset import resolve_dataset_image_paths
+
+    images = tmp_path / "images"
+    images.mkdir()
+    outside = tmp_path / "out"
+    outside.mkdir()
+    absolute = Image.new("RGB", (8, 8), (1, 2, 3))
+    absolute.save(outside / "absolute.jpg")
+    real = Image.new("RGB", (8, 8), (4, 5, 6))
+    real.save(outside / "real.jpg")
+    (images / "link.jpg").symlink_to(outside / "real.jpg")
+    Image.new("RGB", (8, 8), (7, 8, 9)).save(images / "plain.jpg")
+
+    csv_path = tmp_path / "figs.csv"
+    pd.DataFrame(
+        {"image": [str(outside / "absolute.jpg"), "link.jpg", "plain.jpg"]}
+    ).to_csv(csv_path, index=False)
+
+    resolved = resolve_dataset_image_paths(csv_path, images)
+    dataset = MultiCropDataset(csv_path=csv_path, images_dir=images)
+    assert resolved == dataset.image_paths
+    assert resolved[0].is_absolute()
+    # The symlink is reported where it lives; resolving it reaches the target.
+    assert resolved[1] == images / "link.jpg"
+    assert resolved[1].resolve() == (outside / "real.jpg").resolve()
