@@ -921,7 +921,12 @@ def cluster(
     )
     save_distances_enabled = _parse_bool_option("save-distances", save_distances)
 
-    prepare_output_dir(out_dir, overwrite=overwrite)
+    try:
+        prepare_output_dir(
+            out_dir, overwrite=overwrite, protected_paths=[embeddings, label_csv],
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
     tee = TeeLogger(out_dir / "logs" / "cluster.log")
     original_stderr = sys.stderr
     sys.stdout = tee

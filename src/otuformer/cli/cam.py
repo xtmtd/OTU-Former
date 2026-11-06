@@ -189,7 +189,14 @@ def cam(
     from otuformer.utils.logging import TeeLogger
     from otuformer.utils.io import prepare_output_dir
 
-    prepare_output_dir(out_dir, overwrite=overwrite)
+    try:
+        from otuformer.vision.cam import selected_image_paths
+
+        protected = [checkpoint, images_dir, label_csv]
+        protected.extend(selected_image_paths(images_dir, label_csv, max_images))
+        prepare_output_dir(out_dir, overwrite=overwrite, protected_paths=protected)
+    except (ValueError, OSError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
     tee = TeeLogger(out_dir / "logs" / "cam.log")
     original_stderr = sys.stderr
     sys.stdout = tee

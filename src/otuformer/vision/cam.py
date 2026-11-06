@@ -421,6 +421,21 @@ def collect_image_rows(images_dir: Path, label_csv: Optional[Path]) -> pd.DataFr
     return pd.DataFrame({"image": images, "label": [""] * len(images)})
 
 
+def selected_image_paths(
+    images_dir: Path, label_csv: Optional[Path], max_images: Optional[int] = None
+) -> list[Path]:
+    """Keep cleanup protection and CAM image selection identical."""
+    rows = collect_image_rows(images_dir, label_csv)
+    if max_images is not None:
+        rows = rows.head(max(0, max_images))
+    image_map = {}
+    if label_csv is not None:
+        for path in images_dir.rglob("*"):
+            if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS:
+                image_map[path.name] = path
+    return [image_map.get(ref, images_dir / ref) for ref in rows["image"]]
+
+
 def _resolve_device(device: str) -> torch.device:
     return resolve_device(device)
 
@@ -575,22 +590,10 @@ def run_cam(
     if max_images is not None:
         rows_df = rows_df.head(max_images)
 
-    if label_csv is not None:
-        image_map: Dict[str, Path] = {}
-        for p in images_dir.rglob("*"):
-            if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS:
-                image_map[p.name] = p
-    else:
-        image_map = {}
-
+    paths = selected_image_paths(images_dir, label_csv, max_images)
     results = []
-    for idx, row in rows_df.iterrows():
-        if max_images is not None and idx >= max_images:
-            break
-        if image_map and row["image"] in image_map:
-            img_path = image_map[row["image"]].resolve()
-        else:
-            img_path = (images_dir / row["image"]).resolve()
+    for (_, row), selected_path in zip(rows_df.iterrows(), paths):
+        img_path = selected_path.resolve()
         if not img_path.exists():
             logging.error("Image not found: %s", img_path)
             continue

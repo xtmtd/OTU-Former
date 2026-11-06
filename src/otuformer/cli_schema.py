@@ -938,6 +938,16 @@ def check_output_safety(
     not-yet-created directories. Never creates, deletes, or writes anything.
     """
     target = _resolve_for_safety(Path(out_dir))
+    if overwrite:
+        from otuformer.utils.paths import input_dependency_positions
+
+        for protected in protected_paths:
+            for position in input_dependency_positions(Path(protected)):
+                if _is_within(position, target):
+                    raise ValueError(
+                        f"output directory {target} contains protected input "
+                        f"dependency {position}, which {protected} is reached through"
+                    )
     permitted = [
         form for path in allow_inside for form in _safety_forms(Path(path))
     ]

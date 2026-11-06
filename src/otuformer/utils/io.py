@@ -10,6 +10,10 @@ from typing import Any, Sequence
 
 import pandas as pd
 
+from otuformer.utils.paths import input_dependency_positions
+
+from otuformer.utils.paths import input_dependency_positions
+
 
 def prepare_output_dir(
     out_dir: Path,
@@ -43,8 +47,7 @@ def _refuse_clearing_inputs(out_dir: Path, protected_paths: Sequence[object]) ->
     for value in protected_paths:
         if not value:
             continue
-        path = Path(str(value))
-        for candidate in {path, path.expanduser().resolve()}:
+        for candidate in input_dependency_positions(Path(str(value))):
             for target in targets:
                 if candidate == target or target in candidate.parents:
                     raise ValueError(

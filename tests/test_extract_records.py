@@ -134,7 +134,7 @@ def test_records_extraction_never_reparses_csv(tmp_path, monkeypatch):
     monkeypatch.setattr(extractor, "LabelCSVImageDataset", forbidden)
     monkeypatch.setattr(extractor, "ImageFolderDataset", forbidden)
     monkeypatch.setattr(extractor, "detect_batch_mode", forbidden)
-    monkeypatch.setattr(extractor, "_build_recursive_index", forbidden)
+    monkeypatch.setattr(extractor, "resolve_dataset_image_paths", forbidden)
 
     frame = extract_embeddings(
         checkpoint, images, device="cpu", records=bundle, num_workers=0

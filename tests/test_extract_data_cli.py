@@ -1011,7 +1011,7 @@ def test_sparse_payload_outside_the_graph_directory_fails_before_overwrite(tmp_p
     # A location outside the graph directory is refused here as well as by the
     # runtime, before anything is cleared, so the payload survives.
     assert result.exit_code != 0
-    assert "outside the graph directory" in str(result.exception)
+    assert "outside the graph directory" in cli_message(result)
     assert data.exists()
 
 
@@ -1613,7 +1613,7 @@ def test_legacy_onnx_external_weights_inside_out_dir_are_protected(tmp_path):
     # onnxruntime rejects this location too ("escapes model directory"), so the run
     # must refuse before clearing; the payload survives either way.
     assert result.exit_code != 0
-    assert "outside the graph directory" in str(result.exception)
+    assert "outside the graph directory" in cli_message(result)
     assert payload.read_bytes() == before
 
 

@@ -135,7 +135,12 @@ def diversity(
     )
     from otuformer.utils.io import prepare_output_dir, read_csv
 
-    prepare_output_dir(out_dir, overwrite=overwrite)
+    try:
+        prepare_output_dir(
+            out_dir, overwrite=overwrite, protected_paths=[assignments, otu_table_csv, embeddings if phylo else None, tree if phylo and embeddings is None else None],
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
     from otuformer.utils.logging import TeeLogger
 
     tee = TeeLogger(out_dir / "logs" / "diversity.log")

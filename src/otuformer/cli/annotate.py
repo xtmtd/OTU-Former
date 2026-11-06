@@ -113,7 +113,23 @@ def annotate(
     from otuformer.delineation.tree import build_upgma
     from otuformer.utils.io import prepare_output_dir, read_csv, write_csv, write_json
 
-    prepare_output_dir(out_dir, overwrite=overwrite)
+    try:
+        protected = [raw_assignments, corrections, embeddings]
+        # Context inference reads this log even when no embeddings are supplied.
+        cluster_run_dir = raw_assignments.parent.parent.parent.parent
+        protected.append(cluster_run_dir / "logs" / "cluster.log")
+        if embeddings is not None:
+            context = infer_cluster_context(raw_assignments)
+            cluster_run_dir = Path(context["cluster_run_dir"])
+            protected.extend(Path(context["tables_dir"]).glob("partition_*_assignments.csv"))
+            distance_matrix = cluster_run_dir / "distance_statistics" / "distance_matrix.csv"
+            if distance_matrix.exists():
+                protected.append(distance_matrix)
+            upgma_dir = cluster_run_dir / "UPGMA"
+            protected.extend(upgma_dir.glob("UPGMA_*_bootstrap.nwk"))
+        prepare_output_dir(out_dir, overwrite=overwrite, protected_paths=protected)
+    except (ValueError, OSError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
     from otuformer.utils.logging import TeeLogger
 
     tee = TeeLogger(out_dir / "logs" / "annotate.log")

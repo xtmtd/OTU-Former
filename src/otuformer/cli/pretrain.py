@@ -625,31 +625,22 @@ def pretrain(
     except (ValueError, KeyError, OSError, RuntimeError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     try:
-        protected = [
-            train_data,
-            input_images_dir,
-            visualize_data,
-            resume,
-        ]
-        if overwrite:
-            # An absolute CSV reference or a symlinked image can put the pixels
-            # this run reads inside the directory about to be cleared, so the
-            # files themselves are protected, not only their root.
-            from otuformer.training.dataset import resolve_dataset_image_paths
+        from otuformer.training.dataset import resolve_dataset_image_paths
 
-            # A missing CSV is reported by the run itself; the guard must not
-            # turn it into a different error before the manifest is read.
-            if train_data is None or Path(train_data).is_file():
-                protected.extend(
-                    resolve_dataset_image_paths(train_data, input_images_dir)
-                )
+        protected = [input_images_dir, train_data, resume]
+        if overwrite and out_dir.exists() and (train_data is None or train_data.exists()):
+            protected.extend(resolve_dataset_image_paths(train_data, input_images_dir))
+        if (
+            overwrite and out_dir.exists() and not disable_embedding_metrics
+            and visualize_data is not None and visualize_data.exists()
+        ):
+            protected.append(visualize_data)
+            protected.extend(resolve_dataset_image_paths(visualize_data, input_images_dir))
         prepare_output_dir(
-            out_dir,
-            overwrite=overwrite,
-            allow_existing=bool(resume),
+            out_dir, overwrite=overwrite, allow_existing=bool(resume),
             protected_paths=protected,
         )
-    except ValueError as exc:
+    except (ValueError, OSError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     tee = TeeLogger(
         out_dir / "logs" / "pretrain.log",

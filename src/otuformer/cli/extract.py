@@ -300,7 +300,7 @@ def extract(
         input_identities,
         verify_inputs_unchanged,
     )
-    from otuformer.embedding.extractor import extract_embeddings
+    from otuformer.embedding.extractor import extract_embeddings, extraction_image_paths
     from otuformer.utils.io import prepare_output_dir, write_csv
 
     # --overwrite must never remove the label CSV this run reads, nor clear the
@@ -314,7 +314,21 @@ def extract(
     # cleared, with the same helpers the shared path uses, so a checkpoint, graph,
     # external tensor or reusable pooling file inside the output directory is
     # refused instead of deleted.
+    pool_stem = checkpoint.stem if checkpoint is not None else "model"
+    attention_pooling_checkpoint = (
+        out_dir / "checkpoints" / f"{pool_stem}.{attention_pooling_type}_pooling.pth"
+    )
     model_inputs: list[Path] = []
+    try:
+        requested_size = _parse_size(extract_size, stage="--extract-size")
+        _preflight_extract_model({
+            "checkpoint": checkpoint, "onnx_path": onnx_path,
+            "token_mode": token_mode, "attention_pooling_type": attention_pooling_type,
+            "extract_size": requested_size,
+        })
+        selected_images = extraction_image_paths(input_images_dir, label_csv)
+    except (ValueError, OSError) as error:
+        raise typer.BadParameter(str(error)) from None
     if checkpoint is not None:
         model_inputs.append(Path(checkpoint))
     if onnx_path is not None:
@@ -333,6 +347,7 @@ def extract(
         input_images_dir,
         *([label_csv] if label_csv is not None else []),
         *model_inputs,
+        *selected_images,
     ]
     identities = input_identities(written_inputs)
     # The written entries are checked, not only their targets, so an input reached
@@ -355,8 +370,8 @@ def extract(
             f"--out-dir {out_target} would clear the image root {images_root}; "
             "choose a directory outside it"
         )
-    prepare_output_dir(out_dir, overwrite=overwrite)
     try:
+        prepare_output_dir(out_dir, overwrite=overwrite, protected_paths=written_inputs)
         verify_inputs_unchanged(identities)
     except ValueError as error:
         raise typer.BadParameter(str(error)) from None
@@ -395,16 +410,6 @@ def extract(
             seed=seed,
             onnx_path=str(onnx_path) if onnx_path is not None else "",
         )
-        if checkpoint is not None:
-            attention_pooling_checkpoint = (
-                out_dir
-                / "checkpoints"
-                / f"{checkpoint.stem}.{attention_pooling_type}_pooling.pth"
-            )
-        else:
-            attention_pooling_checkpoint = (
-                out_dir / "checkpoints" / f"model.{attention_pooling_type}_pooling.pth"
-            )
         params["attention_pooling_checkpoint"] = str(attention_pooling_checkpoint)
         cli_command = format_user_command(ctx, params, "extract")
         print(f"Command: {cli_command}")
@@ -420,7 +425,7 @@ def extract(
             checkpoint_path=checkpoint,
             images_dir=input_images_dir,
             model_name=model_name,
-            extract_size=_parse_size(extract_size, stage="--extract-size"),
+            extract_size=requested_size,
             batch_size=batch_size,
             device=device,
             num_workers=num_workers,
@@ -795,6 +800,34 @@ def _onnx_input_paths(onnx_path: Path) -> list[Path]:
     return [path for path in paths if path.exists()]
 
 
+def _preflight_extract_model(settings: dict, *, check_size: bool = True) -> None:
+    """Reject deterministic model-source errors before any output mutation."""
+    from otuformer.constants import ATTENTION_POOLING_TYPES, TOKEN_MODES
+
+    if settings["token_mode"] not in TOKEN_MODES:
+        raise ValueError(f"Unsupported --token-mode: {settings['token_mode']}")
+    if settings["attention_pooling_type"] not in ATTENTION_POOLING_TYPES:
+        raise ValueError("Unsupported --attention-pooling-type")
+    graph = settings.get("onnx_path")
+    if graph is not None:
+        from otuformer.utils.size import resolve_onnx_input_size
+
+        if settings["token_mode"] != "cls":
+            raise ValueError("ONNX inference only supports token-mode 'cls'")
+        _onnx_input_paths(Path(graph))
+        if check_size:
+            size = resolve_onnx_input_size(Path(graph))
+            requested = settings.get("extract_size")
+            if requested is not None and requested != size:
+                raise ValueError("--extract-size does not match ONNX input size")
+    else:
+        checkpoint = settings.get("checkpoint")
+        if checkpoint is None:
+            raise ValueError("--checkpoint is required when --onnx-path is not provided.")
+        if not Path(checkpoint).is_file():
+            raise FileNotFoundError(f"Checkpoint not found: {checkpoint}")
+
+
 def _run_new_data_path(*, settings: dict, inputs: dict[str, Path], params: dict) -> None:
     """Orchestrate the shared data path: safety, validation, extraction, publication."""
 
@@ -826,6 +859,23 @@ def _run_new_data_path(*, settings: dict, inputs: dict[str, Path], params: dict)
         "strict" if (settings.get("manifest") or settings.get("label_csv")) else "none"
     )
 
+    try:
+        _preflight_extract_model(settings, check_size=False)
+        bundle = read_dataset(
+            images_dir,
+            manifest=inputs.get("manifest"),
+            coco_instances=inputs.get("coco_instances"),
+            coco_keypoints=inputs.get("coco_keypoints"),
+            coco_panoptic=inputs.get("coco_panoptic"),
+            panoptic_masks_dir=inputs.get("panoptic_masks_dir"),
+        )
+        # Fresh invalid runs retain their diagnostic records; an overwrite must
+        # refuse before replacing any prior result with those diagnostics.
+        if settings["overwrite"] and out_dir.exists():
+            bundle.raise_for_errors()
+    except (ValueError, OSError) as error:
+        raise typer.BadParameter(str(error)) from None
+
     # Every file this run reads is protected before anything can be cleared,
     # including inputs derived from an explicitly passed path.
     protected = [*default_protected_paths(), images_dir, *inputs.values()]
@@ -837,14 +887,31 @@ def _run_new_data_path(*, settings: dict, inputs: dict[str, Path], params: dict)
         protected.extend(_onnx_input_paths(Path(settings["onnx_path"])))
     if settings["token_mode"] == "attention-pool":
         protected.extend(_pool_candidate_paths(out_dir, settings))
+    for image in bundle.records:
+        protected.extend([images_dir / image.image_key, image.access_path, image.image_file.path])
+        if image.selector_reference is not None:
+            protected.append(images_dir / Path(image.selector_reference).expanduser())
+        for reference in image.coco_images:
+            source = bundle.sources[reference.source_id]
+            declared = source.images_by_id[reference.image_id]
+            protected.append(images_dir / Path(declared["file_name"]).expanduser())
+            mask = source.mask_files.get(reference.image_id)
+            if mask is not None:
+                protected.append(mask.path)
+                for annotation in source.annotations_by_image.get(reference.image_id, ()):
+                    if "file_name" in annotation:
+                        protected.append(inputs["panoptic_masks_dir"] / Path(annotation["file_name"]).expanduser())
     # Snapshot the inputs before the check, so the baseline is the state the check
     # judged rather than whatever it looks like afterwards.
     identities = input_identities(protected)
     try:
         conditions = check_output_safety(
-            out_dir, protected_paths=protected, overwrite=settings["overwrite"]
+            out_dir,
+            protected_paths=protected,
+            overwrite=settings["overwrite"],
         )
-    except ValueError as error:
+        _preflight_extract_model(settings)
+    except (ValueError, OSError) as error:
         raise typer.BadParameter(str(error)) from None
     for condition in conditions:
         print(f"[Info] {condition}")
@@ -852,8 +919,8 @@ def _run_new_data_path(*, settings: dict, inputs: dict[str, Path], params: dict)
     # The check above is decided before anything is cleared. Whatever a cleanup did
     # to those paths -- including a directory entry swapped by another process in
     # between -- has to be visible before the run continues.
-    prepare_output_dir(out_dir, overwrite=settings["overwrite"])
     try:
+        prepare_output_dir(out_dir, overwrite=settings["overwrite"], protected_paths=protected)
         verify_inputs_unchanged(identities)
     except ValueError as error:
         raise typer.BadParameter(str(error)) from None
@@ -895,14 +962,6 @@ def _run_new_data_path(*, settings: dict, inputs: dict[str, Path], params: dict)
         write_json_atomic(record(empty_bundle, "running"), run_path)
         created.append(run_path)
 
-        bundle = read_dataset(
-            images_dir,
-            manifest=inputs.get("manifest"),
-            coco_instances=inputs.get("coco_instances"),
-            coco_keypoints=inputs.get("coco_keypoints"),
-            coco_panoptic=inputs.get("coco_panoptic"),
-            panoptic_masks_dir=inputs.get("panoptic_masks_dir"),
-        )
         state["bundle"] = bundle
         validation_path = out_dir / "data_validation.json"
         write_json_atomic(build_validation_record(bundle), validation_path)
