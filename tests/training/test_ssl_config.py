@@ -1517,3 +1517,44 @@ def test_contradictory_warmup_record_is_rejected():
     ):
         with pytest.raises(ValueError, match="contradictory teacher"):
             resolve_pretrain_ssl_config(request, checkpoint)
+
+
+def test_near_equal_warmup_records_are_still_contradictory():
+    """A float difference too small to matter is not a schedule argument.
+
+    The ramp length is ``int(total_iters * ratio)``, so 0.3 and
+    0.29999999999999993 give 3 and 2 warmup steps out of 10. Refusing to migrate
+    means refusing the pair, not rounding it into agreement.
+    """
+    from otuformer.training.trainer import _build_teacher_temp_schedule
+
+    near = 0.29999999999999993
+    assert int(10 * near) != int(10 * 0.3)
+    assert not np.array_equal(
+        _build_teacher_temp_schedule(10, 0.04, 0.07, near),
+        _build_teacher_temp_schedule(10, 0.04, 0.07, 0.3),
+    )
+
+    checkpoint = _recipe_checkpoint()
+    checkpoint["config"]["teacher_temp_warmup_ratio"] = 0.3
+    checkpoint["args"]["teacher_temp_warmup_ratio"] = near
+    with pytest.raises(ValueError, match="contradictory teacher"):
+        resolve_pretrain_ssl_config(ssl_args(resume="ckpt.pth"), checkpoint)
+
+
+def test_historical_ratio_match_is_exact():
+    """An unrecorded ratio is assumed as 0.7; a near miss is not that value."""
+    checkpoint = _recipe_checkpoint()
+    checkpoint["config"].pop("teacher_temp_warmup_ratio")
+    checkpoint["config"].pop("norm_bias_weight_decay")
+    checkpoint["args"].pop("teacher_temp_warmup_ratio", None)
+
+    with pytest.raises(ValueError, match="Explicit nondefault"):
+        resolve_pretrain_ssl_config(
+            ssl_args(
+                resume="ckpt.pth",
+                teacher_temp_warmup_ratio=0.7000000000000001,
+                teacher_temp_warmup_ratio_explicit=True,
+            ),
+            checkpoint,
+        )

@@ -12,8 +12,6 @@ import pandas as pd
 
 from otuformer.utils.paths import input_dependency_positions
 
-from otuformer.utils.paths import input_dependency_positions
-
 
 def prepare_output_dir(
     out_dir: Path,
@@ -26,8 +24,8 @@ def prepare_output_dir(
 
     ``protected_paths`` are this run's inputs. Clearing a directory that holds
     one of them would delete the data the run is about to read, so that overlap
-    is refused before ``rmtree`` runs. Symlinks are compared resolved, because
-    ``rmtree`` follows the directory it is given.
+    is refused before ``rmtree`` runs. Every symlink hop is checked, including
+    directory entries inside a link target.
     """
     if out_dir.exists() and overwrite:
         _refuse_clearing_inputs(out_dir, protected_paths)

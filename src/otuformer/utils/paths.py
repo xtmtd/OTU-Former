@@ -16,7 +16,11 @@ _MAX_LINK_HOPS = 40
 
 
 def input_dependency_positions(path: Path) -> list[Path]:
-    """Entries needed to read an input, following links before applying ``..``."""
+    """Directory entries needed to read an input, including every symlink hop.
+
+    Expand link targets before processing later components: ``link/..`` means
+    the parent of the link target, not the parent of the link entry.
+    """
     entry = Path(path).expanduser()
     if not entry.is_absolute():
         entry = Path.cwd() / entry

@@ -1756,6 +1756,53 @@ def test_link_chain_outside_the_output_directory_is_allowed(tmp_path) -> None:
     )
 
 
+def test_link_chain_through_the_output_directory_is_refused(tmp_path) -> None:
+    """A middle hop inside the output directory is what cleanup deletes.
+
+    Both ends of ``entry -> out/middle -> pixels/real`` are outside the output
+    directory; only the walk sees the hop that clearing it would remove.
+    """
+    out = tmp_path / "out"
+    out.mkdir()
+    pixels = tmp_path / "pixels"
+    pixels.mkdir()
+    real = pixels / "real.png"
+    real.write_text("pixels", encoding="utf-8")
+    middle = out / "middle.png"
+    entry = tmp_path / "entry.png"
+    try:
+        middle.symlink_to(real)
+        entry.symlink_to(middle)
+    except (OSError, NotImplementedError):  # pragma: no cover - platform dependent
+        pytest.skip("symlinks are not available on this platform")
+
+    with pytest.raises(ValueError, match="is reached through"):
+        cli_schema().check_output_safety(
+            out, protected_paths=[entry], overwrite=True
+        )
+    assert middle.exists()
+
+
+def test_symlinked_directory_in_the_chain_is_refused(tmp_path) -> None:
+    """A symlinked directory on the way is a dependency, not only the final link."""
+    out = tmp_path / "out"
+    out.mkdir()
+    pixels = tmp_path / "pixels"
+    pixels.mkdir()
+    (pixels / "real.png").write_text("pixels", encoding="utf-8")
+    entry = tmp_path / "entry.png"
+    try:
+        (out / "stage").symlink_to(pixels)
+        entry.symlink_to(out / "stage" / "real.png")
+    except (OSError, NotImplementedError):  # pragma: no cover - platform dependent
+        pytest.skip("symlinks are not available on this platform")
+
+    with pytest.raises(ValueError, match="is reached through"):
+        cli_schema().check_output_safety(
+            out, protected_paths=[entry], overwrite=True
+        )
+
+
 def test_unresolvable_link_chain_fails_closed(tmp_path) -> None:
     out = tmp_path / "out"
     out.mkdir()

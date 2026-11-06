@@ -716,3 +716,37 @@ def test_non_finite_gradient_norm_stops_the_step(tmp_path, monkeypatch):
     with pytest.raises(ValueError, match="gradient norm became non-finite"):
         trainer.run_pretrain(_args(tmp_path))
     assert not (tmp_path / "out" / "SSL_latest.pth").exists()
+
+
+def test_clip_reduction_overflow_stops_the_step(tmp_path, monkeypatch):
+    """The check and the clip reduce differently; the clip must refuse itself.
+
+    Per-parameter norms squared in Python float64 stay finite at 1e19, while the
+    float32 accumulation inside ``clip_grad_norm_`` overflows, zeroes every
+    gradient and would otherwise still let the optimizer and the teacher advance.
+    """
+    _images(tmp_path)
+    real_clip = torch.nn.utils.clip_grad_norm_
+    steps = {"count": 0}
+    real_step = torch.optim.AdamW.step
+
+    def step_spy(self, *args, **kwargs):
+        steps["count"] += 1
+        return real_step(self, *args, **kwargs)
+
+    def clip_spy(params, max_norm, **kwargs):
+        # The guard above must not already have refused; then the real reduction
+        # is the one that overflows.
+        for parameter in params:
+            if parameter.grad is not None:
+                parameter.grad.fill_(1e19)
+        return real_clip(params, max_norm, **kwargs)
+
+    monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", clip_spy)
+    monkeypatch.setattr(torch.optim.AdamW, "step", step_spy)
+
+    with pytest.raises(ValueError, match="gradient norm became non-finite"):
+        trainer.run_pretrain(_args(tmp_path, max_epochs=1))
+    assert steps["count"] == 0
+    assert not (tmp_path / "out" / "SSL_latest.pth").exists()
+    assert not (tmp_path / "out" / "SSL_epoch_0001.pth").exists()

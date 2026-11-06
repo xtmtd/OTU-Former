@@ -2217,6 +2217,12 @@ def _compute_grad_norm(model: nn.Module) -> float:
 
 
 def _compute_grad_norm_parameters(params) -> float:
+    """A finite check, not the reduction ``clip_grad_norm_`` performs.
+
+    Per-parameter norms squared in Python floats stay finite where the float32
+    accumulation inside the clipping call overflows, so a finite value here does
+    not license the clip; the clip refuses its own non-finite total.
+    """
     total = 0.0
     for p in params:
         if p.grad is not None:
@@ -3171,12 +3177,10 @@ def _resolve_common_recipe(
         if (
             recorded_config_ratio is not None
             and recorded_args_ratio is not None
-            and not math.isclose(
-                float(recorded_config_ratio),
-                float(recorded_args_ratio),
-                rel_tol=0.0,
-                abs_tol=1e-12,
-            )
+            # Exact, not approximate: the schedule is ``int(total * ratio)``, so
+            # 0.3 and 0.29999999999999993 can be different numbers of warmup
+            # steps. Two records that differ at all cannot both be trusted.
+            and float(recorded_config_ratio) != float(recorded_args_ratio)
         ):
             raise ValueError(
                 "Cannot resume: the checkpoint records contradictory teacher "
@@ -3211,8 +3215,8 @@ def _resolve_common_recipe(
                 args, "teacher_temp_warmup_ratio", RECIPE_TEACHER_TEMP_WARMUP_RATIO
             )
         )
-        if _ssl_explicit(args, "teacher_temp_warmup_ratio") and not math.isclose(
-            ratio, RECIPE_TEACHER_TEMP_WARMUP_RATIO, rel_tol=0.0, abs_tol=1e-12
+        if _ssl_explicit(args, "teacher_temp_warmup_ratio") and (
+            ratio != RECIPE_TEACHER_TEMP_WARMUP_RATIO
         ):
             raise ValueError(
                 "The checkpoint does not record teacher_temp_warmup_ratio; "
@@ -5690,7 +5694,20 @@ def run_pretrain(
                     f"{global_step}; refusing to update the parameters. A finite "
                     "loss is not enough: the backward pass can still overflow."
                 )
-            nn.utils.clip_grad_norm_(trainable_params, max_norm=3.0)
+            # ``error_if_nonfinite`` repeats the reduction inside the clip, which
+            # is not the reduction checked above: a total that overflows there
+            # would otherwise zero every gradient and still advance the step.
+            try:
+                nn.utils.clip_grad_norm_(
+                    trainable_params, max_norm=3.0, error_if_nonfinite=True
+                )
+            except RuntimeError as exc:
+                raise ValueError(
+                    "The pretraining gradient norm became non-finite at iteration "
+                    f"{global_step}; refusing to update the parameters. The "
+                    "clipping reduction can overflow where the per-parameter "
+                    "check does not."
+                ) from exc
             optimizer.step()
 
             m = float(momentum_schedule[iter_idx])

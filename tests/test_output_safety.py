@@ -137,6 +137,55 @@ def test_extract_missing_model_preserves_old_output(tmp_path):
     assert keep.read_text() == "keep"
 
 
+@pytest.mark.parametrize("error_type", [None, FileExistsError, PermissionError])
+@pytest.mark.parametrize("command,option,name", [
+    ("cluster", "--embeddings", "embeddings.csv"),
+    ("diversity", "--assignments", "assignments.csv"),
+    ("export", "--checkpoint", "source.pth"),
+])
+def test_downstream_cleanup_oserror_is_a_cli_error(
+    tmp_path, checkpoint, monkeypatch, command, option, name, error_type
+):
+    from otuformer.utils import io
+
+    source = tmp_path / name
+    if command != "export":
+        source.write_text("image,cluster,sample\na.png,A,S1\n")
+    assert source.is_file()
+    original_input = source.read_bytes()
+    out = tmp_path / "out"
+    out.mkdir()
+    sentinel = out / "keep.txt"
+    sentinel.write_text("keep")
+    calls = []
+    real_prepare = io.prepare_output_dir
+
+    def observed_prepare(out_dir, **kwargs):
+        calls.append(out_dir)
+        if error_type is not None:
+            raise error_type("cleanup refused by filesystem")
+        return real_prepare(out_dir, **kwargs)
+
+    monkeypatch.setattr(io, "prepare_output_dir", observed_prepare)
+    argv = [command, option, str(source), "--out-dir", str(out)]
+    if error_type is not None:
+        argv.append("--overwrite")
+    result = CliRunner().invoke(app, argv)
+    assert calls == [out]
+    assert result.exit_code == 2, (result.output, repr(result.exception))
+    assert isinstance(result.exception, SystemExit)
+    output = " ".join(result.output.replace("│", " ").split())
+    if error_type is None:
+        assert "Output directory already contains files" in output
+        assert "pass --overwrite" in output
+    else:
+        assert "cleanup refused by filesystem" in output
+    assert "Traceback" not in output
+    assert source.read_bytes() == original_input
+    assert sentinel.read_text() == "keep"
+    assert set(out.iterdir()) == {sentinel}
+
+
 @pytest.mark.parametrize("command,options,name", [
     ("export", ["--checkpoint"], "source.pth"),
     ("cluster", ["--embeddings"], "embeddings.csv"),
@@ -148,6 +197,11 @@ def test_downstream_inputs_survive_overwrite(tmp_path, checkpoint, command, opti
     out = tmp_path / "out"
     out.mkdir()
     source = out / name
+    if command == "annotate":
+        source = out / "UPGMA" / "partitions" / "tables" / "partition_0.1_assignments.csv"
+        source.parent.mkdir(parents=True)
+        (out / "logs").mkdir()
+        (out / "logs" / "cluster.log").write_text("original log")
     source.write_bytes(checkpoint.read_bytes() if name.endswith(".pth") else b"image,cluster,sample\na.png,A,S1\n")
     argv = [command, "--out-dir", str(out), "--overwrite"]
     for option in options:
@@ -193,6 +247,33 @@ def test_training_selected_images_survive_cleanup(tmp_path, checkpoint, monkeypa
         result = CliRunner().invoke(app, argv + ["--disable-embedding-metrics"])
         assert result.exit_code == 0, (result.output, repr(result.exception))
         assert not real.exists()
+
+
+@pytest.mark.parametrize("nested_output", [False, True])
+def test_extract_nonempty_output_requires_overwrite_without_traceback(
+    tmp_path, checkpoint, nested_output
+):
+    images = tmp_path / "images"
+    images.mkdir()
+    source = images / "safe.png"
+    Image.new("RGB", (32, 32)).save(source)
+    out = images / "run" if nested_output else tmp_path / "run"
+    out.mkdir()
+    old = out / "old.png"
+    Image.new("RGB", (32, 32), "red").save(old)
+    before = {path: path.read_bytes() for path in (source, old)}
+    result = CliRunner().invoke(app, [
+        "extract", "--checkpoint", str(checkpoint), "--input-images-dir", str(images),
+        "--out-dir", str(out), "--device", "cpu", "--num-workers", "0",
+    ])
+    assert result.exit_code == 2, (result.output, repr(result.exception))
+    assert isinstance(result.exception, SystemExit)
+    output = " ".join(result.output.replace("│", " ").split())
+    assert "Output directory already contains files" in output
+    assert "pass --overwrite" in output
+    assert "Traceback" not in output
+    assert {path: path.read_bytes() for path in before} == before
+    assert set(out.iterdir()) == {old}
 
 
 @pytest.mark.parametrize("csv_selection", [False, True])

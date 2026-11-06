@@ -115,12 +115,11 @@ def annotate(
 
     try:
         protected = [raw_assignments, corrections, embeddings]
-        # Context inference reads this log even when no embeddings are supplied.
-        cluster_run_dir = raw_assignments.parent.parent.parent.parent
-        protected.append(cluster_run_dir / "logs" / "cluster.log")
+        # Validate the layout before cleanup and reuse the authoritative paths.
+        context = infer_cluster_context(raw_assignments)
+        cluster_run_dir = Path(context["cluster_run_dir"])
+        protected.append(Path(context["cluster_log"]))
         if embeddings is not None:
-            context = infer_cluster_context(raw_assignments)
-            cluster_run_dir = Path(context["cluster_run_dir"])
             protected.extend(Path(context["tables_dir"]).glob("partition_*_assignments.csv"))
             distance_matrix = cluster_run_dir / "distance_statistics" / "distance_matrix.csv"
             if distance_matrix.exists():
@@ -154,8 +153,6 @@ def annotate(
         print(json.dumps(params, ensure_ascii=False, indent=2, sort_keys=True))
         print("-" * 80)
 
-        context = infer_cluster_context(raw_assignments)
-        cluster_run_dir = Path(context["cluster_run_dir"])
         cluster_log = Path(context["cluster_log"])
         cutoff_tag = str(context["cutoff_tag"])
         tables_dir = Path(context["tables_dir"])

@@ -566,6 +566,35 @@ def test_finetune_registered_source_preflight_precedes_overwrite(tmp_path, monke
     assert sentinel.read_text(encoding="utf-8") == "keep"
 
 
+def test_finetune_visualize_images_are_protected_from_overwrite(tmp_path, monkeypatch):
+    """The periodic metrics open the visualisation CSV, so its pixels are inputs."""
+    checkpoint = _write_init_checkpoint(tmp_path / "pretrained.pth")
+    out_dir = tmp_path / "finetune_out"
+    out_dir.mkdir()
+    Image.new("RGB", (32, 32), (9, 9, 9)).save(out_dir / "validation.png")
+    pd.DataFrame(
+        {"image": [str(out_dir / "validation.png")], "label": ["a"]}
+    ).to_csv(tmp_path / "evaluation.csv", index=False)
+    monkeypatch.setattr(
+        "otuformer.training.trainer.run_finetune", lambda _args, **_kw: None
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "finetune", "--checkpoint", str(checkpoint),
+            "--train-data", str(tmp_path / "labels.csv"),
+            "--input-images-dir", str(tmp_path), "--out-dir", str(out_dir),
+            "--visualize-data", str(tmp_path / "evaluation.csv"),
+            "--overwrite",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "--overwrite would clear" in result.output
+    assert (out_dir / "validation.png").exists()
+
+
 def test_readmes_document_update_and_continued_training():
     for corpus in (_docs_corpus(en_docs()), _docs_corpus(cn_docs())):
         assert "otuformer update" in corpus
@@ -1283,9 +1312,14 @@ def test_cluster_rejects_old_outputs_without_overwrite(tmp_path):
             "0.5",
         ],
     )
-    assert result.exit_code != 0
-    assert "--overwrite" in str(result.exception)
-    assert stale.exists()
+    assert result.exit_code == 2, (result.output, repr(result.exception))
+    assert isinstance(result.exception, SystemExit)
+    output = " ".join(result.output.replace("│", " ").split())
+    assert "Output directory already contains files" in output
+    assert "pass --overwrite" in output
+    assert "Traceback" not in output
+    assert stale.read_text(encoding="utf-8") == "stale"
+    assert set(out_dir.iterdir()) == {stale}
 
 
 def test_cluster_overwrite_cleans_old_outputs_before_writing(tmp_path):
@@ -5146,6 +5180,68 @@ def test_pretrain_invalid_relational_recipe_preserves_overwrite_output(tmp_path)
     )
     assert endpoint.exit_code != 0
     assert sentinel.read_text(encoding="utf-8") == "keep"
+
+
+def test_pretrain_disabled_metrics_do_not_preread_the_visualize_csv(tmp_path):
+    """A CSV the disabled metrics never open must not decide the run.
+
+    The guard follows the run: with ``--disable-embedding-metrics`` nothing reads
+    the visualisation CSV, so a label-only file is a legal combination with and
+    without ``--overwrite``.
+    """
+    _make_tiny_pretrain_data(tmp_path)
+    pd.DataFrame({"label": ["a", "b"]}).to_csv(
+        tmp_path / "labels_only.csv", index=False
+    )
+    out_dir, sentinel = _sentinel_output_dir(tmp_path, "metrics_off_out")
+
+    result = runner.invoke(
+        app,
+        _pretrain_preflight_args(
+            tmp_path,
+            out_dir,
+            "--overwrite",
+            "--train-data", str(tmp_path / "images.csv"),
+            "--visualize-data", str(tmp_path / "labels_only.csv"),
+        ),
+    )
+
+    assert result.exit_code == 0, result.output
+    assert not sentinel.exists()
+    assert (out_dir / "SSL_latest.pth").exists()
+
+
+def test_pretrain_visualize_images_are_protected_from_overwrite(tmp_path):
+    """The periodic metrics open the visualisation CSV, so its pixels are inputs.
+
+    A run whose validation images live inside --out-dir used to clear them and
+    then train on with metrics that silently could not find the files.
+    """
+    _make_tiny_pretrain_data(tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    validation = Image.new("RGB", (224, 224), (9, 9, 9))
+    validation.save(out_dir / "validation.png")
+    pd.DataFrame(
+        {"image": [str(out_dir / "validation.png")], "label": ["a"]}
+    ).to_csv(tmp_path / "evaluation.csv", index=False)
+
+    result = runner.invoke(
+        app,
+        [
+            "pretrain",
+            "--input-images-dir", str(tmp_path),
+            "--out-dir", str(out_dir),
+            "--overwrite",
+            "--train-data", str(tmp_path / "images.csv"),
+            "--visualize-data", str(tmp_path / "evaluation.csv"),
+            "--device", "cpu",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "--overwrite would clear" in result.output
+    assert (out_dir / "validation.png").exists()
 
 
 def test_pretrain_relational_drift_preserves_resume_outputs(tmp_path):

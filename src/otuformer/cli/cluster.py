@@ -925,7 +925,7 @@ def cluster(
         prepare_output_dir(
             out_dir, overwrite=overwrite, protected_paths=[embeddings, label_csv],
         )
-    except ValueError as exc:
+    except (ValueError, OSError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     tee = TeeLogger(out_dir / "logs" / "cluster.log")
     original_stderr = sys.stderr

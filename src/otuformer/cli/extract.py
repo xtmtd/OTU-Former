@@ -296,15 +296,14 @@ def extract(
 
     from otuformer.cli_schema import (
         check_inputs_survive_cleanup,
-        check_output_safety,
         input_identities,
         verify_inputs_unchanged,
     )
     from otuformer.embedding.extractor import extract_embeddings, extraction_image_paths
     from otuformer.utils.io import prepare_output_dir, write_csv
 
-    # --overwrite must never remove the label CSV this run reads, nor clear the
-    # image root itself. An --out-dir *inside* the image root stays supported.
+    # CSV/COCO inputs already returned through the strict records path above.
+    # Legacy extraction permits output below the image root, never clearing it.
     from otuformer.data.paths import is_within
 
     # The entry the user typed is what must survive: `--input-images-dir out/via`
@@ -355,17 +354,14 @@ def extract(
     # cleared. An --out-dir inside the image root stays supported, because checking
     # the entry there finds nothing inside the output directory.
     try:
-        if label_csv is not None:
-            check_output_safety(
-                out_dir, protected_paths=[label_csv], overwrite=overwrite
-            )
         if overwrite:
             check_inputs_survive_cleanup(out_dir, written_inputs)
-    except ValueError as error:
+    except (ValueError, OSError) as error:
         raise typer.BadParameter(str(error)) from None
     out_target = Path(out_dir).expanduser().resolve()
     images_root = Path(input_images_dir).expanduser().resolve()
-    if is_within(out_target, images_root):
+    # Reject output equal to or containing the image root, not output below it.
+    if is_within(root=out_target, candidate=images_root):
         raise typer.BadParameter(
             f"--out-dir {out_target} would clear the image root {images_root}; "
             "choose a directory outside it"
@@ -373,7 +369,7 @@ def extract(
     try:
         prepare_output_dir(out_dir, overwrite=overwrite, protected_paths=written_inputs)
         verify_inputs_unchanged(identities)
-    except ValueError as error:
+    except (ValueError, OSError) as error:
         raise typer.BadParameter(str(error)) from None
 
     from otuformer.utils.logging import TeeLogger
@@ -859,19 +855,20 @@ def _run_new_data_path(*, settings: dict, inputs: dict[str, Path], params: dict)
         "strict" if (settings.get("manifest") or settings.get("label_csv")) else "none"
     )
 
+    bundle = None
+    read_options = {
+        "manifest": inputs.get("manifest"),
+        "coco_instances": inputs.get("coco_instances"),
+        "coco_keypoints": inputs.get("coco_keypoints"),
+        "coco_panoptic": inputs.get("coco_panoptic"),
+        "panoptic_masks_dir": inputs.get("panoptic_masks_dir"),
+    }
     try:
         _preflight_extract_model(settings, check_size=False)
-        bundle = read_dataset(
-            images_dir,
-            manifest=inputs.get("manifest"),
-            coco_instances=inputs.get("coco_instances"),
-            coco_keypoints=inputs.get("coco_keypoints"),
-            coco_panoptic=inputs.get("coco_panoptic"),
-            panoptic_masks_dir=inputs.get("panoptic_masks_dir"),
-        )
-        # Fresh invalid runs retain their diagnostic records; an overwrite must
-        # refuse before replacing any prior result with those diagnostics.
+        # Only destructive reuse needs eager validation and image protection.
+        # Fresh runs read once after logging and provenance are initialized.
         if settings["overwrite"] and out_dir.exists():
+            bundle = read_dataset(images_dir, **read_options)
             bundle.raise_for_errors()
     except (ValueError, OSError) as error:
         raise typer.BadParameter(str(error)) from None
@@ -887,7 +884,7 @@ def _run_new_data_path(*, settings: dict, inputs: dict[str, Path], params: dict)
         protected.extend(_onnx_input_paths(Path(settings["onnx_path"])))
     if settings["token_mode"] == "attention-pool":
         protected.extend(_pool_candidate_paths(out_dir, settings))
-    for image in bundle.records:
+    for image in bundle.records if bundle is not None else ():
         protected.extend([images_dir / image.image_key, image.access_path, image.image_file.path])
         if image.selector_reference is not None:
             protected.append(images_dir / Path(image.selector_reference).expanduser())
@@ -922,7 +919,7 @@ def _run_new_data_path(*, settings: dict, inputs: dict[str, Path], params: dict)
     try:
         prepare_output_dir(out_dir, overwrite=settings["overwrite"], protected_paths=protected)
         verify_inputs_unchanged(identities)
-    except ValueError as error:
+    except (ValueError, OSError) as error:
         raise typer.BadParameter(str(error)) from None
 
     tee = TeeLogger(out_dir / "logs" / "extract.log")
@@ -962,6 +959,8 @@ def _run_new_data_path(*, settings: dict, inputs: dict[str, Path], params: dict)
         write_json_atomic(record(empty_bundle, "running"), run_path)
         created.append(run_path)
 
+        if bundle is None:
+            bundle = read_dataset(images_dir, **read_options)
         state["bundle"] = bundle
         validation_path = out_dir / "data_validation.json"
         write_json_atomic(build_validation_record(bundle), validation_path)

@@ -23,8 +23,10 @@ import shlex
 import shutil
 import subprocess
 import sys
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any, Mapping, Sequence
+
+from otuformer.utils.paths import input_dependency_positions
 
 SCHEMA_VERSION = 1
 BUILTIN_HELP_OPTION = "--help"
@@ -812,9 +814,6 @@ def _safety_forms(path: Path) -> list[Path]:
     return unique
 
 
-_MAX_LINK_HOPS = 40
-
-
 def input_identities(paths: Sequence[Path]) -> dict[Path, Path]:
     """Real targets of the inputs that exist now, for a post-cleanup comparison.
 
@@ -852,73 +851,25 @@ def verify_inputs_unchanged(identities: dict[Path, Path]) -> None:
             )
 
 
-def _removed_entries(path: Path) -> list[Path]:
-    """Every directory entry a path is reached through, links included.
-
-    The path is walked one component at a time and each component's real position is
-    recorded. Resolving a whole parent in one call would hide the links inside it:
-    with ``entry -> out/relay -> real``, ``out/relay`` is only visible while walking,
-    and deleting it makes the input unreachable even though the file itself lives
-    elsewhere. Link targets are walked too, so a link reached only by following
-    another link counts the same way.
-    """
-    entry = Path(path).expanduser()
-    if not entry.is_absolute():
-        entry = Path.cwd() / entry
-    positions: list[Path] = []
-    parts = list(PurePosixPath(entry).parts)
-    current = Path("/")
-    hops = 0
-    while parts:
-        part = parts.pop(0)
-        if part in ("", ".", "/"):
-            continue
-        if part == "..":
-            # `current` only ever holds a fully resolved position, because a link is
-            # expanded into the component queue when it is met. Applying `..` here is
-            # therefore the same as following the link and then going up.
-            current = current.parent
-            continue
-        candidate = current / part
-        if candidate not in positions:
-            positions.append(candidate)
-        if candidate.is_symlink():
-            hops += 1
-            if hops > _MAX_LINK_HOPS:
-                # Refuse rather than allow: an unreadable path is not a safe path.
-                raise ValueError(
-                    f"cannot verify output safety: {path} passes through more than "
-                    f"{_MAX_LINK_HOPS} symbolic links"
-                )
-            try:
-                target = Path(os.readlink(candidate))
-            except OSError:  # pragma: no cover - defensive
-                break
-            current = Path("/") if target.is_absolute() else candidate.parent
-            parts = list(PurePosixPath(target).parts) + parts
-        else:
-            current = candidate
-    return positions
-
-
 def check_inputs_survive_cleanup(out_dir: Path, inputs: Sequence[Path]) -> None:
     """Refuse when clearing ``out_dir`` would remove an entry an input needs.
 
-    Only the deletion direction is checked. An output directory *inside* an input
-    root is a supported layout (a legacy run may write below its image root), while
-    an input reached through an entry inside the output directory is not: cleanup
-    would delete that entry and leave the input unreachable.
+    This legacy guard checks only the deletion direction, unlike the stricter
+    ``check_output_safety`` non-overlap policy. An output directory *inside* an
+    input root is supported if cleanup removes no input dependency. An input
+    equal to or reached through the output directory is rejected.
 
-    ``out_dir`` may be given already resolved; callers inside a check avoid resolving
-    twice.
+    This check never creates, deletes, or writes anything. Its dependency
+    diagnostic matches ``check_output_safety``; ``prepare_output_dir`` keeps
+    the CLI-facing ``--overwrite would clear`` message with remediation.
     """
     target = _resolve_for_safety(Path(out_dir))
     for path in inputs:
-        for position in _removed_entries(Path(path)):
-            if position != target and _is_within(position, target):
+        for position in input_dependency_positions(Path(path)):
+            if _is_within(position, target):
                 raise ValueError(
-                    f"clearing {target} would remove {position}, which the "
-                    f"protected input {path} is reached through"
+                    f"output directory {target} contains protected input "
+                    f"dependency {position}, which {path} is reached through"
                 )
 
 
@@ -930,7 +881,10 @@ def check_output_safety(
     resume: bool = False,
     allow_inside: Sequence[Path] = (),
 ) -> list[str]:
-    """Read-only output-safety check; raises for unsafe overlap.
+    """Read-only non-overlap policy: output and inputs cannot contain each other.
+
+    This is stricter than a deletion-only cleanup guard: an output below an
+    input root is rejected even without overwrite.
 
     ``allow_inside`` names paths that may legitimately live inside the output
     directory as long as no overwrite is requested (for example the checkpoint of
@@ -939,8 +893,6 @@ def check_output_safety(
     """
     target = _resolve_for_safety(Path(out_dir))
     if overwrite:
-        from otuformer.utils.paths import input_dependency_positions
-
         for protected in protected_paths:
             for position in input_dependency_positions(Path(protected)):
                 if _is_within(position, target):
@@ -974,8 +926,6 @@ def check_output_safety(
                 f"output directory {target} contains protected input {resolved}; "
                 "clearing it could remove inputs or results"
             )
-    if overwrite:
-        check_inputs_survive_cleanup(target, protected_paths)
     if target.exists():
         if not target.is_dir():
             raise ValueError(f"output path {target} exists and is not a directory")

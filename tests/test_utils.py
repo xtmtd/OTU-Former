@@ -198,3 +198,122 @@ def test_prepare_output_dir_refuses_a_symlinked_input(tmp_path):
     with pytest.raises(ValueError, match="holds the input"):
         prepare_output_dir(out_dir, overwrite=True, protected_paths=(link,))
     assert real.exists()
+
+
+def test_prepare_output_dir_refuses_a_symlink_chain_through_the_output(tmp_path):
+    """A middle hop is an input dependency, not only the two ends of the chain.
+
+    ``entry -> out/middle -> pixels/real`` resolves outside the output directory
+    at both ends, but clearing it deletes the middle link and leaves the run
+    reading a dangling one after the old results are gone.
+    """
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    pixels = tmp_path / "pixels"
+    pixels.mkdir()
+    real = pixels / "real.png"
+    real.write_text("pixels", encoding="utf-8")
+    middle = out_dir / "middle.png"
+    middle.symlink_to(real)
+    entry = tmp_path / "images" / "entry.png"
+    entry.parent.mkdir()
+    entry.symlink_to(middle)
+
+    with pytest.raises(ValueError, match="holds the input"):
+        prepare_output_dir(out_dir, overwrite=True, protected_paths=(entry,))
+    assert middle.exists() and real.exists()
+
+
+def test_prepare_output_dir_refuses_a_symlinked_directory_in_the_chain(tmp_path):
+    """A symlinked directory on the way is one of the paths the read depends on."""
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    pixels = tmp_path / "pixels"
+    pixels.mkdir()
+    (pixels / "real.png").write_text("pixels", encoding="utf-8")
+    (out_dir / "stage").symlink_to(pixels)
+    entry = tmp_path / "images" / "entry.png"
+    entry.parent.mkdir()
+    entry.symlink_to(out_dir / "stage" / "real.png")
+
+    with pytest.raises(ValueError, match="holds the input"):
+        prepare_output_dir(out_dir, overwrite=True, protected_paths=(entry,))
+    assert (out_dir / "stage").is_symlink()
+    assert (pixels / "real.png").exists()
+
+
+@pytest.mark.parametrize("in_link_target", [False, True])
+def test_prepare_output_dir_preserves_symlink_parent_semantics(tmp_path, in_link_target):
+    out_dir = tmp_path / "out"
+    (out_dir / "sub").mkdir(parents=True)
+    real = out_dir / "real.png"
+    real.write_text("pixels", encoding="utf-8")
+    images = tmp_path / "images"
+    images.mkdir()
+    (images / "jump").symlink_to(out_dir / "sub", target_is_directory=True)
+    source = images / "jump" / ".." / "real.png"
+    if in_link_target:
+        entry = images / "entry.png"
+        entry.symlink_to(source)
+        source = entry
+    assert source.read_text(encoding="utf-8") == "pixels"
+
+    with pytest.raises(ValueError, match="holds the input"):
+        prepare_output_dir(out_dir, overwrite=True, protected_paths=(source,))
+
+    assert real.read_text(encoding="utf-8") == "pixels"
+    assert source.exists()
+
+
+def test_prepare_output_dir_refuses_a_directory_link_inside_a_link_target(tmp_path):
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    sentinel = out_dir / "keep.txt"
+    sentinel.write_text("keep", encoding="utf-8")
+    pixels = tmp_path / "pixels"
+    pixels.mkdir()
+    real = pixels / "real.png"
+    real.write_text("pixels", encoding="utf-8")
+    (out_dir / "middle").symlink_to(pixels, target_is_directory=True)
+    (tmp_path / "bridge").symlink_to(out_dir / "middle", target_is_directory=True)
+    entry = tmp_path / "entry.png"
+    entry.symlink_to(tmp_path / "bridge" / "real.png")
+    assert entry.exists()
+
+    with pytest.raises(ValueError, match="holds the input"):
+        prepare_output_dir(out_dir, overwrite=True, protected_paths=(entry,))
+
+    assert sentinel.read_text(encoding="utf-8") == "keep"
+    assert entry.exists() and real.exists()
+
+
+def test_cleanup_guard_refuses_the_root_input():
+    from pathlib import Path
+
+    from otuformer.utils.io import _refuse_clearing_inputs
+
+    root = Path(Path.cwd().anchor)
+    with pytest.raises(ValueError, match="holds the input"):
+        _refuse_clearing_inputs(root, (root,))
+
+
+@pytest.mark.parametrize("cycle", [False, True])
+def test_prepare_output_dir_refuses_unverifiable_link_chains(tmp_path, cycle):
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    sentinel = out_dir / "keep.txt"
+    sentinel.write_text("keep", encoding="utf-8")
+    images = tmp_path / "images"
+    images.mkdir()
+    real = images / "real.png"
+    real.write_text("pixels", encoding="utf-8")
+    links = [images / f"link_{index}.png" for index in range(65)]
+    for link, target in zip(links, links[1:]):
+        link.symlink_to(target)
+    links[-1].symlink_to(links[0] if cycle else real)
+
+    with pytest.raises(ValueError, match="cannot verify output safety"):
+        prepare_output_dir(out_dir, overwrite=True, protected_paths=(links[0],))
+
+    assert sentinel.read_text(encoding="utf-8") == "keep"
+    assert real.exists()
