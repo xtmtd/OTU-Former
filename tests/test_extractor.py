@@ -43,7 +43,7 @@ def make_checkpoint(
     name: str = "ckpt.pt",
 ) -> Path:
     from otuformer.training.model import OTUFormerEncoder
-    from otuformer.training.trainer import RELATIONAL_TARGET_CONFIG_KEY
+    from otuformer.training.pretrain_recipe import RELATIONAL_TARGET_CONFIG_KEY
 
     model = OTUFormerEncoder(model_name="vit_tiny_patch16_224", out_dim=out_dim)
     config = {"model_name": "vit_tiny_patch16_224", "out_dim": out_dim}

@@ -8,6 +8,7 @@ from PIL import Image
 from typer.testing import CliRunner
 
 from otuformer.cli.main import app
+import otuformer.cli.extract as extract_module
 
 runner = CliRunner()
 

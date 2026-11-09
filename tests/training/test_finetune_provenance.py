@@ -13,8 +13,14 @@ from otuformer.cli.finetune import (
     FIXED_IDENTITY_VALUES,
     PARAM_CLASSIFICATION,
 )
+import otuformer.training.finetune_loop as finetune_loop_module
+import otuformer.training.pretrain_loop as pretrain_loop_module
 from otuformer.training import trainer
 from otuformer.training.dataset import MetricDataset
+import otuformer.training.model as model_module
+import otuformer.training.trainer as trainer_module
+import otuformer.training.augmentation as augmentation_module
+import otuformer.training.finetune_support as finetune_support_module
 
 
 def _write(path: Path, payload: bytes = b"bytes") -> Path:
@@ -53,7 +59,7 @@ def _pseudo_source_config(ssl: Path, manifest: str, **overrides) -> dict:
         "arcface_margin": 0.5,
         "train_manifest_sha256": manifest,
         "ssl_initialization_checkpoint_path": str(ssl),
-        "ssl_initialization_checkpoint_sha256": trainer._sha256_file(ssl),
+        "ssl_initialization_checkpoint_sha256": finetune_loop_module._sha256_file(ssl),
         "pseudo_round": 0,
         "pseudo_source_eligible": True,
     }
@@ -66,7 +72,7 @@ def test_expert_path_identity_distinct_files_same_bytes_eligible(tmp_path):
     _write(root / "a.jpg", b"identical")
     _write(root / "b.jpg", b"identical")
 
-    ok, reason = trainer._expert_path_identity(["a.jpg", "b.jpg"], root)
+    ok, reason = finetune_loop_module._expert_path_identity(["a.jpg", "b.jpg"], root)
     assert ok is True
     assert reason is None
 
@@ -75,7 +81,7 @@ def test_expert_path_identity_nested_relative_eligible(tmp_path):
     root = tmp_path / "images"
     _write(root / "sub" / "a.jpg")
 
-    ok, reason = trainer._expert_path_identity(["sub/a.jpg"], root)
+    ok, reason = finetune_loop_module._expert_path_identity(["sub/a.jpg"], root)
     assert ok is True
     assert reason is None
 
@@ -85,7 +91,7 @@ def test_expert_path_identity_in_root_symlink_alias_is_duplicate(tmp_path):
     target = _write(root / "a.jpg")
     (root / "alias.jpg").symlink_to(target)
 
-    ok, reason = trainer._expert_path_identity(["a.jpg", "alias.jpg"], root)
+    ok, reason = finetune_loop_module._expert_path_identity(["a.jpg", "alias.jpg"], root)
     assert ok is False
     assert "duplicate expert path identity" in reason
 
@@ -96,7 +102,7 @@ def test_expert_path_identity_escaping_symlink_rejected(tmp_path):
     outside = _write(tmp_path / "outside.jpg")
     (root / "escape.jpg").symlink_to(outside)
 
-    ok, reason = trainer._expert_path_identity(["escape.jpg"], root)
+    ok, reason = finetune_loop_module._expert_path_identity(["escape.jpg"], root)
     assert ok is False
     assert "escapes the image root" in reason
 
@@ -105,7 +111,7 @@ def test_expert_path_identity_missing_file_rejected(tmp_path):
     root = tmp_path / "images"
     root.mkdir(parents=True)
 
-    ok, reason = trainer._expert_path_identity(["missing.jpg"], root)
+    ok, reason = finetune_loop_module._expert_path_identity(["missing.jpg"], root)
     assert ok is False
     assert "missing expert image" in reason
 
@@ -121,7 +127,7 @@ def test_expert_path_identity_bare_name_in_subdirectory_eligible(tmp_path):
     _write(root / "Epidorcus_gracilis" / "a.jpg")
     _write(root / "Epidorcus_tonkinensis" / "b.jpg")
 
-    ok, reason = trainer._expert_path_identity(["a.jpg", "b.jpg"], root)
+    ok, reason = finetune_loop_module._expert_path_identity(["a.jpg", "b.jpg"], root)
     assert ok is True
     assert reason is None
 
@@ -132,31 +138,31 @@ def test_expert_path_identity_ambiguous_bare_name_rejected(tmp_path):
     _write(root / "first" / "a.jpg")
     _write(root / "second" / "a.jpg")
 
-    ok, reason = trainer._expert_path_identity(["a.jpg"], root)
+    ok, reason = finetune_loop_module._expert_path_identity(["a.jpg"], root)
     assert ok is False
     assert "ambiguous expert reference" in reason
 
 
 def test_pseudo_source_status_requires_arcface_family_and_ssl_hash():
-    eligible, reason = trainer._pseudo_source_status(
+    eligible, reason = finetune_loop_module._pseudo_source_status(
         loss="arcface", ssl_initialization_sha256="deadbeef", expert_reason=None
     )
     assert eligible is True
     assert reason is None
 
-    eligible, reason = trainer._pseudo_source_status(
+    eligible, reason = finetune_loop_module._pseudo_source_status(
         loss="supcon", ssl_initialization_sha256="deadbeef", expert_reason=None
     )
     assert eligible is False
     assert "not ArcFace-family" in reason
 
-    eligible, reason = trainer._pseudo_source_status(
+    eligible, reason = finetune_loop_module._pseudo_source_status(
         loss="subcenter-arcface", ssl_initialization_sha256=None, expert_reason=None
     )
     assert eligible is False
     assert "SSL initialization" in reason
 
-    eligible, reason = trainer._pseudo_source_status(
+    eligible, reason = finetune_loop_module._pseudo_source_status(
         loss="arcface",
         ssl_initialization_sha256="deadbeef",
         expert_reason="duplicate expert path identity: 'a.jpg'",
@@ -166,7 +172,7 @@ def test_pseudo_source_status_requires_arcface_family_and_ssl_hash():
 
 
 def test_resolved_finetune_identity_effective_head_lr_and_fixed_constants():
-    inherited = trainer._resolved_finetune_identity(
+    inherited = finetune_loop_module._resolved_finetune_identity(
         optimizer_layout="v080_prototype",
         finetune_lr=3e-5,
         metric_head_lr=None,
@@ -186,7 +192,7 @@ def test_resolved_finetune_identity_effective_head_lr_and_fixed_constants():
     assert inherited["optimizer_name"] == "adamw"
     assert inherited["optimizer_groups"] == "v080_prototype"
 
-    explicit = trainer._resolved_finetune_identity(
+    explicit = finetune_loop_module._resolved_finetune_identity(
         optimizer_layout="v080_prototype",
         finetune_lr=3e-5,
         metric_head_lr=1e-4,
@@ -244,7 +250,7 @@ def _pseudo_identity_for(ssl_checkpoint: Path, **overrides):
         "supcon_temperature": None,
     }
     kwargs = dict(
-        ssl_checkpoint=trainer._load_pseudo_source(ssl_checkpoint),
+        ssl_checkpoint=finetune_support_module._load_pseudo_source(ssl_checkpoint),
         source_cfg={"class_labels": ["a", "b"]},
         resolved_loss=resolved_loss,
         model_name="vit_tiny_patch16_224",
@@ -261,7 +267,7 @@ def _pseudo_identity_for(ssl_checkpoint: Path, **overrides):
         long_tail="none",
     )
     kwargs.update(overrides)
-    return trainer.pseudo_cli_identity(**kwargs)
+    return finetune_support_module.pseudo_cli_identity(**kwargs)
 
 
 def test_pseudo_identity_carries_the_resolved_register_count(tmp_path: Path):
@@ -291,7 +297,7 @@ def test_pseudo_identity_sees_a_four_register_source(tmp_path: Path, monkeypatch
         )
 
     monkeypatch.setattr(timm_module, "create_model", factory)
-    encoder = model_module.OTUFormerEncoder(
+    encoder = pretrain_loop_module.OTUFormerEncoder(
         model_name="tiny-vit", out_dim=8, pretrained=False, reg_tokens=4, img_size=32
     )
     ssl = _minimal_ssl_checkpoint(
@@ -326,15 +332,15 @@ def test_pseudo_identity_sees_a_four_register_source(tmp_path: Path, monkeypatch
 def test_pseudo_identity_rejects_a_register_layout_mismatch():
     """finetune#2 must not mix patch sets with finetune#1's pseudo labels."""
     with pytest.raises(ValueError, match="register_tokens"):
-        trainer._assert_pseudo_source_identity(
+        finetune_loop_module._assert_pseudo_source_identity(
             {"register_tokens": 4}, {"register_tokens": 0}
         )
     with pytest.raises(ValueError, match="register_tokens"):
-        trainer._assert_pseudo_source_identity(
+        finetune_loop_module._assert_pseudo_source_identity(
             {"register_tokens": 0}, {"register_tokens": 4}
         )
     # A pre-v0.10.0 source without the key stays comparable.
-    trainer._assert_pseudo_source_identity({}, {"register_tokens": 4})
+    finetune_loop_module._assert_pseudo_source_identity({}, {"register_tokens": 4})
 
 
 def _label_fixture(tmp_path, name, labels):
@@ -366,7 +372,7 @@ def test_label_fixtures_keep_existing_conversion(
     assert ds.label_names == expected_label_names
     assert [str(label) for label in sorted(ds.class_to_idx)] == expected_class_labels
 
-    baseline = trainer._train_manifest_sha256(ds.image_refs, ds.label_names, root)
+    baseline = finetune_loop_module._train_manifest_sha256(ds.image_refs, ds.label_names, root)
     reversed_csv = root / "reversed.csv"
     pd.DataFrame(
         {"image": list(reversed(refs)), "label": list(reversed(labels))}
@@ -375,7 +381,7 @@ def test_label_fixtures_keep_existing_conversion(
         csv_path=reversed_csv, images_dir=root, image_size=32
     )
     assert (
-        trainer._train_manifest_sha256(
+        finetune_loop_module._train_manifest_sha256(
             reversed_ds.image_refs, reversed_ds.label_names, root
         )
         == baseline
@@ -398,33 +404,33 @@ def test_assert_pseudo_paths_rejects_overlap_and_input_inside_out(tmp_path):
     inside = out / "ssl.pth"
     inside.write_bytes(b"x")
 
-    trainer._assert_pseudo_paths(out, root, [tmp_path / "ssl.pth"])
+    finetune_support_module._assert_pseudo_paths(out, root, [tmp_path / "ssl.pth"])
 
     with pytest.raises(ValueError, match="overlap"):
-        trainer._assert_pseudo_paths(root / "runs", root, [])
+        finetune_support_module._assert_pseudo_paths(root / "runs", root, [])
 
     with pytest.raises(ValueError, match="inside out_dir"):
-        trainer._assert_pseudo_paths(out, root, [inside])
+        finetune_support_module._assert_pseudo_paths(out, root, [inside])
 
 
 def test_resolve_pseudo_ssl_path_requires_matching_hash(tmp_path):
     ssl = tmp_path / "ssl.pth"
     ssl.write_bytes(b"weights")
-    digest = trainer._sha256_file(ssl)
+    digest = finetune_loop_module._sha256_file(ssl)
     cfg = {
         "ssl_initialization_checkpoint_path": str(ssl),
         "ssl_initialization_checkpoint_sha256": digest,
     }
 
-    assert trainer._resolve_pseudo_ssl_path(cfg, None) == ssl
-    assert trainer._resolve_pseudo_ssl_path(cfg, ssl) == ssl
+    assert finetune_support_module._resolve_pseudo_ssl_path(cfg, None) == ssl
+    assert finetune_support_module._resolve_pseudo_ssl_path(cfg, ssl) == ssl
 
     other = tmp_path / "other.pth"
     other.write_bytes(b"different")
     with pytest.raises(ValueError, match="does not match"):
-        trainer._resolve_pseudo_ssl_path(cfg, other)
+        finetune_support_module._resolve_pseudo_ssl_path(cfg, other)
     with pytest.raises(ValueError, match="no SSL initialization"):
-        trainer._resolve_pseudo_ssl_path({}, None)
+        finetune_support_module._resolve_pseudo_ssl_path({}, None)
 
 
 def test_metric_dataset_explicit_class_order_supports_numeric_labels(tmp_path):
@@ -466,7 +472,7 @@ def test_prepare_pseudo_round_uses_source_top_level_class_order(tmp_path, monkey
 
     ssl = tmp_path / "ssl.pth"
     torch.save({"model_state_dict": {"backbone.cls_token": torch.zeros(1, 1, 8)}}, ssl)
-    manifest = trainer_module._train_manifest_sha256(refs, labels, root)
+    manifest = finetune_loop_module._train_manifest_sha256(refs, labels, root)
     source = tmp_path / "ft1.pth"
     torch.save(
         {
@@ -488,7 +494,7 @@ def test_prepare_pseudo_round_uses_source_top_level_class_order(tmp_path, monkey
         ),
     )
 
-    data = trainer_module.prepare_pseudo_round(
+    data = finetune_support_module.prepare_pseudo_round(
         pseudo_label_from=source,
         train_data=csv,
         input_images_dir=root,
@@ -519,7 +525,7 @@ def test_prepare_pseudo_round_uses_source_top_level_class_order(tmp_path, monkey
         bad_source,
     )
     with pytest.raises(ValueError, match="class table"):
-        trainer_module.prepare_pseudo_round(
+        finetune_support_module.prepare_pseudo_round(
             pseudo_label_from=bad_source,
             train_data=csv,
             input_images_dir=root,
@@ -548,7 +554,7 @@ def test_prepare_pseudo_round_rejects_incomplete_source(tmp_path):
     pd.DataFrame({"image": ["a.jpg"], "label": ["A"]}).to_csv(csv, index=False)
     ssl = tmp_path / "ssl.pth"
     torch.save({"model_state_dict": {}}, ssl)
-    manifest = trainer_module._train_manifest_sha256(["a.jpg"], ["A"], root)
+    manifest = finetune_loop_module._train_manifest_sha256(["a.jpg"], ["A"], root)
     source = tmp_path / "ft1.pth"
     torch.save(
         {
@@ -561,7 +567,7 @@ def test_prepare_pseudo_round_rejects_incomplete_source(tmp_path):
     )
 
     with pytest.raises(ValueError, match="incomplete"):
-        trainer_module.prepare_pseudo_round(
+        finetune_support_module.prepare_pseudo_round(
             pseudo_label_from=source,
             train_data=csv,
             input_images_dir=root,
@@ -591,7 +597,7 @@ def _save_pseudo_source(
     pd.DataFrame({"image": list(refs), "label": list(labels)}).to_csv(csv, index=False)
     ssl = tmp_path / "ssl.pth"
     ssl.write_bytes(b"weights")
-    manifest = trainer._train_manifest_sha256(list(refs), list(labels), root)
+    manifest = finetune_loop_module._train_manifest_sha256(list(refs), list(labels), root)
     cfg = _pseudo_source_config(ssl, manifest, **cfg_overrides)
     source = tmp_path / "ft1.pth"
     torch.save(
@@ -607,7 +613,7 @@ def _save_pseudo_source(
 
 
 def _call_prepare(source, root, csv, out):
-    return trainer.prepare_pseudo_round(
+    return finetune_support_module.prepare_pseudo_round(
         pseudo_label_from=source,
         train_data=csv,
         input_images_dir=root,
@@ -663,7 +669,7 @@ def test_load_pseudo_source_wraps_corrupt_checkpoint(tmp_path):
     bad.write_bytes(b"not a checkpoint")
 
     with pytest.raises(PseudoLabelError, match="cannot read pseudo source"):
-        trainer._load_pseudo_source(bad)
+        finetune_support_module._load_pseudo_source(bad)
 
 
 def test_empty_acceptance_message_reports_counts_and_bins(tmp_path, monkeypatch):
@@ -712,7 +718,7 @@ def test_resume_drift_warnings_are_non_blocking(tmp_path, capsys):
         "pseudo_labels_sha256": "stale",
     }
 
-    trainer._warn_pseudo_resume_drift(cfg, args, out)
+    finetune_loop_module._warn_pseudo_resume_drift(cfg, args, out)
 
     output = capsys.readouterr().out
     assert "different image root" in output
@@ -726,7 +732,7 @@ def test_resume_drift_warns_on_missing_labels_csv(tmp_path, capsys):
     )
     args = argparse.Namespace(input_images_dir=str(root), train_data=str(csv))
 
-    trainer._warn_pseudo_resume_drift({}, args, tmp_path / "out")
+    finetune_loop_module._warn_pseudo_resume_drift({}, args, tmp_path / "out")
 
     assert "pseudo_labels.csv is missing" in capsys.readouterr().out
 
@@ -774,13 +780,13 @@ def test_finetune_register_plan_detects_added_four(monkeypatch):
         "model_state_dict": _tiny_backbone_state(register_count=4),
         "config": {"register_tokens": 4},
     }
-    assert trainer._finetune_register_plan(checkpoint, "tiny", 32, 8) == ("added", 4)
+    assert finetune_loop_module._finetune_register_plan(checkpoint, "tiny", 32, 8) == ("added", 4)
 
 
 def test_finetune_register_plan_detects_native_registers(monkeypatch):
     _install_tiny_factory(monkeypatch, native_regs=2)
     checkpoint = {"model_state_dict": _tiny_backbone_state(native_regs=2)}
-    assert trainer._finetune_register_plan(checkpoint, "tiny", 32, 8) == ("native", 2)
+    assert finetune_loop_module._finetune_register_plan(checkpoint, "tiny", 32, 8) == ("native", 2)
 
 
 def test_finetune_register_plan_keeps_the_legacy_zero_register_path(monkeypatch):
@@ -789,15 +795,15 @@ def test_finetune_register_plan_keeps_the_legacy_zero_register_path(monkeypatch)
 
     _install_tiny_factory(monkeypatch)
     checkpoint = {"model_state_dict": _tiny_backbone_state()}
-    assert trainer._finetune_register_plan(checkpoint, "tiny", 32, 8) == ("legacy", 0)
+    assert finetune_loop_module._finetune_register_plan(checkpoint, "tiny", 32, 8) == ("legacy", 0)
 
     # Missing backbone keys and a missing source are never tightened here.
     incomplete = _tiny_backbone_state()
     incomplete.pop("backbone.blocks.0.attn.qkv.weight")
-    assert trainer._finetune_register_plan(
+    assert finetune_loop_module._finetune_register_plan(
         {"model_state_dict": incomplete}, "tiny", 32, 8
     ) == ("legacy", 0)
-    assert trainer._finetune_register_plan({}, "tiny", 32, 8) == ("legacy", 0)
+    assert finetune_loop_module._finetune_register_plan({}, "tiny", 32, 8) == ("legacy", 0)
 
     # A wrongly sized register tensor is still not legacy.
     checkpoint = {
@@ -807,7 +813,7 @@ def test_finetune_register_plan_keeps_the_legacy_zero_register_path(monkeypatch)
         }
     }
     with pytest.raises(ValueError, match="reg_token"):
-        trainer._finetune_register_plan(checkpoint, "tiny", 32, 8)
+        finetune_loop_module._finetune_register_plan(checkpoint, "tiny", 32, 8)
 
 
 def test_finetune_register_plan_rejects_incomplete_registered_backbone(monkeypatch):
@@ -817,7 +823,7 @@ def test_finetune_register_plan_rejects_incomplete_registered_backbone(monkeypat
     checkpoint = {"model_state_dict": state, "config": {"register_tokens": 4}}
 
     with pytest.raises(ValueError, match="attn.qkv.weight"):
-        trainer._finetune_register_plan(checkpoint, "tiny", 32, 8)
+        finetune_loop_module._finetune_register_plan(checkpoint, "tiny", 32, 8)
 
 
 def test_finetune_register_plan_rejects_a_prefixed_register_key(monkeypatch):
@@ -830,7 +836,7 @@ def test_finetune_register_plan_rejects_a_prefixed_register_key(monkeypatch):
     }
 
     with pytest.raises(ValueError, match="backbone.reg_token"):
-        trainer._finetune_register_plan(checkpoint, "tiny", 32, 8)
+        finetune_loop_module._finetune_register_plan(checkpoint, "tiny", 32, 8)
 
 
 def test_finetune_register_plan_rejects_no_cls_native_registers(monkeypatch):
@@ -840,7 +846,7 @@ def test_finetune_register_plan_rejects_no_cls_native_registers(monkeypatch):
     }
 
     with pytest.raises(ValueError, match="no CLS token"):
-        trainer._finetune_register_plan(checkpoint, "tiny", 32, 8)
+        finetune_loop_module._finetune_register_plan(checkpoint, "tiny", 32, 8)
 
 
 def test_preflight_finetune_source_uses_recorded_model_name(monkeypatch):
@@ -849,7 +855,7 @@ def test_preflight_finetune_source_uses_recorded_model_name(monkeypatch):
         "model_state_dict": _tiny_backbone_state(),
         "config": {"model_name": "tiny", "out_dim": 8},
     }
-    assert trainer.preflight_finetune_source(checkpoint, "vit_tiny_patch16_224") == (
+    assert finetune_loop_module.preflight_finetune_source(checkpoint, "vit_tiny_patch16_224") == (
         "legacy",
         0,
     )

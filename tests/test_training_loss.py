@@ -1,4 +1,3 @@
-import inspect
 import math
 
 import torch
@@ -74,8 +73,6 @@ def test_masked_patch_cosine_loss_ignores_unselected_positions():
     assert torch.allclose(
         base, masked_patch_cosine_loss(perturbed_student, perturbed_teacher, mask)
     )
-    # The authoritative loss has no EVA-specific branch.
-    assert "eva" not in inspect.getsource(masked_patch_cosine_loss).lower()
 
 
 def test_masked_patch_cosine_loss_is_teacher_detached():
@@ -386,11 +383,11 @@ def test_plain_subcenter_compact_penalty_is_zero():
 
 
 def test_effective_number_weights_reference_example_and_r_bar():
-    from otuformer.training.trainer import (
-        _cb_drw_class_weights,
-        _cb_drw_r_bar,
-        _effective_number_class_weights,
-    )
+    from otuformer.training.finetune_support import (
+    _cb_drw_class_weights,
+    _cb_drw_r_bar,
+    _effective_number_class_weights,
+)
 
     counts = torch.tensor([10.0, 128.0])
     target = _effective_number_class_weights(counts)
@@ -406,7 +403,7 @@ def test_effective_number_weights_reference_example_and_r_bar():
 
 
 def test_drw_lambda_boundaries_and_zero_ramp():
-    from otuformer.training.trainer import _drw_lambda
+    from otuformer.training.finetune_support import _drw_lambda
 
     assert _drw_lambda(0, 1) == 1.0  # T=1 applies the target from the first step
     assert _drw_lambda(50, 100) == 0.0
@@ -417,7 +414,7 @@ def test_drw_lambda_boundaries_and_zero_ramp():
 
 
 def test_weighted_ce_all_ones_is_ordinary_mean_and_uses_batch_size():
-    from otuformer.training.trainer import _weighted_ce
+    from otuformer.training.finetune_support import _weighted_ce
 
     per_row = torch.tensor([1.0, 2.0, 3.0])
     labels = torch.tensor([0, 1, 2])
@@ -434,7 +431,7 @@ def test_prefilled_loss_params_need_the_explicit_marker():
     """A pre-filled arg is only honoured when marked explicit (pseudo mode)."""
     import argparse
 
-    from otuformer.training.trainer import _resolve_finetune_loss_config
+    from otuformer.training.finetune_support import _resolve_finetune_loss_config
 
     args = argparse.Namespace(
         loss="subcenter-arcface",
@@ -457,7 +454,7 @@ def test_prefilled_loss_params_need_the_explicit_marker():
 
 def test_effective_number_class_weights_stay_on_cpu_float64():
     """MPS has no float64, so the class-weight vector must stay on the CPU."""
-    from otuformer.training.trainer import _effective_number_class_weights
+    from otuformer.training.finetune_support import _effective_number_class_weights
 
     weights = _effective_number_class_weights(torch.tensor([10.0, 128.0]))
 
@@ -469,10 +466,10 @@ def test_effective_number_class_weights_stay_on_cpu_float64():
     not torch.backends.mps.is_available(), reason="MPS not available"
 )
 def test_cb_drw_r_bar_moves_counts_to_the_weights_device():
-    from otuformer.training.trainer import (
-        _cb_drw_r_bar,
-        _effective_number_class_weights,
-    )
+    from otuformer.training.finetune_support import (
+    _cb_drw_r_bar,
+    _effective_number_class_weights,
+)
 
     weights = _effective_number_class_weights(
         torch.tensor([10.0, 128.0], device="mps")

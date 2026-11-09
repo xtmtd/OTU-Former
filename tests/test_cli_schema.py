@@ -1345,6 +1345,29 @@ def test_pretrain_patch_applicability_matches_core_rules() -> None:
     assert any("saved patch mode" in note for note in resumed["unresolved"])
 
 
+def test_shared_koleo_is_applicable_to_both_methods() -> None:
+    """KoLeo is a shared regularizer, so the static card must not reject it.
+
+    The training resolver accepts a positive relational weight; a schema that
+    kept the DINO-only rule would contradict the run it is meant to describe.
+    """
+    module = cli_schema()
+    base = {"train_data": "e.csv", "input_images_dir": "images", "out_dir": "runs/x"}
+    for weight in (0.0, 0.1):
+        validation = module.validate_parameters(
+            "pretrain",
+            {**base, "ssl_method": "relational", "koleo_weight": weight},
+        )
+        assert validation["explicit_values"]["koleo_weight"] == weight
+    # The genuinely DINO-exclusive options stay rejected under relational.
+    for extra in (
+        {"ssl_method": "relational", "dino_prototypes": 8},
+        {"ssl_method": "relational", "dino_centering": "ema"},
+    ):
+        with pytest.raises(ValueError):
+            module.validate_parameters("pretrain", {**base, **extra})
+
+
 def test_pretrain_resume_provenance_is_not_blanket() -> None:
     module = cli_schema()
     validation = module.validate_parameters(
@@ -1828,7 +1851,9 @@ def test_ssl_schema_conditional_inheritance() -> None:
     module = cli_schema()
     base = {"train_data": "e.csv", "input_images_dir": "images", "out_dir": "runs/x"}
     resume = "runs/x/SSL_latest.pth"
-    conditional = ("out_dim", "dino_prototypes", "dino_centering", "koleo_weight")
+    # KoLeo is shared, not DINO-conditional: it is inherited on any resume and a
+    # declared default only on a fresh run, which the block at the end checks.
+    conditional = ("out_dim", "dino_prototypes", "dino_centering")
 
     # Resume with an omitted method: the saved method decides, so the labels are
     # conditional instead of assuming the new-run relational default.
@@ -1860,10 +1885,17 @@ def test_ssl_schema_conditional_inheritance() -> None:
     for name in conditional:
         assert relational["provenance"][name] == "omitted-default", name
 
-    # No resume at all: plain declared defaults.
+    # KoLeo is inherited on every resume, for either method.
+    for result in (omitted_method, dino, relational):
+        assert result["provenance"]["koleo_weight"] == "omitted-inherited"
+        assert any("--koleo-weight" in note for note in result["unresolved"])
+    assert card.count("--koleo-weight") >= 1
+
+    # No resume at all: plain declared defaults, including the zero KoLeo weight.
     fresh = module.validate_parameters("pretrain", base)
-    for name in conditional:
+    for name in (*conditional, "koleo_weight"):
         assert fresh["provenance"][name] == "omitted-default", name
+    assert fresh["values"]["koleo_weight"] == 0.0
     assert fresh["provenance"]["ssl_method"] == "omitted-default"
 
     # Explicit values always stay explicit.

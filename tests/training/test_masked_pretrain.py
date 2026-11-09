@@ -12,17 +12,27 @@ import pytest
 import torch
 import torch.nn as nn
 
+import otuformer.training.finetune_loop as finetune_loop_module
+import otuformer.training.pretrain_loop as pretrain_loop_module
 from otuformer.training import trainer
 from otuformer.training.model import OTUFormerEncoder, PatchObjective
+import otuformer.training.loss as loss_module
+import otuformer.training.model as model_module
+import otuformer.training.objectives as objectives_module
+import otuformer.training.patch_objective as patch_objective_module
+import otuformer.training.runtime as runtime_module
+import otuformer.training.augmentation as augmentation_module
+import otuformer.training.pretrain_recipe as pretrain_recipe_module
+import otuformer.training.reporting as reporting_module
 
 # Snapshot the real implementations once so repeated helper calls never chain
 # their spies through a previously installed monkeypatch.
 _REAL_FORWARD_PRETRAIN = OTUFormerEncoder.forward_pretrain
 _REAL_PATCH_OBJECTIVE = PatchObjective
-_REAL_UPDATE_TEACHER = trainer.update_teacher
-_REAL_SAMPLE_PATCH_MASKS = trainer._sample_patch_masks
-_REAL_UPDATE_PATCH_CENTER = trainer._update_patch_center
-_REAL_IBOT_PATCH_LOSS = trainer.ibot_patch_loss
+_REAL_UPDATE_TEACHER = pretrain_loop_module.update_teacher
+_REAL_SAMPLE_PATCH_MASKS = pretrain_loop_module._sample_patch_masks
+_REAL_UPDATE_PATCH_CENTER = pretrain_loop_module._update_patch_center
+_REAL_IBOT_PATCH_LOSS = pretrain_loop_module.ibot_patch_loss
 
 
 def _patch_args(**overrides):
@@ -58,7 +68,7 @@ def _patch_args(**overrides):
 def test_patch_config_resolves_new_run_defaults(
     mode, strategy, expected_requested
 ):
-    config = trainer._resolve_patch_config(
+    config = pretrain_recipe_module._resolve_patch_config(
         _patch_args(patch_loss=mode, masking_strategy=strategy), None
     )
 
@@ -87,13 +97,13 @@ def test_patch_config_resolves_new_run_defaults(
 def test_patch_config_rejects_explicit_ratio_out_of_range():
     for value in (0.0, 1.0, 1.5, -0.2):
         with pytest.raises(ValueError, match="mask_ratio"):
-            trainer._resolve_patch_config(
+            pretrain_recipe_module._resolve_patch_config(
                 _patch_args(mask_ratio=value, mask_ratio_explicit=True), None
             )
 
 
 def test_patch_config_honours_explicit_ratio():
-    config = trainer._resolve_patch_config(
+    config = pretrain_recipe_module._resolve_patch_config(
         _patch_args(
             patch_loss="consistency", mask_ratio=0.5, mask_ratio_explicit=True
         ),
@@ -106,25 +116,25 @@ def test_patch_config_honours_explicit_ratio():
 
 def test_patch_config_rejects_explicit_inapplicable_options():
     with pytest.raises(ValueError, match="mask_ratio"):
-        trainer._resolve_patch_config(
+        pretrain_recipe_module._resolve_patch_config(
             _patch_args(patch_loss="none", mask_ratio=0.3, mask_ratio_explicit=True),
             None,
         )
     with pytest.raises(ValueError, match="masking_strategy"):
-        trainer._resolve_patch_config(
+        pretrain_recipe_module._resolve_patch_config(
             _patch_args(patch_loss="none", masking_strategy_explicit=True), None
         )
     with pytest.raises(ValueError, match="ibot_prototypes"):
-        trainer._resolve_patch_config(
+        pretrain_recipe_module._resolve_patch_config(
             _patch_args(patch_loss="none", ibot_prototypes_explicit=True), None
         )
     with pytest.raises(ValueError, match="lambda_mask"):
-        trainer._resolve_patch_config(
+        pretrain_recipe_module._resolve_patch_config(
             _patch_args(patch_loss="none", lambda_mask=0.5, lambda_mask_explicit=True),
             None,
         )
     with pytest.raises(ValueError, match="masking_strategy"):
-        trainer._resolve_patch_config(
+        pretrain_recipe_module._resolve_patch_config(
             _patch_args(
                 patch_loss="consistency",
                 masking_strategy="blockwise",
@@ -133,11 +143,11 @@ def test_patch_config_rejects_explicit_inapplicable_options():
             None,
         )
     with pytest.raises(ValueError, match="ibot_prototypes"):
-        trainer._resolve_patch_config(
+        pretrain_recipe_module._resolve_patch_config(
             _patch_args(patch_loss="consistency", ibot_prototypes_explicit=True), None
         )
     with pytest.raises(ValueError, match="ibot_prototypes"):
-        trainer._resolve_patch_config(
+        pretrain_recipe_module._resolve_patch_config(
             _patch_args(patch_loss="masked-feature", ibot_prototypes_explicit=True),
             None,
         )
@@ -145,16 +155,16 @@ def test_patch_config_rejects_explicit_inapplicable_options():
 
 def test_patch_config_rejects_unknown_modes_and_strategies():
     with pytest.raises(ValueError, match="patch_loss"):
-        trainer._resolve_patch_config(_patch_args(patch_loss="mystery"), None)
+        pretrain_recipe_module._resolve_patch_config(_patch_args(patch_loss="mystery"), None)
     with pytest.raises(ValueError, match="masking_strategy"):
-        trainer._resolve_patch_config(
+        pretrain_recipe_module._resolve_patch_config(
             _patch_args(patch_loss="ibot", masking_strategy="mystery"), None
         )
 
 
 @pytest.mark.parametrize("prototypes", [2, 3, 256, 999, 4096, 65536])
 def test_patch_config_accepts_a_range_of_ibot_prototype_counts(prototypes):
-    config = trainer._resolve_patch_config(
+    config = pretrain_recipe_module._resolve_patch_config(
         _patch_args(patch_loss="ibot", ibot_prototypes=prototypes), None
     )
 
@@ -164,7 +174,7 @@ def test_patch_config_accepts_a_range_of_ibot_prototype_counts(prototypes):
 @pytest.mark.parametrize("prototypes", [0, 1, -5])
 def test_patch_config_rejects_non_positive_ibot_prototype_counts(prototypes):
     with pytest.raises(ValueError, match="ibot_prototypes"):
-        trainer._resolve_patch_config(
+        pretrain_recipe_module._resolve_patch_config(
             _patch_args(patch_loss="ibot", ibot_prototypes=prototypes), None
         )
 
@@ -179,14 +189,14 @@ def test_mask_generation_exact_count_and_determinism(
     strategy, grid_size, ratio
 ):
     patch_count = grid_size[0] * grid_size[1]
-    expected = trainer._target_patch_count(ratio, patch_count)
+    expected = patch_objective_module._target_patch_count(ratio, patch_count)
 
     torch.manual_seed(0)
-    first = trainer._sample_patch_masks(
+    first = pretrain_loop_module._sample_patch_masks(
         3, grid_size, ratio, strategy, torch.device("cpu")
     )
     torch.manual_seed(0)
-    second = trainer._sample_patch_masks(
+    second = pretrain_loop_module._sample_patch_masks(
         3, grid_size, ratio, strategy, torch.device("cpu")
     )
 
@@ -198,7 +208,7 @@ def test_mask_generation_exact_count_and_determinism(
 
 def test_mask_covers_whole_grid_and_leaves_a_visible_patch():
     for ratio in (0.0001, 0.5, 0.9999):
-        mask = trainer._sample_patch_masks(
+        mask = pretrain_loop_module._sample_patch_masks(
             2, (8, 8), ratio, "random", torch.device("cpu")
         )
         counts = mask.sum(dim=1)
@@ -209,10 +219,10 @@ def test_mask_covers_whole_grid_and_leaves_a_visible_patch():
 @pytest.mark.parametrize("strategy", ["random", "blockwise", "hybrid"])
 def test_mask_views_are_independently_sampled(strategy):
     torch.manual_seed(1)
-    view_a = trainer._sample_patch_masks(
+    view_a = pretrain_loop_module._sample_patch_masks(
         2, (8, 8), 0.3, strategy, torch.device("cpu")
     )
-    view_b = trainer._sample_patch_masks(
+    view_b = pretrain_loop_module._sample_patch_masks(
         2, (8, 8), 0.3, strategy, torch.device("cpu")
     )
     assert view_a is not view_b
@@ -222,7 +232,7 @@ def test_mask_views_are_independently_sampled(strategy):
 
 
 def test_blockwise_geometry_limits_are_respected():
-    shapes = trainer._legal_block_shapes((8, 8))
+    shapes = patch_objective_module._legal_block_shapes((8, 8))
     assert shapes
     max_area = (20 * 64) // 100
     for height, width in shapes:
@@ -234,12 +244,12 @@ def test_blockwise_geometry_limits_are_respected():
 
 def test_blockwise_rejects_four_by_four_grid_area_limit():
     with pytest.raises(ValueError, match="blockwise"):
-        trainer._validate_blockwise_grid((4, 4))
+        pretrain_loop_module._validate_blockwise_grid((4, 4))
 
 
 def test_blockwise_rejects_narrow_grid_without_a_two_patch_side():
     with pytest.raises(ValueError, match="blockwise"):
-        trainer._validate_blockwise_grid((1, 32))
+        pretrain_loop_module._validate_blockwise_grid((1, 32))
 
 
 def test_blockwise_random_fill_happens_only_after_a_legal_rectangle(monkeypatch):
@@ -253,20 +263,20 @@ def test_blockwise_random_fill_happens_only_after_a_legal_rectangle(monkeypatch)
         mask[:4] = True
         return mask
 
-    real_fill = trainer._random_positions_mask
+    real_fill = patch_objective_module._random_positions_mask
 
     def traced_fill(*args, **kwargs):
         calls.append("fill")
         return real_fill(*args, **kwargs)
 
-    monkeypatch.setattr(trainer, "_sample_rectangle", tiny_rectangle)
-    monkeypatch.setattr(trainer, "_random_positions_mask", traced_fill)
+    monkeypatch.setattr(patch_objective_module, "_sample_rectangle", tiny_rectangle)
+    monkeypatch.setattr(patch_objective_module, "_random_positions_mask", traced_fill)
 
-    mask = trainer._sample_patch_masks(
+    mask = pretrain_loop_module._sample_patch_masks(
         1, (8, 8), 0.5, "blockwise", torch.device("cpu")
     )
 
-    assert int(mask.sum()) == trainer._target_patch_count(0.5, 64)
+    assert int(mask.sum()) == patch_objective_module._target_patch_count(0.5, 64)
     assert calls[0] == "rectangle"
     assert "fill" in calls
 
@@ -282,14 +292,14 @@ def test_hybrid_starts_from_blockwise_positions(monkeypatch):
         mask[8:12] = True
         return mask
 
-    monkeypatch.setattr(trainer, "_sample_rectangle", tracked_rectangle)
+    monkeypatch.setattr(patch_objective_module, "_sample_rectangle", tracked_rectangle)
 
-    mask = trainer._sample_patch_masks(
+    mask = pretrain_loop_module._sample_patch_masks(
         1, (8, 8), 0.5, "hybrid", torch.device("cpu")
     )
 
     assert calls and calls[0] == "rectangle"
-    assert int(mask.sum()) == trainer._target_patch_count(0.5, 64)
+    assert int(mask.sum()) == patch_objective_module._target_patch_count(0.5, 64)
     # The blockwise share is exactly floor(target / 2), so part of the seeded
     # rectangle survives into the final mask.
     assert bool(mask[0, 8:12].any())
@@ -297,7 +307,7 @@ def test_hybrid_starts_from_blockwise_positions(monkeypatch):
 
 def test_sample_patch_masks_rejects_unknown_strategy():
     with pytest.raises(ValueError, match="masking_strategy"):
-        trainer._sample_patch_masks(
+        pretrain_loop_module._sample_patch_masks(
             1, (8, 8), 0.3, "mystery", torch.device("cpu")
         )
 
@@ -373,7 +383,7 @@ def _tiny_encoder(monkeypatch, **kwargs):
 
     double = _TinyViT(**kwargs)
     monkeypatch.setattr(model_module.timm, "create_model", lambda *a, **k: double)
-    encoder = model_module.OTUFormerEncoder(
+    encoder = pretrain_loop_module.OTUFormerEncoder(
         model_name="tiny-vit", out_dim=8, return_patch_tokens=True, pretrained=False
     )
     return encoder, double
@@ -493,7 +503,7 @@ def test_validate_pretrain_backbone_names_the_missing_capability(monkeypatch):
 
     broken = types.SimpleNamespace(num_features=16)
     monkeypatch.setattr(model_module.timm, "create_model", lambda *a, **k: broken)
-    encoder = model_module.OTUFormerEncoder(
+    encoder = pretrain_loop_module.OTUFormerEncoder(
         model_name="broken-backbone", out_dim=8, pretrained=False
     )
 
@@ -548,7 +558,7 @@ def _real_tiny_encoder(monkeypatch, native_regs=0, class_token=True,
         )
 
     monkeypatch.setattr(model_module.timm, "create_model", factory)
-    encoder = model_module.OTUFormerEncoder(
+    encoder = pretrain_loop_module.OTUFormerEncoder(
         model_name="tiny-real", out_dim=8, return_patch_tokens=True,
         img_size=32, pretrained=False, reg_tokens=reg_tokens,
     )
@@ -612,24 +622,24 @@ def _encoder(**kwargs):
     kwargs.setdefault("return_patch_tokens", True)
     kwargs.setdefault("img_size", 64)
     kwargs.setdefault("pretrained", False)
-    return model_module.OTUFormerEncoder(model_name=kwargs.pop("model_name", "tiny-vit"), **kwargs)
+    return pretrain_loop_module.OTUFormerEncoder(model_name=kwargs.pop("model_name", "tiny-vit"), **kwargs)
 
 
 def _record_encoder_constructions(monkeypatch, calls):
     """Record every encoder construction, including the helper's TaggedEncoder.
 
-    ``_run_tiny_pretrain`` replaces ``trainer.OTUFormerEncoder`` with a subclass
-    of ``model_module.OTUFormerEncoder``, so subclassing that attribute records
+    ``_run_tiny_pretrain`` replaces ``pretrain_loop_module.OTUFormerEncoder`` with a subclass
+    of ``pretrain_loop_module.OTUFormerEncoder``, so subclassing that attribute records
     both the resume probes and the training encoders.
     """
     import otuformer.training.model as model_module
 
-    class RecordingEncoder(model_module.OTUFormerEncoder):
+    class RecordingEncoder(pretrain_loop_module.OTUFormerEncoder):
         def __init__(self, *args, **kwargs):
             calls.append(dict(kwargs))
             super().__init__(*args, **kwargs)
 
-    monkeypatch.setattr(model_module, "OTUFormerEncoder", RecordingEncoder)
+    monkeypatch.setattr(pretrain_loop_module, "OTUFormerEncoder", RecordingEncoder)
     return RecordingEncoder
 
 
@@ -722,7 +732,7 @@ def test_legacy_pretrain_resume_keeps_its_permissive_partial_load(monkeypatch):
     state.pop("backbone.blocks.0.attn.qkv.weight")
     state.pop("backbone.cls_token")
 
-    assert trainer._resume_register_plan(
+    assert pretrain_loop_module._resume_register_plan(
         {"model_state_dict": state}, "tiny-vit", 64, 8
     ) == ("legacy", 0)
 
@@ -740,9 +750,9 @@ def test_malformed_recorded_register_count_is_rejected_by_every_entry_point(
     for recorded in (-1, False, "4"):
         checkpoint = {"model_state_dict": {}, "config": {"register_tokens": recorded}}
         with pytest.raises(ValueError, match="register_tokens"):
-            trainer._resume_register_plan(checkpoint, "tiny-vit", 64, 8)
+            pretrain_loop_module._resume_register_plan(checkpoint, "tiny-vit", 64, 8)
         with pytest.raises(ValueError, match="register_tokens"):
-            trainer._finetune_register_plan(checkpoint, "tiny-vit", 64, 8)
+            finetune_loop_module._finetune_register_plan(checkpoint, "tiny-vit", 64, 8)
 
     backbone = VisionTransformer(
         img_size=32, patch_size=16, in_chans=3, embed_dim=16, depth=2,
@@ -948,7 +958,7 @@ def test_named_ema_matches_by_name_regardless_of_registration_order():
     student = _module_with(["first", "second"], 1.0)
     teacher = _module_with(["second", "first"], 0.0)
 
-    trainer.update_teacher(student, teacher, 0.9)
+    pretrain_loop_module.update_teacher(student, teacher, 0.9)
 
     for name, param in teacher.named_parameters():
         assert torch.allclose(param, torch.full_like(param, 0.1)), name
@@ -962,7 +972,7 @@ def test_named_ema_raises_when_a_teacher_name_has_no_student_counterpart():
     teacher.orphan = nn.Linear(2, 2)
 
     with pytest.raises(ValueError, match="orphan"):
-        trainer.update_teacher(student, teacher, 0.9)
+        pretrain_loop_module.update_teacher(student, teacher, 0.9)
 
 
 def test_named_ema_ignores_student_only_parameters():
@@ -978,7 +988,7 @@ def test_named_ema_ignores_student_only_parameters():
         with torch.no_grad():
             param.zero_()
 
-    trainer.update_teacher(student, teacher, 0.5)
+    pretrain_loop_module.update_teacher(student, teacher, 0.5)
 
     assert torch.allclose(teacher.shared.weight, torch.full_like(teacher.shared.weight, 0.5))
 
@@ -994,7 +1004,7 @@ def test_named_ema_updates_the_decorrelated_ibot_teacher_head():
         with torch.no_grad():
             param.zero_()
 
-    trainer.update_teacher(
+    pretrain_loop_module.update_teacher(
         objective.student_ibot_head, objective.teacher_ibot_head, 0.75
     )
 
@@ -1016,7 +1026,7 @@ def test_optimizer_membership_is_mode_specific():
     for mode in ("none", "consistency", "masked-feature", "ibot"):
         student = encoder()
         objective = PatchObjective(mode, hidden_dim=4, ibot_prototypes=8)
-        params = trainer._student_optimizer_parameters(student, objective)
+        params = pretrain_recipe_module._student_optimizer_parameters(student, objective)
         ids = {id(p) for p in params}
 
         assert {id(p) for p in student.parameters()} <= ids
@@ -1032,7 +1042,7 @@ def test_optimizer_membership_is_mode_specific():
 
 def test_optimizer_membership_accepts_an_absent_objective():
     student = nn.Linear(4, 4)
-    params = trainer._student_optimizer_parameters(student, None)
+    params = pretrain_recipe_module._student_optimizer_parameters(student, None)
     assert {id(p) for p in params} == {id(p) for p in student.parameters()}
 
 
@@ -1120,11 +1130,11 @@ def _run_tiny_pretrain(tmp_path, monkeypatch, label="", on_first_step=None, **ov
             super().__init__(*a, **k)
             observations["objective"] = self
 
-    monkeypatch.setattr(trainer, "PatchObjective", RecordingObjective)
+    monkeypatch.setattr(pretrain_loop_module, "PatchObjective", RecordingObjective)
 
     created = []
 
-    class TaggedEncoder(model_module.OTUFormerEncoder):
+    class TaggedEncoder(pretrain_loop_module.OTUFormerEncoder):
         def __init__(self, *a, **k):
             super().__init__(*a, **k)
             if k.get("out_dim") == 256:
@@ -1134,7 +1144,7 @@ def _run_tiny_pretrain(tmp_path, monkeypatch, label="", on_first_step=None, **ov
             self.tag = "student" if not created else "teacher"
             created.append(self)
 
-    monkeypatch.setattr(trainer, "OTUFormerEncoder", TaggedEncoder)
+    monkeypatch.setattr(pretrain_loop_module, "OTUFormerEncoder", TaggedEncoder)
 
     real_forward = _REAL_FORWARD_PRETRAIN
 
@@ -1157,7 +1167,7 @@ def _run_tiny_pretrain(tmp_path, monkeypatch, label="", on_first_step=None, **ov
         )
 
     monkeypatch.setattr(
-        model_module.OTUFormerEncoder, "forward_pretrain", spy_forward
+        pretrain_loop_module.OTUFormerEncoder, "forward_pretrain", spy_forward
     )
 
     real_sample = _REAL_SAMPLE_PATCH_MASKS
@@ -1174,9 +1184,9 @@ def _run_tiny_pretrain(tmp_path, monkeypatch, label="", on_first_step=None, **ov
         )
         return mask
 
-    monkeypatch.setattr(trainer, "_sample_patch_masks", spy_sample)
+    monkeypatch.setattr(pretrain_loop_module, "_sample_patch_masks", spy_sample)
 
-    real_teacher_center = trainer._update_teacher_center
+    real_teacher_center = pretrain_loop_module._update_teacher_center
 
     def spy_teacher_center(center, inputs):
         if on_first_step is not None and "first_step_done" not in observations:
@@ -1184,7 +1194,7 @@ def _run_tiny_pretrain(tmp_path, monkeypatch, label="", on_first_step=None, **ov
             on_first_step(created[0], created[1])
         return real_teacher_center(center, inputs)
 
-    monkeypatch.setattr(trainer, "_update_teacher_center", spy_teacher_center)
+    monkeypatch.setattr(pretrain_loop_module, "_update_teacher_center", spy_teacher_center)
 
     real_update = _REAL_UPDATE_TEACHER
 
@@ -1193,7 +1203,7 @@ def _run_tiny_pretrain(tmp_path, monkeypatch, label="", on_first_step=None, **ov
         observations["events"].append("ema")
         return real_update(student, teacher, momentum)
 
-    monkeypatch.setattr(trainer, "update_teacher", spy_update)
+    monkeypatch.setattr(pretrain_loop_module, "update_teacher", spy_update)
 
     real_center = _REAL_UPDATE_PATCH_CENTER
 
@@ -1202,7 +1212,7 @@ def _run_tiny_pretrain(tmp_path, monkeypatch, label="", on_first_step=None, **ov
         observations["events"].append("center")
         return real_center(center, logits)
 
-    monkeypatch.setattr(trainer, "_update_patch_center", spy_center)
+    monkeypatch.setattr(pretrain_loop_module, "_update_patch_center", spy_center)
 
     real_ibot = _REAL_IBOT_PATCH_LOSS
 
@@ -1212,7 +1222,7 @@ def _run_tiny_pretrain(tmp_path, monkeypatch, label="", on_first_step=None, **ov
         observations["ibot_center"] = center.detach().clone()
         return real_ibot(student_logits, teacher_logits, mask, center, s_temp, t_temp)
 
-    monkeypatch.setattr(trainer, "ibot_patch_loss", spy_ibot)
+    monkeypatch.setattr(pretrain_loop_module, "ibot_patch_loss", spy_ibot)
 
     real_step = torch.optim.AdamW.step
 
@@ -1279,13 +1289,16 @@ def _run_tiny_pretrain(tmp_path, monkeypatch, label="", on_first_step=None, **ov
         batch_size=4,
         num_workers=0,
         cpus=2,
+        # CPU: this run uses smaller local crops, whose positional
+        # interpolation needs the antialiased bicubic backward that is
+        # unimplemented on MPS (device policy: retained CPU exception).
         device="cpu",
         seed=42,
         **settings,
     )
 
     observations["encoders"] = created
-    trainer.run_pretrain(args)
+    pretrain_loop_module.run_pretrain(args)
     observations["out_dir"] = out_dir
     observations["args"] = args
     return observations
@@ -1631,7 +1644,7 @@ def _make_legacy_checkpoint(
     ):
         config.pop(key, None)
     if not mixed_generation:
-        config.pop(trainer.RELATIONAL_TARGET_CONFIG_KEY, None)
+        config.pop(pretrain_loop_module.RELATIONAL_TARGET_CONFIG_KEY, None)
     checkpoint["config"] = config
     checkpoint.pop("patch_objective", None)
     checkpoint.pop("rng_state", None)
@@ -1729,7 +1742,7 @@ def test_rng_state_round_trips_python_numpy_and_torch():
     random_module.seed(7)
     np.random.seed(7)
     torch.manual_seed(7)
-    state = trainer._capture_rng_state()
+    state = pretrain_loop_module._capture_rng_state()
     expected = (
         random_module.random(),
         float(np.random.rand()),
@@ -1739,7 +1752,7 @@ def test_rng_state_round_trips_python_numpy_and_torch():
     random_module.seed(99)
     np.random.seed(99)
     torch.manual_seed(99)
-    trainer._restore_rng_state(state)
+    pretrain_loop_module._restore_rng_state(state)
 
     assert (
         random_module.random(),
@@ -1929,7 +1942,7 @@ def test_legacy_pretrain_schema_is_migrated_atomically(tmp_path):
     path = tmp_path / "instant_metrics.pretrain.csv"
     _write_legacy_csv(path)
 
-    trainer.InstantMetricsLogger(path, mode="pretrain")
+    pretrain_loop_module.InstantMetricsLogger(path, mode="pretrain")
 
     migrated = pd.read_csv(path)
     assert len(migrated) == 2
@@ -1938,14 +1951,14 @@ def test_legacy_pretrain_schema_is_migrated_atomically(tmp_path):
     expected_fields = (
         _LEGACY_PRETRAIN_HEADER
         + _NEW_PRETRAIN_FIELDS
-        + trainer._PRETRAIN_SSL_SETTING_FIELDS
-        + trainer._PRETRAIN_SSL_METRIC_FIELDS
+        + reporting_module._PRETRAIN_SSL_SETTING_FIELDS
+        + reporting_module._PRETRAIN_SSL_METRIC_FIELDS
     )
     assert list(migrated.columns) == expected_fields
     assert migrated.iloc[0]["iteration"] == 0
     assert migrated.iloc[1]["iteration"] == 1
-    for field in _NEW_PRETRAIN_FIELDS + trainer._PRETRAIN_SSL_SETTING_FIELDS + (
-        trainer._PRETRAIN_SSL_METRIC_FIELDS
+    for field in _NEW_PRETRAIN_FIELDS + reporting_module._PRETRAIN_SSL_SETTING_FIELDS + (
+        reporting_module._PRETRAIN_SSL_METRIC_FIELDS
     ):
         assert migrated[field].isna().all(), field
     assert list(tmp_path.glob("*.tmp")) == []
@@ -1954,7 +1967,7 @@ def test_legacy_pretrain_schema_is_migrated_atomically(tmp_path):
 def test_migrated_legacy_csv_can_be_plotted(tmp_path):
     path = tmp_path / "instant_metrics.pretrain.csv"
     _write_legacy_csv(path)
-    logger = trainer.InstantMetricsLogger(path, mode="pretrain")
+    logger = pretrain_loop_module.InstantMetricsLogger(path, mode="pretrain")
 
     logger.plot(tmp_path)
 
@@ -1965,10 +1978,10 @@ def test_current_pretrain_schema_is_appended_without_migration(tmp_path):
     import pandas as pd
 
     path = tmp_path / "instant_metrics.pretrain.csv"
-    logger = trainer.InstantMetricsLogger(path, mode="pretrain")
+    logger = pretrain_loop_module.InstantMetricsLogger(path, mode="pretrain")
     before = path.read_bytes()
     logger.log(iteration=0, epoch=0, step=0, loss=1.0)
-    logger_again = trainer.InstantMetricsLogger(path, mode="pretrain")
+    logger_again = pretrain_loop_module.InstantMetricsLogger(path, mode="pretrain")
     logger_again.log(iteration=1, epoch=0, step=1, loss=2.0)
 
     assert path.read_bytes() != before
@@ -1989,7 +2002,7 @@ def test_malformed_pretrain_schema_fails_without_touching_the_file(tmp_path, con
     original = path.read_bytes()
 
     with pytest.raises(ValueError, match="schema"):
-        trainer.InstantMetricsLogger(path, mode="pretrain")
+        pretrain_loop_module.InstantMetricsLogger(path, mode="pretrain")
 
     assert path.read_bytes() == original
     assert list(tmp_path.glob("*.tmp")) == []
@@ -2067,7 +2080,7 @@ def test_ibot_diagnostics_match_reference():
     probs = torch.softmax(torch.randn(6, k), dim=-1)
     center = torch.tensor([[0.5, -0.25, 0.0, 1.0]])
 
-    diagnostics = trainer._ibot_diagnostics(probs, center)
+    diagnostics = pretrain_loop_module._ibot_diagnostics(probs, center)
 
     mean_assignment = probs.mean(dim=0)
     entropy = -(mean_assignment * torch.log(mean_assignment)).sum()
@@ -2117,7 +2130,7 @@ def test_relational_teacher_routing(tmp_path, monkeypatch, capsys):
     checkpoint = torch.load(
         obs["out_dir"] / "SSL_epoch_0001.pth", map_location="cpu", weights_only=False
     )
-    bundle = checkpoint["config"][trainer.RELATIONAL_TARGET_CONFIG_KEY]
+    bundle = checkpoint["config"][pretrain_loop_module.RELATIONAL_TARGET_CONFIG_KEY]
     assert bundle["relational_teacher_views"] == "weak"
     assert bundle["relational_center_source"] == "weak"
     assert bundle["relational_pairing"] == "full"
@@ -2125,9 +2138,9 @@ def test_relational_teacher_routing(tmp_path, monkeypatch, capsys):
         "mean": [0.485, 0.456, 0.406],
         "std": [0.229, 0.224, 0.225],
     }
-    assert set(bundle) == set(trainer.RELATIONAL_BUNDLE_KEYS)
+    assert set(bundle) == set(pretrain_recipe_module.RELATIONAL_BUNDLE_KEYS)
     saved_args = checkpoint["args"]
-    for key in trainer.RELATIONAL_ARGS_KEYS:
+    for key in pretrain_recipe_module.RELATIONAL_ARGS_KEYS:
         assert saved_args[key] == bundle[key]
     assert saved_args["teacher_temp_warmup_ratio"] == 0.7
     for key in (
@@ -2141,13 +2154,13 @@ def test_relational_teacher_routing(tmp_path, monkeypatch, capsys):
 
 def test_relational_teacher_routing_weak_with_ordinary_center(tmp_path, monkeypatch):
     calls = []
-    real_center = trainer._update_teacher_center
+    real_center = pretrain_loop_module._update_teacher_center
 
     def spy_center(center, inputs):
         calls.append((center.detach().clone(), inputs.detach().clone()))
         return real_center(center, inputs)
 
-    monkeypatch.setattr(trainer, "_update_teacher_center", spy_center)
+    monkeypatch.setattr(pretrain_loop_module, "_update_teacher_center", spy_center)
 
     obs = _run_tiny_pretrain(
         tmp_path,
@@ -2174,7 +2187,7 @@ def test_relational_teacher_routing_weak_with_ordinary_center(tmp_path, monkeypa
     checkpoint = torch.load(
         obs["out_dir"] / "SSL_epoch_0001.pth", map_location="cpu", weights_only=False
     )
-    bundle = checkpoint["config"][trainer.RELATIONAL_TARGET_CONFIG_KEY]
+    bundle = checkpoint["config"][pretrain_loop_module.RELATIONAL_TARGET_CONFIG_KEY]
     assert bundle["relational_center_source"] == "ordinary"
     # A disabled center update would leave the saved center at its zero init.
     assert float(checkpoint["center"].abs().sum()) > 0.0
@@ -2307,8 +2320,8 @@ def _saved_epoch(out_dir, epoch):
 
 def _assert_relational_hop(checkpoint, *, views, pairing, center, start, end, weak):
     config = checkpoint["config"]
-    bundle = config[trainer.RELATIONAL_TARGET_CONFIG_KEY]
-    assert set(bundle) == set(trainer.RELATIONAL_BUNDLE_KEYS)
+    bundle = config[pretrain_loop_module.RELATIONAL_TARGET_CONFIG_KEY]
+    assert set(bundle) == set(pretrain_recipe_module.RELATIONAL_BUNDLE_KEYS)
     assert bundle["version"] == 1
     assert bundle["relational_teacher_views"] == views
     assert bundle["relational_center_source"] == center
@@ -2324,7 +2337,7 @@ def _assert_relational_hop(checkpoint, *, views, pairing, center, start, end, we
     else:
         assert bundle["weak_teacher_augmentation_config"] is None
     args = checkpoint["args"]
-    for key in trainer.RELATIONAL_ARGS_KEYS:
+    for key in pretrain_recipe_module.RELATIONAL_ARGS_KEYS:
         assert args[key] == bundle[key], key
     for key in (
         "include_weak_teacher_views",
@@ -2359,7 +2372,7 @@ def test_relational_legacy_checkpoint_resaves_twice(tmp_path, monkeypatch):
             end=0.07,
             weak=False,
         )
-        assert bundle1 == hop1["config"][trainer.RELATIONAL_TARGET_CONFIG_KEY]
+        assert bundle1 == hop1["config"][pretrain_loop_module.RELATIONAL_TARGET_CONFIG_KEY]
 
         second = _run_tiny_pretrain(
             tmp_path,
@@ -2390,7 +2403,7 @@ def test_relational_legacy_same_pairing_survives_two_hops(tmp_path, monkeypatch)
 
     saved = load_checkpoint(legacy)
     saved.pop("rng_state", None)
-    saved["config"].pop(trainer.RELATIONAL_TARGET_CONFIG_KEY, None)
+    saved["config"].pop(pretrain_loop_module.RELATIONAL_TARGET_CONFIG_KEY, None)
     saved["args"]["disable_cross_view_loss"] = True
     _save_ckpt(saved, legacy)
     assert checkpoint is not None
@@ -2444,7 +2457,7 @@ def test_relational_nondefault_ratio_resaves_twice(tmp_path, monkeypatch):
     )
     first = _saved_epoch(start["out_dir"], 1)
     assert first["args"]["teacher_temp_warmup_ratio"] == pytest.approx(0.3)
-    bundle = first["config"][trainer.RELATIONAL_TARGET_CONFIG_KEY]
+    bundle = first["config"][pretrain_loop_module.RELATIONAL_TARGET_CONFIG_KEY]
     assert "teacher_temp_warmup_ratio" not in bundle
 
     hop1 = _run_tiny_pretrain(
@@ -2523,7 +2536,7 @@ def test_relational_resume_preserves_distinct_encoders_twice(tmp_path, monkeypat
     )
     second = _saved_epoch(hop2["out_dir"], 3)
     assert not torch.equal(second["student"][key], second["teacher"][key])
-    assert trainer.RELATIONAL_TARGET_CONFIG_KEY in second["config"]
+    assert pretrain_loop_module.RELATIONAL_TARGET_CONFIG_KEY in second["config"]
     assert "initialization" not in second["config"]
 
 
@@ -2532,7 +2545,7 @@ def test_relational_out_of_band_endpoint_survives_two_hops(tmp_path, monkeypatch
     start = _run_tiny_pretrain(tmp_path, monkeypatch, label="_band_a")
     path = start["out_dir"] / "SSL_epoch_0001.pth"
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
-    bundle = checkpoint["config"][trainer.RELATIONAL_TARGET_CONFIG_KEY]
+    bundle = checkpoint["config"][pretrain_loop_module.RELATIONAL_TARGET_CONFIG_KEY]
     bundle["teacher_temp_start"] = 0.0009
     checkpoint["args"]["teacher_temp_start"] = 0.0009
     _save_ckpt(checkpoint, path)
@@ -2546,7 +2559,7 @@ def test_relational_out_of_band_endpoint_survives_two_hops(tmp_path, monkeypatch
         **_OMITTED_RECIPE,
     )
     first = _saved_epoch(hop1["out_dir"], 2)
-    assert first["config"][trainer.RELATIONAL_TARGET_CONFIG_KEY][
+    assert first["config"][pretrain_loop_module.RELATIONAL_TARGET_CONFIG_KEY][
         "teacher_temp_start"
     ] == 0.0009
     assert first["args"]["teacher_temp_start"] == 0.0009
@@ -2560,7 +2573,7 @@ def test_relational_out_of_band_endpoint_survives_two_hops(tmp_path, monkeypatch
         **_OMITTED_RECIPE,
     )
     second = _saved_epoch(hop2["out_dir"], 3)
-    assert second["config"][trainer.RELATIONAL_TARGET_CONFIG_KEY][
+    assert second["config"][pretrain_loop_module.RELATIONAL_TARGET_CONFIG_KEY][
         "teacher_temp_start"
     ] == 0.0009
     assert second["args"]["teacher_temp_start"] == 0.0009

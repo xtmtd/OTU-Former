@@ -18,6 +18,7 @@ from otuformer.utils.checkpoint import (
     resolve_projector_out_dim,
     resolve_register_layout,
 )
+import otuformer.training.model as model_module
 
 
 def _arcface_weights(embed_dim: int = 192, out_dim: int = 256) -> dict:

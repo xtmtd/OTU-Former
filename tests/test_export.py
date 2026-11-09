@@ -5,6 +5,9 @@ import pytest
 import torch
 
 from otuformer.vision.export import export_to_onnx, load_exported_onnx
+import otuformer.cli.export as export_module
+import otuformer.training.pretrain_loop as pretrain_loop_module
+import otuformer.training.model as model_module
 
 
 def test_export_checkpoint_loader_disables_pretrained_weights(monkeypatch, tmp_path: Path):
@@ -53,7 +56,7 @@ def make_checkpoint(
     tmp_path: Path, out_dim: int = 64, *, annotated: bool = False, name: str = "ckpt.pt"
 ) -> Path:
     from otuformer.training.model import OTUFormerEncoder
-    from otuformer.training.trainer import RELATIONAL_TARGET_CONFIG_KEY
+    from otuformer.training.pretrain_recipe import RELATIONAL_TARGET_CONFIG_KEY
 
     model = OTUFormerEncoder(model_name="vit_tiny_patch16_224", out_dim=out_dim)
     config = {"model_name": "vit_tiny_patch16_224", "out_dim": out_dim}
@@ -397,7 +400,7 @@ def test_export_reconstructs_a_registered_checkpoint(tmp_path: Path, monkeypatch
         )
 
     monkeypatch.setattr(timm_module, "create_model", factory)
-    model = model_module.OTUFormerEncoder(
+    model = pretrain_loop_module.OTUFormerEncoder(
         model_name="tiny-vit", out_dim=8, pretrained=False, reg_tokens=4, img_size=32
     )
     ckpt_path = tmp_path / "registered.pth"
@@ -485,7 +488,7 @@ def test_export_reconstructs_a_native_register_checkpoint(tmp_path: Path, monkey
     import otuformer.training.model as model_module
 
     _install_native_register_factory(monkeypatch, native_regs=2)
-    model = model_module.OTUFormerEncoder(
+    model = pretrain_loop_module.OTUFormerEncoder(
         model_name="tiny-native", out_dim=8, pretrained=False, img_size=32
     )
     ckpt_path = tmp_path / "native.pth"

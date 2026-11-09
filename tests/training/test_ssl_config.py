@@ -11,10 +11,12 @@ from typer.testing import CliRunner
 
 from otuformer.cli.main import app
 from otuformer.training.dino import DINO_FIXED_CONFIG
-from otuformer.training.trainer import (
-    resolve_pretrain_ssl_config,
-    run_pretrain,
-)
+from otuformer.training.pretrain_recipe import resolve_pretrain_ssl_config
+from otuformer.training.trainer import run_pretrain
+import otuformer.training.pretrain_loop as pretrain_loop_module
+import otuformer.training.pretrain_recipe as pretrain_recipe_module
+import otuformer.training.patch_objective as patch_objective_module
+import otuformer.training.reporting as reporting_module
 
 runner = CliRunner()
 
@@ -86,7 +88,7 @@ def dino_checkpoint(
     # absolute epoch 0 leaves the frozen prototype direction without state.
     from otuformer.training import trainer
 
-    params = trainer._student_optimizer_parameters(student, None, objective)
+    params = pretrain_recipe_module._student_optimizer_parameters(student, None, objective)
     frozen = objective.trainable_parameters()[0]
     optimizer_state = {
         index: {
@@ -107,6 +109,9 @@ def dino_checkpoint(
         "koleo_weight": koleo_weight,
         "augmentation_config": {"global_crop": {"size": SIZE}},
         **DINO_FIXED_CONFIG,
+        # The four KoLeo keys belong to the shared pretrain owner, not to
+        # ``dino.py``; a DINO payload still records them.
+        **pretrain_recipe_module.KOLEO_FIXED_CONFIG,
     }
     if centering == "ema":
         config["dino_center_momentum"] = 0.9
@@ -281,12 +286,23 @@ def test_new_run_validation_rejects_invalid_dino_options():
     for overrides in (
         {"dino_prototypes": 64, "dino_prototypes_explicit": True},
         {"dino_centering": "ema", "dino_centering_explicit": True},
-        {"koleo_weight": 0.0, "koleo_weight_explicit": True},
     ):
         with pytest.raises(ValueError, match="relational|not applicable"):
             resolve_pretrain_ssl_config(ssl_args(**overrides), None)
-    # Omitted inactive defaults have no effect.
-    assert resolve_pretrain_ssl_config(ssl_args(), None) == {
+    # KoLeo is shared by both methods, so an explicit zero is a valid
+    # relational request even though relational never records the keys at zero.
+    explicit_zero = resolve_pretrain_ssl_config(
+        ssl_args(koleo_weight=0.0, koleo_weight_explicit=True), None
+    )
+    assert explicit_zero["koleo_weight"] == 0.0
+    # Omitted inactive defaults have no effect. KoLeo is shared, so its four
+    # keys ride along at the resolved zero weight.
+    effective = resolve_pretrain_ssl_config(ssl_args(), None)
+    assert effective["koleo_weight"] == 0.0
+    assert {
+        key: value for key, value in effective.items()
+        if not key.startswith("koleo_")
+    } == {
         "ssl_method": "relational",
         "ssl_head": "projection_mlp_2048",
         "out_dim": 256,
@@ -470,7 +486,7 @@ def test_effective_slot_is_reused(tmp_path, monkeypatch):
         raise AssertionError("the supplied effective slot must be reused")
 
     monkeypatch.setattr(
-        trainer, "resolve_pretrain_ssl_config", fail_second_resolution
+        pretrain_recipe_module, "resolve_pretrain_ssl_config", fail_second_resolution
     )
     args = ssl_args(
         out_dir=str(tmp_path / "reused"),
@@ -499,7 +515,7 @@ def test_absent_slot_resolves_before_mkdir(tmp_path, monkeypatch):
         seen["out_dir_exists"] = out_dir.exists()
         raise RuntimeError("stop before training")
 
-    monkeypatch.setattr(trainer, "resolve_pretrain_ssl_config", record)
+    monkeypatch.setattr(pretrain_recipe_module, "resolve_pretrain_ssl_config", record)
     args = ssl_args(
         out_dir=str(out_dir),
         seed=42,
@@ -527,7 +543,7 @@ def test_dino_resume_rejects_conflicting_fixed_center_settings():
 
 
 def test_ssl_display_projection_differs_from_persisted_config():
-    from otuformer.training.trainer import _ssl_display_config
+    from otuformer.training.pretrain_recipe import _ssl_display_config
 
     relational = {
         "ssl_method": "relational",
@@ -635,11 +651,11 @@ def _checkpoint_with_patch_optimizer(mode="masked-feature", epoch=1):
     student = _encoder(17)
     patch = PatchObjective(mode, student.backbone.num_features, 11)
     objective = DINOObjective(17, 11, "sinkhorn-knopp")
-    checkpoint["config"].update(trainer._resolve_patch_config(
+    checkpoint["config"].update(pretrain_recipe_module._resolve_patch_config(
         argparse.Namespace(patch_loss=mode, ibot_prototypes=11), None
     ))
     checkpoint["patch_objective"] = patch.state_dict()
-    params = trainer._student_optimizer_parameters(student, patch, objective)
+    params = pretrain_recipe_module._student_optimizer_parameters(student, patch, objective)
     checkpoint["optimizer"] = {
         "param_groups": [_adamw_group(list(range(len(params))))],
         "state": {
@@ -771,7 +787,7 @@ def test_dino_preflight_accepts_the_last_recorded_iteration_when_extending():
     from otuformer.training import trainer
 
     objective = DINOObjective(17, 11, "sinkhorn-knopp")
-    params = trainer._student_optimizer_parameters(student, None, objective)
+    params = pretrain_recipe_module._student_optimizer_parameters(student, None, objective)
     state = checkpoint["optimizer"]["state"]
     for index, parameter in enumerate(params):
         state.setdefault(
@@ -856,7 +872,7 @@ def test_pretrain_recipe_defaults_and_validation(method):
 
 
 def test_teacher_temp_warmup_ratio_schedule():
-    from otuformer.training.trainer import _build_teacher_temp_schedule
+    from otuformer.training.pretrain_recipe import _build_teacher_temp_schedule
 
     def historical(total: int, ratio: float):
         warmup = int(total * ratio)
@@ -1114,7 +1130,7 @@ def _wd_model():
     student = _encoder(17)
     patch = PatchObjective("ibot", student.backbone.num_features, 11)
     objective = DINOObjective(17, 11, "ema")
-    groups = trainer._pretrain_optimizer_groups(
+    groups = pretrain_loop_module._pretrain_optimizer_groups(
         student,
         patch,
         objective,
@@ -1130,7 +1146,7 @@ def test_pretrain_norm_bias_wd_groups():
     decay, no_decay = (group["params"] for group in groups)
     assert groups[0]["weight_decay"] == 0.05
     assert groups[1]["weight_decay"] == 0.0
-    every = trainer._student_optimizer_parameters(student, patch, objective)
+    every = pretrain_recipe_module._student_optimizer_parameters(student, patch, objective)
     source_order = [id(p) for p in every]
     # Every parameter exactly once, and each group keeps source-relative order.
     assert sorted(id(p) for p in list(decay) + list(no_decay)) == sorted(source_order)
@@ -1170,10 +1186,10 @@ def test_pretrain_wd_default_preserves_parameter_order():
     student = _encoder(17)
     patch = PatchObjective("masked-feature", student.backbone.num_features, 11)
     objective = DINOObjective(17, 11, "ema")
-    params = trainer._student_optimizer_parameters(student, patch, objective)
+    params = pretrain_recipe_module._student_optimizer_parameters(student, patch, objective)
     baseline = torch.optim.AdamW(params, lr=5e-4, weight_decay=0.05)
     actual = torch.optim.AdamW(
-        trainer._pretrain_optimizer_groups(
+        pretrain_loop_module._pretrain_optimizer_groups(
             student,
             patch,
             objective,
@@ -1200,7 +1216,7 @@ def test_pretrain_joint_clip_includes_no_decay_group():
     for index, parameter in enumerate(flat):
         parameter.grad = torch.full_like(parameter, 1.0)
     lr_before = [group["lr"] for group in optimizer.param_groups]
-    expected = trainer._compute_grad_norm_parameters(flat)
+    expected = pretrain_loop_module._compute_grad_norm_parameters(flat)
     assert expected == pytest.approx(float(len(flat) and expected))
     measured = torch.nn.utils.clip_grad_norm_(flat, max_norm=3.0).item()
     assert measured == pytest.approx(expected, rel=1e-5)
@@ -1254,7 +1270,7 @@ def test_pretrain_resume_rejects_nonzero_wd_in_the_only_no_decay_group():
     )
     corrupt = {"param_groups": [_saved_group(2, 0.1)], "state": {}}
     with pytest.raises(ValueError, match="must be exactly 0.0"):
-        trainer._validate_pretrain_optimizer_layout(
+        pretrain_loop_module._validate_pretrain_optimizer_layout(
             optimizer,
             corrupt,
             norm_bias_weight_decay=False,
@@ -1275,7 +1291,7 @@ def test_pretrain_resume_rejects_noncanonical_optimizer_ids():
         ],
         "state": {},
     }
-    trainer._validate_pretrain_optimizer_layout(
+    pretrain_loop_module._validate_pretrain_optimizer_layout(
         optimizer, saved, norm_bias_weight_decay=False, label="pretrain resume"
     )
     # Two same-shaped parameters: every shape/count check still passes, only the
@@ -1292,7 +1308,7 @@ def test_pretrain_resume_rejects_noncanonical_optimizer_ids():
     ids = permuted["param_groups"][0]["params"]
     ids[0], ids[same_shape] = ids[same_shape], ids[0]
     with pytest.raises(ValueError, match="parameter ids"):
-        trainer._validate_pretrain_optimizer_layout(
+        pretrain_loop_module._validate_pretrain_optimizer_layout(
             optimizer, permuted, norm_bias_weight_decay=False, label="pretrain resume"
         )
 
@@ -1310,7 +1326,7 @@ def test_pretrain_resume_wd_single_group_semantics(capsys):
         ],
         "state": {},
     }
-    trainer._validate_pretrain_optimizer_layout(
+    pretrain_loop_module._validate_pretrain_optimizer_layout(
         two_group_optimizer,
         saved_two,
         norm_bias_weight_decay=False,
@@ -1327,7 +1343,7 @@ def test_pretrain_resume_wd_single_group_semantics(capsys):
         "state": {},
     }
     with pytest.raises(ValueError, match="must be exactly 0.0"):
-        trainer._validate_pretrain_optimizer_layout(
+        pretrain_loop_module._validate_pretrain_optimizer_layout(
             torch.optim.AdamW(groups, lr=5e-4, weight_decay=0.05),
             corrupt,
             norm_bias_weight_decay=False,
@@ -1340,14 +1356,14 @@ def test_pretrain_resume_wd_single_group_semantics(capsys):
         [{"params": params, "weight_decay": 0.0}], lr=5e-4
     )
     saved_one = {"param_groups": [_saved_group(2, 0.0)], "state": {}}
-    trainer._validate_pretrain_optimizer_layout(
+    pretrain_loop_module._validate_pretrain_optimizer_layout(
         no_decay_only,
         saved_one,
         norm_bias_weight_decay=False,
         label="pretrain resume",
     )
     no_decay_only.load_state_dict(saved_one)
-    trainer._report_restored_weight_decay(
+    pretrain_loop_module._report_restored_weight_decay(
         no_decay_only,
         requested_weight_decay=0.2,
         norm_bias_weight_decay=False,
@@ -1364,14 +1380,14 @@ def test_pretrain_resume_wd_single_group_semantics(capsys):
         [{"params": params, "weight_decay": 0.05}], lr=5e-4
     )
     saved_decay_only = {"param_groups": [_saved_group(2, 0.05)], "state": {}}
-    trainer._validate_pretrain_optimizer_layout(
+    pretrain_loop_module._validate_pretrain_optimizer_layout(
         decay_only,
         saved_decay_only,
         norm_bias_weight_decay=False,
         label="pretrain resume",
     )
     decay_only.load_state_dict(saved_decay_only)
-    trainer._report_restored_weight_decay(
+    pretrain_loop_module._report_restored_weight_decay(
         decay_only,
         requested_weight_decay=0.2,
         norm_bias_weight_decay=False,
@@ -1385,7 +1401,7 @@ def test_pretrain_resume_wd_single_group_semantics(capsys):
 def test_pretrain_resume_rejects_layout_conversion():
     trainer, student, patch, objective, groups = _wd_model()
     single = torch.optim.AdamW(
-        trainer._pretrain_optimizer_groups(
+        pretrain_loop_module._pretrain_optimizer_groups(
             student,
             patch,
             objective,
@@ -1406,7 +1422,7 @@ def test_pretrain_resume_rejects_layout_conversion():
     }
     # A two-group checkpoint is never converted into the historical single group.
     with pytest.raises(ValueError, match="never converted|parameter group"):
-        trainer._validate_pretrain_optimizer_layout(
+        pretrain_loop_module._validate_pretrain_optimizer_layout(
             single,
             saved_two,
             norm_bias_weight_decay=True,
@@ -1415,7 +1431,7 @@ def test_pretrain_resume_rejects_layout_conversion():
     # A group whose size changed is rejected rather than remapped by shape.
     wrong_size = {"param_groups": [_saved_group(1, 0.05)], "state": {}}
     with pytest.raises(ValueError, match="cannot be mapped by shape"):
-        trainer._validate_pretrain_optimizer_layout(
+        pretrain_loop_module._validate_pretrain_optimizer_layout(
             single, wrong_size, norm_bias_weight_decay=True, label="pretrain resume"
         )
 
@@ -1526,7 +1542,7 @@ def test_near_equal_warmup_records_are_still_contradictory():
     0.29999999999999993 give 3 and 2 warmup steps out of 10. Refusing to migrate
     means refusing the pair, not rounding it into agreement.
     """
-    from otuformer.training.trainer import _build_teacher_temp_schedule
+    from otuformer.training.pretrain_recipe import _build_teacher_temp_schedule
 
     near = 0.29999999999999993
     assert int(10 * near) != int(10 * 0.3)
@@ -1558,3 +1574,287 @@ def test_historical_ratio_match_is_exact():
             ),
             checkpoint,
         )
+
+
+# --- preflight handoff: one-shot input, one payload per invocation -----------
+
+
+def test_a_supplied_slot_is_consumed_not_cached():
+    """Reusing a Namespace must re-resolve, or the new request is ignored."""
+    args = ssl_args(
+        ssl_method="relational",
+        ssl_method_explicit=True,
+        koleo_weight=0.1,
+        koleo_weight_explicit=True,
+    )
+    args.resume_state = None
+    supplied = {"ssl_method": "relational", "ssl_head": "projection_mlp_2048"}
+    args.ssl_config_effective = supplied
+
+    assert pretrain_recipe_module._effective_pretrain_ssl_config(args) is supplied
+    # Consumed: the next call cannot reuse it.
+    assert getattr(args, "ssl_config_effective", None) is None
+    assert getattr(args, "resume_state", "sentinel") is None
+
+
+def test_changing_the_request_after_a_first_call_is_validated_again():
+    """A second call on the same Namespace must not bypass validation."""
+    args = ssl_args(
+        ssl_method="relational",
+        ssl_method_explicit=True,
+        koleo_weight=0.1,
+        koleo_weight_explicit=True,
+    )
+    args.resume_state = None
+    args.ssl_config_effective = {
+        "ssl_method": "relational",
+        "ssl_head": "projection_mlp_2048",
+        "out_dim": 256,
+        "koleo_weight": 0.1,
+        **pretrain_recipe_module.KOLEO_FIXED_CONFIG,
+        "teacher_temp_warmup_ratio": 0.7,
+        "norm_bias_weight_decay": True,
+    }
+    pretrain_recipe_module._effective_pretrain_ssl_config(args)
+
+    # Same Namespace, different request: a checkpoint with no KoLeo bundle.
+    args.resume = "checkpoint.pth"
+    args.resume_state = relational_checkpoint()
+    args.resume_state_path = "checkpoint.pth"
+
+    with pytest.raises(ValueError, match="records no KoLeo recipe"):
+        pretrain_recipe_module._effective_pretrain_ssl_config(args)
+
+
+def test_changing_the_resume_path_does_not_reuse_the_old_payload(tmp_path):
+    """A handed-over payload is bound to the path it came from."""
+    first = tmp_path / "first.pth"
+    second = tmp_path / "second.pth"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    first_payload = {"config": {"epoch": 1}}
+    second_payload = {"config": {"epoch": 2}}
+
+    args = ssl_args(resume=str(first))
+    args.resume_state = first_payload
+    args.resume_state_path = str(first)
+    handoff = pretrain_recipe_module.take_pretrain_handoff(args)
+    assert pretrain_recipe_module.resume_payload_for(args, handoff) is first_payload
+    # Taken, not cached: the slots are empty for the next call.
+    assert args.resume_state is None and args.resume_state_path is None
+
+    # The caller repoints --resume; the old payload must not be served.
+    args.resume = str(second)
+    loaded = {}
+    real = pretrain_recipe_module.load_checkpoint
+
+    def spy(path):
+        loaded["path"] = str(path)
+        return second_payload
+
+    pretrain_recipe_module.load_checkpoint = spy
+    try:
+        assert pretrain_recipe_module.resume_payload_for(args, handoff) is second_payload
+    finally:
+        pretrain_recipe_module.load_checkpoint = real
+    assert loaded["path"] == str(second)
+
+
+def test_the_same_resume_path_is_read_again_on_the_next_call(tmp_path):
+    """The path string is not the file: a replaced checkpoint must be reloaded."""
+    ckpt = tmp_path / "latest.pth"
+    ckpt.write_bytes(b"first")
+    args = ssl_args(resume=str(ckpt))
+    first_payload = {"config": {"epoch": 1}}
+    second_payload = {"config": {"epoch": 2}}
+    args.resume_state = first_payload
+    args.resume_state_path = str(ckpt)
+
+    reads = []
+    real = pretrain_recipe_module.load_checkpoint
+
+    def spy(path):
+        reads.append(str(path))
+        return second_payload
+
+    pretrain_recipe_module.load_checkpoint = spy
+    try:
+        handoff = pretrain_recipe_module.take_pretrain_handoff(args)
+        assert pretrain_recipe_module.resume_payload_for(args, handoff) is first_payload
+        # Same path, new invocation: the file may hold a newer checkpoint.
+        handoff = pretrain_recipe_module.take_pretrain_handoff(args)
+        assert pretrain_recipe_module.resume_payload_for(args, handoff) is second_payload
+    finally:
+        pretrain_recipe_module.load_checkpoint = real
+    assert reads == [str(ckpt)]
+
+
+def test_dropping_resume_drops_the_payload():
+    args = ssl_args(resume="checkpoint.pth")
+    args.resume_state = {"config": {"epoch": 1}}
+    args.resume_state_path = "checkpoint.pth"
+
+    args.resume = ""
+    handoff = pretrain_recipe_module.take_pretrain_handoff(args)
+    assert pretrain_recipe_module.resume_payload_for(args, handoff) is None
+
+
+def _resumable_dino_checkpoint() -> dict:
+    """A DINO payload that also passes the augmentation drift check."""
+    from otuformer.training.augmentation import build_pretrain_augmentation_config
+
+    checkpoint = dino_checkpoint()
+    checkpoint["config"]["augmentation_profile"] = "global-barcode"
+    checkpoint["config"]["augmentation_config"] = build_pretrain_augmentation_config(
+        "global-barcode", SIZE, 96, 0
+    )
+    return checkpoint
+
+
+def test_the_entry_point_loads_the_resume_checkpoint_exactly_once(
+    tmp_path, monkeypatch
+):
+    """Validation and restore must share one payload.
+
+    A direct caller (no CLI handoff) reaches ``run_pretrain`` with only
+    ``args.resume``. If the SSL resolution reloads the file, the recipe is
+    proven against one checkpoint while the run restores another.
+    """
+    from otuformer.training import pretrain_loop as trainer
+
+    ckpt = tmp_path / "latest.pth"
+    ckpt.write_bytes(b"not a real checkpoint")
+    args = ssl_args(
+        out_dir=str(tmp_path / "out"),
+        seed=0,
+        cpus=0,
+        device="cpu",
+        register_tokens=0,
+        local_crop_size=96,
+        local_crops=0,
+        train_data="",
+        input_images_dir=str(tmp_path),
+        batch_size=2,
+        num_workers=0,
+        max_epochs=5,
+        overwrite=False,
+        resume=str(ckpt),
+        ssl_method="dino",
+        ssl_method_explicit=True,
+        koleo_weight=0.1,
+        koleo_weight_explicit=True,
+    )
+    reads = []
+    payload = _resumable_dino_checkpoint()
+
+    def spy(path):
+        reads.append(str(path))
+        return payload
+
+    class DatasetReached(Exception):
+        """Stop the run after the payload is chosen."""
+
+    monkeypatch.setattr(pretrain_recipe_module, "load_checkpoint", spy)
+    monkeypatch.setattr(
+        trainer, "MultiCropDataset",
+        lambda **_kwargs: (_ for _ in ()).throw(DatasetReached()),
+    )
+
+    with pytest.raises(DatasetReached):
+        trainer.run_pretrain(args)
+
+    assert reads == [str(ckpt)]
+
+
+def test_the_ssl_check_and_the_restore_use_the_same_payload(tmp_path, monkeypatch):
+    """A checkpoint swapped mid-call must not be validated but not restored."""
+    from otuformer.training import pretrain_loop as trainer
+
+    ckpt = tmp_path / "latest.pth"
+    ckpt.write_bytes(b"not a real checkpoint")
+    # The first payload records no KoLeo recipe, so an enabled regularizer is
+    # illegal against it; the second would make the same request legal.
+    refused = _resumable_dino_checkpoint()
+    del refused["config"]["koleo_weight"]
+    accepted = _resumable_dino_checkpoint()
+    served = [refused, accepted]
+    reads = []
+
+    def loader(path):
+        reads.append(str(path))
+        return served[min(len(reads) - 1, len(served) - 1)]
+
+    monkeypatch.setattr(pretrain_recipe_module, "load_checkpoint", loader)
+    args = ssl_args(
+        out_dir=str(tmp_path / "out"),
+        seed=0,
+        cpus=0,
+        device="cpu",
+        register_tokens=0,
+        local_crop_size=96,
+        local_crops=0,
+        train_data="",
+        input_images_dir=str(tmp_path),
+        batch_size=2,
+        num_workers=0,
+        max_epochs=5,
+        overwrite=False,
+        resume=str(ckpt),
+        ssl_method="dino",
+        ssl_method_explicit=True,
+        koleo_weight=0.1,
+        koleo_weight_explicit=True,
+    )
+
+    # A second read would find the accepted payload and let the run continue,
+    # proving the recipe against a checkpoint the run does not restore from.
+    with pytest.raises(ValueError, match="koleo"):
+        trainer.run_pretrain(args)
+
+    assert reads == [str(ckpt)]
+    assert not (tmp_path / "out").exists()
+
+
+def test_a_handoff_left_by_a_failed_call_is_not_reused(tmp_path, monkeypatch):
+    """A rejected call must not leave an answer behind for a retry."""
+    from otuformer.training import pretrain_loop as trainer
+
+    args = ssl_args(
+        ssl_method="relational",
+        ssl_method_explicit=True,
+        koleo_weight=0.1,
+        koleo_weight_explicit=True,
+        out_dir=str(tmp_path / "out"),
+        seed=0,
+        cpus=0,
+        device="cpu",
+        register_tokens=4,
+        train_data="",
+        input_images_dir=str(tmp_path),
+        batch_size=2,
+        num_workers=0,
+        max_epochs=1,
+        resume="",
+        overwrite=False,
+    )
+    args.ssl_config_effective = {
+        "ssl_method": "relational",
+        "ssl_head": "projection_mlp_2048",
+        "out_dim": 256,
+        "koleo_weight": 0.1,
+        **pretrain_recipe_module.KOLEO_FIXED_CONFIG,
+        "teacher_temp_warmup_ratio": 0.7,
+        "norm_bias_weight_decay": True,
+    }
+    # Rejected by the first check in the entry, before any resolution.
+    args.register_tokens = 5
+    with pytest.raises(ValueError, match="--register-tokens"):
+        trainer.run_pretrain(args)
+    assert getattr(args, "ssl_config_effective", None) is None
+
+    # The retry asks for a configuration the stale answer would have skipped.
+    args.register_tokens = 4
+    args.student_temp = 0.0
+    with pytest.raises(ValueError, match="student-temp"):
+        trainer.run_pretrain(args)
+    assert not (tmp_path / "out").exists()

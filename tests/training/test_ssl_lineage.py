@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import shutil
 from pathlib import Path
 
 import pandas as pd
@@ -13,7 +14,9 @@ from typer.testing import CliRunner
 
 from otuformer.cli.main import app
 
+import otuformer.training.finetune_loop as finetune_loop_module
 from otuformer.training import trainer
+import otuformer.training.finetune_support as finetune_support_module
 
 MODEL = "vit_tiny_patch16_224"
 SIZE = 64
@@ -94,6 +97,9 @@ def _finetune_args(root: Path, checkpoint: Path, **overrides) -> argparse.Namesp
     values = dict(
         seed=42,
         cpus=0,
+        # CPU: this run uses smaller local crops, whose positional
+        # interpolation needs the antialiased bicubic backward that is
+        # unimplemented on MPS (device policy: retained CPU exception).
         device="cpu",
         out_dir=str(root / "ft_out"),
         checkpoint=str(checkpoint),
@@ -141,23 +147,23 @@ def _finetune_args(root: Path, checkpoint: Path, **overrides) -> argparse.Namesp
 def test_ssl_identity_matches_finetune_classification(identity, kind):
     checkpoint = _ssl_checkpoint(identity)
 
-    assert trainer._classify_finetune_source(checkpoint) == kind
+    assert finetune_loop_module._classify_finetune_source(checkpoint) == kind
 
 
 def test_dino_source_is_ssl_and_not_head_only():
     checkpoint = _ssl_checkpoint(("dino", "dino_mlp_2048"))
 
-    assert trainer._classify_finetune_source(checkpoint) == "ssl"
-    assert trainer._select_finetune_embedding_head(checkpoint) == "arcface_mlp_512"
-    assert trainer._resolve_finetune_ssl_source(checkpoint) == (
+    assert finetune_loop_module._classify_finetune_source(checkpoint) == "ssl"
+    assert finetune_loop_module._select_finetune_embedding_head(checkpoint) == "arcface_mlp_512"
+    assert finetune_loop_module._resolve_finetune_ssl_source(checkpoint) == (
         "dino",
         "dino_mlp_2048",
     )
 
 
 def test_metric_payload_exposes_only_its_source_pair():
-    assert trainer._resolve_finetune_ssl_source(_metric_checkpoint()) is None
-    assert trainer._resolve_finetune_ssl_source(
+    assert finetune_loop_module._resolve_finetune_ssl_source(_metric_checkpoint()) is None
+    assert finetune_loop_module._resolve_finetune_ssl_source(
         _metric_checkpoint(source=("dino", "dino_mlp_2048"))
     ) == ("dino", "dino_mlp_2048")
 
@@ -166,7 +172,7 @@ def test_sha_only_metric_resume_does_not_reopen_ssl(tmp_path):
     checkpoint = _metric_checkpoint(source=None, sha=SHA)
 
     # No pair is readable from a hash alone, and no file is opened for it.
-    assert trainer._resolve_finetune_ssl_source(checkpoint) is None
+    assert finetune_loop_module._resolve_finetune_ssl_source(checkpoint) is None
 
 
 def test_legacy_relational_source_is_recorded(tmp_path):
@@ -175,7 +181,7 @@ def test_legacy_relational_source_is_recorded(tmp_path):
     path = tmp_path / "ssl.pth"
     torch.save(checkpoint, path)
 
-    trainer.run_finetune(_finetune_args(tmp_path, path))
+    finetune_loop_module.run_finetune(_finetune_args(tmp_path, path))
 
     saved = torch.load(tmp_path / "ft_out" / "finetune_latest.pth", weights_only=False)
     config = saved["config"]
@@ -192,7 +198,7 @@ def test_dino_finetune_installs_fresh_metric_head(tmp_path):
     path = tmp_path / "dino_ssl.pth"
     torch.save(checkpoint, path)
 
-    trainer.run_finetune(_finetune_args(tmp_path, path))
+    finetune_loop_module.run_finetune(_finetune_args(tmp_path, path))
 
     saved = torch.load(tmp_path / "ft_out" / "finetune_latest.pth", weights_only=False)
     config = saved["config"]
@@ -209,7 +215,7 @@ def test_finetune_resume_preserves_ssl_lineage(tmp_path):
     checkpoint = _ssl_checkpoint(("dino", "dino_mlp_2048"), out_dim=8)
     path = tmp_path / "dino_ssl.pth"
     torch.save(checkpoint, path)
-    trainer.run_finetune(_finetune_args(tmp_path, path, out_dir=str(tmp_path / "ft")))
+    finetune_loop_module.run_finetune(_finetune_args(tmp_path, path, out_dir=str(tmp_path / "ft")))
 
     resume_args = _finetune_args(
         tmp_path,
@@ -219,7 +225,7 @@ def test_finetune_resume_preserves_ssl_lineage(tmp_path):
         finetune_epochs=2,
     )
     resume_args.checkpoint = ""
-    trainer.run_finetune(resume_args)
+    finetune_loop_module.run_finetune(resume_args)
 
     saved = torch.load(tmp_path / "ft" / "finetune_latest.pth", weights_only=False)
     assert saved["config"]["ssl_source_method"] == "dino"
@@ -233,14 +239,14 @@ def test_finetune_preflight_rejects_alias_conflict(tmp_path):
     checkpoint["model_state_dict"]["projector.net.4.weight"] = torch.zeros(9, 2048)
 
     with pytest.raises(ValueError):
-        trainer.preflight_finetune_source(checkpoint, MODEL)
+        finetune_loop_module.preflight_finetune_source(checkpoint, MODEL)
 
 
 def test_resolve_pseudo_ssl_source_contract():
     original = _ssl_checkpoint(("dino", "dino_mlp_2048"))
 
     # No recorded pair: the original identity (or None) passes through.
-    assert trainer.resolve_pseudo_ssl_source(original, {}) == (
+    assert finetune_loop_module.resolve_pseudo_ssl_source(original, {}) == (
         "dino",
         "dino_mlp_2048",
     )
@@ -251,7 +257,7 @@ def test_resolve_pseudo_ssl_source_contract():
         for key, value in unknown["model_state_dict"].items()
         if not key.startswith("projector.")
     }
-    assert trainer.resolve_pseudo_ssl_source(unknown, {}) is None
+    assert finetune_loop_module.resolve_pseudo_ssl_source(unknown, {}) is None
 
     # A matching pair is accepted; a contradicting or unverifiable one is not.
     recorded = {
@@ -259,21 +265,21 @@ def test_resolve_pseudo_ssl_source_contract():
         "ssl_source_head": "dino_mlp_2048",
         "ssl_initialization_checkpoint_sha256": SHA,
     }
-    assert trainer.resolve_pseudo_ssl_source(original, recorded) == (
+    assert finetune_loop_module.resolve_pseudo_ssl_source(original, recorded) == (
         "dino",
         "dino_mlp_2048",
     )
     with pytest.raises(ValueError, match="unknown|contradict"):
-        trainer.resolve_pseudo_ssl_source(unknown, recorded)
+        finetune_loop_module.resolve_pseudo_ssl_source(unknown, recorded)
     contradicts = dict(recorded, ssl_source_method="relational", ssl_source_head="projection_mlp_2048")
     with pytest.raises(ValueError, match="contradict"):
-        trainer.resolve_pseudo_ssl_source(original, contradicts)
+        finetune_loop_module.resolve_pseudo_ssl_source(original, contradicts)
     unanchored = {
         "ssl_source_method": "dino",
         "ssl_source_head": "dino_mlp_2048",
     }
     with pytest.raises(ValueError, match="SHA|source|identity"):
-        trainer.resolve_pseudo_ssl_source(original, unanchored)
+        finetune_loop_module.resolve_pseudo_ssl_source(original, unanchored)
 
 
 def test_direct_finetune_lineage_rejection_creates_no_output(tmp_path):
@@ -286,7 +292,7 @@ def test_direct_finetune_lineage_rejection_creates_no_output(tmp_path):
     out_dir = tmp_path / "rejected"
 
     with pytest.raises(ValueError):
-        trainer.run_finetune(_finetune_args(tmp_path, path, out_dir=str(out_dir)))
+        finetune_loop_module.run_finetune(_finetune_args(tmp_path, path, out_dir=str(out_dir)))
     assert not out_dir.exists()
 
 
@@ -310,7 +316,7 @@ def test_pseudo_round_lineage_conflict_fails_before_output(tmp_path):
     }
 
     with pytest.raises(ValueError, match="contradict|unknown"):
-        trainer.run_finetune(args, source_checkpoint=original)
+        finetune_loop_module.run_finetune(args, source_checkpoint=original)
     assert not out_dir.exists()
 
 
@@ -419,7 +425,7 @@ def test_finetune_resume_identity_preflight_preserves_logs(tmp_path):
     ssl_path = tmp_path / "dino_ssl.pth"
     torch.save(ssl, ssl_path)
     out_dir = tmp_path / "ft"
-    trainer.run_finetune(_finetune_args(tmp_path, ssl_path, out_dir=str(out_dir)))
+    finetune_loop_module.run_finetune(_finetune_args(tmp_path, ssl_path, out_dir=str(out_dir)))
 
     # Corrupt the resumed payload's own lineage anchor: a pair without a valid
     # SHA is contradictory for every consumer.
@@ -474,7 +480,7 @@ def test_old_pseudo_source_gains_validated_ssl_lineage(tmp_path):
     ssl = _ssl_checkpoint(("dino", "dino_mlp_2048"), out_dim=8)
     ssl_path = tmp_path / "dino_ssl.pth"
     torch.save(ssl, ssl_path)
-    trainer.run_finetune(
+    finetune_loop_module.run_finetune(
         _finetune_args(tmp_path, ssl_path, out_dir=str(tmp_path / "ft1"))
     )
     ft1_path = tmp_path / "ft1" / "finetune_latest.pth"
@@ -509,7 +515,7 @@ def test_old_pseudo_source_gains_validated_ssl_lineage(tmp_path):
         "source_checkpoint": str(ft1_path),
     }
 
-    trainer.run_finetune(args, source_checkpoint=ssl)
+    finetune_loop_module.run_finetune(args, source_checkpoint=ssl)
 
     config = torch.load(
         tmp_path / "ft2" / "finetune_latest.pth", weights_only=False
@@ -553,7 +559,7 @@ def test_pseudo_resume_preserves_lineage_without_reopening_ssl(
     ssl = _ssl_checkpoint(("dino", "dino_mlp_2048"), out_dim=8)
     ssl_path = tmp_path / "dino_ssl.pth"
     torch.save(ssl, ssl_path)
-    trainer.run_finetune(
+    finetune_loop_module.run_finetune(
         _finetune_args(
             tmp_path, ssl_path, out_dir=str(tmp_path / "ft1"), finetune_epochs=2
         )
@@ -579,10 +585,10 @@ def test_pseudo_resume_preserves_lineage_without_reopening_ssl(
 
     args = _pseudo_args(tmp_path, ssl_path, source_cfg, ft1_path, tmp_path / "ft2")
     args.finetune_epochs = 2
-    monkeypatch.setattr(trainer.shutil, "copy", copy_spy)
+    monkeypatch.setattr(shutil, "copy", copy_spy)
     with pytest.raises(_Interrupted):
-        trainer.run_finetune(args, source_checkpoint=ssl)
-    monkeypatch.setattr(trainer.shutil, "copy", real_copy)
+        finetune_loop_module.run_finetune(args, source_checkpoint=ssl)
+    monkeypatch.setattr(shutil, "copy", real_copy)
 
     # The original SSL file is gone before the resume: a resume that reopened it
     # would fail here.
@@ -596,14 +602,14 @@ def test_pseudo_resume_preserves_lineage_without_reopening_ssl(
     # from the checkpoint and no new pseudo artifacts are written.
     resume_args.pseudo_round_data = None
     writes = []
-    real_write = trainer._write_pseudo_outputs
+    real_write = finetune_loop_module._write_pseudo_outputs
 
     def write_spy(out_dir, diagnostics, summary):
         writes.append(Path(out_dir))
         return real_write(out_dir, diagnostics, summary)
 
-    monkeypatch.setattr(trainer, "_write_pseudo_outputs", write_spy)
-    trainer.run_finetune(resume_args)
+    monkeypatch.setattr(finetune_loop_module, "_write_pseudo_outputs", write_spy)
+    finetune_loop_module.run_finetune(resume_args)
     assert writes == []
 
     config = torch.load(
@@ -627,7 +633,7 @@ def test_pseudo_original_identity_rejected_before_output(
     ssl = _ssl_checkpoint(("dino", "dino_mlp_2048"))
     ssl_path = tmp_path / "ssl.pth"
     torch.save(ssl, ssl_path)
-    trainer.run_finetune(_finetune_args(tmp_path, ssl_path))
+    finetune_loop_module.run_finetune(_finetune_args(tmp_path, ssl_path))
     ft1_path = tmp_path / "ft_out" / "finetune_latest.pth"
     ft1 = torch.load(ft1_path, weights_only=False)
     if corruption != "unknown_identity":
@@ -659,7 +665,7 @@ def test_pseudo_original_identity_rejected_before_output(
     message = "projector|width|identity|unknown|SSL"
     if entry == "direct":
         with pytest.raises(ValueError, match=message):
-            trainer.run_finetune(
+            finetune_loop_module.run_finetune(
                 _pseudo_args(tmp_path, ssl_path, source_cfg, ft1_path, out_dir),
                 source_checkpoint=ssl,
             )
@@ -686,11 +692,11 @@ def test_pseudo_resume_identity_rejected_before_output(tmp_path, entry):
     ssl = _ssl_checkpoint(("dino", "dino_mlp_2048"))
     ssl_path = tmp_path / "ssl.pth"
     torch.save(ssl, ssl_path)
-    trainer.run_finetune(_finetune_args(tmp_path, ssl_path))
+    finetune_loop_module.run_finetune(_finetune_args(tmp_path, ssl_path))
     ft1_path = tmp_path / "ft_out" / "finetune_latest.pth"
     source = torch.load(ft1_path, weights_only=False)
     out_dir = tmp_path / "ft2"
-    trainer.run_finetune(
+    finetune_loop_module.run_finetune(
         _pseudo_args(tmp_path, ssl_path, source["config"], ft1_path, out_dir),
         source_checkpoint=ssl,
     )
@@ -707,7 +713,7 @@ def test_pseudo_resume_identity_rejected_before_output(tmp_path, entry):
         args = _finetune_args(tmp_path, ssl_path, out_dir=str(out_dir),
                               resume=str(path), finetune_epochs=2)
         with pytest.raises(ValueError, match="SSL|source|pair"):
-            trainer.run_finetune(args)
+            finetune_loop_module.run_finetune(args)
     else:
         result = runner.invoke(app, [
             "finetune", "--resume", str(path), "--train-data", str(labels),
@@ -735,7 +741,7 @@ def test_unknown_ssl_pseudo_source_omits_the_pair(tmp_path, layout):
             out_dim=8, source=None, sha=None
         )["model_state_dict"]
         assert original["model_state_dict"]["projector.net.0.weight"].shape[0] == 512
-    assert trainer._classify_finetune_source(original) == "ssl"
+    assert finetune_loop_module._classify_finetune_source(original) == "ssl"
     path = tmp_path / "unknown_ssl.pth"
     torch.save(original, path)
     _write_dataset(tmp_path)
@@ -749,7 +755,7 @@ def test_unknown_ssl_pseudo_source_omits_the_pair(tmp_path, layout):
     source_cfg["pseudo_round"] = 0
     source_cfg["ssl_initialization_checkpoint_sha256"] = _sha(path)
 
-    trainer.run_finetune(
+    finetune_loop_module.run_finetune(
         _pseudo_args(
             tmp_path, path, source_cfg, ft1_path, tmp_path / "ft2"
         ),

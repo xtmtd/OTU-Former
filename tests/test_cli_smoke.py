@@ -18,6 +18,17 @@ from otuformer.cli import README_URL, docs_url
 from otuformer.cli.main import app
 
 from test_docs import TOKEN_RE, all_docs, cn_docs, en_docs
+import otuformer.training.finetune_loop as finetune_loop_module
+import otuformer.training.dataset as dataset_module
+import otuformer.cli.finetune as finetune_module
+import otuformer.training.model as model_module
+import otuformer.training.pretrain_loop as pretrain_loop_module
+import otuformer.training.pretrain_recipe as pretrain_recipe_module
+import otuformer.training.trainer as trainer_module
+import otuformer.cli.update as update_module
+import otuformer.training.augmentation as augmentation_module
+import otuformer.training.finetune_support as finetune_support_module
+import otuformer.training.patch_objective as patch_objective_module
 
 runner = CliRunner()
 
@@ -39,6 +50,105 @@ def _update_section(text: str) -> str:
         if lines[i].startswith("## "):
             return "\n".join(lines[start + 1:i])
     return "\n".join(lines[start + 1:])
+
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+@pytest.fixture(autouse=True)
+def _plain_help_rendering(monkeypatch):
+    """Render help without ANSI styling, whatever the terminal env says.
+
+    Rich decides colour from FORCE_COLOR/NO_COLOR/TERM when a Console is built,
+    so a help assertion could pass locally and fail in CI. The contract under
+    test is the wording; colour is terminal presentation, so it is pinned here
+    instead of being normalised away differently per environment.
+    """
+    import rich.console
+
+    real_init = rich.console.Console.__init__
+
+    def init(self, *args, **kwargs):
+        kwargs["no_color"] = True
+        kwargs["force_terminal"] = False
+        kwargs["color_system"] = None
+        return real_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(rich.console.Console, "__init__", init)
+    for name in ("FORCE_COLOR", "CLICOLOR_FORCE", "PY_COLORS"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("NO_COLOR", "1")
+    monkeypatch.setenv("TERM", "dumb")
+
+
+def flat_help(text: str) -> str:
+    """Help text that is independent of terminal styling.
+
+    Rich emits ANSI escapes when color is forced, and those escapes sit inside
+    words. Stripping them first and box borders second makes the assertion
+    depend on wording only.
+    """
+    plain = ANSI_RE.sub("", text)
+    for char in "\u2502\u2500\u256d\u256e\u2570\u256f":
+        plain = plain.replace(char, " ")
+    return " ".join(plain.split()).lower()
+
+
+def test_training_help_renders_every_declared_option_exactly_once():
+    """Exactly-once coverage over the whole declaration set, not a sample.
+
+    A grouped panel can silently drop or duplicate an option; a sample of five
+    flags would not notice. The rendered text is compared against the declared
+    Typer options, independent of styling.
+    """
+    from typer.main import get_command
+
+    for command_name in ("pretrain", "finetune"):
+        result = runner.invoke(app, [command_name, "--help"], terminal_width=200)
+        assert result.exit_code == 0
+        declared = []
+        for parameter in get_command(app).commands[command_name].params:
+            declared.extend(parameter.opts)
+        assert declared, command_name
+        # Count declarations, not every mention: help prose and the usage
+        # example also name flags. A declaration line starts a cell with the
+        # flag, so the column position is what the panel owns.
+        declared_flags = _help_declaration_column(result.output).split("\n")
+        for flag in declared:
+            # Exact equality, not substring: ``--teacher-momentum`` is a prefix
+            # of ``--teacher-momentum-end``.
+            assert declared_flags.count(flag) == 1, (command_name, flag)
+
+        # Safety order survives grouping.
+        assert (
+            declared_flags.index("--out-dir")
+            < declared_flags.index("--resume")
+            < declared_flags.index("--overwrite")
+        )
+
+
+def _help_declaration_column(text: str) -> str:
+    """The option column of a rendered Rich help table, styling stripped.
+
+    Counting every occurrence would also count the usage example and prose that
+    names a flag, so this keeps only lines whose first cell is the option.
+    """
+    plain = ANSI_RE.sub("", text)
+    flags = []
+    for line in plain.splitlines():
+        cell = line.lstrip("\u2502\u2500\u256d\u256e\u2570\u256f ").strip()
+        # A declaration puts the flag in its own column, followed by the
+        # metavar or description after a gap. Wrapped prose that happens to
+        # begin with a flag continues with a single space, so it is skipped;
+        # a required option is prefixed by the panel's "*" marker.
+        cell = cell.lstrip("* ")
+        match = re.match(r"(-[\w-]+)\s{2,}\S", cell)
+        if match:
+            flags.append(match.group(1))
+    return "\n".join(flags)
+
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 
 def test_help():
@@ -66,10 +176,11 @@ def test_help_lists_safety_options_after_out_dir(command, options):
     result = runner.invoke(app, [command, "--help"])
 
     assert result.exit_code == 0
-    positions = [result.output.rfind(option) for option in options]
+    rendered = flat_help(result.output)
+    positions = [rendered.rfind(option) for option in options]
     assert all(position >= 0 for position in positions)
     assert positions == sorted(positions)
-    assert positions[-1] > result.output.rfind("--out-dir")
+    assert positions[-1] > rendered.rfind("--out-dir")
 
 
 def test_doctor():
@@ -302,7 +413,7 @@ def test_pretrain_resume_allows_existing_output_and_appends_log(tmp_path, monkey
     log_path = out_dir / "logs" / "pretrain.log"
     log_path.parent.mkdir(parents=True)
     log_path.write_text("old run\n", encoding="utf-8")
-    monkeypatch.setattr("otuformer.training.trainer.run_pretrain",
+    monkeypatch.setattr("otuformer.training.pretrain_loop.run_pretrain",
         lambda _args, **kwargs: None,)
 
     result = runner.invoke(
@@ -336,7 +447,7 @@ def test_pretrain_register_tokens_rejects_invalid_value(tmp_path):
 def test_pretrain_register_tokens_none_matches_omission(tmp_path, monkeypatch):
     seen: dict = {}
     monkeypatch.setattr(
-        "otuformer.training.trainer.run_pretrain",
+        "otuformer.training.pretrain_loop.run_pretrain",
         lambda args, **kwargs: seen.update(vars(args)),
     )
 
@@ -355,7 +466,7 @@ def test_pretrain_register_tokens_none_matches_omission(tmp_path, monkeypatch):
 def test_pretrain_register_option_provenance_reaches_the_trainer(tmp_path, monkeypatch):
     seen: dict = {}
     monkeypatch.setattr(
-        "otuformer.training.trainer.run_pretrain",
+        "otuformer.training.pretrain_loop.run_pretrain",
         lambda args, **kwargs: seen.update(vars(args)),
     )
     out_dir = tmp_path / "pretrain_out"
@@ -401,7 +512,7 @@ def test_pretrain_new_run_rejects_an_impossible_register_option_before_overwrite
     out_dir.mkdir()
     sentinel = out_dir / "keep.txt"
     sentinel.write_text("keep", encoding="utf-8")
-    monkeypatch.setattr("otuformer.training.trainer.run_pretrain",
+    monkeypatch.setattr("otuformer.training.pretrain_loop.run_pretrain",
         lambda _args, **kwargs: None,)
 
     result = runner.invoke(
@@ -467,7 +578,7 @@ def test_pretrain_registered_resume_preflight_preserves_existing_output(tmp_path
     (out_dir / "logs").mkdir(parents=True)
     sentinel = out_dir / "keep.txt"
     sentinel.write_text("keep", encoding="utf-8")
-    monkeypatch.setattr("otuformer.training.trainer.run_pretrain",
+    monkeypatch.setattr("otuformer.training.pretrain_loop.run_pretrain",
         lambda _args, **kwargs: None,)
 
     result = runner.invoke(
@@ -508,7 +619,7 @@ def test_finetune_checkpoint_initialization_requires_empty_or_overwrite(tmp_path
     out_dir.mkdir()
     stale = out_dir / "stale.txt"
     stale.write_text("stale", encoding="utf-8")
-    monkeypatch.setattr("otuformer.training.trainer.run_finetune", lambda _args, **_kw: None)
+    monkeypatch.setattr("otuformer.training.finetune_loop.run_finetune", lambda _args, **_kw: None)
     args = [
         "finetune", "--checkpoint", str(checkpoint), "--train-data", str(tmp_path / "labels.csv"),
         "--input-images-dir", str(tmp_path), "--out-dir", str(out_dir),
@@ -548,7 +659,7 @@ def test_finetune_registered_source_preflight_precedes_overwrite(tmp_path, monke
     sentinel = out_dir / "keep.txt"
     sentinel.write_text("keep", encoding="utf-8")
     monkeypatch.setattr(
-        "otuformer.training.trainer.run_finetune", lambda _args, **_kw: None
+        "otuformer.training.finetune_loop.run_finetune", lambda _args, **_kw: None
     )
 
     result = runner.invoke(
@@ -576,7 +687,7 @@ def test_finetune_visualize_images_are_protected_from_overwrite(tmp_path, monkey
         {"image": [str(out_dir / "validation.png")], "label": ["a"]}
     ).to_csv(tmp_path / "evaluation.csv", index=False)
     monkeypatch.setattr(
-        "otuformer.training.trainer.run_finetune", lambda _args, **_kw: None
+        "otuformer.training.finetune_loop.run_finetune", lambda _args, **_kw: None
     )
 
     result = runner.invoke(
@@ -625,7 +736,7 @@ def test_finetune_optimizer_arguments_are_forwarded(monkeypatch, tmp_path):
     def fake_run_finetune(args, *, explicit_options=frozenset(), source_checkpoint=None):
         seen.update(vars(args))
 
-    monkeypatch.setattr("otuformer.training.trainer.run_finetune", fake_run_finetune)
+    monkeypatch.setattr("otuformer.training.finetune_loop.run_finetune", fake_run_finetune)
     result = runner.invoke(
         app,
         [
@@ -1687,7 +1798,7 @@ def test_pretrain_default_model_name_and_device_auto(tmp_path, monkeypatch):
         seen["local_crop_size"] = args.local_crop_size
         seen["local_crops"] = args.local_crops
 
-    monkeypatch.setattr("otuformer.training.trainer.run_pretrain", fake_run_pretrain)
+    monkeypatch.setattr("otuformer.training.pretrain_loop.run_pretrain", fake_run_pretrain)
 
     result = runner.invoke(
         app,
@@ -1717,7 +1828,7 @@ def test_pretrain_forwards_patch_defaults_and_implicit_sources(tmp_path, monkeyp
     def fake_run_pretrain(args, *, pretrain_recipe=None):
         seen.update(vars(args))
 
-    monkeypatch.setattr("otuformer.training.trainer.run_pretrain", fake_run_pretrain)
+    monkeypatch.setattr("otuformer.training.pretrain_loop.run_pretrain", fake_run_pretrain)
 
     result = runner.invoke(
         app,
@@ -1746,7 +1857,7 @@ def test_pretrain_records_commandline_patch_sources(tmp_path, monkeypatch):
     def fake_run_pretrain(args, *, pretrain_recipe=None):
         seen.update(vars(args))
 
-    monkeypatch.setattr("otuformer.training.trainer.run_pretrain", fake_run_pretrain)
+    monkeypatch.setattr("otuformer.training.pretrain_loop.run_pretrain", fake_run_pretrain)
 
     result = runner.invoke(
         app,
@@ -1808,7 +1919,7 @@ def test_pretrain_forwards_large_ibot_prototype_counts(tmp_path, monkeypatch):
     def fake_run_pretrain(args, *, pretrain_recipe=None):
         seen.update(vars(args))
 
-    monkeypatch.setattr("otuformer.training.trainer.run_pretrain", fake_run_pretrain)
+    monkeypatch.setattr("otuformer.training.pretrain_loop.run_pretrain", fake_run_pretrain)
 
     result = runner.invoke(
         app,
@@ -1891,19 +2002,16 @@ def test_pretrain_help_documents_patch_modes_and_mask_migration():
     result = runner.invoke(app, ["pretrain", "--help"])
     assert result.exit_code == 0
     output = result.output
-    # Strip Rich table borders so a phrase wrapped across a cell boundary is
-    # still searchable as contiguous text.
-    normalized = " ".join(
-        re.sub(r"[^a-zA-Z0-9.\-]+", " ", output).lower().split()
-    )
+    normalized = flat_help(output)
     assert "masked-feature" in normalized
     assert "ibot" in normalized
     assert "experimental" in normalized
     assert "auto" in normalized
     assert "0.30" in normalized
-    assert "selected" in normalized
-    # Consistency must be described as visible-position selection, not masking.
-    assert "input masking" in normalized
+    # Target the patch objective's own wording; a bare "selected" also matches
+    # unrelated --mask-ratio prose, so it proves nothing on its own.
+    assert "visible same-position cosine regression" in normalized
+    assert "no input masking" in normalized
     assert "A+" not in output
     assert "lower it" in normalized  # ibot lambda-mask guidance
     for flag in (
@@ -1927,12 +2035,12 @@ def test_pretrain_help_distinguishes_cls_and_patch_objectives():
     assert options["ssl_method"].opts == ["--ssl-method"]
     assert options["ssl_method"].default == "relational"
     assert "global-to-global and local-to-global" in cls_help
-    assert "not a complete training recipe" in cls_help
+    assert "Not a complete training recipe" in cls_help
     assert "--patch-loss" in cls_help
-    assert "selected independently" in cls_help
+    assert "Select --patch-loss independently" in cls_help
     assert "share the encoder and teacher temperature" in cls_help
     assert "--ssl-method" in patch_help
-    assert "selected independently" in patch_help
+    assert "Select --ssl-method independently" in patch_help
     assert "share the encoder and teacher temperature" in patch_help
 
 
@@ -2123,7 +2231,7 @@ def test_pretrain_log_contains_command_params_and_stderr_on_error(
         sys.stderr.write("\x1b[31mstderr-line\x1b[0m\n")
         raise RuntimeError("boom")
 
-    monkeypatch.setattr("otuformer.training.trainer.run_pretrain", fake_run_pretrain)
+    monkeypatch.setattr("otuformer.training.pretrain_loop.run_pretrain", fake_run_pretrain)
 
     out_dir = tmp_path / "pretrain_out"
     result = runner.invoke(
@@ -2157,84 +2265,10 @@ def test_pretrain_log_contains_command_params_and_stderr_on_error(
     assert "RuntimeError: boom" in log_text
 
 
-def test_pretrain_enables_mps_fallback_env_for_auto(tmp_path, monkeypatch):
-    monkeypatch.delenv("PYTORCH_ENABLE_MPS_FALLBACK", raising=False)
-    seen = {}
-
-    def fake_run_pretrain(_args, *, pretrain_recipe=None):
-        seen["fallback"] = os.environ.get("PYTORCH_ENABLE_MPS_FALLBACK")
-
-    monkeypatch.setattr("otuformer.training.trainer.run_pretrain", fake_run_pretrain)
-
-    result = runner.invoke(
-        app,
-        [
-            "pretrain",
-            "--train-data",
-            str(tmp_path / "images.csv"),
-            "--input-images-dir",
-            str(tmp_path),
-            "--out-dir",
-            str(tmp_path / "pretrain_out"),
-            "--device",
-            "auto",
-        ],
-    )
-
-    assert result.exit_code == 0
-    assert seen["fallback"] == "1"
-
-
-@pytest.mark.parametrize(
-    ("command", "run_attr", "augmentation"),
-    [
-        ("pretrain", "otuformer.training.trainer.run_pretrain", "global-barcode"),
-        ("finetune", "otuformer.training.trainer.run_finetune", "conservative"),
-    ],
-)
-def test_training_enables_mps_fallback_before_augmentation_validation(
-    tmp_path, monkeypatch, command, run_attr, augmentation
-):
-    """PyTorch latches PYTORCH_ENABLE_MPS_FALLBACK at import time, so the CLI
-    must set it before the augmentation validators import torch."""
-    prior_fallback = os.environ.get("PYTORCH_ENABLE_MPS_FALLBACK")
-    monkeypatch.delenv("PYTORCH_ENABLE_MPS_FALLBACK", raising=False)
-    assert "PYTORCH_ENABLE_MPS_FALLBACK" not in os.environ
-    seen = {}
-
-    def spy_validate_augmentation(value, *, stage):
-        seen["fallback"] = os.environ.get("PYTORCH_ENABLE_MPS_FALLBACK")
-
-    monkeypatch.setattr(
-        f"otuformer.cli.{command}._validate_augmentation", spy_validate_augmentation
-    )
-    monkeypatch.setattr(run_attr, lambda _args, **_kw: None)
-
-    try:
-        result = runner.invoke(
-            app,
-            [
-                command,
-                "--train-data",
-                str(tmp_path / "data.csv"),
-                "--input-images-dir",
-                str(tmp_path),
-                "--out-dir",
-                str(tmp_path / "out"),
-                "--device",
-                "mps",
-                "--augmentation",
-                augmentation,
-            ],
-        )
-    finally:
-        if prior_fallback is None:
-            os.environ.pop("PYTORCH_ENABLE_MPS_FALLBACK", None)
-        else:
-            os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = prior_fallback
-
-    assert result.exit_code == 0, result.output
-    assert seen.get("fallback") == "1"
+# The MPS CPU-fallback switch is armed by the package import, not by a command
+# function: a late ``setdefault`` cannot take effect, so the CLI no longer sets
+# it. tests/test_mps_fallback_timing.py proves the import-order contract against
+# the real missing kernel, and it also asserts that no entry point sets it.
 
 
 # ---- Resolution & preprocessing consistency (2026-09-07 plan) ----
@@ -2367,7 +2401,7 @@ def test_pretrain_resume_allows_equal_input_size(tmp_path, monkeypatch):
     def fake_run_pretrain(args, *, pretrain_recipe=None):
         seen["global_crop_size"] = args.global_crop_size
 
-    monkeypatch.setattr("otuformer.training.trainer.run_pretrain", fake_run_pretrain)
+    monkeypatch.setattr("otuformer.training.pretrain_loop.run_pretrain", fake_run_pretrain)
 
     result = runner.invoke(
         app,
@@ -2398,7 +2432,7 @@ def test_pretrain_auto_global_crop_size_forwards_none(tmp_path, monkeypatch):
         seen["global_crop_size"] = args.global_crop_size
         seen["extract_size"] = args.extract_size
 
-    monkeypatch.setattr("otuformer.training.trainer.run_pretrain", fake_run_pretrain)
+    monkeypatch.setattr("otuformer.training.pretrain_loop.run_pretrain", fake_run_pretrain)
 
     result = runner.invoke(
         app,
@@ -2866,7 +2900,7 @@ def test_pretrain_augmentation_argument_forwarding_defaults_to_none(
         seen["local_crop_size"] = args.local_crop_size
         seen["local_crops"] = args.local_crops
 
-    monkeypatch.setattr("otuformer.training.trainer.run_pretrain", fake_run_pretrain)
+    monkeypatch.setattr("otuformer.training.pretrain_loop.run_pretrain", fake_run_pretrain)
 
     result = runner.invoke(
         app,
@@ -2901,7 +2935,7 @@ def test_pretrain_augmentation_argument_forwarding_explicit_values(
         seen["local_crop_size"] = args.local_crop_size
         seen["local_crops"] = args.local_crops
 
-    monkeypatch.setattr("otuformer.training.trainer.run_pretrain", fake_run_pretrain)
+    monkeypatch.setattr("otuformer.training.pretrain_loop.run_pretrain", fake_run_pretrain)
 
     result = runner.invoke(
         app,
@@ -2934,7 +2968,7 @@ def test_pretrain_augmentation_argument_forwarding_explicit_values(
 
 
 def test_format_user_command_omits_unset_augmentation_flags(tmp_path, monkeypatch):
-    monkeypatch.setattr("otuformer.training.trainer.run_pretrain",
+    monkeypatch.setattr("otuformer.training.pretrain_loop.run_pretrain",
         lambda _args, **kwargs: None,)
 
     def command_line(out_dir):
@@ -2991,7 +3025,7 @@ def test_finetune_augmentation_argument_forwarding_defaults_to_none(
         seen["augmentation"] = args.augmentation
         seen["orientation_policy"] = args.orientation_policy
 
-    monkeypatch.setattr("otuformer.training.trainer.run_finetune", fake_run_finetune)
+    monkeypatch.setattr("otuformer.training.finetune_loop.run_finetune", fake_run_finetune)
 
     result = runner.invoke(
         app,
@@ -3019,7 +3053,7 @@ def test_finetune_augmentation_argument_forwarding_explicit_values(
         seen["augmentation"] = args.augmentation
         seen["orientation_policy"] = args.orientation_policy
 
-    monkeypatch.setattr("otuformer.training.trainer.run_finetune", fake_run_finetune)
+    monkeypatch.setattr("otuformer.training.finetune_loop.run_finetune", fake_run_finetune)
 
     result = runner.invoke(
         app,
@@ -3060,14 +3094,14 @@ def test_finetune_initialization_inherits_policy_but_not_profile(
         loaded = torch.load(ckpt, map_location="cpu", weights_only=False)
         seen["augmentation"] = args.augmentation
         seen["orientation_policy"] = args.orientation_policy
-        seen["profile"] = trainer._select_augmentation_profile(
+        seen["profile"] = finetune_loop_module._select_augmentation_profile(
             args.augmentation, None, stage="finetune"
         )
-        seen["policy"] = trainer._select_orientation_policy(
+        seen["policy"] = finetune_loop_module._select_orientation_policy(
             args.orientation_policy, loaded, stage="finetune", resume=False
         )
 
-    monkeypatch.setattr("otuformer.training.trainer.run_finetune", fake_run_finetune)
+    monkeypatch.setattr("otuformer.training.finetune_loop.run_finetune", fake_run_finetune)
 
     result = runner.invoke(
         app,
@@ -3105,10 +3139,10 @@ def test_training_augmentation_argument_rejects_invalid_before_training(
 ):
     called = []
     monkeypatch.setattr(
-        "otuformer.training.trainer.run_pretrain", lambda _args: called.append("p")
+        "otuformer.training.pretrain_loop.run_pretrain", lambda _args: called.append("p")
     )
     monkeypatch.setattr(
-        "otuformer.training.trainer.run_finetune", lambda _args, **_kw: called.append("f")
+        "otuformer.training.finetune_loop.run_finetune", lambda _args, **_kw: called.append("f")
     )
     out_dir = tmp_path / "augmentation_out"
 
@@ -3147,11 +3181,11 @@ def test_pretrain_resume_inherits_saved_local_views_without_explicit_flags(
         loaded = torch.load(ckpt, map_location="cpu", weights_only=False)
         seen["local_crop_size"] = args.local_crop_size
         seen["local_crops"] = args.local_crops
-        seen["resolved"] = trainer._resolve_pretrain_local_views(
+        seen["resolved"] = pretrain_recipe_module._resolve_pretrain_local_views(
             args.local_crop_size, args.local_crops, loaded
         )
 
-    monkeypatch.setattr("otuformer.training.trainer.run_pretrain", fake_run_pretrain)
+    monkeypatch.setattr("otuformer.training.pretrain_loop.run_pretrain", fake_run_pretrain)
 
     result = runner.invoke(
         app,
@@ -3231,7 +3265,7 @@ def test_run_pretrain_resume_inherits_new_style_augmentation_into_dataset(
         seen.update(kwargs)
         raise _DatasetCaptured
 
-    monkeypatch.setattr(trainer, "MultiCropDataset", capturing_multi_crop_dataset)
+    monkeypatch.setattr(pretrain_loop_module, "MultiCropDataset", capturing_multi_crop_dataset)
 
     args = argparse.Namespace(
         seed=42,
@@ -3252,7 +3286,7 @@ def test_run_pretrain_resume_inherits_new_style_augmentation_into_dataset(
         num_workers=0,
     )
     with pytest.raises(_DatasetCaptured):
-        trainer.run_pretrain(args)
+        pretrain_loop_module.run_pretrain(args)
 
     assert seen["augmentation_profile"] == "color-robust"
     assert seen["orientation_policy"] == "sensitive"
@@ -3533,7 +3567,7 @@ def test_extract_metrics_include_balanced_probe_and_empty_unavailable_values(tmp
     metrics = pd.read_csv(tmp_path / "extract_metrics" / "metrics.csv")
     values = dict(zip(metrics["metric"], metrics["value"]))
 
-    from otuformer.training.trainer import EnhancedMetricsLogger
+    from otuformer.training.reporting import EnhancedMetricsLogger
 
     trainer_logger = EnhancedMetricsLogger(tmp_path / "trainer_fields.csv")
     expected_keys = set(trainer_logger.fieldnames) - {"epoch", "split"}
@@ -3640,8 +3674,8 @@ def _supcon_resume_optimizer_state():
         model_name="vit_tiny_patch16_224", out_dim=16, pretrained=False, img_size=32
     )
     encoder.projector = ArcFaceEmbeddingHead(encoder.backbone.num_features, 16)
-    trainer._freeze_backbone_blocks(encoder, 0.7)
-    optimizer = trainer._build_finetune_optimizer_for_layout(
+    finetune_loop_module._freeze_backbone_blocks(encoder, 0.7)
+    optimizer = finetune_loop_module._build_finetune_optimizer_for_layout(
         "v080_supcon",
         encoder,
         SupConLoss(temperature=0.07),
@@ -3694,15 +3728,15 @@ def test_supcon_resume_fixture_is_a_real_resumable_source(tmp_path):
     encoder.projector = ArcFaceEmbeddingHead(encoder.backbone.num_features, 16)
     # strict=True proves the fixture is a complete, loadable fine-tune source.
     encoder.load_state_dict(checkpoint["model_state_dict"], strict=True)
-    assert trainer._classify_finetune_source(checkpoint) == "v080"
+    assert finetune_loop_module._classify_finetune_source(checkpoint) == "v080"
     assert (
-        trainer._finetune_optimizer_layout(checkpoint, True, "supcon")
+        finetune_loop_module._finetune_optimizer_layout(checkpoint, True, "supcon")
         == "v080_supcon"
     )
     # The recorded optimizer must actually restore into the rebuilt layout;
     # the real resume path calls exactly this load.
-    trainer._freeze_backbone_blocks(encoder, 0.7)
-    optimizer = trainer._build_finetune_optimizer_for_layout(
+    finetune_loop_module._freeze_backbone_blocks(encoder, 0.7)
+    optimizer = finetune_loop_module._build_finetune_optimizer_for_layout(
         "v080_supcon",
         encoder,
         SupConLoss(temperature=0.07),
@@ -3775,7 +3809,7 @@ def test_finetune_compact_accepts_k_above_two(tmp_path, monkeypatch):
     def fake_run_finetune(args, *, explicit_options=frozenset(), source_checkpoint=None):
         seen["subcenters"] = args.subcenters
 
-    monkeypatch.setattr("otuformer.training.trainer.run_finetune", fake_run_finetune)
+    monkeypatch.setattr("otuformer.training.finetune_loop.run_finetune", fake_run_finetune)
     result = runner.invoke(
         app,
         _finetune_cli_argv(
@@ -3796,7 +3830,7 @@ def test_finetune_loss_mode_forwards_explicit_options_without_namespace_markers(
         seen["args"] = args
         seen["explicit"] = set(explicit_options)
 
-    monkeypatch.setattr("otuformer.training.trainer.run_finetune", fake_run_finetune)
+    monkeypatch.setattr("otuformer.training.finetune_loop.run_finetune", fake_run_finetune)
     result = runner.invoke(
         app,
         _finetune_cli_argv(
@@ -3819,7 +3853,7 @@ def test_pretrain_log_records_requested_auto_and_none_keywords(tmp_path, monkeyp
     def fake_run_pretrain(ns, *, pretrain_recipe=None):
         seen.update(vars(ns))
 
-    monkeypatch.setattr("otuformer.training.trainer.run_pretrain", fake_run_pretrain)
+    monkeypatch.setattr("otuformer.training.pretrain_loop.run_pretrain", fake_run_pretrain)
 
     out_dir = tmp_path / "pretrain_auto"
     result = runner.invoke(
@@ -3852,7 +3886,7 @@ def test_finetune_loss_mode_defaults_to_no_explicit_options(tmp_path, monkeypatc
     def fake_run_finetune(args, *, explicit_options=frozenset(), source_checkpoint=None):
         seen["explicit"] = set(explicit_options)
 
-    monkeypatch.setattr("otuformer.training.trainer.run_finetune", fake_run_finetune)
+    monkeypatch.setattr("otuformer.training.finetune_loop.run_finetune", fake_run_finetune)
     result = runner.invoke(app, _finetune_cli_argv(tmp_path))
 
     assert result.exit_code == 0, result.output
@@ -3863,7 +3897,7 @@ def test_finetune_loss_mode_defaults_to_no_explicit_options(tmp_path, monkeypatc
 
 def test_pretrain_command_replay_keeps_the_disable_metrics_switch(tmp_path, monkeypatch):
     """The replay line must show the CLI switch, not its inverted core argument."""
-    monkeypatch.setattr("otuformer.training.trainer.run_pretrain",
+    monkeypatch.setattr("otuformer.training.pretrain_loop.run_pretrain",
         lambda _ns, **kwargs: None,)
 
     result = runner.invoke(
@@ -3888,7 +3922,7 @@ def test_finetune_command_replay_keeps_explicit_auto_extract_size(
     tmp_path, monkeypatch
 ):
     monkeypatch.setattr(
-        "otuformer.training.trainer.run_finetune", lambda *_a, **_k: None
+        "otuformer.training.finetune_loop.run_finetune", lambda *_a, **_k: None
     )
     result = runner.invoke(
         app, _finetune_cli_argv(tmp_path, "--extract-size", "auto")
@@ -3960,7 +3994,7 @@ def test_finetune_loss_mode_supcon_resume_requires_matching_temperature(
     ):
         calls.append(set(explicit_options))
 
-    monkeypatch.setattr("otuformer.training.trainer.run_finetune", fake_run_finetune)
+    monkeypatch.setattr("otuformer.training.finetune_loop.run_finetune", fake_run_finetune)
 
     equal_out = tmp_path / "equal_out"
     equal = runner.invoke(
@@ -4067,7 +4101,7 @@ def test_finetune_loss_mode_resume_hands_the_preloaded_checkpoint_to_the_trainer
     ):
         seen["preloaded"] = source_checkpoint
 
-    monkeypatch.setattr("otuformer.training.trainer.run_finetune", fake_run_finetune)
+    monkeypatch.setattr("otuformer.training.finetune_loop.run_finetune", fake_run_finetune)
     result = runner.invoke(app, _finetune_cli_argv(tmp_path, "--resume", str(source)))
 
     assert result.exit_code == 0, result.output
@@ -4259,7 +4293,7 @@ def test_finetune_pseudo_overwrite_is_allowed(monkeypatch, tmp_path):
     stale.write_text("old", encoding="utf-8")
 
     monkeypatch.setattr(
-        trainer_module,
+        finetune_support_module,
         "prepare_pseudo_round",
         lambda **kwargs: {
             "source_config": {"loss": "arcface", "long_tail": "none"},
@@ -4273,7 +4307,7 @@ def test_finetune_pseudo_overwrite_is_allowed(monkeypatch, tmp_path):
             "source_checkpoint": str(ft1),
         },
     )
-    monkeypatch.setattr(trainer_module, "run_finetune", lambda args, **kwargs: None)
+    monkeypatch.setattr(finetune_loop_module, "run_finetune", lambda args, **kwargs: None)
 
     result = runner.invoke(
         app,
@@ -4299,7 +4333,7 @@ def test_finetune_pseudo_identity_conflict_fails_before_output(monkeypatch, tmp_
     ft1 = _write_init_checkpoint(tmp_path / "ft1.pth")
     ssl = _write_init_checkpoint(tmp_path / "ssl.pth")
     monkeypatch.setattr(
-        trainer_module,
+        finetune_support_module,
         "prepare_pseudo_round",
         lambda **kwargs: {
             "source_config": {
@@ -4363,7 +4397,7 @@ def test_finetune_pseudo_inherits_nondefault_loss_params(monkeypatch, tmp_path):
     ssl = _write_init_checkpoint(tmp_path / "ssl.pth")
     source_cfg = torch.load(ft1, map_location="cpu", weights_only=False)["config"]
     monkeypatch.setattr(
-        trainer_module,
+        finetune_support_module,
         "prepare_pseudo_round",
         lambda **kwargs: {
             "source_config": source_cfg,
@@ -4378,7 +4412,7 @@ def test_finetune_pseudo_inherits_nondefault_loss_params(monkeypatch, tmp_path):
     )
     seen = {}
     monkeypatch.setattr(
-        trainer_module,
+        finetune_loop_module,
         "run_finetune",
         lambda args, **kwargs: seen.update(vars(args)),
     )
@@ -4495,8 +4529,8 @@ def test_finetune_pseudo_log_is_concise_per_class_summary(monkeypatch, tmp_path)
             "source_checkpoint": str(ft1),
         }
 
-    monkeypatch.setattr(trainer_module, "prepare_pseudo_round", fake_prepare)
-    monkeypatch.setattr(trainer_module, "run_finetune", lambda args, **kwargs: None)
+    monkeypatch.setattr(finetune_support_module, "prepare_pseudo_round", fake_prepare)
+    monkeypatch.setattr(finetune_loop_module, "run_finetune", lambda args, **kwargs: None)
 
     result = runner.invoke(
         app,
@@ -4542,8 +4576,8 @@ def test_finetune_pseudo_cap_options_are_forwarded(monkeypatch, tmp_path):
             "source_checkpoint": str(ft1),
         }
 
-    monkeypatch.setattr(trainer_module, "prepare_pseudo_round", fake_prepare)
-    monkeypatch.setattr(trainer_module, "run_finetune", lambda args, **kwargs: None)
+    monkeypatch.setattr(finetune_support_module, "prepare_pseudo_round", fake_prepare)
+    monkeypatch.setattr(finetune_loop_module, "run_finetune", lambda args, **kwargs: None)
 
     result = runner.invoke(
         app,
@@ -4609,7 +4643,7 @@ def _capture_initial_student(monkeypatch, seen):
             # Only the preflight's throwaway probe is built while preflighting.
             self.is_probe = bool(seen.get("in_preflight"))
 
-    real_preflight = trainer.preflight_pretrain_run
+    real_preflight = pretrain_loop_module.preflight_pretrain_run
 
     def marking_preflight(args, settings):
         seen["in_preflight"] = True
@@ -4618,7 +4652,7 @@ def _capture_initial_student(monkeypatch, seen):
         finally:
             seen["in_preflight"] = False
 
-    monkeypatch.setattr(trainer, "preflight_pretrain_run", marking_preflight)
+    monkeypatch.setattr(pretrain_loop_module, "preflight_pretrain_run", marking_preflight)
     real_validate = OTUFormerEncoder.validate_pretrain_backbone
 
     def capturing_validate(self, require_intermediates=False):
@@ -4631,7 +4665,7 @@ def _capture_initial_student(monkeypatch, seen):
         }
         raise _StudentCaptured
 
-    monkeypatch.setattr(trainer, "OTUFormerEncoder", TaggedEncoder)
+    monkeypatch.setattr(pretrain_loop_module, "OTUFormerEncoder", TaggedEncoder)
     monkeypatch.setattr(
         OTUFormerEncoder, "validate_pretrain_backbone", capturing_validate
     )
@@ -4705,7 +4739,7 @@ def test_pretrain_preflight_probes_do_not_consume_the_seed(tmp_path, monkeypatch
         global_crop_size=224,
     )
     with pytest.raises(_StudentCaptured):
-        trainer.run_pretrain(direct)
+        pretrain_loop_module.run_pretrain(direct)
     states["explicit"] = seen.pop("state_dict")
 
     assert states["auto"].keys() == states["explicit"].keys()
@@ -4721,8 +4755,8 @@ def test_pretrain_re_resolves_a_reused_namespace(tmp_path, monkeypatch):
     """
     from otuformer.training import trainer
 
-    real_dataset = trainer.MultiCropDataset
-    real_objective = trainer.PatchObjective
+    real_dataset = pretrain_loop_module.MultiCropDataset
+    real_objective = pretrain_loop_module.PatchObjective
     captured = {"datasets": []}
     stop = {"at": "dataset"}
 
@@ -4740,8 +4774,8 @@ def test_pretrain_re_resolves_a_reused_namespace(tmp_path, monkeypatch):
             captured["patch_mode"] = patch_mode
             raise _Stopped
 
-    monkeypatch.setattr(trainer, "MultiCropDataset", capturing_dataset)
-    monkeypatch.setattr(trainer, "PatchObjective", RecordingObjective)
+    monkeypatch.setattr(pretrain_loop_module, "MultiCropDataset", capturing_dataset)
+    monkeypatch.setattr(pretrain_loop_module, "PatchObjective", RecordingObjective)
 
     args = _pretrain_run_namespace(
         tmp_path,
@@ -4751,7 +4785,7 @@ def test_pretrain_re_resolves_a_reused_namespace(tmp_path, monkeypatch):
         patch_loss="consistency",
     )
     with pytest.raises(_Stopped):
-        trainer.run_pretrain(args)
+        pretrain_loop_module.run_pretrain(args)
     assert captured["datasets"][-1]["global_crop_size"] == 224
     assert captured["datasets"][-1]["local_crops"] == 0
 
@@ -4764,7 +4798,7 @@ def test_pretrain_re_resolves_a_reused_namespace(tmp_path, monkeypatch):
     args.out_dir = str(tmp_path / "retry_out")
 
     with pytest.raises(_Stopped):
-        trainer.run_pretrain(args)
+        pretrain_loop_module.run_pretrain(args)
 
     assert captured["datasets"][-1]["global_crop_size"] == 112
     assert captured["datasets"][-1]["local_crop_size"] == 80
@@ -4782,7 +4816,7 @@ def test_pretrain_resume_trains_the_checkpoint_backbone(tmp_path, monkeypatch):
     from otuformer.training import trainer
 
     _make_tiny_pretrain_data(tmp_path)
-    patch_config = trainer._resolve_patch_config(
+    patch_config = pretrain_recipe_module._resolve_patch_config(
         argparse.Namespace(
             patch_loss="masked-feature",
             masking_strategy="random",
@@ -4800,13 +4834,13 @@ def test_pretrain_resume_trains_the_checkpoint_backbone(tmp_path, monkeypatch):
         patch_config=patch_config,
     )
     resolutions = []
-    original_resolve = trainer.resolve_pretrain_settings
+    original_resolve = pretrain_loop_module.resolve_pretrain_settings
 
     def counting_resolve(*args, **kwargs):
         resolutions.append(1)
         return original_resolve(*args, **kwargs)
 
-    monkeypatch.setattr(trainer, "resolve_pretrain_settings", counting_resolve)
+    monkeypatch.setattr(pretrain_loop_module, "resolve_pretrain_settings", counting_resolve)
     seen = {}
     _capture_initial_student(monkeypatch, seen)
 
@@ -5008,7 +5042,7 @@ def _relational_resume_checkpoint(tmp_path, *, bundle=None, drift_weak=False):
         build_weak_teacher_augmentation_config,
     )
     from otuformer.training.model import OTUFormerEncoder
-    from otuformer.training.trainer import RELATIONAL_TARGET_CONFIG_KEY
+    from otuformer.training.pretrain_recipe import RELATIONAL_TARGET_CONFIG_KEY
 
     ordinary = build_pretrain_augmentation_config("global-barcode", 224, 96, 2)
     weak = build_weak_teacher_augmentation_config(ordinary)
@@ -5313,15 +5347,107 @@ def test_pretrain_marked_v2_resume_preserves_outputs(tmp_path):
         assert sentinel.read_text(encoding="utf-8") == "keep"
 
 
+def test_pretrain_cli_hands_over_the_resume_payload_and_its_path(
+    tmp_path, monkeypatch
+):
+    """The CLI must hand over the payload *and* the path it came from.
+
+    The entry only accepts a payload for the path it was loaded from; without the
+    path it reloads the file and can then validate one checkpoint while restoring
+    another. The resolution steps are stubbed: this test is about the handoff.
+    """
+    import otuformer.utils.checkpoint as checkpoint_module
+
+    csv_path = tmp_path / "images.csv"
+    pd.DataFrame({"image": ["img_0.jpg"]}).to_csv(csv_path, index=False)
+    Image.new("RGB", (64, 64)).save(tmp_path / "img_0.jpg")
+    resume = tmp_path / "source.pth"
+    resume.write_bytes(b"payload")
+    payload = {"config": {"model_name": "vit_tiny_patch16_224"}, "epoch": 0}
+    loads = []
+
+    monkeypatch.setattr(
+        checkpoint_module, "load_checkpoint",
+        lambda path: loads.append(str(path)) or payload,
+    )
+    monkeypatch.setattr(
+        pretrain_recipe_module, "preflight_pretrain_resume", lambda *a, **k: None
+    )
+    settings = pretrain_recipe_module.PretrainSettings(
+        model_name="vit_tiny_patch16_224",
+        global_crop_size=224,
+        local_crop_size=96,
+        local_crops=0,
+        patch_config={
+            "patch_loss": "none",
+            "masking_strategy": None,
+            "mask_ratio_requested": None,
+            "mask_ratio_resolved": None,
+            "ibot_prototypes": None,
+            "patch_target_layers": None,
+            "patch_center_momentum": None,
+        },
+    )
+    monkeypatch.setattr(
+        pretrain_loop_module, "resolve_pretrain_settings", lambda *a, **k: settings
+    )
+    monkeypatch.setattr(
+        pretrain_loop_module, "preflight_pretrain_run", lambda *a, **k: None
+    )
+    monkeypatch.setattr(
+        pretrain_loop_module, "_resolve_pretrain_recipe",
+        lambda *a, **k: types.SimpleNamespace(settings=settings),
+    )
+    monkeypatch.setattr(
+        pretrain_recipe_module, "resolve_pretrain_ssl_config",
+        lambda *a, **k: {
+            "ssl_method": "relational",
+            "ssl_head": "projection_mlp_2048",
+            "out_dim": 256,
+            "koleo_weight": 0.0,
+            **pretrain_recipe_module.KOLEO_FIXED_CONFIG,
+            "teacher_temp_warmup_ratio": 0.7,
+            "norm_bias_weight_decay": True,
+        },
+    )
+    seen = {}
+
+    def spy(args, *, pretrain_recipe=None):
+        handoff = pretrain_recipe_module.take_pretrain_handoff(args)
+        seen["payload"] = pretrain_recipe_module.resume_payload_for(args, handoff)
+        seen["path_slot"] = handoff.resume_state_path
+        seen["settings_slot"] = handoff.settings is settings
+
+    monkeypatch.setattr(pretrain_loop_module, "run_pretrain", spy)
+
+    result = runner.invoke(
+        app,
+        [
+            "pretrain",
+            "--train-data", str(csv_path),
+            "--input-images-dir", str(tmp_path),
+            "--out-dir", str(tmp_path / "out"),
+            "--resume", str(resume),
+            "--device", "cpu",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    # One read during preflight, none afterwards: the handoff is used as-is.
+    assert loads == [str(resume)]
+    assert seen["path_slot"] == str(resume)
+    assert seen["payload"] is payload
+    assert seen["settings_slot"] is True
+
+
 def test_pretrain_relational_preflight_handoff(tmp_path, monkeypatch):
     from otuformer.training import trainer
     from otuformer.training.dataset import MultiCropDataset
 
     calls = {"settings": 0, "patch": 0, "recipe": 0, "preflight": 0, "dataset": 0}
-    real_settings = trainer.resolve_pretrain_settings
-    real_patch = trainer._resolve_patch_config
-    real_recipe = trainer._resolve_pretrain_recipe
-    real_preflight = trainer.preflight_pretrain_run
+    real_settings = pretrain_loop_module.resolve_pretrain_settings
+    real_patch = pretrain_recipe_module._resolve_patch_config
+    real_recipe = pretrain_loop_module._resolve_pretrain_recipe
+    real_preflight = pretrain_loop_module.preflight_pretrain_run
     real_dataset = MultiCropDataset.__init__
     seen = {}
 
@@ -5352,12 +5478,12 @@ def test_pretrain_relational_preflight_handoff(tmp_path, monkeypatch):
         seen["settings"] = args.pretrain_settings
         seen["prepared"] = calls["recipe"] == 1
 
-    monkeypatch.setattr(trainer, "resolve_pretrain_settings", counting_settings)
-    monkeypatch.setattr(trainer, "_resolve_patch_config", counting_patch)
-    monkeypatch.setattr(trainer, "_resolve_pretrain_recipe", counting_recipe)
-    monkeypatch.setattr(trainer, "preflight_pretrain_run", counting_preflight)
+    monkeypatch.setattr(pretrain_loop_module, "resolve_pretrain_settings", counting_settings)
+    monkeypatch.setattr(pretrain_recipe_module, "_resolve_patch_config", counting_patch)
+    monkeypatch.setattr(pretrain_loop_module, "_resolve_pretrain_recipe", counting_recipe)
+    monkeypatch.setattr(pretrain_loop_module, "preflight_pretrain_run", counting_preflight)
     monkeypatch.setattr(MultiCropDataset, "__init__", counting_dataset)
-    monkeypatch.setattr(trainer, "run_pretrain", fake_run_pretrain)
+    monkeypatch.setattr(pretrain_loop_module, "run_pretrain", fake_run_pretrain)
 
     csv_path = tmp_path / "images.csv"
     pd.DataFrame({"image": ["img_0.jpg"]}).to_csv(csv_path, index=False)
@@ -5394,13 +5520,13 @@ def test_pretrain_relational_saved_recipe_matches_preflight_and_log(tmp_path, mo
         Image.new("RGB", (64, 64), color=(30, 60, 90 + index)).save(tmp_path / name)
     out_dir = tmp_path / "recipe_out"
     seen = {}
-    real = trainer._resolve_pretrain_recipe
+    real = pretrain_loop_module._resolve_pretrain_recipe
 
     def capture(*a, **k):
         seen["recipe"] = real(*a, **k)
         return seen["recipe"]
 
-    monkeypatch.setattr(trainer, "_resolve_pretrain_recipe", capture)
+    monkeypatch.setattr(pretrain_loop_module, "_resolve_pretrain_recipe", capture)
     result = runner.invoke(
         app,
         [
@@ -5424,7 +5550,7 @@ def test_pretrain_relational_saved_recipe_matches_preflight_and_log(tmp_path, mo
     saved = torch.load(
         out_dir / "SSL_epoch_0001.pth", map_location="cpu", weights_only=False
     )
-    assert saved["config"][trainer.RELATIONAL_TARGET_CONFIG_KEY] == bundle
+    assert saved["config"][pretrain_loop_module.RELATIONAL_TARGET_CONFIG_KEY] == bundle
 
     log = (out_dir / "logs" / "pretrain.log").read_text(encoding="utf-8")
     lines = [line for line in log.splitlines() if "Relational target config: " in line]
@@ -5462,9 +5588,11 @@ def test_pretrain_relational_log_separates_requests_and_resolved_recipe(tmp_path
         return None
 
     out_dir = tmp_path / "logged"
-    with mock.patch.object(trainer, "preflight_pretrain_run", fake_preflight):
+    with mock.patch.object(
+        pretrain_loop_module, "preflight_pretrain_run", fake_preflight
+    ):
         with mock.patch.object(
-            trainer,
+            pretrain_loop_module,
             "run_pretrain",
             lambda args, *, pretrain_recipe=None: None,
         ):

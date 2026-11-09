@@ -15,6 +15,10 @@ from typer.testing import CliRunner
 
 from otuformer.cli.main import app
 from otuformer.training import trainer
+import otuformer.training.dino as dino_module
+import otuformer.training.pretrain_loop as pretrain_loop_module
+import otuformer.training.model as model_module
+import otuformer.training.pretrain_recipe as pretrain_recipe_module
 
 MODEL = "vit_tiny_patch16_224"
 SIZE = 224
@@ -99,7 +103,7 @@ def _args(root: Path, **overrides) -> argparse.Namespace:
         batch_size=2,
         num_workers=0,
         cpus=1,
-        device="cpu",
+        device="auto",
         seed=42,
     )
     base.update(overrides)
@@ -112,7 +116,7 @@ def _saved(root: Path) -> dict:
 
 def _train(root: Path, **overrides) -> dict:
     _images(root, rows=overrides.pop("rows", 2))
-    trainer.run_pretrain(_args(root, **overrides))
+    pretrain_loop_module.run_pretrain(_args(root, **overrides))
     return _saved(root)
 
 
@@ -176,7 +180,7 @@ def test_direct_dino_prototype_contract_fails_before_mkdir(tmp_path, monkeypatch
 
     monkeypatch.setattr(WeightNormLinear, "__init__", broken_init)
     with pytest.raises(ValueError, match="DINO prototype layer"):
-        trainer.run_pretrain(_args(tmp_path))
+        pretrain_loop_module.run_pretrain(_args(tmp_path))
     assert not (tmp_path / "out").exists()
 
 
@@ -258,10 +262,10 @@ def test_dino_checkpoint_preserves_requested_out_dim(tmp_path):
 def test_dino_resume_constructs_both_encoders_with_inherited_dim(tmp_path):
     _images(tmp_path)
     first = _args(tmp_path, out_dim=17, max_epochs=1)
-    trainer.run_pretrain(first)
+    pretrain_loop_module.run_pretrain(first)
 
     dims = []
-    real_init = trainer.OTUFormerEncoder.__init__
+    real_init = pretrain_loop_module.OTUFormerEncoder.__init__
 
     def init_spy(self, *args, **kwargs):
         real_init(self, *args, **kwargs)
@@ -279,11 +283,11 @@ def test_dino_resume_constructs_both_encoders_with_inherited_dim(tmp_path):
         resume=str(tmp_path / "out" / "SSL_latest.pth"),
         max_epochs=2,
     )
-    trainer.OTUFormerEncoder.__init__ = init_spy
+    pretrain_loop_module.OTUFormerEncoder.__init__ = init_spy
     try:
-        trainer.run_pretrain(resume)
+        pretrain_loop_module.run_pretrain(resume)
     finally:
-        trainer.OTUFormerEncoder.__init__ = real_init
+        pretrain_loop_module.OTUFormerEncoder.__init__ = real_init
 
     # Both encoders (and the RNG-isolated validation probes) build at D=17; the
     # preflight probe still builds at the requested width.
@@ -298,8 +302,11 @@ class _Interrupted(Exception):
 
 @pytest.mark.parametrize("centering", ["ema", "sinkhorn-knopp"])
 def test_dino_same_plan_resume_matches_uninterrupted(tmp_path, monkeypatch, centering):
+    # Exact replay: bit-identical weights, AdamW state, RNG and loss rows. The
+    # device policy keeps this contract on CPU; an accelerator pass cannot
+    # substitute for it.
     straight = tmp_path / "straight"
-    _train(straight, max_epochs=3, dino_centering=centering, rows=4)
+    _train(straight, max_epochs=3, dino_centering=centering, rows=4, device="cpu")
     reference = _saved(straight)
 
     split = tmp_path / "split"
@@ -316,22 +323,25 @@ def test_dino_same_plan_resume_matches_uninterrupted(tmp_path, monkeypatch, cent
             raise _Interrupted
         return result
 
-    monkeypatch.setattr(trainer.shutil, "copy", copy_spy)
+    monkeypatch.setattr(shutil, "copy", copy_spy)
     with pytest.raises(_Interrupted):
-        trainer.run_pretrain(_args(split, max_epochs=3, dino_centering=centering))
-    monkeypatch.setattr(trainer.shutil, "copy", real_copy)
+        pretrain_loop_module.run_pretrain(
+            _args(split, max_epochs=3, dino_centering=centering, device="cpu")
+        )
+    monkeypatch.setattr(shutil, "copy", real_copy)
 
     # The interruption left a complete epoch-0 checkpoint with the same plan.
     resumed_partial = _saved(split)
     assert resumed_partial["epoch"] == 0
     assert resumed_partial["iteration"] == 2
 
-    trainer.run_pretrain(
+    pretrain_loop_module.run_pretrain(
         _args(
             split,
             max_epochs=3,
             dino_centering=centering,
             resume=str(split / "out" / "SSL_latest.pth"),
+            device="cpu",
         )
     )
     resumed = _saved(split)
@@ -376,7 +386,7 @@ def _loss_rows(root: Path) -> list[dict[str, str]]:
 
 def test_dino_extension_does_not_reinitialize_or_refreeze(tmp_path, monkeypatch):
     _images(tmp_path, rows=2)
-    trainer.run_pretrain(
+    pretrain_loop_module.run_pretrain(
         _args(tmp_path, batch_size=1, koleo_weight=0.0, koleo_weight_explicit=True,
               patch_loss="none")
     )
@@ -389,26 +399,24 @@ def test_dino_extension_does_not_reinitialize_or_refreeze(tmp_path, monkeypatch)
     manifest = _images(tmp_path, rows=8)
     events = {"projector_inits": 0, "teacher_syncs": 0, "clip_prototype": [],
               "direction": []}
-    real_init = trainer._initialize_dino_student_projector
-    real_sync = trainer._synchronize_dino_teacher
+    real_init = pretrain_loop_module._initialize_dino_student_projector
+    real_sync = pretrain_loop_module._synchronize_dino_teacher
     real_clip = torch.nn.utils.clip_grad_norm_
     captured = []
-    real_objective = trainer.DINOObjective
+    real_objective = pretrain_loop_module.DINOObjective
 
     def objective_spy(*args, **kwargs):
         objective = real_objective(*args, **kwargs)
         captured.append(objective)
         return objective
 
-    monkeypatch.setattr(trainer, "DINOObjective", objective_spy)
+    monkeypatch.setattr(pretrain_loop_module, "DINOObjective", objective_spy)
     monkeypatch.setattr(
-        trainer,
-        "_initialize_dino_student_projector",
+        pretrain_loop_module, "_initialize_dino_student_projector",
         lambda student: events.__setitem__("projector_inits", events["projector_inits"] + 1),
     )
     monkeypatch.setattr(
-        trainer,
-        "_synchronize_dino_teacher",
+        pretrain_loop_module, "_synchronize_dino_teacher",
         lambda student, teacher, objective: events.__setitem__(
             "teacher_syncs", events["teacher_syncs"] + 1
         ),
@@ -422,7 +430,7 @@ def test_dino_extension_does_not_reinitialize_or_refreeze(tmp_path, monkeypatch)
 
     monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", clip_spy)
 
-    trainer.run_pretrain(
+    pretrain_loop_module.run_pretrain(
         _args(
             tmp_path,
             batch_size=1,
@@ -475,15 +483,232 @@ def _resume_cli(
     )
 
 
+# --- shared immutable sources for the 19 corrupt-resume cases -----------------
+#
+# Two serialized sources are trained once per module; every case copies the
+# inputs it needs and deserializes the checkpoint itself. Only the files are
+# shared, never a loaded dict: ``dict(saved)`` would still alias the nested
+# optimizer state and tensors between cases.
+
+_SOURCE_A = "corrupt_source_complete"      # one-epoch plan, final checkpoint
+_SOURCE_B = "corrupt_source_two_epoch"     # two-epoch plan, first-epoch checkpoint
+
+from otuformer.training.runtime import (  # noqa: E402
+    _capture_rng_state,
+    _restore_rng_state,
+)
+
+
+def _backend_rng_state() -> dict[str, object]:
+    """Process RNG state, including the MPS backend when it is available.
+
+    ``torch.manual_seed`` also seeds MPS, so a CPU-only training run still moves
+    that state; the production helper covers Python, NumPy, CPU and CUDA only.
+    """
+    state = _capture_rng_state()
+    if hasattr(torch, "mps") and hasattr(torch.mps, "get_rng_state"):
+        try:
+            state["mps"] = torch.mps.get_rng_state()
+        except RuntimeError:  # pragma: no cover - backend not initialised
+            pass
+    return state
+
+
+def _restore_backend_rng_state(state: dict[str, object]) -> None:
+    _restore_rng_state(state)
+    mps = state.get("mps")
+    if mps is not None:
+        torch.mps.set_rng_state(mps)
+
+
+def _numpy_state_equal(left, right) -> bool:
+    """Full NumPy RNG equality: array, position cursor and cached values.
+
+    Comparing only the state array would let a wrong cursor or a stale Gaussian
+    cache through, and the next draw would then differ.
+    """
+    if left[0] != right[0]:
+        return False
+    if not np.array_equal(left[1], right[1]):
+        return False
+    if left[2:] != right[2:]:
+        return False
+    return True
+
+
+def _train_sources(root: Path) -> dict[str, Path]:
+    """The source-training work, with no state bookkeeping of its own."""
+    a_root = root / _SOURCE_A
+    _train(a_root, max_epochs=1, device="cpu")
+    b_root = root / _SOURCE_B
+    _train(b_root, max_epochs=2, device="cpu")
+    return {
+        _SOURCE_A: a_root / "out" / "SSL_latest.pth",
+        _SOURCE_B: b_root / "out" / "SSL_epoch_0001.pth",
+    }
+
+
+def _build_sources(root: Path) -> dict[str, Path]:
+    """Train the sources and put the process back exactly as it was.
+
+    This is the one place the restore happens. Both the module fixture and the
+    regression call it: a regression that restored by itself would leave the
+    fixture's own restore path untested.
+    """
+    rng_before = _backend_rng_state()
+    threads_before = torch.get_num_threads()
+    try:
+        return _train_sources(root)
+    finally:
+        _restore_backend_rng_state(rng_before)
+        torch.set_num_threads(threads_before)
+
+
+@pytest.fixture(scope="module")
+def corrupt_sources(tmp_path_factory):
+    """Train each source once and return paths only.
+
+    The RNG and thread state are restored *before* the fixture hands the paths
+    over, not at module teardown: a consumer must not inherit the seeding the
+    source training performed, and a teardown restore would also roll back
+    whatever later tests advanced.
+    """
+    return _build_sources(tmp_path_factory.mktemp("corrupt_sources"))
+
+
+def _case_inputs(source_path: Path, tmp_path: Path, rows: int = 2) -> tuple[Path, Path]:
+    """Build a case's own images, manifest, output dir and log sentinel.
+
+    ``source_path`` names the shared source the case will deserialize; the
+    inputs themselves are regenerated per case rather than copied, so no case
+    can edit another's files.
+    """
+    images = tmp_path / "images"
+    images.mkdir(parents=True, exist_ok=True)
+    for index in range(rows):
+        Image.new("RGB", (SIZE, SIZE), (index * 30, 20, 60)).save(
+            images / f"{index}.png"
+        )
+    manifest = tmp_path / "data.csv"
+    with manifest.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["image"])
+        for index in range(rows):
+            writer.writerow([f"{index}.png"])
+    out_dir = tmp_path / "out"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    _seed_log(out_dir)
+    return manifest, out_dir
+
+
+def _load_source(source_path: Path) -> dict:
+    """A private deserialization, so one case cannot mutate another's payload."""
+    return torch.load(source_path, map_location="cpu", weights_only=False)
+
+
+def test_source_generation_restores_process_state(tmp_path):
+    """Building the sources must leave the process exactly as it found it.
+
+    The boundary is owned here, so the check does not depend on running first
+    among the consumers or on what other tests did in between. It goes through
+    ``_build_sources`` — the same function the module fixture uses — so removing
+    the fixture's restore fails this test instead of going unnoticed.
+    """
+    import random
+
+    # Perturb first, so the sources' own seeding definitely changes the state
+    # whatever a previous test left behind; the guard below then means something
+    # in any execution order.
+    random.random()
+    np.random.random()
+    torch.rand(1)
+    if hasattr(torch, "mps") and hasattr(torch.mps, "get_rng_state"):
+        torch.mps.manual_seed(1234)
+    rng_before = _backend_rng_state()
+    threads_before = torch.get_num_threads()
+
+    # No restore here on purpose: ``_build_sources`` owns it, exactly as the
+    # module fixture does. Deleting that restore must fail this test.
+    sources = _build_sources(tmp_path)
+
+    assert set(sources) == {_SOURCE_A, _SOURCE_B}
+    assert all(path.is_file() for path in sources.values())
+    assert random.getstate() == rng_before["python"]
+    assert _numpy_state_equal(np.random.get_state(), rng_before["numpy"])
+    assert torch.equal(torch.get_rng_state(), rng_before["torch"])
+    assert torch.get_num_threads() == threads_before
+    if "mps" in rng_before:
+        assert torch.equal(torch.mps.get_rng_state(), rng_before["mps"])
+    if torch.cuda.is_available():  # pragma: no cover - CUDA host only
+        for left, right in zip(torch.cuda.get_rng_state_all(), rng_before["cuda"]):
+            assert torch.equal(left, right)
+
+
+def test_the_shared_sources_do_not_leak_state_into_consumers(corrupt_sources):
+    """A consumer sees restored state, not whatever the fixture trained with.
+
+    Compared against a snapshot taken right here: the earlier module-level
+    snapshot would only be valid if this test happened to run first.
+    """
+    now = _backend_rng_state()
+    # Whatever the fixture did, the state observed here is stable across a
+    # capture/restore round trip, so nothing fixture-owned is in force.
+    _restore_backend_rng_state(now)
+    assert _numpy_state_equal(np.random.get_state(), now["numpy"])
+    assert torch.equal(torch.get_rng_state(), now["torch"])
+    if "mps" in now:
+        assert torch.equal(torch.mps.get_rng_state(), now["mps"])
+
+
+def test_each_source_deserializes_independently(corrupt_sources):
+    """No case can reach another's payload, and the files never change."""
+    import hashlib
+
+    for name in (_SOURCE_A, _SOURCE_B):
+        path = corrupt_sources[name]
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        first = _load_source(path)
+        second = _load_source(path)
+        # Optimizer scalars, tensors and the nested structure are all private.
+        first["optimizer"]["param_groups"][0]["lr"] = 123.0
+        first["student"]["backbone.cls_token"].add_(1.0)
+        # Mutate the nested optimizer state in place: rebinding the outer dict
+        # would not prove anything, because a shared inner dict survives it.
+        first_moment = next(iter(first["optimizer"]["state"].values()))
+        original_moment = next(iter(second["optimizer"]["state"].values()))
+        first_moment["exp_avg"].add_(1.0)
+        first["optimizer"]["state"].clear()
+        assert second["optimizer"]["param_groups"][0]["lr"] != 123.0
+        assert second["optimizer"]["state"], "nested optimizer state was shared"
+        assert not torch.equal(
+            next(iter(second["optimizer"]["state"].values()))["exp_avg"],
+            first_moment["exp_avg"],
+        )
+        assert torch.equal(
+            next(iter(second["optimizer"]["state"].values()))["exp_avg"],
+            original_moment["exp_avg"],
+        )
+        third = _load_source(path)
+        assert not torch.equal(
+            third["student"]["backbone.cls_token"],
+            first["student"]["backbone.cls_token"],
+        )
+        assert third["optimizer"]["state"], "a cleared state leaked into a load"
+        assert hashlib.sha256(path.read_bytes()).hexdigest() == digest
+
+
 @pytest.mark.parametrize(
     "corruption",
     ["missing_objective", "truncated_objective", "missing_optimizer",
      "missing_schedule", "wrong_scale", "unexpected_center"],
 )
-def test_dino_incomplete_resume_fails_before_logs(tmp_path, corruption):
-    saved = _train(tmp_path / "source")
-    out_dir = tmp_path / "source" / "out"
-    log_path, log_bytes = _seed_log(out_dir)
+def test_dino_incomplete_resume_fails_before_logs(
+    tmp_path, corruption, corrupt_sources
+):
+    manifest, out_dir = _case_inputs(corrupt_sources[_SOURCE_A], tmp_path)
+    log_path = out_dir / "logs" / "pretrain.log"
+    log_bytes = log_path.read_bytes()
+    saved = _load_source(corrupt_sources[_SOURCE_A])
     checkpoint = dict(saved)
     if corruption == "missing_objective":
         checkpoint.pop("dino_objective")
@@ -510,7 +735,7 @@ def test_dino_incomplete_resume_fails_before_logs(tmp_path, corruption):
     torch.save(checkpoint, path)
     before = set(p.name for p in (out_dir / "logs").iterdir())
 
-    result = _resume_cli(tmp_path / "source", path, out_dir)
+    result = _resume_cli(tmp_path, path, out_dir)
 
     assert result.exit_code != 0
     assert log_path.read_bytes() == log_bytes
@@ -519,10 +744,13 @@ def test_dino_incomplete_resume_fails_before_logs(tmp_path, corruption):
 
 @pytest.mark.parametrize("key", ["student", "teacher", "model_state_dict"])
 @pytest.mark.parametrize("corruption", ["missing", "dropped", "wrong_dim"])
-def test_dino_corrupt_encoder_resume_preserves_logs(tmp_path, key, corruption):
-    saved = _train(tmp_path / "source")
-    out_dir = tmp_path / "source" / "out"
-    log_path, log_bytes = _seed_log(out_dir)
+def test_dino_corrupt_encoder_resume_preserves_logs(
+    tmp_path, key, corruption, corrupt_sources
+):
+    manifest, out_dir = _case_inputs(corrupt_sources[_SOURCE_A], tmp_path)
+    log_path = out_dir / "logs" / "pretrain.log"
+    log_bytes = log_path.read_bytes()
+    saved = _load_source(corrupt_sources[_SOURCE_A])
     checkpoint = {name: value for name, value in saved.items()}
     states = {name: dict(value) for name, value in saved.items() if isinstance(value, dict) and name in ("student", "teacher", "model_state_dict")}
     state = states[key]
@@ -537,21 +765,35 @@ def test_dino_corrupt_encoder_resume_preserves_logs(tmp_path, key, corruption):
 
     path = tmp_path / "corrupt_encoder.pth"
     torch.save(checkpoint, path)
-    result = _resume_cli(tmp_path / "source", path, out_dir)
+    result = _resume_cli(tmp_path, path, out_dir)
 
     assert result.exit_code != 0
     assert log_path.read_bytes() == log_bytes
 
 
 @pytest.mark.parametrize(
-    "corruption",
-    ["betas", "final_norm_alias", "iteration_past_end", "iteration_short_of_epoch"],
+    ("corruption", "diagnostic"),
+    [
+        ("betas", "betas"),
+        ("final_norm_alias", "final_norm"),
+        ("iteration_past_end", "iteration"),
+        ("iteration_short_of_epoch", "epoch"),
+    ],
 )
-def test_dino_preflight_gaps_fail_before_any_log_write(tmp_path, corruption):
-    """These payloads passed the old preflight and failed only in the trainer."""
-    saved = _train(tmp_path / "source", max_epochs=2)
-    out_dir = tmp_path / "source" / "out"
-    log_path, log_bytes = _seed_log(out_dir)
+def test_dino_preflight_gaps_fail_before_any_log_write(
+    tmp_path, corruption, diagnostic, corrupt_sources
+):
+    """Each gap is rejected by the check it is about, before any log write.
+
+    The source is the first-epoch checkpoint: resuming a *completed* plan and
+    asking for the same number of epochs fails the requested-epoch check first,
+    which would mask a broken payload and make this test pass for the wrong
+    reason.
+    """
+    manifest, out_dir = _case_inputs(corrupt_sources[_SOURCE_B], tmp_path, rows=2)
+    log_path = out_dir / "logs" / "pretrain.log"
+    log_bytes = log_path.read_bytes()
+    saved = _load_source(corrupt_sources[_SOURCE_B])
     checkpoint = {name: value for name, value in saved.items()}
     checkpoint["optimizer"] = {
         "state": saved["optimizer"]["state"],
@@ -569,10 +811,7 @@ def test_dino_preflight_gaps_fail_before_any_log_write(tmp_path, corruption):
     elif corruption == "iteration_past_end":
         checkpoint["iteration"] = saved["schedule"]["total_steps"] + 5
     else:
-        # A same-plan resume must sit exactly on a recorded epoch boundary. This
-        # checkpoint claims a completed epoch at an iteration the 2 x 1 plan does
-        # not place on any boundary, so the schedule could not cover the epochs
-        # that still have to train.
+        # A same-plan resume must sit exactly on a recorded epoch boundary.
         checkpoint["epoch"] = 0
         checkpoint["iteration"] = 0
 
@@ -580,13 +819,15 @@ def test_dino_preflight_gaps_fail_before_any_log_write(tmp_path, corruption):
     torch.save(checkpoint, path)
     before = set(p.name for p in (out_dir / "logs").iterdir())
 
-    # Keep the recorded plan so the run is a same-plan resume; extending it would
-    # legitimately change the remaining step count.
-    result = _resume_cli(tmp_path / "source", path, out_dir, max_epochs=2)
+    result = _resume_cli(tmp_path, path, out_dir, max_epochs=2)
 
     assert result.exit_code != 0
+    # The intended check produced the diagnostic, not an unrelated epoch rule.
+    flat = " ".join(result.output.replace("│", " ").split())
+    assert diagnostic in flat, flat
     assert log_path.read_bytes() == log_bytes
     assert set(p.name for p in (out_dir / "logs").iterdir()) == before
+
 
 
 def _mutated(saved: dict, **changes) -> dict:
@@ -642,7 +883,7 @@ def test_dino_resume_accepts_a_real_epoch_zero_checkpoint(tmp_path):
         resume=str(tmp_path / "src" / "out" / "SSL_latest.pth"),
     )
 
-    trainer.run_pretrain(resume)
+    pretrain_loop_module.run_pretrain(resume)
 
     assert _saved(tmp_path / "src")["epoch"] == 1
 
@@ -685,7 +926,7 @@ def test_pretrain_resume_weight_decay_uses_saved_value_with_notice(tmp_path, cap
     assert len(saved["optimizer"]["param_groups"]) == 1
     capsys.readouterr()
 
-    trainer.run_pretrain(
+    pretrain_loop_module.run_pretrain(
         _args(
             tmp_path,
             max_epochs=2,
@@ -710,7 +951,7 @@ def test_pretrain_resume_two_group_policy_round_trip(tmp_path, capsys):
     assert saved["optimizer"]["param_groups"][1]["weight_decay"] == 0.0
     capsys.readouterr()
 
-    trainer.run_pretrain(
+    pretrain_loop_module.run_pretrain(
         _args(
             tmp_path,
             max_epochs=2,
@@ -730,7 +971,7 @@ def test_pretrain_resume_two_group_policy_round_trip(tmp_path, capsys):
 def test_pretrain_resume_rejects_changed_wd_policy(tmp_path):
     _train(tmp_path, max_epochs=1)
     with pytest.raises(ValueError, match="norm_bias_weight_decay|Cannot change"):
-        trainer.run_pretrain(
+        pretrain_loop_module.run_pretrain(
             _args(
                 tmp_path,
                 max_epochs=2,
@@ -751,7 +992,7 @@ def test_pretrain_recipe_fields_are_published_for_both_methods(tmp_path):
     other = tmp_path / "relational"
     other.mkdir()
     _images(other, rows=2)
-    trainer.run_pretrain(
+    pretrain_loop_module.run_pretrain(
         _args(
             other,
             max_epochs=1,
@@ -780,7 +1021,7 @@ def test_dino_repeated_extension_with_changed_loader_resumes(tmp_path):
     not reapply the newest loader length to the earlier epochs.
     """
     _images(tmp_path, rows=2)
-    trainer.run_pretrain(
+    pretrain_loop_module.run_pretrain(
         _args(tmp_path, batch_size=1, koleo_weight=0.0, koleo_weight_explicit=True)
     )
     saved = _saved(tmp_path)
@@ -788,7 +1029,7 @@ def test_dino_repeated_extension_with_changed_loader_resumes(tmp_path):
 
     latest = str(tmp_path / "out" / "SSL_latest.pth")
     _images(tmp_path, rows=8)
-    trainer.run_pretrain(
+    pretrain_loop_module.run_pretrain(
         _args(
             tmp_path,
             batch_size=1,
@@ -804,7 +1045,7 @@ def test_dino_repeated_extension_with_changed_loader_resumes(tmp_path):
     assert saved["schedule"]["steps_per_epoch"] == 8
     assert saved["schedule"]["total_steps"] == 10
 
-    trainer.run_pretrain(
+    pretrain_loop_module.run_pretrain(
         _args(
             tmp_path,
             batch_size=1,
@@ -898,6 +1139,8 @@ def test_pretrain_resume_at_ratio_03_matches_uninterrupted(
         dino_prototypes_explicit=False,
         dino_centering="ema",
         dino_centering_explicit=False,
+        # Exact replay (rtol=0, atol=0) is a CPU contract; see the device policy.
+        device="cpu",
     )
     straight = tmp_path / "straight"
     _train(straight, **shared)
@@ -913,13 +1156,13 @@ def test_pretrain_resume_at_ratio_03_matches_uninterrupted(
             raise _Interrupted
         return result
 
-    monkeypatch.setattr(trainer.shutil, "copy", copy_spy)
+    monkeypatch.setattr(shutil, "copy", copy_spy)
     with pytest.raises(_Interrupted):
-        trainer.run_pretrain(_args(split, **shared))
-    monkeypatch.setattr(trainer.shutil, "copy", real_copy)
+        pretrain_loop_module.run_pretrain(_args(split, **shared))
+    monkeypatch.setattr(shutil, "copy", real_copy)
     assert _saved(split)["iteration"] == 2
 
-    trainer.run_pretrain(
+    pretrain_loop_module.run_pretrain(
         _args(split, **shared, resume=str(split / "out" / "SSL_latest.pth"))
     )
     resumed = _saved(split)
@@ -988,10 +1231,10 @@ def test_pretrain_recipe_one_step_remaining_or_insufficient_schedule(
             raise _Interrupted
         return result
 
-    monkeypatch.setattr(trainer.shutil, "copy", interrupt)
+    monkeypatch.setattr(shutil, "copy", interrupt)
     with pytest.raises(_Interrupted):
-        trainer.run_pretrain(_args(tmp_path, **shared))
-    monkeypatch.setattr(trainer.shutil, "copy", real_copy)
+        pretrain_loop_module.run_pretrain(_args(tmp_path, **shared))
+    monkeypatch.setattr(shutil, "copy", real_copy)
     saved = _saved(tmp_path)
     assert (saved["iteration"], saved["schedule"]["total_steps"]) == (1, 2)
     if insufficient:
@@ -1007,7 +1250,7 @@ def test_pretrain_recipe_one_step_remaining_or_insufficient_schedule(
         assert log.read_bytes() == original
         assert {p.name for p in (out_dir / "logs").iterdir()} == before
     else:
-        trainer.run_pretrain(_args(
+        pretrain_loop_module.run_pretrain(_args(
             tmp_path, **shared, resume=str(tmp_path / "out" / "SSL_latest.pth")
         ))
         resumed = _saved(tmp_path)
@@ -1018,7 +1261,7 @@ def test_pretrain_recipe_one_step_remaining_or_insufficient_schedule(
 def test_legacy_recipe_checkpoint_resumes_for_real(tmp_path, capsys):
     """A payload without the two common fields resumes with 0.7/True in practice."""
     _images(tmp_path, rows=2)
-    trainer.run_pretrain(
+    pretrain_loop_module.run_pretrain(
         _args(tmp_path, batch_size=1, koleo_weight=0.0, koleo_weight_explicit=True)
     )
     checkpoint = _saved(tmp_path)
@@ -1031,7 +1274,7 @@ def test_legacy_recipe_checkpoint_resumes_for_real(tmp_path, capsys):
     torch.save(checkpoint, legacy)
     capsys.readouterr()
 
-    trainer.run_pretrain(
+    pretrain_loop_module.run_pretrain(
         _args(
             tmp_path,
             batch_size=1,
@@ -1073,10 +1316,10 @@ def test_dino_extension_with_shorter_loader_and_nonzero_warmup(tmp_path, monkeyp
         koleo_weight_explicit=True,
         warmup_epochs=3,
     )
-    monkeypatch.setattr(trainer.shutil, "copy", copy_spy)
+    monkeypatch.setattr(shutil, "copy", copy_spy)
     with pytest.raises(_Interrupted):
-        trainer.run_pretrain(_args(tmp_path, max_epochs=4, **shared))
-    monkeypatch.setattr(trainer.shutil, "copy", real_copy)
+        pretrain_loop_module.run_pretrain(_args(tmp_path, max_epochs=4, **shared))
+    monkeypatch.setattr(shutil, "copy", real_copy)
     saved = _saved(tmp_path)
     assert (saved["epoch"], saved["iteration"]) == (0, 8)
     assert saved["schedule"]["warmup_steps"] == 24
@@ -1084,7 +1327,7 @@ def test_dino_extension_with_shorter_loader_and_nonzero_warmup(tmp_path, monkeyp
 
     latest = str(tmp_path / "out" / "SSL_latest.pth")
     _images(tmp_path, rows=1)
-    trainer.run_pretrain(
+    pretrain_loop_module.run_pretrain(
         _args(tmp_path, max_epochs=5, resume=latest, **shared)
     )
     saved = _saved(tmp_path)
@@ -1092,7 +1335,7 @@ def test_dino_extension_with_shorter_loader_and_nonzero_warmup(tmp_path, monkeyp
     assert saved["schedule"]["total_steps"] == 12
     assert saved["schedule"]["warmup_steps"] == 24
 
-    trainer.run_pretrain(
+    pretrain_loop_module.run_pretrain(
         _args(tmp_path, max_epochs=6, resume=latest, **shared)
     )
     assert _saved(tmp_path)["epoch"] == 5
@@ -1123,15 +1366,15 @@ def test_pretrain_extended_plan_cannot_return_to_original_target(
             return result
         return copy_spy
 
-    monkeypatch.setattr(trainer.shutil, "copy", interrupt_after("SSL_epoch_0001.pth"))
+    monkeypatch.setattr(shutil, "copy", interrupt_after("SSL_epoch_0001.pth"))
     with pytest.raises(_Interrupted):
-        trainer.run_pretrain(_args(tmp_path, max_epochs=4, **shared))
+        pretrain_loop_module.run_pretrain(_args(tmp_path, max_epochs=4, **shared))
     latest = str(tmp_path / "out" / "SSL_latest.pth")
     _images(tmp_path, rows=rows)
-    monkeypatch.setattr(trainer.shutil, "copy", interrupt_after("SSL_epoch_0002.pth"))
+    monkeypatch.setattr(shutil, "copy", interrupt_after("SSL_epoch_0002.pth"))
     with pytest.raises(_Interrupted):
-        trainer.run_pretrain(_args(tmp_path, max_epochs=6, resume=latest, **shared))
-    monkeypatch.setattr(trainer.shutil, "copy", real_copy)
+        pretrain_loop_module.run_pretrain(_args(tmp_path, max_epochs=6, resume=latest, **shared))
+    monkeypatch.setattr(shutil, "copy", real_copy)
     saved = _saved(tmp_path)
     assert saved["args"]["max_epochs"] == 6
     assert saved["epoch"] == 1
@@ -1201,10 +1444,10 @@ def test_legacy_pretrain_changed_target_fails_before_logs(
         koleo_weight_explicit=False, dino_prototypes_explicit=False,
         dino_centering_explicit=False,
     )
-    monkeypatch.setattr(trainer.shutil, "copy", copy_spy)
+    monkeypatch.setattr(shutil, "copy", copy_spy)
     with pytest.raises(_Interrupted):
-        trainer.run_pretrain(_args(tmp_path, max_epochs=2, **shared))
-    monkeypatch.setattr(trainer.shutil, "copy", real_copy)
+        pretrain_loop_module.run_pretrain(_args(tmp_path, max_epochs=2, **shared))
+    monkeypatch.setattr(shutil, "copy", real_copy)
     saved = _saved(tmp_path)
     assert saved["epoch"] == 0
     saved.pop("schedule")
@@ -1220,7 +1463,7 @@ def test_legacy_pretrain_changed_target_fails_before_logs(
     assert log_path.read_bytes() == log_bytes
     assert {p.name for p in (out_dir / "logs").iterdir()} == before
 
-    trainer.run_pretrain(
+    pretrain_loop_module.run_pretrain(
         _args(tmp_path, max_epochs=2, resume=str(checkpoint), **shared)
     )
     resumed = _saved(tmp_path)

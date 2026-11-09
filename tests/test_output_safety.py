@@ -10,6 +10,9 @@ from typer.testing import CliRunner
 
 from otuformer.cli.main import app
 from otuformer.utils.io import prepare_output_dir
+import otuformer.cli.finetune as finetune_module
+import otuformer.training.finetune_loop as finetune_loop_module
+import otuformer.training.pretrain_loop as pretrain_loop_module
 
 
 @pytest.mark.parametrize("layout", ["direct", "link", "chain", "directory_target", "dotdot", "target_dotdot", "cycle", "long_chain"])
@@ -219,9 +222,9 @@ def test_downstream_inputs_survive_overwrite(tmp_path, checkpoint, command, opti
 @pytest.mark.parametrize("command", ["pretrain", "finetune"])
 @pytest.mark.parametrize("manifest_kind", ["training", "validation"])
 def test_training_selected_images_survive_cleanup(tmp_path, checkpoint, monkeypatch, command, manifest_kind):
-    from otuformer.training import trainer
+    loop_module = pretrain_loop_module if command == "pretrain" else finetune_loop_module
 
-    monkeypatch.setattr(trainer, f"run_{command}", lambda *args, **kwargs: None)
+    monkeypatch.setattr(loop_module, f"run_{command}", lambda *args, **kwargs: None)
     images = tmp_path / "images"
     images.mkdir()
     Image.new("RGB", (32, 32)).save(images / "safe.png")
@@ -465,13 +468,13 @@ def test_finetune_protects_accepted_pseudo_images(tmp_path, checkpoint, monkeypa
     train = tmp_path / "train.csv"
     pd.DataFrame({"image": ["expert.png"], "label": ["A"]}).to_csv(train, index=False)
     rows = [{"image": "expert.png", "label": "A", "source": "expert"}, {"image": "pseudo.png", "label": "A", "source": "known-pseudo"}]
-    monkeypatch.setattr(trainer, "prepare_pseudo_round", lambda **kwargs: {
+    monkeypatch.setattr(finetune_module, "prepare_pseudo_round", lambda **kwargs: {
         "source_config": {"loss": "arcface", "long_tail": "none"},
         "source_class_labels": ["A"], "ssl_checkpoint": str(checkpoint),
         "rows": rows, "accepted": rows[1:], "diagnostics": [], "summary": {},
         "class_labels": ["A"], "source_checkpoint": str(checkpoint),
     })
-    monkeypatch.setattr(trainer, "run_finetune", lambda *args, **kwargs: None)
+    monkeypatch.setattr(finetune_loop_module, "run_finetune", lambda *args, **kwargs: None)
     result = CliRunner().invoke(app, ["finetune", "--pseudo-label-from", str(checkpoint), "--train-data", str(train), "--input-images-dir", str(images), "--out-dir", str(out), "--overwrite"])
     assert result.exit_code == 2, (result.output, repr(result.exception))
     assert any(message in " ".join(result.output.replace("│", " ").split()) for message in ("holds the input", "contains protected input", "is reached through"))

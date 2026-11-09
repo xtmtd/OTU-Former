@@ -13,6 +13,13 @@ from PIL import Image
 
 from otuformer.training import trainer
 from otuformer.training.model import OTUFormerEncoder
+import otuformer.training.dino as dino_module
+import otuformer.training.loss as loss_module
+import otuformer.training.objectives as objectives_module
+import otuformer.training.pretrain_recipe as pretrain_recipe_module
+import otuformer.training.reporting as reporting_module
+import otuformer.training.runtime as runtime_module
+import otuformer.training.pretrain_loop as pretrain_loop_module
 
 MODEL = "vit_tiny_patch16_224"
 SIZE = 224
@@ -93,7 +100,7 @@ def _args(tmp_path: Path, **overrides) -> argparse.Namespace:
         batch_size=2,
         num_workers=0,
         cpus=1,
-        device="cpu",
+        device="auto",
         seed=42,
     )
     base.update(overrides)
@@ -106,25 +113,30 @@ def tiny_run(tmp_path):
 
 
 def _dino_objective_built(monkeypatch, captured: list) -> None:
-    real = trainer.DINOObjective
+    """Capture every objective the run builds.
+
+    The trainer constructs it from its own namespace, so the patch has to land
+    where the call happens, not on the class definition module.
+    """
+    real = pretrain_loop_module.DINOObjective
 
     def spy(*args, **kwargs):
         objective = real(*args, **kwargs)
         captured.append(objective)
         return objective
 
-    monkeypatch.setattr(trainer, "DINOObjective", spy)
+    monkeypatch.setattr(pretrain_loop_module, "DINOObjective", spy)
 
 
 def _capture_teacher(monkeypatch, teachers: list) -> None:
-    real_update = trainer.update_teacher
+    real_update = pretrain_loop_module.update_teacher
 
     def update_spy(student, teacher, momentum):
         if hasattr(teacher, "backbone"):
             teachers.append(teacher)
         return real_update(student, teacher, momentum)
 
-    monkeypatch.setattr(trainer, "update_teacher", update_spy)
+    monkeypatch.setattr(pretrain_loop_module, "update_teacher", update_spy)
 
 
 def test_dino_global_pairs_skip_same_crop_and_zero_locals():
@@ -135,19 +147,19 @@ def test_dino_global_pairs_skip_same_crop_and_zero_locals():
         F.one_hot(torch.tensor([4, 4, 4]), 5).float(),
     ]
 
-    loss = trainer._compute_dino_global_loss(logits, targets, 0.1)
+    loss = pretrain_loop_module._compute_dino_global_loss(logits, targets, 0.1)
     cross = (
-        trainer.dino_distillation_loss(logits[0], targets[1], 0.1)
-        + trainer.dino_distillation_loss(logits[1], targets[0], 0.1)
+        objectives_module.dino_distillation_loss(logits[0], targets[1], 0.1)
+        + objectives_module.dino_distillation_loss(logits[1], targets[0], 0.1)
     ) / 2
     same_crop = (
-        trainer.dino_distillation_loss(logits[0], targets[0], 0.1)
-        + trainer.dino_distillation_loss(logits[1], targets[1], 0.1)
+        objectives_module.dino_distillation_loss(logits[0], targets[0], 0.1)
+        + objectives_module.dino_distillation_loss(logits[1], targets[1], 0.1)
     ) / 2
     torch.testing.assert_close(loss, cross)
     assert not torch.allclose(loss, same_crop)
 
-    zero_local = trainer._compute_dino_local_loss([], targets, 0.1)
+    zero_local = pretrain_loop_module._compute_dino_local_loss([], targets, 0.1)
     assert float(zero_local) == 0.0
     assert zero_local.ndim == 0
 
@@ -162,7 +174,7 @@ def test_dino_reuses_unmasked_cls_and_backbone_tokens(
     _images(tmp_path)
     events = {"unmasked": [], "masked": [], "koleo_inputs": []}
     real_forward = OTUFormerEncoder.forward_pretrain
-    real_koleo = trainer.koleo_loss
+    real_koleo = objectives_module.koleo_loss
 
     def forward_spy(self, *args, **kwargs):
         out = real_forward(self, *args, **kwargs)
@@ -175,9 +187,9 @@ def test_dino_reuses_unmasked_cls_and_backbone_tokens(
         return real_koleo(features, **kwargs)
 
     monkeypatch.setattr(OTUFormerEncoder, "forward_pretrain", forward_spy)
-    monkeypatch.setattr(trainer, "koleo_loss", koleo_spy)
+    monkeypatch.setattr(objectives_module, "koleo_loss", koleo_spy)
 
-    trainer.run_pretrain(
+    pretrain_loop_module.run_pretrain(
         _args(
             tmp_path,
             patch_loss=patch_mode,
@@ -209,7 +221,7 @@ def test_dino_epoch_zero_freeze_then_joint_clip(tmp_path, monkeypatch):
         "clip_calls": [],
         "direction": [],
     }
-    real_norm = trainer._compute_grad_norm_parameters
+    real_norm = pretrain_loop_module._compute_grad_norm_parameters
     real_clip = torch.nn.utils.clip_grad_norm_
 
     def norm_spy(params):
@@ -226,7 +238,7 @@ def test_dino_epoch_zero_freeze_then_joint_clip(tmp_path, monkeypatch):
         observed["clip_calls"].append(direction.grad is None)
         return real_clip(params, max_norm, **kwargs)
 
-    monkeypatch.setattr(trainer, "_compute_grad_norm_parameters", norm_spy)
+    monkeypatch.setattr(pretrain_loop_module, "_compute_grad_norm_parameters", norm_spy)
     monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", clip_spy)
 
     values = []
@@ -245,7 +257,7 @@ def test_dino_epoch_zero_freeze_then_joint_clip(tmp_path, monkeypatch):
         return result
 
     monkeypatch.setattr(torch.optim.AdamW, "step", step_spy)
-    trainer.run_pretrain(_args(tmp_path, max_epochs=2))
+    pretrain_loop_module.run_pretrain(_args(tmp_path, max_epochs=2))
     snapshots["epoch0_direction_unchanged"] = torch.equal(
         observed["direction"][0], after_step[0]
     )
@@ -268,8 +280,8 @@ def test_dino_sk_ibot_centers_are_independent(tmp_path, monkeypatch):
     _dino_objective_built(monkeypatch, captured)
     _capture_teacher(monkeypatch, teachers)
     events = {"legacy_center_updates": 0, "patch_center_updates": 0, "steps": 0}
-    real_center = trainer._update_teacher_center
-    real_patch_center = trainer._update_patch_center
+    real_center = pretrain_loop_module._update_teacher_center
+    real_patch_center = pretrain_loop_module._update_patch_center
     real_step = torch.optim.AdamW.step
 
     def center_spy(center, teacher_global):
@@ -284,11 +296,11 @@ def test_dino_sk_ibot_centers_are_independent(tmp_path, monkeypatch):
         events["steps"] += 1
         return real_step(self, *args, **kwargs)
 
-    monkeypatch.setattr(trainer, "_update_teacher_center", center_spy)
-    monkeypatch.setattr(trainer, "_update_patch_center", patch_center_spy)
+    monkeypatch.setattr(pretrain_loop_module, "_update_teacher_center", center_spy)
+    monkeypatch.setattr(pretrain_loop_module, "_update_patch_center", patch_center_spy)
     monkeypatch.setattr(torch.optim.AdamW, "step", step_spy)
 
-    trainer.run_pretrain(
+    pretrain_loop_module.run_pretrain(
         _args(
             tmp_path,
             dino_centering="sinkhorn-knopp",
@@ -310,18 +322,18 @@ def test_dino_sk_ibot_centers_are_independent(tmp_path, monkeypatch):
 def test_dino_koleo_sums_crops_without_work_when_disabled(tmp_path, monkeypatch):
     _images(tmp_path)
     calls = []
-    real_koleo = trainer.koleo_loss
+    real_koleo = objectives_module.koleo_loss
 
     def koleo_spy(features, **kwargs):
         calls.append(tuple(features.shape))
         return real_koleo(features, **kwargs)
 
-    monkeypatch.setattr(trainer, "koleo_loss", koleo_spy)
-    trainer.run_pretrain(_args(tmp_path, koleo_weight=0.0))
+    monkeypatch.setattr(objectives_module, "koleo_loss", koleo_spy)
+    pretrain_loop_module.run_pretrain(_args(tmp_path, koleo_weight=0.0))
     assert calls == []
 
     calls.clear()
-    trainer.run_pretrain(
+    pretrain_loop_module.run_pretrain(
         _args(tmp_path, koleo_weight=0.1, out_dir=str(tmp_path / "out2"))
     )
     # One call per global crop, each over exactly the batch pool.
@@ -331,14 +343,14 @@ def test_dino_koleo_sums_crops_without_work_when_disabled(tmp_path, monkeypatch)
 def test_dino_koleo_duplicate_records_keep_per_crop_pool(tmp_path, monkeypatch):
     _images(tmp_path, rows=2, duplicates=True)
     calls = []
-    real_koleo = trainer.koleo_loss
+    real_koleo = objectives_module.koleo_loss
 
     def koleo_spy(features, **kwargs):
         calls.append(tuple(features.shape))
         return real_koleo(features, **kwargs)
 
-    monkeypatch.setattr(trainer, "koleo_loss", koleo_spy)
-    trainer.run_pretrain(_args(tmp_path, koleo_weight=0.1))
+    monkeypatch.setattr(objectives_module, "koleo_loss", koleo_spy)
+    pretrain_loop_module.run_pretrain(_args(tmp_path, koleo_weight=0.1))
 
     assert calls == [(2, 192), (2, 192)]
 
@@ -376,7 +388,7 @@ def test_dino_construction_uses_supplied_effective_dim(tmp_path, monkeypatch):
         "koleo_log_eps": 1e-8,
     }
 
-    trainer.run_pretrain(args)
+    pretrain_loop_module.run_pretrain(args)
 
     # The first encoder is the preflight probe at the requested width; the
     # student and teacher then use the resolved effective DINO width.
@@ -390,7 +402,7 @@ def test_dino_initializes_only_projector_before_teacher_sync(tmp_path, monkeypat
     real_init = OTUFormerEncoder.__init__
     real_trunc = torch.nn.init.trunc_normal_
     initialised = []
-    real_sync = trainer._synchronize_dino_teacher
+    real_sync = pretrain_loop_module._synchronize_dino_teacher
 
     def init_spy(self, *args, **kwargs):
         real_init(self, *args, **kwargs)
@@ -424,9 +436,11 @@ def test_dino_initializes_only_projector_before_teacher_sync(tmp_path, monkeypat
 
     monkeypatch.setattr(OTUFormerEncoder, "__init__", init_spy)
     monkeypatch.setattr(torch.nn.init, "trunc_normal_", trunc_spy)
-    monkeypatch.setattr(trainer, "_synchronize_dino_teacher", sync_spy)
+    monkeypatch.setattr(pretrain_loop_module, "_synchronize_dino_teacher", sync_spy)
 
-    trainer.run_pretrain(_args(tmp_path))
+    # CPU: this compares parameter snapshots taken at construction with the
+    # moved model, which the device policy keeps on CPU.
+    pretrain_loop_module.run_pretrain(_args(tmp_path, device="cpu"))
 
     # Only the projector's linear weights are re-initialized (3 layers), and the
     # teacher copy happens after it.
@@ -437,15 +451,25 @@ def test_dino_initializes_only_projector_before_teacher_sync(tmp_path, monkeypat
 
 
 def test_dino_targets_and_ema_update_once_after_step(tmp_path, monkeypatch):
+    """One ordered update per step: step, encoder EMA, prototype EMA, center.
+
+    The two EMA calls share one function, so they are told apart by the objects
+    they receive; a single label would let a removed or reordered prototype EMA
+    pass. The whole sequence is compared, not just the first position.
+    """
     _images(tmp_path)
     captured: list = []
-    _dino_objective_built(monkeypatch, captured)
-    events = {"target_builds": 0, "center_updates": 0, "steps": 0}
+    # Capture the real class members before ``_dino_objective_built`` replaces
+    # the module attribute with a factory, or this spy would wrap that factory.
     from otuformer.training.dino import DINOObjective
 
     real_teacher_targets = DINOObjective.teacher_targets
     real_update_center = DINOObjective.update_center
     real_step = torch.optim.AdamW.step
+    real_update_teacher = pretrain_loop_module.update_teacher
+    events = {"target_builds": 0, "center_updates": 0, "steps": 0}
+    order: list[str] = []
+    _dino_objective_built(monkeypatch, captured)
 
     def targets_spy(self, teacher_logits, teacher_temp):
         events["target_builds"] += 1
@@ -456,22 +480,39 @@ def test_dino_targets_and_ema_update_once_after_step(tmp_path, monkeypatch):
 
     def center_spy(self, teacher_logits):
         events["center_updates"] += 1
+        order.append("center")
         events["center_input"] = [tensor.detach().clone() for tensor in teacher_logits]
         return real_update_center(self, teacher_logits)
 
     def step_spy(self, *args, **kwargs):
         events["steps"] += 1
-        events["steps_at_center"] = events.get("steps_at_center", [])
+        order.append("step")
         return real_step(self, *args, **kwargs)
+
+    def teacher_ema_spy(student, teacher, momentum):
+        # Identity decides which EMA this is: the objective owns the prototype
+        # pair, so a missing or reordered prototype update changes the sequence.
+        objective = captured[0]
+        if student is objective.student_prototypes:
+            order.append("prototype_ema")
+        elif getattr(student, "backbone", None) is not None:
+            order.append("encoder_ema")
+        else:
+            order.append("other_ema")
+        return real_update_teacher(student, teacher, momentum)
 
     monkeypatch.setattr(DINOObjective, "teacher_targets", targets_spy)
     monkeypatch.setattr(DINOObjective, "update_center", center_spy)
     monkeypatch.setattr(torch.optim.AdamW, "step", step_spy)
+    monkeypatch.setattr(pretrain_loop_module, "update_teacher", teacher_ema_spy)
 
-    trainer.run_pretrain(_args(tmp_path, max_epochs=1, log_every_n_steps=1000))
+    pretrain_loop_module.run_pretrain(_args(tmp_path, max_epochs=1, log_every_n_steps=1000))
 
     assert events["target_builds"] == events["steps"]
     assert events["center_updates"] == events["steps"]
+    # The exact per-step sequence, repeated once per optimizer step.
+    expected_step = ["step", "encoder_ema", "prototype_ema", "center"]
+    assert order == expected_step * events["steps"]
     # The center consumes the same cached pre-EMA logits used for the targets.
     for cached, used in zip(events["pre_ema_logits"], events["center_input"]):
         torch.testing.assert_close(cached, used)
@@ -483,18 +524,18 @@ def test_dino_prototype_scales_remain_one(tmp_path, monkeypatch):
     _images(tmp_path)
     captured: list = []
     _dino_objective_built(monkeypatch, captured)
-    trainer.run_pretrain(_args(tmp_path, max_epochs=2))
+    pretrain_loop_module.run_pretrain(_args(tmp_path, max_epochs=2))
 
     state = captured[-1].state_dict()
     for key in ("student_prototypes.weight_g", "teacher_prototypes.weight_g"):
-        assert torch.equal(state[key], torch.ones(11, 1)), key
+        assert torch.equal(state[key], torch.ones(11, 1, device=state[key].device)), key
     assert "center" not in state  # SK/EMA center lives under cls_center
     assert "cls_center" in state
 
 
 def test_dino_single_epoch_warns(tmp_path, capsys):
     _images(tmp_path)
-    trainer.run_pretrain(_args(tmp_path, max_epochs=1))
+    pretrain_loop_module.run_pretrain(_args(tmp_path, max_epochs=1))
     output = capsys.readouterr().out
     assert "prototype direction" in output
     assert "frozen" in output
@@ -502,7 +543,7 @@ def test_dino_single_epoch_warns(tmp_path, capsys):
 
 def test_relational_loop_is_unchanged(tmp_path):
     _images(tmp_path)
-    trainer.run_pretrain(
+    pretrain_loop_module.run_pretrain(
         _args(
             tmp_path,
             ssl_method="relational",
@@ -539,7 +580,7 @@ def _metric_rows(root: Path) -> list[dict[str, str]]:
 
 def test_dino_instant_metrics_rows_end_to_end(tmp_path):
     _images(tmp_path)
-    trainer.run_pretrain(
+    pretrain_loop_module.run_pretrain(
         _args(
             tmp_path,
             max_epochs=1,
@@ -573,7 +614,7 @@ def test_dino_instant_metrics_rows_end_to_end(tmp_path):
 
 def test_relational_instant_metrics_rows_keep_legacy_meaning(tmp_path, capsys):
     _images(tmp_path)
-    trainer.run_pretrain(
+    pretrain_loop_module.run_pretrain(
         _args(
             tmp_path,
             ssl_method="relational",
@@ -592,8 +633,11 @@ def test_relational_instant_metrics_rows_keep_legacy_meaning(tmp_path, capsys):
 
     assert row["ssl_method"] == "relational"
     assert row["dino_centering"] == ""
-    assert row["koleo_weight"] == ""
-    assert row["koleo_status"] == "not-applicable"
+    # KoLeo is a shared regularizer, so the display always carries its effective
+    # value, zero included; persistence still omits the four keys at zero weight.
+    assert row["koleo_weight"] == "0.0"
+    # KoLeo is shared now, so a zero weight reads as "disabled", not "N/A".
+    assert row["koleo_status"] == "disabled"
     assert row["cls_center_norm"] == ""
     float(row["teacher_center_norm"])
     float(row["cosine_similarity"])
@@ -610,7 +654,7 @@ def test_relational_instant_metrics_rows_keep_legacy_meaning(tmp_path, capsys):
 
 def test_dino_singleton_batch_records_koleo_skip_end_to_end(tmp_path):
     _images(tmp_path, rows=4)
-    trainer.run_pretrain(
+    pretrain_loop_module.run_pretrain(
         _args(
             tmp_path,
             batch_size=1,
@@ -643,16 +687,16 @@ def test_dino_ce_only_backward_reaches_backbone_projector_and_prototypes(
     students: list = []
     _dino_objective_built(monkeypatch, captured)
     _capture_teacher(monkeypatch, teachers)
-    stacked_update = trainer.update_teacher
+    stacked_update = pretrain_loop_module.update_teacher
 
     def update_spy(student, teacher, momentum):
         if hasattr(teacher, "backbone"):
             students.append(student)
         return stacked_update(student, teacher, momentum)
 
-    monkeypatch.setattr(trainer, "update_teacher", update_spy)
+    monkeypatch.setattr(pretrain_loop_module, "update_teacher", update_spy)
 
-    real_norm = trainer._compute_grad_norm_parameters
+    real_norm = pretrain_loop_module._compute_grad_norm_parameters
     calls = {"count": 0}
     observed: dict = {}
 
@@ -677,8 +721,8 @@ def test_dino_ce_only_backward_reaches_backbone_projector_and_prototypes(
             ]
         return real_norm(params)
 
-    monkeypatch.setattr(trainer, "_compute_grad_norm_parameters", norm_spy)
-    trainer.run_pretrain(
+    monkeypatch.setattr(pretrain_loop_module, "_compute_grad_norm_parameters", norm_spy)
+    pretrain_loop_module.run_pretrain(
         _args(
             tmp_path,
             max_epochs=2,
@@ -711,10 +755,10 @@ def test_non_finite_gradient_norm_stops_the_step(tmp_path, monkeypatch):
     """A finite loss is not enough: the backward pass can still overflow."""
     _images(tmp_path)
     monkeypatch.setattr(
-        trainer, "_compute_grad_norm_parameters", lambda params: float("inf")
+        pretrain_loop_module, "_compute_grad_norm_parameters", lambda params: float("inf")
     )
     with pytest.raises(ValueError, match="gradient norm became non-finite"):
-        trainer.run_pretrain(_args(tmp_path))
+        pretrain_loop_module.run_pretrain(_args(tmp_path))
     assert not (tmp_path / "out" / "SSL_latest.pth").exists()
 
 
@@ -746,7 +790,7 @@ def test_clip_reduction_overflow_stops_the_step(tmp_path, monkeypatch):
     monkeypatch.setattr(torch.optim.AdamW, "step", step_spy)
 
     with pytest.raises(ValueError, match="gradient norm became non-finite"):
-        trainer.run_pretrain(_args(tmp_path, max_epochs=1))
+        pretrain_loop_module.run_pretrain(_args(tmp_path, max_epochs=1))
     assert steps["count"] == 0
     assert not (tmp_path / "out" / "SSL_latest.pth").exists()
     assert not (tmp_path / "out" / "SSL_epoch_0001.pth").exists()

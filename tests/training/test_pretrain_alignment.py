@@ -20,6 +20,15 @@ from otuformer.utils.size import (
     resolve_training_image_size,
     validate_input_size,
 )
+import otuformer.training.dataset as dataset_module
+import otuformer.training.finetune_loop as finetune_loop_module
+import otuformer.training.model as model_module
+import otuformer.training.objectives as objectives_module
+import otuformer.training.pretrain_recipe as pretrain_recipe_module
+import otuformer.training.pretrain_loop as pretrain_loop_module
+import otuformer.training.reporting as reporting_module
+import otuformer.training.augmentation as augmentation_module
+import otuformer.training.finetune_support as finetune_support_module
 
 
 def _schedule_args(max_epochs=5):
@@ -44,7 +53,7 @@ def test_pretrain_extension_starts_at_saved_lr_and_never_increases():
         "last_lr": 0.0002,
         "final_lr": 0.00001,
     }
-    lr, momentum, _, teacher_temp, metadata = trainer._build_pretrain_schedules(
+    lr, momentum, _, teacher_temp, metadata = pretrain_loop_module._build_pretrain_schedules(
         _schedule_args(), saved, steps_per_epoch=6, global_step=8, completed_epochs=2
     )
 
@@ -67,7 +76,7 @@ def test_same_plan_pretrain_resume_rejects_changed_loader_length():
     }
 
     with pytest.raises(ValueError, match="same-plan resume"):
-        trainer._build_pretrain_schedules(
+        pretrain_loop_module._build_pretrain_schedules(
             _schedule_args(2), saved, steps_per_epoch=5, global_step=4, completed_epochs=1
         )
 
@@ -85,7 +94,7 @@ def test_extended_schedule_rejects_return_to_original_plan(
         "final_lr": 0.00001,
     }
     with pytest.raises(ValueError, match="extended.*original"):
-        trainer._build_pretrain_schedules(
+        pretrain_loop_module._build_pretrain_schedules(
             _schedule_args(4), saved, steps_per_epoch=steps_per_epoch,
             global_step=global_step, completed_epochs=2, original_max_epochs=6,
         )
@@ -93,13 +102,13 @@ def test_extended_schedule_rejects_return_to_original_plan(
 
 def test_finetune_resume_rejects_different_class_mapping():
     with pytest.raises(ValueError, match="class labels differ"):
-        trainer._validate_finetune_resume(
+        finetune_loop_module._validate_finetune_resume(
             {"epoch": 0, "class_labels": ["a", "b"]}, ["a", "c"], 2
         )
 
 
 def test_legacy_pretrain_same_plan_resume_is_allowed():
-    lr, *_ = trainer._build_pretrain_schedules(
+    lr, *_ = pretrain_loop_module._build_pretrain_schedules(
         _schedule_args(5),
         None,
         steps_per_epoch=4,
@@ -113,12 +122,12 @@ def test_legacy_pretrain_same_plan_resume_is_allowed():
 
 @pytest.mark.parametrize("recorded_epochs", [5, "5"])
 def test_legacy_pretrain_same_target_remains_valid(recorded_epochs):
-    trainer._validate_pretrain_epoch_target(5, 2, None, recorded_epochs)
+    pretrain_recipe_module._validate_pretrain_epoch_target(5, 2, None, recorded_epochs)
 
 
 def test_legacy_pretrain_resume_rejects_missing_schedule_metadata():
     with pytest.raises(ValueError, match="legacy checkpoint"):
-        trainer._build_pretrain_schedules(
+        pretrain_loop_module._build_pretrain_schedules(
             _schedule_args(6),
             None,
             steps_per_epoch=4,
@@ -130,13 +139,13 @@ def test_legacy_pretrain_resume_rejects_missing_schedule_metadata():
 
 def test_finetune_resume_rejects_completed_epoch_target():
     with pytest.raises(ValueError, match="finetune-epochs must exceed"):
-        trainer._validate_finetune_resume(
+        finetune_loop_module._validate_finetune_resume(
             {"epoch": 2, "class_labels": ["a", "b"]}, ["a", "b"], 3
         )
 
 
 def test_teacher_temp_schedule_uses_70_percent_warmup():
-    schedule = trainer._build_teacher_temp_schedule(
+    schedule = pretrain_recipe_module._build_teacher_temp_schedule(
         total_iters=10,
         teacher_temp_start=0.04,
         teacher_temp_end=0.07,
@@ -151,7 +160,7 @@ def test_teacher_temp_schedule_uses_70_percent_warmup():
 def test_teacher_center_update_uses_current_iteration_global_outputs():
     teacher_center = torch.zeros(1, 2)
     teacher_global = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
-    updated = trainer._update_teacher_center(teacher_center, teacher_global)
+    updated = pretrain_loop_module._update_teacher_center(teacher_center, teacher_global)
     assert updated.shape == (1, 2)
     assert updated[0, 0] == pytest.approx(0.05)
     assert updated[0, 1] == pytest.approx(0.05)
@@ -174,8 +183,8 @@ def test_relational_global_pair_sets(monkeypatch, pairing, expected):
         calls.append((float(s.item()), float(t.item())))
         return torch.tensor(1.0)
 
-    monkeypatch.setattr(trainer, "_ssl_loss", fake_ssl_loss)
-    loss = trainer._compute_global_loss(
+    monkeypatch.setattr(objectives_module, "_ssl_loss", fake_ssl_loss)
+    loss = pretrain_loop_module._compute_global_loss(
         student, teacher, 0.1, 0.04, relational_pairing=pairing
     )
     assert set(calls) == expected
@@ -188,11 +197,11 @@ def test_relational_global_pair_sets_reject_unknown_or_wrong_arity():
     student = [torch.tensor([[1.0]]), torch.tensor([[2.0]])]
     teacher = [torch.tensor([[3.0]]), torch.tensor([[4.0]])]
     with pytest.raises(ValueError, match="relational_pairing"):
-        trainer._compute_global_loss(
+        pretrain_loop_module._compute_global_loss(
             student, teacher, 0.1, 0.04, relational_pairing="zip"
         )
     with pytest.raises(ValueError, match="exactly two"):
-        trainer._compute_global_loss(
+        pretrain_loop_module._compute_global_loss(
             student + student, teacher, 0.1, 0.04, relational_pairing="cross"
         )
 
@@ -202,7 +211,7 @@ def test_relational_loss_keeps_candidate_diagonal():
     teacher = torch.nn.functional.normalize(torch.randn(4, 6), dim=-1)
     student = torch.nn.functional.normalize(torch.randn(4, 6), dim=-1)
     student.requires_grad_(True)
-    loss = trainer._ssl_loss(student, teacher, 0.1, 0.04)
+    loss = objectives_module._ssl_loss(student, teacher, 0.1, 0.04)
     loss.backward()
     assert torch.isfinite(loss)
     assert torch.isfinite(student.grad).all()
@@ -233,34 +242,54 @@ def test_local_loss_averages_all_local_to_teacher_global_pairs(monkeypatch):
         calls.append((float(s.item()), float(t.item())))
         return torch.tensor(0.0)
 
-    monkeypatch.setattr(trainer, "_ssl_loss", fake_ssl_loss)
-    trainer._compute_local_loss(local_student, teacher, 0.1, 0.04)
+    monkeypatch.setattr(objectives_module, "_ssl_loss", fake_ssl_loss)
+    pretrain_loop_module._compute_local_loss(local_student, teacher, 0.1, 0.04)
     assert len(calls) == 6
 
 
-def test_pretrain_metric_names_and_values_match_expected_mapping():
-    """Metric keys in metrics.pretrain.csv must match reference log column names exactly."""
-    import inspect
+def test_pretrain_metric_names_and_values_match_expected_mapping(monkeypatch):
+    """Each reported name carries the value its own computation produced.
 
-    src = inspect.getsource(trainer._compute_all_metrics)
-    required_keys = [
-        "NMI",
-        "ARI",
-        "Recall@1",
-        "Recall@5",
-        "Recall@10",
-        "kNN_Acc_k1",
-        "kNN_Acc_k5",
-        "kNN_Acc_k20",
-        "Linear_Probing_Acc",
-        "mAP",
-        "Silhouette_Score",
-        "Purity",
-    ]
-    for key in required_keys:
-        assert f'"{key}"' in src or f"'{key}'" in src, (
-            f"Metric key '{key}' not found in _compute_all_metrics"
-        )
+    Every downstream metric is stubbed with a distinct sentinel, so a swapped or
+    aliased mapping fails even when both names are present: comparing NMI with
+    ARI alone would let a mutual swap through.
+    """
+    sentinels = {
+        "NMI": 0.11,
+        "ARI": 0.22,
+        "Silhouette_Score": 0.33,
+        "Purity": 0.44,
+        "mAP": 0.55,
+    }
+    monkeypatch.setattr(
+        reporting_module, "compute_recall_at_k",
+        lambda *a, **k: {"Recall@1": 0.61, "Recall@5": 0.62, "Recall@10": 0.63},
+    )
+    monkeypatch.setattr(
+        reporting_module, "compute_knn_accuracy",
+        lambda *a, **k: {"kNN_Acc_k1": 0.71, "kNN_Acc_k5": 0.72, "kNN_Acc_k20": 0.73},
+    )
+    monkeypatch.setattr(reporting_module, "compute_map", lambda *a, **k: sentinels["mAP"])
+    monkeypatch.setattr(
+        reporting_module, "compute_clustering_metrics", lambda *a, **k: dict(sentinels)
+    )
+
+    labels = np.array([0, 0, 1, 1, 2, 2])
+    embeddings = np.arange(12, dtype=float).reshape(6, 2)
+    metrics = reporting_module._compute_all_metrics(
+        embeddings, labels, compute_linear_probe=False
+    )
+
+    for key, value in {
+        **sentinels,
+        "Recall@1": 0.61,
+        "Recall@5": 0.62,
+        "Recall@10": 0.63,
+        "kNN_Acc_k1": 0.71,
+        "kNN_Acc_k5": 0.72,
+        "kNN_Acc_k20": 0.73,
+    }.items():
+        assert metrics[key] == value, key
 
 
 def test_pretrain_encoder_exposes_projector_output_and_patch_tokens():
@@ -274,13 +303,57 @@ def test_pretrain_encoder_exposes_projector_output_and_patch_tokens():
     assert patch_tokens.ndim == 3
 
 
-def test_pretrain_periodic_evaluation_uses_cls_token_features():
-    """Embedding extraction for eval uses CLS token features from backbone tokens."""
-    import inspect
+def test_pretrain_periodic_evaluation_uses_cls_token_features(tmp_path, monkeypatch):
+    """Evaluation embeddings come from the CLS token, observed on real tensors.
 
-    src = inspect.getsource(trainer._compute_embeddings_from_csv)
-    assert "tokens = _extract_tokens(model, batch)" in src
-    assert "emb = tokens[:, 0]" in src
+    The previous source-string check passed even when the extraction selected
+    patch tokens and left a CLS statement behind. This drives the function with a
+    stub model whose CLS and patch rows are distinguishable.
+    """
+    seen = {}
+
+    class StubBackbone:
+        def forward_features(self, images):
+            batch = images.shape[0]
+            tokens = torch.zeros(batch, 5, 4)
+            tokens[:, 0] = 1.0  # CLS row
+            tokens[:, 1:] = 2.0  # patch rows
+            return tokens
+
+    class StubModel:
+        backbone = StubBackbone()
+
+        def eval(self):
+            return self
+
+        def __call__(self, images):
+            return torch.zeros(images.shape[0], 4)
+
+    images = tmp_path / "images"
+    images.mkdir()
+    for index in range(3):
+        Image.new("RGB", (32, 32), color=(index * 40, 0, 0)).save(
+            images / f"img_{index}.jpg"
+        )
+    csv_path = tmp_path / "eval.csv"
+    pd.DataFrame(
+        {"image": [f"img_{i}.jpg" for i in range(3)], "label": ["A", "A", "B"]}
+    ).to_csv(csv_path, index=False)
+
+    features, labels = reporting_module._compute_embeddings_from_csv(
+        model=StubModel(),
+        csv_path=csv_path,
+        root_dir=images,
+        image_size=32,
+        device=torch.device("cpu"),
+        batch_size=2,
+        num_workers=0,
+    )
+    assert len(labels) == 3
+    # The CLS row is the constant 1.0 row; a patch-token selection would yield
+    # 2.0, and a projector path would yield zeros.
+    assert torch.as_tensor(features).shape == (3, 4)
+    assert torch.allclose(torch.as_tensor(features), torch.ones(3, 4))
 
 
 def test_unlabeled_periodic_evaluation_still_generates_umap(
@@ -293,13 +366,11 @@ def test_unlabeled_periodic_evaluation_still_generates_umap(
             calls.append((args, kwargs))
 
     monkeypatch.setattr(
-        trainer,
-        "_compute_embeddings_from_csv",
+        reporting_module, "_compute_embeddings_from_csv",
         lambda **kwargs: (np.zeros((10, 4), dtype=np.float32), None),
     )
     monkeypatch.setattr(
-        trainer,
-        "run_umap",
+        reporting_module, "run_umap",
         lambda embeddings, labels, out_path, **kwargs: calls.append(
             (embeddings, labels, out_path)
         ),
@@ -318,7 +389,7 @@ def test_unlabeled_periodic_evaluation_still_generates_umap(
         visualize_class_number=20,
     )
 
-    trainer._compute_and_log_all_metrics(
+    pretrain_loop_module._compute_and_log_all_metrics(
         args=args,
         model=object(),
         device=torch.device("cpu"),
@@ -337,7 +408,7 @@ def test_unlabeled_periodic_evaluation_still_generates_umap(
 def test_zero_metrics_sample_size_does_not_subsample():
     embeddings = np.arange(20, dtype=np.float32).reshape(10, 2)
 
-    sampled, labels = trainer._maybe_subsample_for_metrics(
+    sampled, labels = reporting_module._maybe_subsample_for_metrics(
         embeddings, None, max_samples=0, seed=42
     )
 
@@ -346,7 +417,7 @@ def test_zero_metrics_sample_size_does_not_subsample():
 
 
 def test_single_class_periodic_evaluation_skips_supervised_metrics():
-    fields = trainer._compute_all_metrics(
+    fields = reporting_module._compute_all_metrics(
         np.zeros((4, 3), dtype=np.float32),
         np.array(["one"] * 4),
         compute_linear_probe=True,
@@ -365,13 +436,11 @@ def test_unlabeled_periodic_evaluation_skips_small_sampled_umap(
             pass
 
     monkeypatch.setattr(
-        trainer,
-        "_compute_embeddings_from_csv",
+        reporting_module, "_compute_embeddings_from_csv",
         lambda **kwargs: (np.zeros((20, 4), dtype=np.float32), None),
     )
     monkeypatch.setattr(
-        trainer,
-        "run_umap",
+        reporting_module, "run_umap",
         lambda *args, **kwargs: calls.append(args),
     )
     args = argparse.Namespace(
@@ -388,7 +457,7 @@ def test_unlabeled_periodic_evaluation_skips_small_sampled_umap(
         visualize_class_number=20,
     )
 
-    trainer._compute_and_log_all_metrics(
+    pretrain_loop_module._compute_and_log_all_metrics(
         args=args,
         model=object(),
         device=torch.device("cpu"),
@@ -412,13 +481,11 @@ def test_unlabeled_periodic_evaluation_uses_sampled_umap_features(
             pass
 
     monkeypatch.setattr(
-        trainer,
-        "_compute_embeddings_from_csv",
+        reporting_module, "_compute_embeddings_from_csv",
         lambda **kwargs: (np.zeros((20, 4), dtype=np.float32), None),
     )
     monkeypatch.setattr(
-        trainer,
-        "run_umap",
+        reporting_module, "run_umap",
         lambda embeddings, labels, out_path, **kwargs: calls.append(embeddings),
     )
     args = argparse.Namespace(
@@ -435,7 +502,7 @@ def test_unlabeled_periodic_evaluation_uses_sampled_umap_features(
         visualize_class_number=20,
     )
 
-    trainer._compute_and_log_all_metrics(
+    pretrain_loop_module._compute_and_log_all_metrics(
         args=args,
         model=object(),
         device=torch.device("cpu"),
@@ -456,16 +523,14 @@ def test_sampled_single_class_evaluation_reports_skipped_metrics(
             pass
 
     monkeypatch.setattr(
-        trainer,
-        "_compute_embeddings_from_csv",
+        reporting_module, "_compute_embeddings_from_csv",
         lambda **kwargs: (
             np.zeros((10, 4), dtype=np.float32),
             np.array(["one"] * 10),
         ),
     )
     monkeypatch.setattr(
-        trainer,
-        "_maybe_subsample_for_metrics",
+        reporting_module, "_maybe_subsample_for_metrics",
         lambda embeddings, labels, max_samples, seed: (
             embeddings[:5],
             np.array(["one"] * 5),
@@ -485,7 +550,7 @@ def test_sampled_single_class_evaluation_reports_skipped_metrics(
         visualize_class_number=20,
     )
 
-    trainer._compute_and_log_all_metrics(
+    pretrain_loop_module._compute_and_log_all_metrics(
         args=args,
         model=object(),
         device=torch.device("cpu"),
@@ -498,17 +563,64 @@ def test_sampled_single_class_evaluation_reports_skipped_metrics(
     assert "fewer than two label classes after sampling" in capsys.readouterr().out
 
 
-def test_teacher_momentum_updates_after_optimizer_step():
-    """Momentum update must happen after optimizer.step(), not before."""
-    # Verify ordering by inspecting the pretrain loop source for the update_teacher call
-    import inspect
+def test_teacher_momentum_updates_after_optimizer_step(tmp_path, monkeypatch):
+    """The EMA update happens after ``optimizer.step()``, observed at runtime.
 
-    src = inspect.getsource(trainer.run_pretrain)
-    opt_pos = src.find("optimizer.step()")
-    ema_pos = src.find("update_teacher(student, teacher")
-    assert opt_pos != -1, "optimizer.step() not found in run_pretrain"
-    assert ema_pos != -1, "update_teacher call not found in run_pretrain"
-    assert opt_pos < ema_pos, "EMA update must occur after optimizer.step()"
+    Source position is not evidence: a comment, a branch or a reordering inside
+    the step could satisfy it. Record the real event order instead.
+    """
+    events = []
+    real_step = torch.optim.AdamW.step
+    real_update = pretrain_loop_module.update_teacher
+
+    def step_spy(self, *args, **kwargs):
+        events.append("step")
+        return real_step(self, *args, **kwargs)
+
+    def update_spy(student, teacher, momentum):
+        events.append("ema")
+        return real_update(student, teacher, momentum)
+
+    monkeypatch.setattr(torch.optim.AdamW, "step", step_spy)
+    monkeypatch.setattr(pretrain_loop_module, "update_teacher", update_spy)
+
+    args = argparse.Namespace(
+        seed=42, cpus=0, device="cpu", out_dir=str(tmp_path / "out"),
+        model_name="vit_tiny_patch16_224", register_tokens=None,
+        out_dim=16, ssl_method="relational", ssl_method_explicit=False,
+        koleo_weight=0.0, koleo_weight_explicit=False,
+        max_epochs=1, lr=1e-3, weight_decay=0.05, warmup_epochs=0,
+        augmentation=None, orientation_policy=None,
+        global_crop_size=224, local_crop_size=96, local_crops=0,
+        mask_ratio="auto", lambda_local=1.5, lambda_mask=1.0,
+        patch_loss="none", masking_strategy="random",
+        teacher_momentum=0.995, teacher_momentum_end=0.999,
+        student_temp=0.1, teacher_temp_start=0.04, teacher_temp_end=0.07,
+        teacher_temp_warmup_ratio=None, resume="", log_every_n_steps=1000,
+        save_every_epochs=1, keep_last_checkpoints=1, visualize_data="",
+        extract_size=None, metrics_sample_size=10, umap_n_neighbors=5,
+        umap_min_dist=0.1, umap_metric="cosine", visualize_class_number=5,
+        compute_embedding_metrics=False, batch_size=2, num_workers=0,
+        train_data=str(tmp_path / "data.csv"),
+        input_images_dir=str(tmp_path / "images"),
+    )
+    images = tmp_path / "images"
+    images.mkdir()
+    for index in range(4):
+        Image.new("RGB", (64, 64), color=(index * 50, 0, 0)).save(
+            images / f"img_{index}.jpg"
+        )
+    pd.DataFrame({"image": [f"img_{i}.jpg" for i in range(4)]}).to_csv(
+        tmp_path / "data.csv", index=False
+    )
+    pretrain_loop_module.run_pretrain(args)
+
+    # Per optimizer step the teacher is refreshed once, and never before it.
+    assert events.count("step") == events.count("ema")
+    assert events[:2] == ["step", "ema"]
+    for index, event in enumerate(events):
+        if event == "ema":
+            assert events[index - 1] == "step"
 
 
 def test_resolve_training_image_size_precedence():
@@ -623,7 +735,7 @@ def test_finetune_resolves_and_persists_checkpoint_size(tmp_path):
         visualize_data="",
         metrics_sample_size=10000,
     )
-    trainer.run_finetune(args)
+    finetune_loop_module.run_finetune(args)
 
     saved = torch.load(
         tmp_path / "ft_out" / "finetune_latest.pth",
@@ -792,7 +904,7 @@ def test_historical_sft_new_run_can_resume_saved_projection_checkpoint(tmp_path)
         weight_decay=1e-4,
         metric_head_lr=None,
     )
-    trainer.run_finetune(first_args)
+    finetune_loop_module.run_finetune(first_args)
     first_path = tmp_path / "first" / "finetune_latest.pth"
     first = torch.load(first_path, map_location="cpu", weights_only=False)
     assert first["config"]["embedding_head"] == "projection_mlp_2048"
@@ -814,7 +926,7 @@ def test_historical_sft_new_run_can_resume_saved_projection_checkpoint(tmp_path)
         weight_decay=1e-4,
         metric_head_lr=None,
     )
-    trainer.run_finetune(resume_args)
+    finetune_loop_module.run_finetune(resume_args)
     second = torch.load(
         tmp_path / "second" / "finetune_latest.pth",
         map_location="cpu",
@@ -829,11 +941,11 @@ def test_historical_sft_new_run_can_resume_saved_projection_checkpoint(tmp_path)
     [("pretrain", "global-barcode"), ("finetune", "none")],
 )
 def test_new_run_uses_stage_defaults(stage, expected_profile):
-    profile = trainer._select_augmentation_profile(None, None, stage=stage)
-    policy = trainer._select_orientation_policy(None, None, stage=stage)
+    profile = finetune_loop_module._select_augmentation_profile(None, None, stage=stage)
+    policy = finetune_loop_module._select_orientation_policy(None, None, stage=stage)
     config = _augmentation_config(stage, profile, policy)
     assert (profile, policy) == (expected_profile, "sensitive")
-    assert trainer._validate_augmentation_config(
+    assert finetune_loop_module._validate_augmentation_config(
         profile, config, None, stage=stage
     ) == config
 
@@ -849,25 +961,25 @@ def test_old_checkpoint_maps_to_compatible_augmentation(
     stage, legacy_profile, expected_policy
 ):
     checkpoint = {"config": {"model_name": "vit_tiny_patch16_224"}}
-    profile = trainer._select_augmentation_profile(None, checkpoint, stage=stage)
-    policy = trainer._select_orientation_policy(None, checkpoint, stage=stage)
+    profile = finetune_loop_module._select_augmentation_profile(None, checkpoint, stage=stage)
+    policy = finetune_loop_module._select_orientation_policy(None, checkpoint, stage=stage)
     config = _augmentation_config(stage, profile, policy)
     assert (profile, policy) == (legacy_profile, expected_policy)
-    assert trainer._validate_augmentation_config(
+    assert finetune_loop_module._validate_augmentation_config(
         profile, config, checkpoint, stage=stage
     ) == config
 
 
 def test_pretrain_resume_inherits_saved_augmentation():
     checkpoint = _augmented_checkpoint("pretrain", "global-barcode", "invariant")
-    profile = trainer._select_augmentation_profile(None, checkpoint, stage="pretrain")
-    policy = trainer._select_orientation_policy(
+    profile = finetune_loop_module._select_augmentation_profile(None, checkpoint, stage="pretrain")
+    policy = finetune_loop_module._select_orientation_policy(
         None, checkpoint, stage="pretrain", resume=True
     )
     config = _augmentation_config("pretrain", profile, policy)
     assert (profile, policy) == ("global-barcode", "invariant")
     assert (
-        trainer._validate_augmentation_config(
+        finetune_loop_module._validate_augmentation_config(
             profile, config, checkpoint, stage="pretrain"
         )
         == config
@@ -876,16 +988,16 @@ def test_pretrain_resume_inherits_saved_augmentation():
 
 def test_pretrain_resume_accepts_explicit_matching_augmentation():
     checkpoint = _augmented_checkpoint("pretrain", "color-robust", "sensitive")
-    profile = trainer._select_augmentation_profile(
+    profile = finetune_loop_module._select_augmentation_profile(
         "color-robust", checkpoint, stage="pretrain"
     )
-    policy = trainer._select_orientation_policy(
+    policy = finetune_loop_module._select_orientation_policy(
         "sensitive", checkpoint, stage="pretrain", resume=True
     )
     config = _augmentation_config("pretrain", profile, policy)
     assert (profile, policy) == ("color-robust", "sensitive")
     assert (
-        trainer._validate_augmentation_config(
+        finetune_loop_module._validate_augmentation_config(
             profile, config, checkpoint, stage="pretrain"
         )
         == config
@@ -895,12 +1007,12 @@ def test_pretrain_resume_accepts_explicit_matching_augmentation():
 def test_pretrain_resume_rejects_different_profile_and_policy():
     checkpoint = _augmented_checkpoint("pretrain", "global-barcode", "invariant")
     with pytest.raises(ValueError, match="Cannot resume") as excinfo:
-        trainer._select_augmentation_profile(
+        finetune_loop_module._select_augmentation_profile(
             "color-robust", checkpoint, stage="pretrain"
         )
     assert "new run" in str(excinfo.value)
     with pytest.raises(ValueError, match="Cannot resume") as excinfo:
-        trainer._select_orientation_policy(
+        finetune_loop_module._select_orientation_policy(
             "sensitive", checkpoint, stage="pretrain", resume=True
         )
     assert "new run" in str(excinfo.value)
@@ -910,26 +1022,26 @@ def test_finetune_resume_inherits_and_matches_saved_augmentation():
     checkpoint = _augmented_checkpoint(
         "finetune", "conservative", "sensitive", image_size=224
     )
-    profile = trainer._select_augmentation_profile(None, checkpoint, stage="finetune")
-    policy = trainer._select_orientation_policy(
+    profile = finetune_loop_module._select_augmentation_profile(None, checkpoint, stage="finetune")
+    policy = finetune_loop_module._select_orientation_policy(
         None, checkpoint, stage="finetune", resume=True
     )
     config = _augmentation_config("finetune", profile, policy, image_size=224)
     assert (profile, policy) == ("conservative", "sensitive")
     assert (
-        trainer._validate_augmentation_config(
+        finetune_loop_module._validate_augmentation_config(
             profile, config, checkpoint, stage="finetune"
         )
         == config
     )
     assert (
-        trainer._select_augmentation_profile(
+        finetune_loop_module._select_augmentation_profile(
             "conservative", checkpoint, stage="finetune"
         )
         == "conservative"
     )
     assert (
-        trainer._select_orientation_policy(
+        finetune_loop_module._select_orientation_policy(
             "sensitive", checkpoint, stage="finetune", resume=True
         )
         == "sensitive"
@@ -942,47 +1054,47 @@ def test_resume_rejects_changed_expanded_configuration():
     changed = json.loads(json.dumps(saved))
     changed["color_jitter"]["brightness"] = 0.9
     with pytest.raises(ValueError, match="configuration differs"):
-        trainer._validate_augmentation_config(
+        finetune_loop_module._validate_augmentation_config(
             "global-barcode", changed, checkpoint, stage="pretrain"
         )
     changed_policy = json.loads(json.dumps(saved))
     changed_policy["orientation_policy"] = "sensitive"
     with pytest.raises(ValueError, match="configuration differs"):
-        trainer._validate_augmentation_config(
+        finetune_loop_module._validate_augmentation_config(
             "global-barcode", changed_policy, checkpoint, stage="pretrain"
         )
 
 
 def test_new_run_orientation_policy_defaults_and_override():
     assert (
-        trainer._select_orientation_policy(None, None, stage="pretrain")
+        finetune_loop_module._select_orientation_policy(None, None, stage="pretrain")
         == "sensitive"
     )
     assert (
-        trainer._select_orientation_policy("sensitive", None, stage="pretrain")
+        finetune_loop_module._select_orientation_policy("sensitive", None, stage="pretrain")
         == "sensitive"
     )
     assert (
-        trainer._select_orientation_policy("invariant", None, stage="pretrain")
+        finetune_loop_module._select_orientation_policy("invariant", None, stage="pretrain")
         == "invariant"
     )
     assert (
-        trainer._select_orientation_policy(None, None, stage="finetune")
+        finetune_loop_module._select_orientation_policy(None, None, stage="finetune")
         == "sensitive"
     )
     assert (
-        trainer._select_orientation_policy("sensitive", None, stage="finetune")
+        finetune_loop_module._select_orientation_policy("sensitive", None, stage="finetune")
         == "sensitive"
     )
     assert (
-        trainer._select_orientation_policy("invariant", None, stage="finetune")
+        finetune_loop_module._select_orientation_policy("invariant", None, stage="finetune")
         == "invariant"
     )
 
 
 def test_new_legacy_run_records_explicit_sensitive_without_changing_transform():
-    profile = trainer._select_augmentation_profile("legacy", None, stage="pretrain")
-    policy = trainer._select_orientation_policy("sensitive", None, stage="pretrain")
+    profile = finetune_loop_module._select_augmentation_profile("legacy", None, stage="pretrain")
+    policy = finetune_loop_module._select_orientation_policy("sensitive", None, stage="pretrain")
     config = _augmentation_config("pretrain", profile, policy)
     assert (profile, policy) == ("legacy", "sensitive")
     assert config["orientation_policy"] == "sensitive"
@@ -993,31 +1105,31 @@ def test_new_legacy_run_records_explicit_sensitive_without_changing_transform():
 def test_old_pretrain_resume_profile_and_policy_compatibility():
     checkpoint = {"config": {"model_name": "vit_tiny_patch16_224"}}
     assert (
-        trainer._select_augmentation_profile(None, checkpoint, stage="pretrain")
+        finetune_loop_module._select_augmentation_profile(None, checkpoint, stage="pretrain")
         == "legacy"
     )
     assert (
-        trainer._select_augmentation_profile("legacy", checkpoint, stage="pretrain")
+        finetune_loop_module._select_augmentation_profile("legacy", checkpoint, stage="pretrain")
         == "legacy"
     )
     with pytest.raises(ValueError, match="Cannot resume"):
-        trainer._select_augmentation_profile(
+        finetune_loop_module._select_augmentation_profile(
             "global-barcode", checkpoint, stage="pretrain"
         )
     assert (
-        trainer._select_orientation_policy(
+        finetune_loop_module._select_orientation_policy(
             None, checkpoint, stage="pretrain", resume=True
         )
         == "invariant"
     )
     assert (
-        trainer._select_orientation_policy(
+        finetune_loop_module._select_orientation_policy(
             "invariant", checkpoint, stage="pretrain", resume=True
         )
         == "invariant"
     )
     with pytest.raises(ValueError, match="Cannot resume"):
-        trainer._select_orientation_policy(
+        finetune_loop_module._select_orientation_policy(
             "sensitive", checkpoint, stage="pretrain", resume=True
         )
 
@@ -1025,56 +1137,56 @@ def test_old_pretrain_resume_profile_and_policy_compatibility():
 def test_old_finetune_resume_compatibility():
     checkpoint = {"config": {"model_name": "vit_tiny_patch16_224"}}
     assert (
-        trainer._select_augmentation_profile(None, checkpoint, stage="finetune")
+        finetune_loop_module._select_augmentation_profile(None, checkpoint, stage="finetune")
         == "none"
     )
     assert (
-        trainer._select_augmentation_profile("none", checkpoint, stage="finetune")
+        finetune_loop_module._select_augmentation_profile("none", checkpoint, stage="finetune")
         == "none"
     )
     with pytest.raises(ValueError, match="Cannot resume"):
-        trainer._select_augmentation_profile(
+        finetune_loop_module._select_augmentation_profile(
             "conservative", checkpoint, stage="finetune"
         )
     assert (
-        trainer._select_orientation_policy(
+        finetune_loop_module._select_orientation_policy(
             None, checkpoint, stage="finetune", resume=True
         )
         == "invariant"
     )
     assert (
-        trainer._select_orientation_policy(
+        finetune_loop_module._select_orientation_policy(
             "invariant", checkpoint, stage="finetune", resume=True
         )
         == "invariant"
     )
     with pytest.raises(ValueError, match="Cannot resume"):
-        trainer._select_orientation_policy(
+        finetune_loop_module._select_orientation_policy(
             "sensitive", checkpoint, stage="finetune", resume=True
         )
 
 
 def test_old_pretrain_checkpoint_finetune_initialization():
     checkpoint = {"config": {"model_name": "vit_tiny_patch16_224"}}
-    assert trainer._select_augmentation_profile(None, None, stage="finetune") == "none"
+    assert finetune_loop_module._select_augmentation_profile(None, None, stage="finetune") == "none"
     assert (
-        trainer._select_augmentation_profile("conservative", None, stage="finetune")
+        finetune_loop_module._select_augmentation_profile("conservative", None, stage="finetune")
         == "conservative"
     )
     assert (
-        trainer._select_orientation_policy(
+        finetune_loop_module._select_orientation_policy(
             None, checkpoint, stage="finetune", resume=False
         )
         == "sensitive"
     )
     assert (
-        trainer._select_orientation_policy(
+        finetune_loop_module._select_orientation_policy(
             "invariant", checkpoint, stage="finetune", resume=False
         )
         == "invariant"
     )
     assert (
-        trainer._select_orientation_policy(
+        finetune_loop_module._select_orientation_policy(
             "sensitive", checkpoint, stage="finetune", resume=False
         )
         == "sensitive"
@@ -1083,15 +1195,15 @@ def test_old_pretrain_checkpoint_finetune_initialization():
 
 def test_new_style_pretrain_checkpoint_finetune_initialization_inherits_policy_only():
     checkpoint = _augmented_checkpoint("pretrain", "color-robust", "sensitive")
-    assert trainer._select_augmentation_profile(None, None, stage="finetune") == "none"
+    assert finetune_loop_module._select_augmentation_profile(None, None, stage="finetune") == "none"
     assert (
-        trainer._select_orientation_policy(
+        finetune_loop_module._select_orientation_policy(
             None, checkpoint, stage="finetune", resume=False
         )
         == "sensitive"
     )
     assert (
-        trainer._select_orientation_policy(
+        finetune_loop_module._select_orientation_policy(
             "invariant", checkpoint, stage="finetune", resume=False
         )
         == "invariant"
@@ -1150,13 +1262,13 @@ def test_new_style_pretrain_checkpoint_finetune_initialization_inherits_policy_o
 )
 def test_malformed_augmentation_metadata(checkpoint):
     with pytest.raises(ValueError, match="malformed augmentation metadata"):
-        trainer._select_augmentation_profile(None, checkpoint, stage="pretrain")
+        finetune_loop_module._select_augmentation_profile(None, checkpoint, stage="pretrain")
     with pytest.raises(ValueError, match="malformed augmentation metadata"):
-        trainer._select_orientation_policy(
+        finetune_loop_module._select_orientation_policy(
             None, checkpoint, stage="pretrain", resume=True
         )
     with pytest.raises(ValueError, match="malformed augmentation metadata"):
-        trainer._validate_augmentation_config(
+        finetune_loop_module._validate_augmentation_config(
             "legacy",
             _augmentation_config("pretrain", "legacy", "invariant"),
             checkpoint,
@@ -1181,19 +1293,19 @@ def test_saved_profile_must_match_stage():
     }
 
     with pytest.raises(ValueError, match="not valid for finetune"):
-        trainer._select_augmentation_profile(None, pretrain_style, stage="finetune")
+        finetune_loop_module._select_augmentation_profile(None, pretrain_style, stage="finetune")
     with pytest.raises(ValueError, match="not valid for pretrain"):
-        trainer._select_augmentation_profile(None, finetune_style, stage="pretrain")
+        finetune_loop_module._select_augmentation_profile(None, finetune_style, stage="pretrain")
 
 
 @pytest.mark.parametrize("stage", ["other", "pretraining", ""])
 def test_unsupported_stage_raises(stage):
     with pytest.raises(ValueError, match="Unsupported augmentation stage"):
-        trainer._select_augmentation_profile(None, None, stage=stage)
+        finetune_loop_module._select_augmentation_profile(None, None, stage=stage)
     with pytest.raises(ValueError, match="Unsupported augmentation stage"):
-        trainer._select_orientation_policy(None, None, stage=stage)
+        finetune_loop_module._select_orientation_policy(None, None, stage=stage)
     with pytest.raises(ValueError, match="Unsupported augmentation stage"):
-        trainer._validate_augmentation_config(
+        finetune_loop_module._validate_augmentation_config(
             "none",
             _augmentation_config("finetune", "none", "invariant"),
             None,
@@ -1202,15 +1314,15 @@ def test_unsupported_stage_raises(stage):
 
 
 def test_pretrain_local_views_new_run_defaults_and_validation():
-    assert trainer._resolve_pretrain_local_views(None, None, None) == (96, 6)
-    assert trainer._resolve_pretrain_local_views(128, 4, None) == (128, 4)
-    assert trainer._resolve_pretrain_local_views(128, 0, None) == (128, 0)
+    assert pretrain_recipe_module._resolve_pretrain_local_views(None, None, None) == (96, 6)
+    assert pretrain_recipe_module._resolve_pretrain_local_views(128, 4, None) == (128, 4)
+    assert pretrain_recipe_module._resolve_pretrain_local_views(128, 0, None) == (128, 0)
     for bad_size in (0, -1, True, 1.5, "96"):
         with pytest.raises(ValueError):
-            trainer._resolve_pretrain_local_views(bad_size, None, None)
+            pretrain_recipe_module._resolve_pretrain_local_views(bad_size, None, None)
     for bad_crops in (-1, False, 1.5, "6"):
         with pytest.raises(ValueError):
-            trainer._resolve_pretrain_local_views(None, bad_crops, None)
+            pretrain_recipe_module._resolve_pretrain_local_views(None, bad_crops, None)
 
 
 def test_pretrain_resume_inherits_saved_local_views():
@@ -1221,12 +1333,12 @@ def test_pretrain_resume_inherits_saved_local_views():
         local_crop_size=128,
         local_crops=4,
     )
-    assert trainer._resolve_pretrain_local_views(None, None, checkpoint) == (128, 4)
-    assert trainer._resolve_pretrain_local_views(128, 4, checkpoint) == (128, 4)
+    assert pretrain_recipe_module._resolve_pretrain_local_views(None, None, checkpoint) == (128, 4)
+    assert pretrain_recipe_module._resolve_pretrain_local_views(128, 4, checkpoint) == (128, 4)
     with pytest.raises(ValueError, match="Cannot resume"):
-        trainer._resolve_pretrain_local_views(96, None, checkpoint)
+        pretrain_recipe_module._resolve_pretrain_local_views(96, None, checkpoint)
     with pytest.raises(ValueError, match="Cannot resume"):
-        trainer._resolve_pretrain_local_views(None, 6, checkpoint)
+        pretrain_recipe_module._resolve_pretrain_local_views(None, 6, checkpoint)
 
 
 def test_old_pretrain_local_views_inherit_and_fallback():
@@ -1234,21 +1346,21 @@ def test_old_pretrain_local_views_inherit_and_fallback():
         "config": {"model_name": "vit_tiny_patch16_224"},
         "args": {"local_crop_size": 128, "local_crops": 0},
     }
-    assert trainer._resolve_pretrain_local_views(None, None, checkpoint) == (128, 0)
-    assert trainer._resolve_pretrain_local_views(128, 0, checkpoint) == (128, 0)
+    assert pretrain_recipe_module._resolve_pretrain_local_views(None, None, checkpoint) == (128, 0)
+    assert pretrain_recipe_module._resolve_pretrain_local_views(128, 0, checkpoint) == (128, 0)
 
     missing = {"config": {"model_name": "vit_tiny_patch16_224"}, "args": {}}
-    assert trainer._resolve_pretrain_local_views(None, None, missing) == (96, 6)
+    assert pretrain_recipe_module._resolve_pretrain_local_views(None, None, missing) == (96, 6)
     with pytest.raises(ValueError, match="Cannot resume"):
-        trainer._resolve_pretrain_local_views(128, None, missing)
+        pretrain_recipe_module._resolve_pretrain_local_views(128, None, missing)
 
     invalid = {
         "config": {"model_name": "vit_tiny_patch16_224"},
         "args": {"local_crop_size": 0, "local_crops": True},
     }
-    assert trainer._resolve_pretrain_local_views(None, None, invalid) == (96, 6)
+    assert pretrain_recipe_module._resolve_pretrain_local_views(None, None, invalid) == (96, 6)
     with pytest.raises(ValueError, match="Cannot resume"):
-        trainer._resolve_pretrain_local_views(None, 0, invalid)
+        pretrain_recipe_module._resolve_pretrain_local_views(None, 0, invalid)
 
 
 def test_augmentation_metadata_round_trips_training_size():
@@ -1276,7 +1388,7 @@ def test_pretrain_passes_resolved_augmentation_to_dataset(
         captured.update(kwargs)
         raise _DatasetConstructionReached
 
-    monkeypatch.setattr(trainer, "MultiCropDataset", fake_dataset)
+    monkeypatch.setattr(pretrain_loop_module, "MultiCropDataset", fake_dataset)
     args = argparse.Namespace(
         seed=42,
         cpus=0,
@@ -1295,7 +1407,7 @@ def test_pretrain_passes_resolved_augmentation_to_dataset(
     )
 
     with pytest.raises(_DatasetConstructionReached):
-        trainer.run_pretrain(args)
+        pretrain_loop_module.run_pretrain(args)
 
     assert captured["augmentation_profile"] == "global-barcode"
     assert captured["orientation_policy"] == "sensitive"
@@ -1316,7 +1428,7 @@ def test_pretrain_passes_explicit_augmentation_to_dataset(tmp_path, monkeypatch)
         captured.update(kwargs)
         raise _DatasetConstructionReached
 
-    monkeypatch.setattr(trainer, "MultiCropDataset", fake_dataset)
+    monkeypatch.setattr(pretrain_loop_module, "MultiCropDataset", fake_dataset)
     args = argparse.Namespace(
         seed=42,
         cpus=0,
@@ -1335,7 +1447,7 @@ def test_pretrain_passes_explicit_augmentation_to_dataset(tmp_path, monkeypatch)
     )
 
     with pytest.raises(_DatasetConstructionReached):
-        trainer.run_pretrain(args)
+        pretrain_loop_module.run_pretrain(args)
 
     assert captured["augmentation_profile"] == "legacy"
     assert captured["orientation_policy"] == "sensitive"
@@ -1362,11 +1474,11 @@ def test_finetune_initialization_does_not_inherit_pretrain_augmentation(
         captured.update(kwargs)
         raise _DatasetConstructionReached
 
-    monkeypatch.setattr(trainer, "MetricDataset", fake_dataset)
+    monkeypatch.setattr(finetune_loop_module, "MetricDataset", fake_dataset)
     args = _finetune_args(tmp_path, checkpoint_path)
 
     with pytest.raises(_DatasetConstructionReached):
-        trainer.run_finetune(args)
+        finetune_loop_module.run_finetune(args)
 
     assert captured["augmentation_profile"] == "none"
     assert captured["orientation_policy"] == "sensitive"
@@ -1383,7 +1495,7 @@ def test_finetune_passes_resolved_training_size_to_model_and_dataset(
     captured_model = {}
     captured_dataset = {}
 
-    real_encoder = trainer.OTUFormerEncoder
+    real_encoder = finetune_loop_module.OTUFormerEncoder
 
     def fake_encoder(*args, **kwargs):
         captured_model["img_size"] = kwargs.get("img_size")
@@ -1393,12 +1505,12 @@ def test_finetune_passes_resolved_training_size_to_model_and_dataset(
         captured_dataset.update(kwargs)
         raise _DatasetConstructionReached
 
-    monkeypatch.setattr(trainer, "OTUFormerEncoder", fake_encoder)
-    monkeypatch.setattr(trainer, "MetricDataset", fake_dataset)
+    monkeypatch.setattr(finetune_loop_module, "OTUFormerEncoder", fake_encoder)
+    monkeypatch.setattr(finetune_loop_module, "MetricDataset", fake_dataset)
     args = _finetune_args(tmp_path, checkpoint_path)
 
     with pytest.raises(_DatasetConstructionReached):
-        trainer.run_finetune(args)
+        finetune_loop_module.run_finetune(args)
 
     assert captured_model["img_size"] == 32
     assert captured_dataset["image_size"] == 32
@@ -1592,7 +1704,7 @@ def _run_frozen_finetune(tmp_path, checkpoint_path, out_name, **overrides):
             **overrides,
         ),
     )
-    trainer.run_finetune(args)
+    finetune_loop_module.run_finetune(args)
     return torch.load(
         Path(args.out_dir) / "finetune_latest.pth", map_location="cpu", weights_only=False
     )
@@ -1643,7 +1755,7 @@ def test_finetune_resume_rejects_a_changed_embedding_dim(tmp_path):
     first = _finetune_args(
         tmp_path, ssl, finetune_epochs=1, **_finetune_overrides(tmp_path, "f1")
     )
-    trainer.run_finetune(first)
+    finetune_loop_module.run_finetune(first)
 
     resume = _finetune_args(
         tmp_path,
@@ -1654,7 +1766,7 @@ def test_finetune_resume_rejects_a_changed_embedding_dim(tmp_path):
         **_finetune_overrides(tmp_path, "f2"),
     )
     with pytest.raises(ValueError, match="Cannot resume"):
-        trainer.run_finetune(resume)
+        finetune_loop_module.run_finetune(resume)
 
 
 def test_metric_embed_dim_is_rejected_for_a_projection_head_checkpoint(tmp_path):
@@ -1669,7 +1781,7 @@ def test_metric_embed_dim_is_rejected_for_a_projection_head_checkpoint(tmp_path)
     )
 
     with pytest.raises(ValueError, match="cannot be applied to a ProjectionHead"):
-        trainer.run_finetune(args)
+        finetune_loop_module.run_finetune(args)
 
 
 def test_finetune_resume_rejects_a_changed_freeze_ratio(tmp_path):
@@ -1682,7 +1794,7 @@ def test_finetune_resume_rejects_a_changed_freeze_ratio(tmp_path):
         freeze_ratio=0.5,
         **_finetune_overrides(tmp_path, "f1"),
     )
-    trainer.run_finetune(first)
+    finetune_loop_module.run_finetune(first)
     saved = torch.load(
         tmp_path / "f1" / "finetune_latest.pth", map_location="cpu", weights_only=False
     )
@@ -1697,7 +1809,7 @@ def test_finetune_resume_rejects_a_changed_freeze_ratio(tmp_path):
         **_finetune_overrides(tmp_path, "f2"),
     )
     with pytest.raises(ValueError, match="freeze_ratio"):
-        trainer.run_finetune(resume)
+        finetune_loop_module.run_finetune(resume)
 
 
 _V070_ENHANCED_HEADER = [
@@ -1731,7 +1843,7 @@ def test_maybe_subsample_for_metrics_returns_sorted_indices():
     embeddings = np.arange(30, dtype=np.float32).reshape(-1, 1)
     labels = np.arange(30)
 
-    sampled, sampled_labels = trainer._maybe_subsample_for_metrics(
+    sampled, sampled_labels = reporting_module._maybe_subsample_for_metrics(
         embeddings, labels, max_samples=10, seed=42
     )
 
@@ -1744,7 +1856,7 @@ def test_compute_all_metrics_uses_empty_strings_for_unavailable_metrics():
     embeddings = np.random.default_rng(0).standard_normal((6, 4)).astype(np.float32)
     labels = np.array(["a", "a", "a", "b", "b", "b"])
 
-    fields = trainer._compute_all_metrics(embeddings, labels, compute_linear_probe=True)
+    fields = reporting_module._compute_all_metrics(embeddings, labels, compute_linear_probe=True)
 
     assert fields["Recall@10"] == ""
     assert fields["kNN_Acc_k20"] == ""
@@ -1755,7 +1867,7 @@ def test_compute_all_metrics_uses_empty_strings_for_unavailable_metrics():
 
 
 def test_enhanced_metrics_logger_keeps_history_and_adds_balanced_probe(tmp_path):
-    logger = trainer.EnhancedMetricsLogger(
+    logger = pretrain_loop_module.EnhancedMetricsLogger(
         tmp_path / "metrics.pretrain.csv", mode="pretrain"
     )
 
@@ -1777,7 +1889,7 @@ def test_v070_enhanced_header_is_migrated_atomically(tmp_path, filename):
     path = tmp_path / filename
     _write_v070_enhanced_csv(path)
 
-    logger = trainer.EnhancedMetricsLogger(path, mode="pretrain")
+    logger = pretrain_loop_module.EnhancedMetricsLogger(path, mode="pretrain")
     logger.log(2, "train", {"NMI": 0.5})
 
     rows = list(csv.reader(path.read_text(encoding="utf-8").splitlines()))
@@ -1798,10 +1910,10 @@ def test_current_enhanced_schema_is_appended_without_migration(tmp_path):
     import csv
 
     path = tmp_path / "metrics.pretrain.csv"
-    logger = trainer.EnhancedMetricsLogger(path, mode="pretrain")
+    logger = pretrain_loop_module.EnhancedMetricsLogger(path, mode="pretrain")
     logger.log(1, "train", {"NMI": 0.2})
 
-    logger_again = trainer.EnhancedMetricsLogger(path, mode="pretrain")
+    logger_again = pretrain_loop_module.EnhancedMetricsLogger(path, mode="pretrain")
     logger_again.log(2, "train", {"NMI": 0.3})
 
     rows = list(csv.reader(path.read_text(encoding="utf-8").splitlines()))
@@ -1824,7 +1936,7 @@ def test_malformed_enhanced_schema_fails_without_touching_the_file(tmp_path, con
     original = path.read_bytes()
 
     with pytest.raises(ValueError, match="schema"):
-        trainer.EnhancedMetricsLogger(path, mode="pretrain")
+        pretrain_loop_module.EnhancedMetricsLogger(path, mode="pretrain")
 
     assert path.read_bytes() == original
     assert list(tmp_path.glob("*.tmp")) == []
@@ -1836,7 +1948,7 @@ def test_malformed_enhanced_schema_fails_without_touching_the_file(tmp_path, con
 def test_resolve_finetune_loss_mode_new_run_defaults(tmp_path):
     args = _finetune_args(tmp_path, tmp_path / "source.pth")
 
-    resolved = trainer._resolve_finetune_loss_config(args, None)
+    resolved = finetune_loop_module._resolve_finetune_loss_config(args, None)
 
     assert resolved["loss"] == "arcface"
     assert resolved["subcenters"] is None
@@ -1849,7 +1961,7 @@ def test_resolve_finetune_loss_mode_applies_only_applicable_settings(tmp_path):
     args = _finetune_args(
         tmp_path, tmp_path / "source.pth", loss="supcon", supcon_temperature=0.1
     )
-    resolved = trainer._resolve_finetune_loss_config(
+    resolved = finetune_loop_module._resolve_finetune_loss_config(
         args, None, explicit_options={"loss", "supcon_temperature"}
     )
     assert resolved["loss"] == "supcon"
@@ -1861,7 +1973,7 @@ def test_resolve_finetune_loss_mode_applies_only_applicable_settings(tmp_path):
     args = _finetune_args(
         tmp_path, tmp_path / "source.pth", loss="subcenter-arcface", subcenters=3
     )
-    resolved = trainer._resolve_finetune_loss_config(
+    resolved = finetune_loop_module._resolve_finetune_loss_config(
         args, None, explicit_options={"loss", "subcenters"}
     )
     assert resolved["subcenters"] == 3
@@ -1874,7 +1986,7 @@ def test_resolve_finetune_loss_mode_applies_only_applicable_settings(tmp_path):
         loss="subcenter-arcface-compact",
         compact_weight=0.25,
     )
-    resolved = trainer._resolve_finetune_loss_config(
+    resolved = finetune_loop_module._resolve_finetune_loss_config(
         args, None, explicit_options={"loss", "compact_weight"}
     )
     assert resolved["compact_weight"] == 0.25
@@ -1911,7 +2023,7 @@ def test_resolve_finetune_loss_option_rejects_inapplicable_or_invalid(
     args = _finetune_args(tmp_path, tmp_path / "source.pth", **overrides)
 
     with pytest.raises(ValueError):
-        trainer._resolve_finetune_loss_config(args, None, explicit_options=explicit)
+        finetune_loop_module._resolve_finetune_loss_config(args, None, explicit_options=explicit)
 
 
 @pytest.mark.parametrize(
@@ -1941,7 +2053,7 @@ def test_resolve_finetune_loss_option_rejects_non_finite_values(
     args = _finetune_args(tmp_path, tmp_path / "source.pth", **overrides)
 
     with pytest.raises(ValueError):
-        trainer._resolve_finetune_loss_config(args, None, explicit_options=explicit)
+        finetune_loop_module._resolve_finetune_loss_config(args, None, explicit_options=explicit)
 
 
 def test_resolve_finetune_loss_mode_resume_inherits_saved_mode(tmp_path):
@@ -1952,7 +2064,7 @@ def test_resolve_finetune_loss_mode_resume_inherits_saved_mode(tmp_path):
     # option is not explicit, so the recorded mode must win.
     args = _finetune_args(tmp_path, tmp_path / "source.pth", loss="arcface")
 
-    resolved = trainer._resolve_finetune_loss_config(args, checkpoint)
+    resolved = finetune_loop_module._resolve_finetune_loss_config(args, checkpoint)
 
     assert resolved["loss"] == "supcon"
     assert resolved["supcon_temperature"] == 0.05
@@ -1965,7 +2077,7 @@ def test_resolve_finetune_loss_mode_resume_allows_equal_and_rejects_conflict(tmp
     args = _finetune_args(
         tmp_path, tmp_path / "source.pth", loss="supcon", supcon_temperature=0.07
     )
-    resolved = trainer._resolve_finetune_loss_config(
+    resolved = finetune_loop_module._resolve_finetune_loss_config(
         args, checkpoint, explicit_options={"loss", "supcon_temperature"}
     )
     assert resolved["loss"] == "supcon"
@@ -1975,13 +2087,13 @@ def test_resolve_finetune_loss_mode_resume_allows_equal_and_rejects_conflict(tmp
         tmp_path, tmp_path / "source.pth", loss="supcon", supcon_temperature=0.1
     )
     with pytest.raises(ValueError):
-        trainer._resolve_finetune_loss_config(
+        finetune_loop_module._resolve_finetune_loss_config(
             args, checkpoint, explicit_options={"loss", "supcon_temperature"}
         )
 
     args = _finetune_args(tmp_path, tmp_path / "source.pth", loss="arcface")
     with pytest.raises(ValueError):
-        trainer._resolve_finetune_loss_config(
+        finetune_loop_module._resolve_finetune_loss_config(
             args, checkpoint, explicit_options={"loss"}
         )
 
@@ -1996,7 +2108,7 @@ def test_resolve_compact_subcenters_uses_the_requested_k(tmp_path):
         compact_weight=0.25,
     )
 
-    resolved = trainer._resolve_finetune_loss_config(
+    resolved = finetune_loop_module._resolve_finetune_loss_config(
         args, None, explicit_options={"loss", "subcenters", "compact_weight"}
     )
 
@@ -2012,7 +2124,7 @@ def test_resolve_subcenters_rejects_k_outside_the_bound(tmp_path, k):
         tmp_path, tmp_path / "source.pth", loss="subcenter-arcface", subcenters=k
     )
     with pytest.raises(ValueError, match="--subcenters"):
-        trainer._resolve_finetune_loss_config(
+        finetune_loop_module._resolve_finetune_loss_config(
             args, None, explicit_options={"subcenters"}
         )
 
@@ -2029,7 +2141,7 @@ def test_resume_rejects_explicit_k_against_a_legacy_compact_checkpoint(tmp_path)
         subcenters=3,
     )
     with pytest.raises(ValueError, match="subcenters"):
-        trainer._resolve_finetune_loss_config(
+        finetune_loop_module._resolve_finetune_loss_config(
             args, checkpoint, explicit_options={"subcenters"}
         )
 
@@ -2037,7 +2149,7 @@ def test_resume_rejects_explicit_k_against_a_legacy_compact_checkpoint(tmp_path)
     args = _finetune_args(
         tmp_path, tmp_path / "source.pth", loss="subcenter-arcface-compact"
     )
-    resolved = trainer._resolve_finetune_loss_config(args, checkpoint)
+    resolved = finetune_loop_module._resolve_finetune_loss_config(args, checkpoint)
     assert resolved["subcenters"] == 2
 
 
@@ -2046,12 +2158,12 @@ def test_resolve_finetune_loss_mode_rejects_new_mode_on_legacy_resume(tmp_path):
 
     args = _finetune_args(tmp_path, tmp_path / "source.pth", loss="supcon")
     with pytest.raises(ValueError, match="legacy"):
-        trainer._resolve_finetune_loss_config(
+        finetune_loop_module._resolve_finetune_loss_config(
             args, legacy, explicit_options={"loss"}
         )
 
     args = _finetune_args(tmp_path, tmp_path / "source.pth", loss="arcface")
-    resolved = trainer._resolve_finetune_loss_config(
+    resolved = finetune_loop_module._resolve_finetune_loss_config(
         args, legacy, explicit_options={"loss"}
     )
     assert resolved["loss"] == "arcface"
@@ -2069,17 +2181,17 @@ def test_finetune_source_decision_table_classifies_sources():
         "model_state_dict": _ssl_like_state(),
         "config": {"model_name": "m", "out_dim": 16},
     }
-    assert trainer._classify_finetune_source(ssl) == "ssl"
-    assert trainer._select_finetune_embedding_head(ssl) == "arcface_mlp_512"
+    assert finetune_loop_module._classify_finetune_source(ssl) == "ssl"
+    assert finetune_loop_module._select_finetune_embedding_head(ssl) == "arcface_mlp_512"
 
     v080_supcon = {
         "model_state_dict": _ssl_like_state(),
         "config": {"loss": "supcon", "embedding_head": "arcface_mlp_512"},
         "loss_state_dict": {},
     }
-    assert trainer._classify_finetune_source(v080_supcon) == "v080"
+    assert finetune_loop_module._classify_finetune_source(v080_supcon) == "v080"
     assert (
-        trainer._select_finetune_embedding_head(v080_supcon) == "arcface_mlp_512"
+        finetune_loop_module._select_finetune_embedding_head(v080_supcon) == "arcface_mlp_512"
     )
 
     v080_arcface = {
@@ -2087,16 +2199,16 @@ def test_finetune_source_decision_table_classifies_sources():
         "config": {"loss": "arcface", "embedding_head": "arcface_mlp_512"},
         "loss_state_dict": {"head.weight": torch.zeros(2, 16)},
     }
-    assert trainer._classify_finetune_source(v080_arcface) == "v080"
+    assert finetune_loop_module._classify_finetune_source(v080_arcface) == "v080"
 
     legacy_with_head = {
         "model_state_dict": _ssl_like_state(),
         "config": {"embedding_head": "projection_mlp_2048"},
         "loss_state_dict": {"head.weight": torch.zeros(2, 16)},
     }
-    assert trainer._classify_finetune_source(legacy_with_head) == "legacy_arcface"
+    assert finetune_loop_module._classify_finetune_source(legacy_with_head) == "legacy_arcface"
     assert (
-        trainer._select_finetune_embedding_head(legacy_with_head)
+        finetune_loop_module._select_finetune_embedding_head(legacy_with_head)
         == "projection_mlp_2048"
     )
 
@@ -2104,18 +2216,18 @@ def test_finetune_source_decision_table_classifies_sources():
         "model_state_dict": _ssl_like_state(),
         "loss_state_dict": {"head.weight": torch.zeros(2, 16)},
     }
-    assert trainer._classify_finetune_source(historical) == "legacy_arcface"
+    assert finetune_loop_module._classify_finetune_source(historical) == "legacy_arcface"
     assert (
-        trainer._select_finetune_embedding_head(historical) == "projection_mlp_2048"
+        finetune_loop_module._select_finetune_embedding_head(historical) == "projection_mlp_2048"
     )
 
     head_only = {
         "config": {"embedding_head": "arcface_mlp_512"},
         "model_state_dict": _ssl_like_state(),
     }
-    assert trainer._classify_finetune_source(head_only) == "head_only"
+    assert finetune_loop_module._classify_finetune_source(head_only) == "head_only"
     assert (
-        trainer._select_finetune_embedding_head(head_only) == "arcface_mlp_512"
+        finetune_loop_module._select_finetune_embedding_head(head_only) == "arcface_mlp_512"
     )
 
     # Repo SSL checkpoints also carry teacher/student and args; only `config`
@@ -2127,7 +2239,7 @@ def test_finetune_source_decision_table_classifies_sources():
         "args": {"model_name": "m"},
         "config": {"model_name": "m", "out_dim": 16},
     }
-    assert trainer._classify_finetune_source(repo_ssl) == "ssl"
+    assert finetune_loop_module._classify_finetune_source(repo_ssl) == "ssl"
 
 
 @pytest.mark.parametrize(
@@ -2200,7 +2312,7 @@ def test_finetune_source_decision_table_classifies_sources():
 )
 def test_finetune_source_decision_table_rejects(checkpoint):
     with pytest.raises(ValueError):
-        trainer._classify_finetune_source(checkpoint)
+        finetune_loop_module._classify_finetune_source(checkpoint)
 
 
 def test_finetune_legacy_inference_requires_projector_weights():
@@ -2210,7 +2322,7 @@ def test_finetune_legacy_inference_requires_projector_weights():
         "config": {},
     }
     with pytest.raises(ValueError, match="encoder weights"):
-        trainer._select_finetune_embedding_head(weightless)
+        finetune_loop_module._select_finetune_embedding_head(weightless)
 
     # Encoder weights present, but no projector weights and no declared head:
     # there is nothing to infer the embedding head from.
@@ -2220,7 +2332,7 @@ def test_finetune_legacy_inference_requires_projector_weights():
         "config": {},
     }
     with pytest.raises(ValueError, match="projector"):
-        trainer._select_finetune_embedding_head(no_projector)
+        finetune_loop_module._select_finetune_embedding_head(no_projector)
 
 
 # --- manifest hashing -------------------------------------------------------
@@ -2232,30 +2344,30 @@ def test_train_manifest_hash_is_permutation_invariant_and_content_sensitive(
     root = tmp_path / "images"
     refs = ["b.jpg", "a.jpg", "a.jpg"]
     labels = ["classB", "classA", "classA"]
-    baseline = trainer._train_manifest_sha256(refs, labels, root)
+    baseline = finetune_loop_module._train_manifest_sha256(refs, labels, root)
 
     assert (
-        trainer._train_manifest_sha256(
+        finetune_loop_module._train_manifest_sha256(
             ["a.jpg", "b.jpg", "a.jpg"], ["classA", "classB", "classA"], root
         )
         == baseline
     )
     # ``./img.jpg`` and ``img.jpg`` are the same canonical reference.
     assert (
-        trainer._train_manifest_sha256(
+        finetune_loop_module._train_manifest_sha256(
             ["./a.jpg", "a.jpg", "b.jpg"], ["classA", "classA", "classB"], root
         )
         == baseline
     )
     # Duplicate rows and label assignments are part of the manifest.
     assert (
-        trainer._train_manifest_sha256(
+        finetune_loop_module._train_manifest_sha256(
             refs + ["a.jpg"], labels + ["classA"], root
         )
         != baseline
     )
     assert (
-        trainer._train_manifest_sha256(
+        finetune_loop_module._train_manifest_sha256(
             refs, ["classB", "classA", "classB"], root
         )
         != baseline
@@ -2267,10 +2379,10 @@ def test_train_manifest_hash_ignores_the_absolute_root(tmp_path):
     one = tmp_path / "one"
     two = tmp_path / "two"
 
-    first = trainer._train_manifest_sha256(
+    first = finetune_loop_module._train_manifest_sha256(
         [str(one / "a.jpg"), "b.jpg"], labels, one
     )
-    second = trainer._train_manifest_sha256(
+    second = finetune_loop_module._train_manifest_sha256(
         [str(two / "a.jpg"), "b.jpg"], labels, two
     )
 
@@ -2279,7 +2391,7 @@ def test_train_manifest_hash_ignores_the_absolute_root(tmp_path):
 
 def test_train_manifest_hash_rejects_references_outside_the_root(tmp_path):
     with pytest.raises(ValueError, match="input-images-dir"):
-        trainer._train_manifest_sha256(
+        finetune_loop_module._train_manifest_sha256(
             [str(tmp_path / "elsewhere" / "a.jpg")], ["classA"], tmp_path / "images"
         )
 
@@ -2321,9 +2433,9 @@ def test_metric_dataset_retains_recursive_csv_refs(tmp_path):
     # The image is discovered under nested/, but the CSV reference is retained,
     # so the manifest hash covers the reference, not the discovered path.
     assert ds.image_refs == ["img_0.jpg", "img_1.jpg"]
-    assert trainer._train_manifest_sha256(
+    assert finetune_loop_module._train_manifest_sha256(
         ds.image_refs, ds.label_names, img_dir
-    ) == trainer._train_manifest_sha256(
+    ) == finetune_loop_module._train_manifest_sha256(
         ["img_0.jpg", "img_1.jpg"], ["classA", "classB"], img_dir
     )
 
@@ -2337,13 +2449,13 @@ def test_sha256_file_matches_hashlib(tmp_path):
     path = tmp_path / "payload.bin"
     path.write_bytes(b"otuformer" * 5000)
 
-    assert trainer._sha256_file(path) == hashlib.sha256(
+    assert finetune_loop_module._sha256_file(path) == hashlib.sha256(
         path.read_bytes()
     ).hexdigest()
 
 
 def _expected_manifest(tmp_path):
-    return trainer._train_manifest_sha256(
+    return finetune_loop_module._train_manifest_sha256(
         [f"img_{i}.jpg" for i in range(4)],
         ["classA", "classA", "classB", "classB"],
         tmp_path / "images",
@@ -2356,7 +2468,7 @@ def test_finetune_records_provenance_and_effective_config(tmp_path):
     saved = _run_frozen_finetune(tmp_path, ssl, "provenance")
 
     config = saved["config"]
-    ssl_sha = trainer._sha256_file(ssl)
+    ssl_sha = finetune_loop_module._sha256_file(ssl)
     assert config["loss"] == "arcface"
     assert config["subcenters"] is None
     assert config["compact_weight"] is None
@@ -2373,7 +2485,7 @@ def test_finetune_records_provenance_and_effective_config(tmp_path):
     second = _run_frozen_finetune(tmp_path, finetune_path, "provenance2")
     second_config = second["config"]
     assert second_config["initialization_checkpoint_sha256"] == (
-        trainer._sha256_file(finetune_path)
+        finetune_loop_module._sha256_file(finetune_path)
     )
     assert second_config["ssl_initialization_checkpoint_sha256"] == ssl_sha
 
@@ -2411,7 +2523,7 @@ def test_build_finetune_loss_uses_effective_mode_kwargs():
         SupConLoss,
     )
 
-    arcface = trainer._build_finetune_loss(
+    arcface = finetune_loop_module._build_finetune_loss(
         {
             "loss": "arcface",
             "subcenters": None,
@@ -2425,7 +2537,7 @@ def test_build_finetune_loss_uses_effective_mode_kwargs():
     assert isinstance(arcface, ArcFaceLoss)
     assert tuple(arcface.head.weight.shape) == (3, 8)
 
-    supcon = trainer._build_finetune_loss(
+    supcon = finetune_loop_module._build_finetune_loss(
         {
             "loss": "supcon",
             "subcenters": None,
@@ -2439,7 +2551,7 @@ def test_build_finetune_loss_uses_effective_mode_kwargs():
     assert isinstance(supcon, SupConLoss)
     assert supcon.temperature == 0.1
 
-    subcenter = trainer._build_finetune_loss(
+    subcenter = finetune_loop_module._build_finetune_loss(
         {
             "loss": "subcenter-arcface",
             "subcenters": 3,
@@ -2454,7 +2566,7 @@ def test_build_finetune_loss_uses_effective_mode_kwargs():
     assert subcenter.head.k == 3
     assert subcenter.compact_weight == 0.0
 
-    compact = trainer._build_finetune_loss(
+    compact = finetune_loop_module._build_finetune_loss(
         {
             "loss": "subcenter-arcface-compact",
             "subcenters": 3,
@@ -2472,17 +2584,17 @@ def test_build_finetune_loss_uses_effective_mode_kwargs():
 
 
 def test_compact_checkpoint_k_comes_from_recorded_subcenters():
-    trainer._validate_v080_loss_state(
+    finetune_support_module._validate_v080_loss_state(
         {"loss": "subcenter-arcface-compact", "subcenters": 3},
         {"head.weight": torch.zeros(4, 3, 16)},
     )
     with pytest.raises(ValueError, match="centers"):
-        trainer._validate_v080_loss_state(
+        finetune_support_module._validate_v080_loss_state(
             {"loss": "subcenter-arcface-compact", "subcenters": 3},
             {"head.weight": torch.zeros(4, 2, 16)},
         )
     # A compact checkpoint written before K was recorded still expects K=2.
-    trainer._validate_v080_loss_state(
+    finetune_support_module._validate_v080_loss_state(
         {"loss": "subcenter-arcface-compact"},
         {"head.weight": torch.zeros(4, 2, 16)},
     )
@@ -2519,7 +2631,7 @@ def test_finetune_resume_rejects_ssl_and_head_only_sources(tmp_path):
             **_finetune_overrides(tmp_path, f"resume_{index}"),
         )
         with pytest.raises(ValueError, match="SSL"):
-            trainer.run_finetune(args)
+            finetune_loop_module.run_finetune(args)
 
 
 # --- one epoch per loss mode, skips, diagnostics and traces ----------------
@@ -2553,7 +2665,7 @@ def _run_loss_mode_epoch(tmp_path, mode, out_name, **extra):
             **extra,
         ),
     )
-    trainer.run_finetune(args)
+    finetune_loop_module.run_finetune(args)
     return torch.load(
         tmp_path / out_name / "finetune_latest.pth",
         map_location="cpu",
@@ -2600,7 +2712,7 @@ def test_finetune_one_epoch_then_resume_for_each_loss_mode(tmp_path, mode, capsy
             weight_decay=0.0,
         ),
     )
-    trainer.run_finetune(resume_args)
+    finetune_loop_module.run_finetune(resume_args)
     # The SupCon-only batch/anchor line must not clutter the other modes.
     epoch_log = capsys.readouterr().out
     if mode == "supcon":
@@ -2662,7 +2774,7 @@ def test_finetune_supcon_epoch_without_negatives_fails_without_checkpoint(tmp_pa
     )
 
     with pytest.raises(ValueError, match="usable"):
-        trainer.run_finetune(args)
+        finetune_loop_module.run_finetune(args)
 
     assert not (tmp_path / "one_class_out" / "finetune_latest.pth").exists()
 
@@ -2683,7 +2795,7 @@ def _write_legacy_finetune_checkpoint(path, *, groups: int):
         model_name="vit_tiny_patch16_224", out_dim=16, pretrained=False, img_size=32
     )
     loss = ArcFaceLoss(embed_dim=16, num_classes=2)
-    trainer._freeze_backbone_blocks(encoder, 0.7)
+    finetune_loop_module._freeze_backbone_blocks(encoder, 0.7)
     if groups == 1:
         optimizer = torch.optim.AdamW(
             [p for p in encoder.parameters() if p.requires_grad]
@@ -2735,7 +2847,7 @@ def test_finetune_legacy_resume_keeps_historical_layout(
         **_finetune_overrides(tmp_path, out_name, batch_size=4),
     )
 
-    trainer.run_finetune(args)
+    finetune_loop_module.run_finetune(args)
 
     resumed = torch.load(
         tmp_path / out_name / "finetune_latest.pth",
@@ -2760,7 +2872,7 @@ def test_run_finetune_uses_a_preloaded_resume_checkpoint(tmp_path, monkeypatch):
     def fail(*_args, **_kwargs):
         raise AssertionError("resume checkpoint was loaded a second time")
 
-    monkeypatch.setattr(trainer, "load_checkpoint", fail)
+    monkeypatch.setattr(finetune_loop_module, "load_checkpoint", fail)
     args = _finetune_args(
         tmp_path,
         source,
@@ -2769,7 +2881,7 @@ def test_run_finetune_uses_a_preloaded_resume_checkpoint(tmp_path, monkeypatch):
         **_finetune_overrides(tmp_path, "preloaded_resume", batch_size=4),
     )
 
-    trainer.run_finetune(args, source_checkpoint=preloaded)
+    finetune_loop_module.run_finetune(args, source_checkpoint=preloaded)
 
     assert (tmp_path / "preloaded_resume" / "finetune_latest.pth").exists()
 
@@ -2786,7 +2898,7 @@ def test_center_direction_cosine_uses_post_epoch_boundaries(tmp_path):
         **_finetune_overrides(tmp_path, "post_epoch", batch_size=4),
     )
 
-    trainer.run_finetune(args)
+    finetune_loop_module.run_finetune(args)
 
     diagnostics = pd.read_csv(
         tmp_path / "post_epoch" / "logs" / "loss_diagnostics.finetune.csv"
@@ -2801,7 +2913,7 @@ def test_center_direction_cosine_uses_post_epoch_boundaries(tmp_path):
             state["loss_state_dict"]["head.weight"], dim=-1
         )
 
-    expected = trainer._center_direction_cosine(
+    expected = finetune_loop_module._center_direction_cosine(
         saved_centers("finetune_epoch_0001.pth"),
         saved_centers("finetune_epoch_0002.pth"),
     )
@@ -2820,7 +2932,7 @@ def test_batch_id_trace_appends_on_resume_into_the_same_output_dir(tmp_path):
         trace_batch_ids=True,
         **_finetune_overrides(tmp_path, "trace_resume", batch_size=4),
     )
-    trainer.run_finetune(first)
+    finetune_loop_module.run_finetune(first)
     trace_path = tmp_path / "trace_resume" / "logs" / "batch_ids.finetune.jsonl"
     first_lines = trace_path.read_text(encoding="utf-8").splitlines()
     assert first_lines
@@ -2833,7 +2945,7 @@ def test_batch_id_trace_appends_on_resume_into_the_same_output_dir(tmp_path):
         trace_batch_ids=True,
         **_finetune_overrides(tmp_path, "trace_resume", batch_size=4),
     )
-    trainer.run_finetune(resume)
+    finetune_loop_module.run_finetune(resume)
 
     records = [
         json.loads(line)
@@ -2854,7 +2966,7 @@ def test_finetune_legacy_resume_twice_keeps_the_recorded_layout(tmp_path):
         finetune_epochs=2,
         **_finetune_overrides(tmp_path, "legacy_twice_1", batch_size=4),
     )
-    trainer.run_finetune(first_args)
+    finetune_loop_module.run_finetune(first_args)
     first_path = tmp_path / "legacy_twice_1" / "finetune_latest.pth"
     first = torch.load(first_path, map_location="cpu", weights_only=False)
     assert first["config"]["loss"] == "arcface"
@@ -2868,7 +2980,7 @@ def test_finetune_legacy_resume_twice_keeps_the_recorded_layout(tmp_path):
         finetune_epochs=3,
         **_finetune_overrides(tmp_path, "legacy_twice_2", batch_size=4),
     )
-    trainer.run_finetune(second_args)
+    finetune_loop_module.run_finetune(second_args)
     second = torch.load(
         tmp_path / "legacy_twice_2" / "finetune_latest.pth",
         map_location="cpu",
@@ -2893,7 +3005,7 @@ def test_center_direction_cosine_continues_across_a_resume(tmp_path):
         loss="subcenter-arcface-compact",
         **_finetune_overrides(tmp_path, out_name, batch_size=4),
     )
-    trainer.run_finetune(first)
+    finetune_loop_module.run_finetune(first)
 
     resume = _finetune_args(
         tmp_path,
@@ -2903,7 +3015,7 @@ def test_center_direction_cosine_continues_across_a_resume(tmp_path):
         loss="subcenter-arcface-compact",
         **_finetune_overrides(tmp_path, out_name, batch_size=4),
     )
-    trainer.run_finetune(resume)
+    finetune_loop_module.run_finetune(resume)
 
     diagnostics = pd.read_csv(
         tmp_path / out_name / "logs" / "loss_diagnostics.finetune.csv"
@@ -2919,7 +3031,7 @@ def test_center_direction_cosine_continues_across_a_resume(tmp_path):
             state["loss_state_dict"]["head.weight"], dim=-1
         )
 
-    expected = trainer._center_direction_cosine(
+    expected = finetune_loop_module._center_direction_cosine(
         saved_centers("finetune_epoch_0001.pth"),
         saved_centers("finetune_epoch_0002.pth"),
     )
@@ -2951,7 +3063,7 @@ def test_finetune_rejects_a_partial_encoder_source(tmp_path):
     )
 
     with pytest.raises(ValueError, match="encoder weights"):
-        trainer.run_finetune(args)
+        finetune_loop_module.run_finetune(args)
 
 
 def test_finetune_resume_rejects_a_source_without_projector_weights(tmp_path):
@@ -2974,7 +3086,7 @@ def test_finetune_resume_rejects_a_source_without_projector_weights(tmp_path):
     )
 
     with pytest.raises(ValueError, match="encoder weights"):
-        trainer.run_finetune(args)
+        finetune_loop_module.run_finetune(args)
 
 
 def test_finetune_resume_rejects_a_partially_populated_backbone(tmp_path):
@@ -3000,7 +3112,7 @@ def test_finetune_resume_rejects_a_partially_populated_backbone(tmp_path):
     )
 
     with pytest.raises(ValueError, match="complete encoder weights"):
-        trainer.run_finetune(args)
+        finetune_loop_module.run_finetune(args)
 
 
 def test_finetune_rejects_a_declared_head_without_projector_weights(tmp_path):
@@ -3024,7 +3136,7 @@ def test_finetune_rejects_a_declared_head_without_projector_weights(tmp_path):
     )
 
     with pytest.raises(ValueError, match="encoder weights"):
-        trainer.run_finetune(args)
+        finetune_loop_module.run_finetune(args)
 
 
 def test_loss_diagnostics_counts_local_and_global_winners_differently():
@@ -3039,8 +3151,8 @@ def test_loss_diagnostics_counts_local_and_global_winners_differently():
         loss.head.weight[1, 0] = torch.tensor([1.0, 0.0, 0.0, 0.0])
         loss.head.weight[1, 1] = torch.tensor([0.0, 0.0, 1.0, 0.0])
 
-    counts = trainer._empty_loss_diagnostic_counts(2, 2)
-    trainer._accumulate_loss_diagnostics(
+    counts = finetune_loop_module._empty_loss_diagnostic_counts(2, 2)
+    finetune_loop_module._accumulate_loss_diagnostics(
         counts, loss, torch.tensor([[1.0, 0.0, 0.0, 0.0]]), torch.tensor([0])
     )
 
@@ -3057,8 +3169,8 @@ def test_loss_diagnostics_margin_hits_use_margin_adjusted_target_logit():
         loss.head.weight[0] = torch.tensor([1.0, 0.0, 0.0, 0.0])
         loss.head.weight[1] = torch.tensor([-1.0, 0.0, 0.0, 0.0])
 
-    counts = trainer._empty_loss_diagnostic_counts(2, 1)
-    trainer._accumulate_loss_diagnostics(
+    counts = finetune_loop_module._empty_loss_diagnostic_counts(2, 1)
+    finetune_loop_module._accumulate_loss_diagnostics(
         counts,
         loss,
         torch.tensor([[1.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]]),
@@ -3082,11 +3194,11 @@ def test_loss_diagnostics_compact_hinge_stats_match_prescribed_centers():
         loss.head.weight[1, 0] = torch.tensor([0.0, 1.0, 0.0, 0.0])
         loss.head.weight[1, 1] = torch.tensor([math.sqrt(1 - 0.01), 0.1, 0.0, 0.0])
 
-    fraction, mean_penalty = trainer._compact_hinge_stats(loss)
+    fraction, mean_penalty = finetune_loop_module._compact_hinge_stats(loss)
 
     assert fraction == pytest.approx(0.5)
     assert mean_penalty == pytest.approx(0.1 * 0.4 / 2)
-    assert trainer._compact_hinge_stats(ArcFaceLoss(embed_dim=4, num_classes=2)) == (
+    assert finetune_loop_module._compact_hinge_stats(ArcFaceLoss(embed_dim=4, num_classes=2)) == (
         None,
         None,
     )
@@ -3096,42 +3208,42 @@ def test_center_direction_cosine_is_empty_before_the_second_epoch():
     from otuformer.training.loss import ArcFaceLoss, SupConLoss
 
     loss = ArcFaceLoss(embed_dim=4, num_classes=2)
-    first = trainer._prototype_centers(loss)
+    first = finetune_loop_module._prototype_centers(loss)
     assert first is not None
-    assert trainer._center_direction_cosine(None, first) == []
+    assert finetune_loop_module._center_direction_cosine(None, first) == []
 
     with torch.no_grad():
         loss.head.weight.mul_(2.0)
-    second = trainer._prototype_centers(loss)
-    scaled = trainer._center_direction_cosine(first, second)
+    second = finetune_loop_module._prototype_centers(loss)
+    scaled = finetune_loop_module._center_direction_cosine(first, second)
     assert scaled[0][0] == pytest.approx(1.0)
     assert scaled[1][0] == pytest.approx(1.0)
 
     with torch.no_grad():
         loss.head.weight[0].neg_()
-    third = trainer._prototype_centers(loss)
-    cosines = trainer._center_direction_cosine(second, third)
+    third = finetune_loop_module._prototype_centers(loss)
+    cosines = finetune_loop_module._center_direction_cosine(second, third)
     assert cosines[0][0] == pytest.approx(-1.0)
     assert cosines[1][0] == pytest.approx(1.0)
 
-    assert trainer._prototype_centers(SupConLoss(temperature=0.07)) is None
+    assert finetune_loop_module._prototype_centers(SupConLoss(temperature=0.07)) is None
 
 
 def test_loss_diagnostics_logger_creates_the_file_and_rejects_unknown_schema(
     tmp_path,
 ):
     path = tmp_path / "nested" / "loss_diagnostics.finetune.csv"
-    logger = trainer.LossDiagnosticsLogger(path)
+    logger = finetune_loop_module.LossDiagnosticsLogger(path)
     logger.log(epoch=0, mode="arcface", usable_batches=2)
 
     text = path.read_text(encoding="utf-8")
-    assert text.splitlines()[0] == ",".join(trainer._LOSS_DIAGNOSTIC_FIELDS)
+    assert text.splitlines()[0] == ",".join(finetune_support_module._LOSS_DIAGNOSTIC_FIELDS)
     assert "arcface" in text
 
     broken = tmp_path / "broken.csv"
     broken.write_text("a,b\n1,2\n", encoding="utf-8")
     with pytest.raises(ValueError, match="schema"):
-        trainer.LossDiagnosticsLogger(broken)
+        finetune_loop_module.LossDiagnosticsLogger(broken)
     assert broken.read_text(encoding="utf-8") == "a,b\n1,2\n"
 
 
@@ -3192,7 +3304,7 @@ def test_cb_drw_resume_restores_the_original_horizon(tmp_path):
         keep_last_checkpoints=0,
         long_tail="cb-drw",
     )
-    trainer.run_finetune(args)
+    finetune_loop_module.run_finetune(args)
     saved = torch.load(
         tmp_path / "ft_cbdrw" / "finetune_latest.pth",
         map_location="cpu",
@@ -3225,7 +3337,7 @@ def test_cb_drw_resume_restores_the_original_horizon(tmp_path):
     )
     # Resume restores the original horizon T; extra epochs keep the target
     # weights instead of being rejected.
-    trainer.run_finetune(resume_args)
+    finetune_loop_module.run_finetune(resume_args)
     resumed = torch.load(
         tmp_path / "ft_cbdrw_resume" / "finetune_latest.pth",
         map_location="cpu",
@@ -3258,7 +3370,7 @@ def test_cb_drw_is_rejected_for_supcon(tmp_path):
         long_tail="cb-drw",
     )
     with pytest.raises(ValueError, match="SupCon"):
-        trainer.run_finetune(args)
+        finetune_loop_module.run_finetune(args)
 
 
 def _write_pseudo_ft_data(tmp_path, *, per_class=5):
@@ -3287,7 +3399,7 @@ def test_pseudo_round_end_to_end_and_third_round_rejected(tmp_path):
     # A hard-linked duplicate candidate exercises pre-scan rejection counting.
     os.link(img_dir / "cand_0.jpg", img_dir / "cand_2.jpg")
     ssl = _write_pretrain_checkpoint(tmp_path / "ssl.pth")
-    trainer.run_finetune(
+    finetune_loop_module.run_finetune(
         _finetune_args(
             tmp_path,
             ssl,
@@ -3304,7 +3416,7 @@ def test_pseudo_round_end_to_end_and_third_round_rejected(tmp_path):
     )
     ft1 = tmp_path / "ft1" / "finetune_latest.pth"
 
-    pseudo = trainer.prepare_pseudo_round(
+    pseudo = finetune_support_module.prepare_pseudo_round(
         pseudo_label_from=ft1,
         train_data=labels_path,
         input_images_dir=img_dir,
@@ -3327,7 +3439,7 @@ def test_pseudo_round_end_to_end_and_third_round_rejected(tmp_path):
         == 1
     )
 
-    trainer.run_finetune(
+    finetune_loop_module.run_finetune(
         _finetune_args(
             tmp_path,
             ssl,
@@ -3369,7 +3481,7 @@ def test_pseudo_round_end_to_end_and_third_round_rejected(tmp_path):
     # A finetune#2 resume must also fix the experiment identity: an explicit
     # batch-size change is rejected even with unchanged training rows.
     with pytest.raises(ValueError, match="batch_size"):
-        trainer.run_finetune(
+        finetune_loop_module.run_finetune(
             _finetune_args(
                 tmp_path,
                 ssl,
@@ -3392,7 +3504,7 @@ def test_pseudo_round_end_to_end_and_third_round_rejected(tmp_path):
     changed_frame.loc[0, "label"] = "classB"
     changed_frame.to_csv(changed, index=False)
     with pytest.raises(ValueError, match="manifest hash mismatch"):
-        trainer.run_finetune(
+        finetune_loop_module.run_finetune(
             _finetune_args(
                 tmp_path,
                 ssl,
@@ -3410,7 +3522,7 @@ def test_pseudo_round_end_to_end_and_third_round_rejected(tmp_path):
         )
 
     with pytest.raises(ValueError, match="finetune#2"):
-        trainer.prepare_pseudo_round(
+        finetune_support_module.prepare_pseudo_round(
             pseudo_label_from=tmp_path / "ft2" / "finetune_latest.pth",
             train_data=labels_path,
             input_images_dir=img_dir,
@@ -3433,7 +3545,7 @@ def test_pseudo_mode_rejects_experiment_identity_mismatch(tmp_path):
     image.putpixel((0, 0), (1, 1, 1))
     image.save(img_dir / "cand_0.jpg")
     ssl = _write_pretrain_checkpoint(tmp_path / "ssl.pth")
-    trainer.run_finetune(
+    finetune_loop_module.run_finetune(
         _finetune_args(
             tmp_path,
             ssl,
@@ -3448,7 +3560,7 @@ def test_pseudo_mode_rejects_experiment_identity_mismatch(tmp_path):
             keep_last_checkpoints=0,
         )
     )
-    pseudo = trainer.prepare_pseudo_round(
+    pseudo = finetune_support_module.prepare_pseudo_round(
         pseudo_label_from=tmp_path / "ft1" / "finetune_latest.pth",
         train_data=labels_path,
         input_images_dir=img_dir,
@@ -3465,7 +3577,7 @@ def test_pseudo_mode_rejects_experiment_identity_mismatch(tmp_path):
     )
 
     with pytest.raises(ValueError, match="freeze_ratio"):
-        trainer.run_finetune(
+        finetune_loop_module.run_finetune(
             _finetune_args(
                 tmp_path,
                 ssl,
@@ -3501,7 +3613,7 @@ def test_pseudo_round_preserves_numeric_class_order_across_resume(tmp_path):
         image.save(img_dir / f"cand_{index}.jpg")
 
     ssl = _write_pretrain_checkpoint(tmp_path / "ssl.pth")
-    trainer.run_finetune(
+    finetune_loop_module.run_finetune(
         _finetune_args(
             tmp_path, ssl, out_dir=str(tmp_path / "num_ft1"),
             train_data=str(labels_path), input_images_dir=str(img_dir),
@@ -3516,7 +3628,7 @@ def test_pseudo_round_preserves_numeric_class_order_across_resume(tmp_path):
     assert source["class_order"] == ["2", "10"]
     assert source["class_labels"] == ["10", "2"]
 
-    pseudo = trainer.prepare_pseudo_round(
+    pseudo = finetune_support_module.prepare_pseudo_round(
         pseudo_label_from=ft1, train_data=labels_path, input_images_dir=img_dir,
         out_dir=tmp_path / "num_ft2", similarity_floor=-1.0, min_gap=0.0,
         neighbors=3, long_tail="none", loss=None, checkpoint=None,
@@ -3524,7 +3636,7 @@ def test_pseudo_round_preserves_numeric_class_order_across_resume(tmp_path):
     )
     assert pseudo["class_labels"] == ["2", "10"]
 
-    trainer.run_finetune(
+    finetune_loop_module.run_finetune(
         _finetune_args(
             tmp_path, ssl, out_dir=str(tmp_path / "num_ft2"),
             train_data=str(labels_path), input_images_dir=str(img_dir),
@@ -3539,7 +3651,7 @@ def test_pseudo_round_preserves_numeric_class_order_across_resume(tmp_path):
     assert saved["class_labels"] == ["2", "10"]
     assert saved["class_order"] == ["2", "10"]
 
-    trainer.run_finetune(
+    finetune_loop_module.run_finetune(
         _finetune_args(
             tmp_path, ssl, out_dir=str(tmp_path / "num_ft2_resume"),
             resume=str(ft2), train_data=str(labels_path),
@@ -3581,7 +3693,7 @@ def test_pseudo_cli_preflight_accepts_numeric_class_order(tmp_path, monkeypatch)
     pd.DataFrame(rows).to_csv(labels_path, index=False)
 
     ssl = _write_pretrain_checkpoint(tmp_path / "num_cli_ssl.pth")
-    trainer.run_finetune(
+    finetune_loop_module.run_finetune(
         _finetune_args(
             tmp_path, ssl, out_dir=str(tmp_path / "num_cli_ft1"),
             train_data=str(labels_path), input_images_dir=str(img_dir),
@@ -3607,7 +3719,7 @@ def test_pseudo_cli_preflight_accepts_numeric_class_order(tmp_path, monkeypatch)
             },
         ),
     )
-    monkeypatch.setattr(trainer, "run_finetune", lambda args, **kwargs: None)
+    monkeypatch.setattr(finetune_loop_module, "run_finetune", lambda args, **kwargs: None)
 
     result = CliRunner().invoke(
         app,
@@ -3640,9 +3752,9 @@ def test_resolve_pretrain_settings_is_pure_and_single_valued():
     torch.manual_seed(0)
     before = torch.get_rng_state()
 
-    settings = trainer.resolve_pretrain_settings(args)
+    settings = pretrain_loop_module.resolve_pretrain_settings(args)
     assert torch.equal(torch.get_rng_state(), before), "resolution advanced the RNG"
-    trainer.preflight_pretrain_run(args, settings)
+    pretrain_loop_module.preflight_pretrain_run(args, settings)
     assert torch.equal(torch.get_rng_state(), before), "preflight advanced the RNG"
     assert vars(args) == {
         "model_name": "vit_tiny_patch16_224",
@@ -3660,14 +3772,14 @@ def test_resolve_pretrain_settings_is_pure_and_single_valued():
         local_crop_size=96,
         local_crops=6,
     )
-    auto = trainer.resolve_pretrain_settings(args)
-    assert trainer.resolve_pretrain_settings(explicit) == auto
-    assert trainer.resolve_pretrain_settings(args) == auto
+    auto = pretrain_loop_module.resolve_pretrain_settings(args)
+    assert pretrain_loop_module.resolve_pretrain_settings(explicit) == auto
+    assert pretrain_loop_module.resolve_pretrain_settings(args) == auto
 
 
 def test_run_pretrain_reuses_a_handed_over_resolution(tmp_path, monkeypatch):
     """A handed-over resolution must not be resolved or preflighted twice."""
-    settings = trainer.PretrainSettings(
+    settings = pretrain_recipe_module.PretrainSettings(
         model_name="vit_tiny_patch16_224",
         global_crop_size=224,
         local_crop_size=96,
@@ -3686,15 +3798,14 @@ def test_run_pretrain_reuses_a_handed_over_resolution(tmp_path, monkeypatch):
     def forbidden(*_args, **_kwargs):
         raise AssertionError("the handed-over resolution was redone")
 
-    monkeypatch.setattr(trainer, "resolve_pretrain_settings", forbidden)
-    monkeypatch.setattr(trainer, "preflight_pretrain_run", forbidden)
+    monkeypatch.setattr(pretrain_loop_module, "resolve_pretrain_settings", forbidden)
+    monkeypatch.setattr(pretrain_loop_module, "preflight_pretrain_run", forbidden)
 
     class DatasetReached(Exception):
         """Stop the run at the first trainer-owned step after preflight."""
 
     monkeypatch.setattr(
-        trainer,
-        "MultiCropDataset",
+        pretrain_loop_module, "MultiCropDataset",
         lambda **_kwargs: (_ for _ in ()).throw(DatasetReached()),
     )
     args = argparse.Namespace(
@@ -3718,7 +3829,7 @@ def test_run_pretrain_reuses_a_handed_over_resolution(tmp_path, monkeypatch):
     )
 
     with pytest.raises(DatasetReached):
-        trainer.run_pretrain(args)
+        pretrain_loop_module.run_pretrain(args)
 
     # The resolved values still drive the trainer's own bookkeeping.
     assert args.global_crop_size == 224
@@ -3745,7 +3856,7 @@ def _recipe_args(**overrides):
 
 
 def _recipe_settings(global_crop_size=32, local_crop_size=16, local_crops=0):
-    return trainer.PretrainSettings(
+    return pretrain_recipe_module.PretrainSettings(
         model_name="vit_tiny_patch16_224",
         global_crop_size=global_crop_size,
         local_crop_size=local_crop_size,
@@ -3763,7 +3874,7 @@ def _recipe_settings(global_crop_size=32, local_crop_size=16, local_crops=0):
 
 
 def _recipe(overrides=None, checkpoint=None, settings=None):
-    return trainer._resolve_pretrain_recipe(
+    return pretrain_loop_module._resolve_pretrain_recipe(
         _recipe_args(**(overrides or {})),
         checkpoint,
         settings=settings or _recipe_settings(),
@@ -3804,7 +3915,7 @@ def _versioned_checkpoint(bundle=_DEFAULT_BUNDLE, args_extra=None):
             "augmentation_config": build_pretrain_augmentation_config(
                 "global-barcode", 32, 16, 0
             ),
-            trainer.RELATIONAL_TARGET_CONFIG_KEY: resolved_bundle,
+            pretrain_loop_module.RELATIONAL_TARGET_CONFIG_KEY: resolved_bundle,
         },
         "args": saved_args,
     }
@@ -3990,7 +4101,7 @@ def test_relational_recipe_legacy_and_versioned_resolution():
     args = _recipe_args()
     checkpoint = _versioned_checkpoint()
     snapshot = json.dumps(checkpoint, sort_keys=True)
-    trainer._resolve_relational_target_config(args, checkpoint)
+    pretrain_recipe_module._resolve_relational_target_config(args, checkpoint)
     assert args.relational_teacher_views is None
     assert json.dumps(checkpoint, sort_keys=True) == snapshot
 
@@ -4014,10 +4125,10 @@ def test_relational_recipe_rejects_bad_metadata():
 
     # the retired spelling is not an alias
     retired = _versioned_checkpoint()
-    del retired["config"][trainer.RELATIONAL_TARGET_CONFIG_KEY][
+    del retired["config"][pretrain_loop_module.RELATIONAL_TARGET_CONFIG_KEY][
         "relational_center_source"
     ]
-    retired["config"][trainer.RELATIONAL_TARGET_CONFIG_KEY][
+    retired["config"][pretrain_loop_module.RELATIONAL_TARGET_CONFIG_KEY][
         "teacher_center_source"
     ] = "ordinary"
     with pytest.raises(ValueError, match="incomplete"):
@@ -4098,7 +4209,7 @@ def test_relational_recipe_accepts_v2_marked_resume():
         {
             "config": {
                 "ssl_method": "relational",
-                trainer.RELATIONAL_TARGET_CONFIG_KEY: _bundle(),
+                pretrain_loop_module.RELATIONAL_TARGET_CONFIG_KEY: _bundle(),
             },
             "args": {},
         },
@@ -4116,30 +4227,30 @@ def test_relational_resume_teacher_schedule():
         teacher_temp_start=0.08,
         teacher_temp_end=0.11,
     )
-    assert trainer._build_teacher_temp_schedule(4, **base, teacher_temp_warmup_ratio=0.0) == pytest.approx(
+    assert pretrain_recipe_module._build_teacher_temp_schedule(4, **base, teacher_temp_warmup_ratio=0.0) == pytest.approx(
         [0.11] * 4
     )
-    full_ramp = trainer._build_teacher_temp_schedule(
+    full_ramp = pretrain_recipe_module._build_teacher_temp_schedule(
         4, **base, teacher_temp_warmup_ratio=1.0
     )
     assert full_ramp == pytest.approx([0.08, 0.09, 0.10, 0.11])
     # one planned step at ratio 1 keeps the start value, not the end
-    assert trainer._build_teacher_temp_schedule(
+    assert pretrain_recipe_module._build_teacher_temp_schedule(
         1, **base, teacher_temp_warmup_ratio=1.0
     ) == pytest.approx([0.08])
     # a multi-step plan whose ramp truncates to one step also keeps the start
-    assert trainer._build_teacher_temp_schedule(
+    assert pretrain_recipe_module._build_teacher_temp_schedule(
         10, **base, teacher_temp_warmup_ratio=0.1
     )[0] == pytest.approx(0.08)
     # truncation to zero ramp steps uses the end temperature throughout
-    assert trainer._build_teacher_temp_schedule(
+    assert pretrain_recipe_module._build_teacher_temp_schedule(
         9, **base, teacher_temp_warmup_ratio=0.1
     ) == pytest.approx([0.11] * 9)
     # the default reproduces the pre-change 0.7 schedule bit for bit
-    assert trainer._build_teacher_temp_schedule(
+    assert pretrain_recipe_module._build_teacher_temp_schedule(
         10, 0.04, 0.07
     ) == pytest.approx(
-        trainer._build_teacher_temp_schedule(
+        pretrain_recipe_module._build_teacher_temp_schedule(
             10, 0.04, 0.07, teacher_temp_warmup_ratio=0.7
         )
     )
@@ -4165,13 +4276,13 @@ def test_relational_same_plan_schedule_uses_the_inherited_ratio():
         teacher_temp_end=0.11,
         teacher_temp_warmup_ratio=1.0,
     )
-    _, _, _, teacher_temp, _ = trainer._build_pretrain_schedules(
+    _, _, _, teacher_temp, _ = pretrain_loop_module._build_pretrain_schedules(
         args, saved, steps_per_epoch=2, global_step=2, completed_epochs=1
     )
     assert teacher_temp == pytest.approx([0.08, 0.09, 0.10, 0.11])
 
     extended = argparse.Namespace(**{**vars(args), "max_epochs": 3})
-    _, _, _, tail, _ = trainer._build_pretrain_schedules(
+    _, _, _, tail, _ = pretrain_loop_module._build_pretrain_schedules(
         extended, saved, steps_per_epoch=2, global_step=4, completed_epochs=2
     )
     assert tail[4:] == pytest.approx([0.11] * len(tail[4:]))
@@ -4190,7 +4301,7 @@ def test_relational_zero_ratio_reaches_the_real_schedule():
         teacher_temp_end=0.11,
         teacher_temp_warmup_ratio=0.0,
     )
-    _, _, _, fresh, _ = trainer._build_pretrain_schedules(
+    _, _, _, fresh, _ = pretrain_loop_module._build_pretrain_schedules(
         args, None, steps_per_epoch=2, global_step=0, completed_epochs=0
     )
     assert fresh == pytest.approx([0.11] * len(fresh))
@@ -4203,7 +4314,7 @@ def test_relational_zero_ratio_reaches_the_real_schedule():
         "last_lr": 0.0005,
         "final_lr": 0.00001,
     }
-    _, _, _, same_plan, _ = trainer._build_pretrain_schedules(
+    _, _, _, same_plan, _ = pretrain_loop_module._build_pretrain_schedules(
         args, saved, steps_per_epoch=2, global_step=4, completed_epochs=2
     )
     assert same_plan == pytest.approx([0.11] * len(same_plan))
@@ -4211,8 +4322,8 @@ def test_relational_zero_ratio_reaches_the_real_schedule():
     # a missing attribute still falls back to the historical ramp
     legacy_args = argparse.Namespace(**vars(args))
     del legacy_args.teacher_temp_warmup_ratio
-    ramped = trainer._build_teacher_temp_schedule(
-        10, 0.08, 0.11, trainer._teacher_temp_warmup_ratio(legacy_args)
+    ramped = pretrain_recipe_module._build_teacher_temp_schedule(
+        10, 0.08, 0.11, pretrain_recipe_module._teacher_temp_warmup_ratio(legacy_args)
     )
     assert ramped[0] == pytest.approx(0.08)
     assert ramped[7] == pytest.approx(0.11)
@@ -4246,19 +4357,19 @@ def test_relational_interrupted_extension_diverges_without_reproducing():
 
     # An interrupted extension saved at completed epoch 3 / step 30 can return
     # to --max-epochs 5, but rebuilds the ramp over 100 steps.
-    _, _, _, diverged, _ = trainer._build_pretrain_schedules(
+    _, _, _, diverged, _ = pretrain_loop_module._build_pretrain_schedules(
         args(5), saved, steps_per_epoch=10, global_step=30, completed_epochs=3
     )
     assert float(diverged[40]) == pytest.approx(0.0573913045, abs=1e-9)
     # the original 50-step plan plateaued at the end temperature
-    original = trainer._build_teacher_temp_schedule(50, 0.04, 0.07)
+    original = pretrain_recipe_module._build_teacher_temp_schedule(50, 0.04, 0.07)
     assert float(original[40]) == pytest.approx(0.07)
     # endpoints and recipe are unchanged; only the step-wise schedule differs
     assert float(diverged[-1]) == pytest.approx(0.07, abs=1e-6)
 
     # A completed 10-epoch extension rejects the return outright.
     with pytest.raises(ValueError, match="must exceed the completed checkpoint epoch"):
-        trainer._build_pretrain_schedules(
+        pretrain_loop_module._build_pretrain_schedules(
             args(5), saved, steps_per_epoch=10, global_step=100, completed_epochs=10
         )
 
@@ -4284,7 +4395,7 @@ def test_relational_checkpoint_metadata_is_additive(tmp_path):
             **base,
             "config": {
                 **base["config"],
-                trainer.RELATIONAL_TARGET_CONFIG_KEY: _bundle(),
+                pretrain_loop_module.RELATIONAL_TARGET_CONFIG_KEY: _bundle(),
             },
         },
         annotated,
@@ -4295,7 +4406,7 @@ def test_relational_checkpoint_metadata_is_additive(tmp_path):
     for key, value in left["model_state_dict"].items():
         assert torch.equal(value, right["model_state_dict"][key])
     # the additive bundle is inert metadata, not a weight or architecture change
-    assert right["config"][trainer.RELATIONAL_TARGET_CONFIG_KEY] == _bundle()
+    assert right["config"][pretrain_loop_module.RELATIONAL_TARGET_CONFIG_KEY] == _bundle()
 
 
 def test_relational_recipe_rejects_present_null_metadata():
@@ -4362,7 +4473,7 @@ def test_relational_admission_boundary_is_adjacent():
         exact = float(max(batch_size, 2)) / limit
         # a temperature that sits just inside the bound is admitted
         assert (
-            trainer._admissible_temperature(
+            pretrain_recipe_module._admissible_temperature(
                 np.nextafter(np.float32(exact), np.float32(np.inf)).item(),
                 batch_size,
                 "--teacher-temp-start",
@@ -4371,7 +4482,7 @@ def test_relational_admission_boundary_is_adjacent():
         )
         # one float32 step smaller crosses the bound and is rejected
         with pytest.raises(ValueError, match="overflows"):
-            trainer._admissible_temperature(
+            pretrain_recipe_module._admissible_temperature(
                 np.nextafter(np.float32(exact), np.float32(0.0)).item(),
                 batch_size,
                 "--teacher-temp-start",
@@ -4384,7 +4495,7 @@ def test_finetune_does_not_copy_the_ssl_relational_bundle(tmp_path):
         tmp_path / "annotated_sft.pth", groups=2
     )
     checkpoint = torch.load(source, map_location="cpu", weights_only=False)
-    checkpoint["config"][trainer.RELATIONAL_TARGET_CONFIG_KEY] = _bundle(
+    checkpoint["config"][pretrain_loop_module.RELATIONAL_TARGET_CONFIG_KEY] = _bundle(
         relational_teacher_views="weak",
         relational_center_source="weak",
         relational_pairing="cross",
@@ -4400,11 +4511,11 @@ def test_finetune_does_not_copy_the_ssl_relational_bundle(tmp_path):
         finetune_epochs=1,
         **_finetune_overrides(tmp_path, "annotated_ft", batch_size=4),
     )
-    trainer.run_finetune(args)
+    finetune_loop_module.run_finetune(args)
     saved = torch.load(
         tmp_path / "annotated_ft" / "finetune_latest.pth",
         map_location="cpu",
         weights_only=False,
     )
-    assert trainer.RELATIONAL_TARGET_CONFIG_KEY not in saved["config"]
+    assert pretrain_loop_module.RELATIONAL_TARGET_CONFIG_KEY not in saved["config"]
     assert saved["config"]["loss"] == "arcface"

@@ -417,3 +417,68 @@ def test_metric_outcome_failure_branches(monkeypatch):
     assert evaluator.compute_linear_probing_metrics(embeddings, labels)[
         "Linear_Probing_Acc"
     ] is None
+
+
+def test_run_umap_preserves_rendered_labels_title_and_neighbor_limit(
+    tmp_path, monkeypatch
+):
+    """The rendered figure carries the caller's labels and title.
+
+    Replaces the historical source-string checks: read the actual artists instead
+    of grepping the implementation.
+    """
+
+    seen = {}
+
+    class FakeUMAP:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def fit_transform(self, x):
+            return np.zeros((len(x), 2))
+
+    umap_module = types.ModuleType("umap")
+    umap_submodule = types.ModuleType("umap.umap_")
+    class RecordingUMAP(FakeUMAP):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            seen["reducer"] = self
+
+    umap_submodule.UMAP = RecordingUMAP
+    monkeypatch.setitem(sys.modules, "umap", umap_module)
+    monkeypatch.setitem(sys.modules, "umap.umap_", umap_submodule)
+    monkeypatch.setattr("matplotlib.pyplot.savefig", lambda *args, **kwargs: None)
+
+    import matplotlib.pyplot as plt
+
+    real_subplots = plt.subplots
+
+    def spy_subplots(*args, **kwargs):
+        fig, ax = real_subplots(*args, **kwargs)
+        seen["ax"] = ax
+        return fig, ax
+
+    monkeypatch.setattr(plt, "subplots", spy_subplots)
+
+    from otuformer.embedding.evaluator import run_umap
+
+    embeddings = np.eye(6)
+    labels = np.array(["alpha", "beta", "alpha", "beta", "alpha", "beta"])
+    run_umap(embeddings, labels, tmp_path / "umap.pdf", n_neighbors=99)
+    # The requested neighbour count is capped to the sample count, as the
+    # historical source-string test intended to protect.
+    assert seen["reducer"].kwargs["n_neighbors"] == len(embeddings) - 1
+    # ... and raised to the UMAP minimum, so neither end of the clamp is dead.
+    run_umap(embeddings, labels, tmp_path / "floor.pdf", n_neighbors=1)
+    assert seen["reducer"].kwargs["n_neighbors"] == 2
+    assert seen["ax"].get_title() == "UMAP"
+    assert sorted(text.get_text() for text in seen["ax"].get_legend().get_texts()) == [
+        "alpha",
+        "beta",
+    ]
+
+    run_umap(
+        embeddings, labels, tmp_path / "titled.pdf", n_neighbors=99, title="Custom"
+    )
+    assert seen["ax"].get_title() == "Custom"
+    plt.close("all")

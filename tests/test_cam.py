@@ -13,6 +13,9 @@ from otuformer.vision.cam import (
     map_cam_to_original,
     vit_reshape_transform,
 )
+import otuformer.cli.cam as cam_module
+import otuformer.training.pretrain_loop as pretrain_loop_module
+import otuformer.training.model as model_module
 
 
 def test_cam_checkpoint_loader_accepts_legacy_arcface_model_key(monkeypatch, tmp_path):
@@ -325,7 +328,7 @@ def _tiny_vit_encoder(monkeypatch, class_token=True, img_size=48, **kwargs):
     import otuformer.training.model as model_module
 
     _install_vit_factory(monkeypatch, class_token=class_token, img_size=img_size)
-    return model_module.OTUFormerEncoder(
+    return pretrain_loop_module.OTUFormerEncoder(
         model_name="tiny-vit", out_dim=8, pretrained=False, img_size=img_size, **kwargs
     ).eval()
 
@@ -427,7 +430,7 @@ def test_run_cam_accepts_an_injected_relational_bundle(tmp_path, monkeypatch):
     import pandas as pd
 
     import otuformer.vision.cam as cam_module
-    from otuformer.training.trainer import RELATIONAL_TARGET_CONFIG_KEY
+    from otuformer.training.pretrain_recipe import RELATIONAL_TARGET_CONFIG_KEY
 
     encoder = _tiny_vit_encoder(monkeypatch, reg_tokens=4)
     checkpoint = tmp_path / "annotated.pth"

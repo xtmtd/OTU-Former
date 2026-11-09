@@ -11,10 +11,13 @@ import pandas as pd
 import pytest
 import torch
 
+import otuformer.training.pretrain_loop as pretrain_loop_module
 from otuformer.training import trainer
+import otuformer.training.objectives as objectives_module
+import otuformer.training.reporting as reporting_module
 
-LEGACY_HEADER = list(trainer._PRETRAIN_LEGACY_FIELDS)
-V070_HEADER = list(trainer._PRETRAIN_V070_FIELDS)
+LEGACY_HEADER = list(reporting_module._PRETRAIN_LEGACY_FIELDS)
+V070_HEADER = list(reporting_module._PRETRAIN_V070_FIELDS)
 
 
 def _write(path: Path, header: list[str], rows: list[list[str]]) -> None:
@@ -42,16 +45,16 @@ def test_ssl_metrics_migrate_both_prior_headers(tmp_path, prior):
         second[header.index("patch_loss_raw")] = "0.25"
     _write(path, header, [first, second])
 
-    trainer.InstantMetricsLogger(path, mode="pretrain")
+    pretrain_loop_module.InstantMetricsLogger(path, mode="pretrain")
 
     frame = _read(path)
-    assert list(frame.columns) == list(trainer._PRETRAIN_CURRENT_FIELDS)
+    assert list(frame.columns) == list(reporting_module._PRETRAIN_CURRENT_FIELDS)
     # Historical values and order survive.
     assert frame.loc[0, "loss"] == "1.5"
     assert frame.loc[1, "loss"] == "0.5"
     assert frame.loc[0, "ssl_method"] == ""  # unknown, not relational
     assert frame.loc[1, "ssl_method"] == ""
-    for name in trainer._PRETRAIN_SSL_SETTING_FIELDS:
+    for name in reporting_module._PRETRAIN_SSL_SETTING_FIELDS:
         assert (frame[name] == "").all(), name
     if prior == "v070":
         assert frame.loc[1, "patch_loss_raw"] == "0.25"
@@ -61,11 +64,11 @@ def test_ssl_metrics_migration_is_idempotent(tmp_path):
     path = tmp_path / "instant_metrics.pretrain.csv"
     _write(path, LEGACY_HEADER, [["0", "0", "0", "1.0"] + [""] * (len(LEGACY_HEADER) - 4)])
 
-    logger = trainer.InstantMetricsLogger(path, mode="pretrain")
+    logger = pretrain_loop_module.InstantMetricsLogger(path, mode="pretrain")
     logger.log(iteration=1, epoch=0, step=1, loss=0.5, ssl_method="relational")
     before = path.read_bytes()
 
-    trainer.InstantMetricsLogger(path, mode="pretrain")
+    pretrain_loop_module.InstantMetricsLogger(path, mode="pretrain")
     assert path.read_bytes() == before
 
     frame = _read(path)
@@ -85,7 +88,7 @@ def test_ssl_metrics_failed_migration_preserves_bytes(tmp_path, monkeypatch):
 
     monkeypatch.setattr("os.replace", boom)
     with pytest.raises(OSError):
-        trainer.InstantMetricsLogger(path, mode="pretrain")
+        pretrain_loop_module.InstantMetricsLogger(path, mode="pretrain")
 
     assert path.read_bytes() == old_bytes
     assert list(tmp_path.glob("*.tmp")) == []
@@ -95,37 +98,37 @@ def test_ssl_metrics_reject_unknown_or_duplicate_header(tmp_path):
     unknown = tmp_path / "unknown.csv"
     _write(unknown, ["iteration", "mystery"], [["0", "1"]])
     with pytest.raises(ValueError, match="Unrecognized|duplicate"):
-        trainer.InstantMetricsLogger(unknown, mode="pretrain")
+        pretrain_loop_module.InstantMetricsLogger(unknown, mode="pretrain")
 
     duplicate = tmp_path / "duplicate.csv"
     _write(duplicate, ["iteration", "iteration"], [["0", "1"]])
     with pytest.raises(ValueError, match="duplicate"):
-        trainer.InstantMetricsLogger(duplicate, mode="pretrain")
+        pretrain_loop_module.InstantMetricsLogger(duplicate, mode="pretrain")
 
     malformed = tmp_path / "malformed.csv"
     _write(malformed, LEGACY_HEADER, [["0", "0"]])
     with pytest.raises(ValueError, match="malformed"):
-        trainer.InstantMetricsLogger(malformed, mode="pretrain")
+        pretrain_loop_module.InstantMetricsLogger(malformed, mode="pretrain")
 
 
 def test_epoch_and_finetune_headers_remain_unchanged(tmp_path):
-    finetune = trainer.InstantMetricsLogger(
+    finetune = pretrain_loop_module.InstantMetricsLogger(
         tmp_path / "instant_metrics.finetune.csv", mode="finetune"
     )
     assert list(finetune.fieldnames) == (
-        list(trainer._PRETRAIN_BASE_FIELDS) + list(trainer._FINETUNE_FIELDS)
+        list(reporting_module._PRETRAIN_BASE_FIELDS) + list(reporting_module._FINETUNE_FIELDS)
     )
-    pretrain = trainer.InstantMetricsLogger(
+    pretrain = pretrain_loop_module.InstantMetricsLogger(
         tmp_path / "instant_metrics.pretrain.csv", mode="pretrain"
     )
-    assert list(pretrain.fieldnames) == list(trainer._PRETRAIN_CURRENT_FIELDS)
+    assert list(pretrain.fieldnames) == list(reporting_module._PRETRAIN_CURRENT_FIELDS)
     # The extended schema keeps every frozen v0.7.0 column in order.
     assert list(pretrain.fieldnames)[: len(V070_HEADER)] == V070_HEADER
 
 
-def _logger(tmp_path: Path) -> tuple[trainer.InstantMetricsLogger, Path]:
+def _logger(tmp_path: Path) -> tuple[pretrain_loop_module.InstantMetricsLogger, Path]:
     path = tmp_path / "instant_metrics.pretrain.csv"
-    return trainer.InstantMetricsLogger(path, mode="pretrain"), path
+    return pretrain_loop_module.InstantMetricsLogger(path, mode="pretrain"), path
 
 
 def _row(path: Path, index: int = -1) -> dict[str, str]:
@@ -133,7 +136,7 @@ def _row(path: Path, index: int = -1) -> dict[str, str]:
     return {name: str(frame.loc[frame.index[index], name]) for name in frame.columns}
 
 
-def _plot_lines(tmp_path: Path, logger: trainer.InstantMetricsLogger):
+def _plot_lines(tmp_path: Path, logger: pretrain_loop_module.InstantMetricsLogger):
     """Run plot() and return {panel title: {label: y values}} for assertions.
 
     monkeypatch-free: matplotlib is already a hard dependency of plot(), and the
@@ -322,15 +325,15 @@ def _metric_args() -> argparse.Namespace:
 def test_koleo_instant_metrics_helper_states():
     ssl_config = {"koleo_weight": 0.1}
     zero = torch.zeros(())
-    assert trainer._koleo_instant_metrics(ssl_config, False, zero, [2, 2]) == {
+    assert pretrain_loop_module._koleo_instant_metrics(ssl_config, False, zero, [2, 2]) == {
         "koleo_status": "disabled",
         "koleo_loss_raw": None,
         "koleo_loss_weighted": None,
     }
-    skipped = trainer._koleo_instant_metrics(ssl_config, True, zero, [1, 1])
+    skipped = pretrain_loop_module._koleo_instant_metrics(ssl_config, True, zero, [1, 1])
     assert skipped["koleo_status"] == "skipped"
     assert skipped["koleo_skipped_samples"] == 2
-    active = trainer._koleo_instant_metrics(ssl_config, True, torch.tensor(-0.5), [2, 3])
+    active = pretrain_loop_module._koleo_instant_metrics(ssl_config, True, torch.tensor(-0.5), [2, 3])
     assert active["koleo_status"] == "active"
     assert active["koleo_eligible_samples"] == 5
     assert active["koleo_loss_weighted"] == pytest.approx(-0.05)
@@ -341,7 +344,7 @@ def test_dino_cls_diagnostics_are_finite_and_entropy_safe():
         torch.tensor([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]),
         torch.tensor([[0.0, 0.0, 1.0], [1.0, 0.0, 0.0]]),
     ]
-    metrics = trainer._dino_cls_diagnostics(targets, 3)
+    metrics = pretrain_loop_module._dino_cls_diagnostics(targets, 3)
 
     assert metrics["cls_assignment_entropy"] == pytest.approx(0.0, abs=1e-7)
     assert metrics["cls_active_prototype_ratio"] == pytest.approx(1.0)
@@ -352,7 +355,7 @@ def test_dino_cls_diagnostics_are_finite_and_entropy_safe():
 
     # Uniform assignments: maximum entropy, finite perplexity, no NaN.
     uniform = [torch.full((2, 4), 0.25), torch.full((2, 4), 0.25)]
-    uniform_metrics = trainer._dino_cls_diagnostics(uniform, 4)
+    uniform_metrics = pretrain_loop_module._dino_cls_diagnostics(uniform, 4)
     assert uniform_metrics["cls_assignment_entropy"] > metrics["cls_assignment_entropy"]
     assert uniform_metrics["cls_prototype_perplexity"] == pytest.approx(4.0)
     assert torch.isfinite(torch.tensor(uniform_metrics["cls_prototype_perplexity"]))
@@ -360,7 +363,7 @@ def test_dino_cls_diagnostics_are_finite_and_entropy_safe():
 
 def test_optional_metric_plots_keep_historical_rows(tmp_path):
     logger, path = _logger(tmp_path)
-    legacy_row = {name: "" for name in trainer._PRETRAIN_CURRENT_FIELDS}
+    legacy_row = {name: "" for name in reporting_module._PRETRAIN_CURRENT_FIELDS}
     legacy_row.update(iteration="0", epoch="0", step="0", loss="1.0", lr="0.001")
     current_row = dict(legacy_row)
     current_row.update(
@@ -374,7 +377,7 @@ def test_optional_metric_plots_keep_historical_rows(tmp_path):
     )
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(
-            handle, fieldnames=list(trainer._PRETRAIN_CURRENT_FIELDS)
+            handle, fieldnames=list(reporting_module._PRETRAIN_CURRENT_FIELDS)
         )
         writer.writeheader()
         writer.writerow(legacy_row)
@@ -405,13 +408,13 @@ def test_optional_metric_plots_keep_historical_rows(tmp_path):
 def test_plot_keeps_legacy_mask_loss_rows(tmp_path):
     """A mixed history must not drop the pre-patch-schema observations."""
     logger, path = _logger(tmp_path)
-    legacy_row = {name: "" for name in trainer._PRETRAIN_CURRENT_FIELDS}
+    legacy_row = {name: "" for name in reporting_module._PRETRAIN_CURRENT_FIELDS}
     legacy_row.update(iteration="0", epoch="0", step="0", loss="1.0", mask_loss="2.0")
     current_row = dict(legacy_row)
     current_row.update(iteration="1", loss="0.5", mask_loss="1.0", patch_loss_raw="1.0")
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(
-            handle, fieldnames=list(trainer._PRETRAIN_CURRENT_FIELDS)
+            handle, fieldnames=list(reporting_module._PRETRAIN_CURRENT_FIELDS)
         )
         writer.writeheader()
         writer.writerow(legacy_row)
@@ -449,12 +452,12 @@ def test_plot_keeps_a_log_axis_for_positive_losses(tmp_path):
 def test_plot_reads_a_pure_legacy_mask_loss_file(tmp_path):
     """A file predating the patch schema must still draw the mask curve."""
     logger, path = _logger(tmp_path)
-    legacy_row = {name: "" for name in trainer._PRETRAIN_CURRENT_FIELDS}
+    legacy_row = {name: "" for name in reporting_module._PRETRAIN_CURRENT_FIELDS}
     legacy_row.update(iteration="0", epoch="0", step="0", loss="1.0", mask_loss="2.0")
     second = dict(legacy_row, iteration="1", loss="0.5", mask_loss="1.0")
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(
-            handle, fieldnames=list(trainer._PRETRAIN_CURRENT_FIELDS)
+            handle, fieldnames=list(reporting_module._PRETRAIN_CURRENT_FIELDS)
         )
         writer.writeheader()
         writer.writerow(legacy_row)
@@ -537,7 +540,7 @@ def test_singleton_batch_reports_feature_std_as_missing():
         pretrained=False,
         img_size=64,
     )
-    metrics = trainer._compute_instant_metrics(
+    metrics = pretrain_loop_module._compute_instant_metrics(
         encoder, torch.zeros(1, 3, 64, 64), torch.device("cpu")
     )
 
@@ -546,7 +549,7 @@ def test_singleton_batch_reports_feature_std_as_missing():
     assert math.isfinite(metrics["embedding_norm_mean"])
     assert math.isfinite(metrics["cls_token_norm_mean"])
 
-    batched = trainer._compute_instant_metrics(
+    batched = pretrain_loop_module._compute_instant_metrics(
         encoder, torch.zeros(2, 3, 64, 64), torch.device("cpu")
     )
     assert math.isfinite(batched["feature_std"])

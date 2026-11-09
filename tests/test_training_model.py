@@ -16,12 +16,13 @@ from otuformer.training.model import (
     OTUFormerEncoder,
     SubCenterArcFaceHead,
 )
-from otuformer.training.trainer import (
+from otuformer.training.finetune_support import (
     _build_finetune_optimizer,
     _build_finetune_optimizer_for_layout,
     _finetune_optimizer_layout,
     _select_finetune_embedding_head,
 )
+import otuformer.training.model as model_module
 
 
 def test_encoder_does_not_silently_fall_back_to_random_weights(monkeypatch):
@@ -535,7 +536,7 @@ def test_omitted_register_option_preserves_pre_change_construction():
     ``pretrained=True`` and ``pretrained=False``, so this offline recipe
     represents the real trainer path.
     """
-    from otuformer.training.trainer import _set_seed
+    from otuformer.training.runtime import _set_seed
 
     _set_seed(1234)
     student = OTUFormerEncoder(
