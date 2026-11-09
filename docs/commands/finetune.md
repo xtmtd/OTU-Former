@@ -22,7 +22,7 @@ otuformer finetune \
 
 **Default:** `None`
 
-Initialization checkpoint used when --resume is not set. An SSL pretrain checkpoint installs a fresh embedding head; a fine-tune checkpoint with a matching head keeps its trained projector. Pretrained checkpoint path (typically `runs/pretrain/SSL_latest.pth`); optional in `--pseudo-label-from` mode (where it only relocates the recorded SSL file) and on `--resume`
+Initialization when not using --resume: SSL installs a fresh embedding head; a matching fine-tune head keeps its projector. See --pseudo-label-from for round 2 initialization. Pretrained checkpoint path (typically `runs/pretrain/SSL_latest.pth`); optional in `--pseudo-label-from` mode (where it only relocates the recorded SSL file) and on `--resume`
 
 ### `--train-data`
 
@@ -88,7 +88,7 @@ Fraction of backbone blocks to freeze (0.0=none, 1.0=all). Must match the saved 
 
 **Default:** `arcface` · **Allowed:** arcface / supcon / subcenter-arcface / subcenter-arcface-compact
 
-Metric-learning loss: arcface (default), supcon, subcenter-arcface, or subcenter-arcface-compact. Rejected before any output when the name is unknown. On --resume an omitted --loss inherits the recorded mode; an explicit conflicting value fails. Metric-learning loss: `arcface` (default), `supcon`, `subcenter-arcface`, or `subcenter-arcface-compact`; see "Metric-loss modes (v0.8.0)"
+Metric loss: arcface (default), supcon, subcenter-arcface, or subcenter-arcface-compact. Unknown names fail before output setup. On --resume, omit to inherit; explicit conflicts fail. Metric-learning loss: `arcface` (default), `supcon`, `subcenter-arcface`, or `subcenter-arcface-compact`; see "Metric-loss modes (v0.8.0)"
 
 ### `--subcenters`
 
@@ -191,6 +191,8 @@ CPU threads for PyTorch/MKL.
 **Default:** `auto` · **Allowed:** auto / cpu / cuda / mps
 
 Device: auto / cpu / cuda / mps.
+
+On Apple GPUs some antialiased resampling backward kernels are unimplemented in PyTorch. Importing the `otuformer` package sets `PYTORCH_ENABLE_MPS_FALLBACK=1` before PyTorch initialises, which lets those kernels run on the CPU. The switch is latched when the MPS backend starts, so when it takes effect depends on the process: the package can only arm it before that point, and a host that imports `torch` first is too late for the package to help. If such a host exports the variable itself before launching, the fallback does work; the package cannot see that, so it reports the state as unknown rather than claiming protection is missing. A run on MPS warns once when the state is not `ARMED`: `DISABLED` says the variable was switched off explicitly, and `UNKNOWN` says this process cannot confirm that the switch took effect, without claiming the operator failed to set it.
 
 ### `--seed`
 

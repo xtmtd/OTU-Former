@@ -60,7 +60,7 @@ Key, target mechanism and KoLeo weight are recorded effective settings. On `--re
 
 **Default:** `relational` · **Allowed:** relational / dino
 
-CLS distillation objective: 'relational' (default; the relational target recipe — a synchronized student/teacher pair with weak teacher views and cross/full pairing) or 'dino' (prototype distribution distillation with an explicit prototype layer). Applies to global-to-global and local-to-global pairs, not a complete training recipe. The patch objective is selected independently by --patch-loss; both objectives share the encoder and teacher temperature (used by ibot). DINO is opt-in and is not a resume of a relational run. Omit to inherit the saved method on --resume; a cross-method resume is rejected. The methods are mutually exclusive: a DINO run keeps the two global views and no relational center update, and the `--relational-teacher-views`, `--relational-center-source` and `--relational-pairing` selectors are rejected under `--ssl-method dino`.
+CLS objective for global-to-global and local-to-global pairs: relational (default; weak teacher targets, cross/full pairing) or dino (prototype distillation). Not a complete training recipe. Select --patch-loss independently; both share the encoder and teacher temperature (ibot). On --resume, omit to inherit; switching methods is rejected. The methods are mutually exclusive: a DINO run keeps the two global views and no relational center update, and the `--relational-teacher-views`, `--relational-center-source` and `--relational-pairing` selectors are rejected under `--ssl-method dino`.
 
 ### `--dino-prototypes`
 
@@ -82,9 +82,9 @@ Sinkhorn-Knopp balances soft prototype usage, not species frequencies, and small
 
 **Default:** `0.0` · **Allowed:** finite value >= 0
 
-Weight for the optional KoLeo regularizer on normalized backbone CLS features. 0 (default) disables it and skips all neighbor search; any finite value > 0 enables it. Experimental: it spreads the CLS space but also repels same-species and near-duplicate specimens, batches smaller than 2 skip it, and repeated records can dominate the total. DINO-only and not changeable on resume.
+Shared relational/DINO KoLeo weight on normalized backbone CLS; finite and >= 0. Default 0 skips neighbor search; batches < 2 skip KoLeo. Experimental: also repels same-species/near-duplicate samples; repeats can dominate. On --resume, omit to inherit; changing the weight requires a new run.
 
-The setting is DINO-only, cannot be changed on resume, and retires the `patch_loss_fraction_of_total` column for the whole run once it is positive, because a signed contribution does not have an ordinary positive loss fraction.
+The regularizer applies to both pretrain methods and is chosen independently of `--ssl-method` and `--patch-loss`; it is not a fine-tune feature. It retires the `patch_loss_fraction_of_total` column for the whole run once it is positive, because a signed contribution does not have an ordinary positive loss fraction. A checkpoint records the weight and the three epsilon constants as one four-key bundle: relational writes none of them at weight 0 (absence is its canonical "disabled" encoding, so older readers still accept the file) and all four at a positive weight, while DINO always records all four. Resuming a relational checkpoint that carries no bundle cannot enable KoLeo; start a new run.
 
 ### `--max-epochs`
 
@@ -152,7 +152,7 @@ Number of local crops. Omit to use 6 for a new run or inherit the checkpoint val
 
 **Default:** `consistency` · **Allowed:** none / consistency / masked-feature / ibot
 
-Patch-level objective. 'none', 'consistency' (default; selects visible same-position patches for normalized cosine regression, i.e. masked-position consistency, never input masking), 'masked-feature' (true continuous masked feature prediction of the teacher's final-four-block patch target) or 'ibot' (experimental prototype-distribution prediction). The CLS distillation objective is selected independently by --ssl-method; both objectives share the encoder and teacher temperature (used by ibot).
+Patch objective: none; consistency (default; visible same-position cosine regression, no input masking); masked-feature (masked input, teacher final-four-block feature targets); or ibot (experimental prototype prediction). Select --ssl-method independently; both share the encoder and teacher temperature (ibot).
 
 ### `--masking-strategy`
 
@@ -236,7 +236,7 @@ Teacher feature population that updates the running CLS center: weak or ordinary
 
 **Default:** unset (`null`); effective new-run default `cross`
 
-Global student/teacher view pairs averaged in the relational loss: cross (A-to-B and B-to-A) or full (all four). Effective default for a new run: cross. Replaces the removed disable-cross-view-loss switch.
+Relational global pairs: cross (A-to-B and B-to-A; new-run default) or full (all four). On --resume, omit to inherit. Replaces the removed disable-cross-view-loss switch.
 
 ### `--log-every-n-steps`
 
@@ -328,6 +328,8 @@ CPU threads for PyTorch/MKL.
 
 Device: auto / cpu / cuda / mps.
 
+On Apple GPUs some antialiased resampling backward kernels are unimplemented in PyTorch. Importing the `otuformer` package sets `PYTORCH_ENABLE_MPS_FALLBACK=1` before PyTorch initialises, which lets those kernels run on the CPU. The switch is latched when the MPS backend starts, so when it takes effect depends on the process: the package can only arm it before that point, and a host that imports `torch` first is too late for the package to help. If such a host exports the variable itself before launching, the fallback does work; the package cannot see that, so it reports the state as unknown rather than claiming protection is missing. A run on MPS warns once when the state is not `ARMED`: `DISABLED` says the variable was switched off explicitly, and `UNKNOWN` says this process cannot confirm that the switch took effect, without claiming the operator failed to set it.
+
 ### `--seed`
 
 **Default:** `42`
@@ -364,12 +366,14 @@ Clear an existing non-empty output directory.
 `logs/instant_metrics.pretrain.csv` carries the constant-per-run `ssl_method`, `dino_centering` and `koleo_weight` settings plus the new CLS diagnostics, weighted component losses and KoLeo status/counts. This is the only schema that changed in this release; `metrics.pretrain.csv` (epoch metrics) and the fine-tune instant metrics keep their previous columns.
 
 - Blank `ssl_method` on a migrated row means unknown/unrecorded, not "relational": the resumed invocation is never backfilled into historical rows.
-- Under a recorded method, a blank inactive setting is N/A (for example `dino_centering` under relational, or `koleo_weight=0` with blank KoLeo loss cells), and the JSON form records `null`, never an observed zero.
+- Under a recorded method, a blank inactive setting is N/A (for example `dino_centering` under relational), and the JSON form records `null`, never an observed zero. `koleo_weight` is shared, so every new row records it numerically, including `0`; the KoLeo loss cells stay blank while the regularizer is disabled.
 - `teacher_center_norm` and `cosine_similarity` remain relational-only; DINO records `cls_center_norm` (EMA only) and shows `COS=N/A`, while the startup `[Info] Initial cosine similarity` line is still printed for DINO.
 - `global_loss_weighted` intentionally equals `global_loss` because there is no global weight, while `local_loss_weighted` includes `lambda_local`.
 - `cls_prototype_perplexity` describes the teacher assignment marginals only: Sinkhorn-Knopp partly imposes balance and uniform identical predictions can look balanced, so it is not proof against collapse or evidence of learned morphology.
 
-KoLeo values are signed, so its contribution does not have an ordinary positive loss fraction; once `koleo_weight > 0` the legacy `patch_loss_fraction_of_total` column is recorded as N/A for the whole run, including batches that skip KoLeo as too small. With KoLeo disabled or under relational, the historical positive-fraction meaning is preserved.
+KoLeo values are signed, so its contribution does not have an ordinary positive loss fraction; once `koleo_weight > 0` the legacy `patch_loss_fraction_of_total` column is recorded as N/A for the whole run, including batches that skip KoLeo as too small. With KoLeo disabled the historical positive-fraction meaning is preserved.
+
+KoLeo statuses are `active`, `disabled` and `skipped` for both methods. A default relational run now writes `koleo_weight=0` with status `disabled` where older rows wrote a blank weight and `not-applicable`; that is an intentional reporting change and historical rows are never rewritten or backfilled. It changes no training numerics and adds no checkpoint keys at weight zero.
 
 A resumed instant-metrics file can contain historical blank-identity rows next to current labeled rows; plots keep both. External merged analysis must retain those unknown groups (for example `dropna=False`) instead of inferring them, and loss magnitudes are not comparable across methods or target choices as if they measured the same objective.
 

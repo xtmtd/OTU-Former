@@ -16,7 +16,7 @@ Turning specimen photographs into reproducible OTUs usually means stitching an e
 ## Workflow Overview
 
 1. **`doctor`** — check the environment and dependencies.
-2. **`pretrain`** — self-supervised pretraining; no labels required. Relational CLS distillation is the default, and an optional DINO-style prototype objective adds Sinkhorn-Knopp targets and a KoLeo regularizer as explicit experiments (`--ssl-method dino`).
+2. **`pretrain`** — self-supervised pretraining; no labels required. Relational CLS distillation is the default, and an optional DINO-style prototype objective adds Sinkhorn-Knopp targets as an explicit experiment (`--ssl-method dino`). The KoLeo regularizer is opt-in for both methods (`--koleo-weight`), disabled by default.
 3. **`finetune`** — supervised metric-learning finetuning with a selectable objective.
 4. **`extract`** — extract embeddings from images.
 5. **`cluster`** — UPGMA hierarchical clustering into morphological OTUs.
@@ -129,7 +129,7 @@ Press `Ctrl+C` — the current image finishes before exiting; partial results ar
 
 ### Device Selection
 
-`--device auto` prefers CUDA, then MPS on Apple Silicon, then CPU.
+`--device auto` prefers CUDA, then MPS on Apple Silicon, then CPU. On MPS, importing `otuformer` arms `PYTORCH_ENABLE_MPS_FALLBACK=1` before PyTorch starts, since a few antialiased resampling backward kernels are unimplemented there. A process that imports `torch` first cannot be armed by the package; if it exports the variable itself before launching, the fallback still works, and the package reports the state as unknown rather than as missing.
 
 ### Shell Completion
 

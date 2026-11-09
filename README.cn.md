@@ -16,7 +16,7 @@
 ## 工作流程
 
 1. **`doctor`** — 检查环境与依赖。
-2. **`pretrain`** — 自监督预训练，无需标签。默认使用 relational CLS 蒸馏；可选的 DINO 风格原型目标通过 `--ssl-method dino` 显式开启，并提供 Sinkhorn-Knopp 目标与 KoLeo 正则作为实验选项。
+2. **`pretrain`** — 自监督预训练，无需标签。默认使用 relational CLS 蒸馏；可选的 DINO 风格原型目标通过 `--ssl-method dino` 显式开启并提供 Sinkhorn-Knopp 目标；KoLeo 正则对两种方法都是可选实验项（`--koleo-weight`），默认禁用。
 3. **`finetune`** — 监督度量学习微调，目标函数可选。
 4. **`extract`** — 从图像提取嵌入向量。
 5. **`cluster`** — UPGMA 层次聚类为形态学 OTU。
@@ -128,7 +128,7 @@ otuformer update --yes
 
 ### 设备选择
 
-`--device auto` 依次优先选择 CUDA、Apple Silicon 上的 MPS，最后回退到 CPU。
+`--device auto` 依次优先选择 CUDA、Apple Silicon 上的 MPS，最后回退到 CPU。MPS 下，导入 `otuformer` 会在 PyTorch 启动前设置 `PYTORCH_ENABLE_MPS_FALLBACK=1`，因为部分抗锯齿重采样反向算子在 MPS 上未实现。若宿主进程先导入 `torch`，包已无法为其设置；但该宿主若自己在启动前导出该变量，回退仍然生效，包会把状态报告为未知而不是缺失。
 
 ### Shell 补全
 

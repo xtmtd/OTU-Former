@@ -293,6 +293,15 @@ future change wants to compress a specific per-option help, it lists the current
 text and the proposed text for operator approval before applying it; blanket "one
 sentence per option" rules are rejected.
 
+One bounded exception was approved on 2026-11-07 for the training CLI
+(`--ssl-method`, `--patch-loss` and the KoLeo wording): the operator approved the
+current and proposed text option by option, and the rule still holds — no
+unapproved compression, no blanket shortening, and the retained semantics
+(method applicability, independent patch selection, shared encoder/temperature,
+experimental marker) are asserted by the help tests. The exception is recorded
+in the [training modularity, CLI help and verification design](2026-11-07-training-modularity-cli-testing-design.md);
+this section remains the governing rule for every other option.
+
 5.4 **Safety-relevant warnings stay visible at the point of use.** The full
 explanation moves to the document, but the warning itself stays in the CLI: a
 phrase that changes what a user would type is retained in the relevant option's

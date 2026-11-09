@@ -467,6 +467,48 @@ The load-bearing rules:
   pairing and structure test.
 - **Documentation assertions read a corpus**, not fixed filenames, so moving
   reference material cannot silently break a content test.
+- **Local development documents are English-only.** Design specs, execution
+  plans, and developer guides under `docs/superpowers/` and `.pi/` have no
+  `.cn.md` counterpart. User-facing `README*` and `docs/commands/*` keep their
+  existing bilingual convention; the exception is scoped to development
+  documents, not a translation or deletion of the command reference.
+
+## 8. Engineering Rules
+
+Short normative rules added after the training modularity work. They describe
+how changes are expected to be shaped, not a file map.
+
+1. **Ownership.** The CLI parses arguments and orchestrates; core modules own
+   behavior. Depend on explicit entry points and lightweight shared
+   definitions, and never import orchestration from a downstream consumer.
+   `otuformer.training.trainer.run_pretrain` / `run_finetune` stay importable as
+   compatibility entry points, but they are not a supported public API for
+   private helpers.
+2. **Reuse.** Share demonstrated behavior, not hypothetical extension points.
+   Separate method-specific state from reusable objectives and reporting. Avoid
+   a universal training engine and avoid dumping-ground `common` modules.
+3. **Configuration.** Keep requested, effective, inherited, and inactive
+   settings distinct. Resolve once per invocation and validate before any
+   output mutation. A new flag needs a real user decision, documented
+   applicability, and explicit recovery semantics.
+4. **Help.** Expose every option, group it by user task, keep safety and
+   recovery warnings at the point of use, and approve specific compressions.
+   The CLI owns executable declarations, command documents own the full prose,
+   README owns navigation, and schema/cards derive from the runtime truth.
+5. **Verification (§8.5).** Choose focused tests by affected behavior while
+   iterating; widen at feature and contract boundaries and run the full suite at
+   refactor, merge, and release gates. Report exact scope, failures, skips, and
+   environment limits. These obligations are mandatory, and their detail lives in
+   [the development testing policy](2026-11-07-development-testing-policy.md):
+   that document is the single source for impact-based selection, full-regression
+   triggers, training-test device boundaries and CPU exceptions, test-helper
+   boundaries, and evidence requirements. This design states the obligation and
+   links there; feature designs identify their affected behavior and required
+   checks without maintaining a competing policy.
+6. **Performance.** Establish stage evidence before optimizing. Preserve
+   reproducibility and safety, and distinguish startup, first-batch, steady
+   state, and evaluation costs. Startup phases log a start before their slow
+   operation so silence is never mistaken for a hang.
 
 The full conventions — layer model, language and naming rules, the command
 document skeleton, the `--help` boundary, the new-command checklist, and the test

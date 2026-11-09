@@ -192,6 +192,8 @@ PyTorch/MKL 使用的 CPU 线程数。
 
 设备：auto / cpu / cuda / mps。
 
+在 Apple GPU 上，PyTorch 未实现部分抗锯齿重采样反向算子。导入 `otuformer` 包会在 PyTorch 初始化之前设置 `PYTORCH_ENABLE_MPS_FALLBACK=1`，使这些算子回落到 CPU 运行。该开关在 MPS 后端启动时锁定，何时生效取决于进程：包只能在那一刻之前设置它，宿主进程若先导入 `torch`，包就来得太晚。若这类宿主自己在启动前导出该变量，回退实际可以生效；包看不到这一点，因此把状态报告为未知，而不会声称未受保护。在 MPS 上运行时，只要状态不是 `ARMED` 就会警告一次：`DISABLED` 提示变量被显式关闭，`UNKNOWN` 提示本进程无法确认开关是否生效，而不会断言操作者没有设置。
+
 ### `--seed`
 
 **默认值：** `42`

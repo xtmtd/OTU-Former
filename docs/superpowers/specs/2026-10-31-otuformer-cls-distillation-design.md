@@ -25,7 +25,16 @@ The existing global morphological barcode -> distance -> UPGMA -> morphOTU workf
 - Add `--dino-prototypes`, default 64, independent of `--ibot-prototypes` (existing default 512). Both are adjustable; neither is inferred from image/species/OTU count.
 - Add `--dino-centering ema|sinkhorn-knopp`, default `ema`. This selects alternative CLS teacher-target mechanisms, not two stacked centering operations. Fix SK to three iterations in this delivery; no iteration-count option, queue, or cross-batch assignment buffer.
 - Add `--koleo-weight`, default 0 (disabled); finite values greater than zero enable KoLeo. No separate enable switch. Sum the two per-crop KoLeo losses as in DINOv2, so the reference weight 0.1 has the same crop-aggregation convention; it remains an experimental starting point, not an automatic default or a validated project recommendation.
-- Explicit DINO-only prototype, centering, or KoLeo settings are rejected in relational mode, including explicitly supplied inactive defaults. Omitted inactive defaults have no effect. Both embedding and prototype dimensions must be positive integers; DINO requires at least two prototypes to avoid a degenerate one-category objective. KoLeo weight must be finite and nonnegative.
+- Explicit DINO-only prototype or centering settings are rejected in relational mode, including explicitly supplied inactive defaults. Omitted inactive defaults have no effect. Both embedding and prototype dimensions must be positive integers; DINO requires at least two prototypes to avoid a degenerate one-category objective. KoLeo weight must be finite and nonnegative.
+
+  **Superseded in part (2026-11-07).** KoLeo is no longer a DINO-only setting:
+  `--koleo-weight` is a shared pretrain regularizer that applies to relational as
+  well, still disabled by default, and is still rejected for finetune. This
+  paragraph keeps its historical wording for the 0.12.0 delivery it describes;
+  the current rule is in
+  [Training Modularity, CLI Help, and Verification](2026-11-07-training-modularity-cli-testing-design.md)
+  §5, which also defines the four-key checkpoint bundle and the
+  `active`/`disabled`/`skipped` metric statuses.
 - Neither method accepts `--disable-cross-view-loss` any more: `0.12.0` removed that switch in favour of `--relational-pairing`, so the relational method no longer keeps the pre-`0.12.0` batch-relative pairing this design was written against. DINO builds its own pairwise targets. See the Status note for the rebase.
 - DINO supports all existing, mutually exclusive `--patch-loss` values: `none`, `consistency`, `masked-feature`, `ibot`. Keep existing masking ratios, strategies, and patch semantics.
 - Preserve augmentation profiles, orientation policies, global/local crop settings, backbone support, register-token behavior, optimizer family, clipping, LR and EMA schedules. Do not silently activate new augmentation or extend backbone support.

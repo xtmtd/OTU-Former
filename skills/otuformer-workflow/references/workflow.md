@@ -65,13 +65,18 @@ cards for the accepted values and declared defaults instead of quoting them here
 The CLS method is explicit: a new run defaults to `--ssl-method relational`
 (unchanged batch-relative distillation), while `--ssl-method dino` adds a
 DINO-style prototype objective with `--dino-prototypes` (default 64,
-independent of `--ibot-prototypes`), `--dino-centering ema|sinkhorn-knopp` and
-`--koleo-weight` (default 0, experimental). Present DINO as a default-off
-experiment, recommend the EMA/no-KoLeo baseline first, and state that K x 2B
+independent of `--ibot-prototypes`), `--dino-centering ema|sinkhorn-knopp`. Present DINO as a default-off
+experiment, recommend the EMA baseline first, and state that K x 2B
 assignments and K x D prototypes cost memory and that two crops of one image are
 not independent specimens. A cross-method resume is rejected, and DINO resumes
 only inherit the settings it omits. `--use-projector-output` returns the DINO
 bottleneck D, never K prototype logits.
+
+`--koleo-weight` (default 0, experimental) is a separate shared regularizer, not
+a DINO-only or fine-tune feature: it applies to whichever CLS method is selected
+and costs no extra forward pass. Recommending a KoLeo baseline means keeping the
+weight at 0 first. A relational resume that records no KoLeo bundle cannot
+enable it; start a new run.
 
 Two shared experiment controls apply to both SSL methods and change nothing by
 default: `--teacher-temp-warmup-ratio` (default 0.7, fraction of planned steps

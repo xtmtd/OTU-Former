@@ -84,7 +84,7 @@ Sinkhorn-Knopp 平衡的是软原型使用率，不是物种频率；小批量�
 
 可选的 KoLeo 正则项权重，作用于每个全局裁剪归一化后的骨干 CLS 特征，两个裁剪的损失相加。`0` 表示禁用并跳过全部近邻搜索，没有单独的开关。任何大于 0 的取值都会启用一个实验性项：它让默认提取所用的 CLS 空间更分散，但同时也会排斥同种个体与近重复样本；批量小于 2 时会被跳过；重复记录或重合向量可能贡献很大的单裁剪正值 `-log(1e-8*sqrt(H)+1e-8)`，从而主导求和后的梯度（以及裁剪后的步长）。建议先评估默认的 `ema`/无 KoLeo 基线，再逐项改变。
 
-该设置仅适用于 DINO，续跑时不可更改；一旦其取值大于 0，整轮运行的 `patch_loss_fraction_of_total` 列都会作废，因为带符号的贡献不具备通常意义上的正损失占比。
+该正则项同时适用于两种预训练方法，与 `--ssl-method`、`--patch-loss` 无关，也不是微调特性；一旦其取值大于 0，整轮运行的 `patch_loss_fraction_of_total` 列都会作废，因为带符号的贡献不具备通常意义上的正损失占比。检查点把权重与三个 epsilon 常量作为一个四键组合记录：relational 在权重为 0 时四个键全部不写（缺失即其规范的“禁用”编码，旧版读取器仍可打开该文件），权重为正时四个键一起写入；DINO 在任何权重下都记录四个键。续跑一个不带该组合的 relational 检查点无法启用 KoLeo，请新开一轮。
 
 ### `--max-epochs`
 
@@ -328,6 +328,8 @@ PyTorch/MKL 使用的 CPU 线程数。
 
 设备：auto / cpu / cuda / mps。
 
+在 Apple GPU 上，PyTorch 未实现部分抗锯齿重采样反向算子。导入 `otuformer` 包会在 PyTorch 初始化之前设置 `PYTORCH_ENABLE_MPS_FALLBACK=1`，使这些算子回落到 CPU 运行。该开关在 MPS 后端启动时锁定，何时生效取决于进程：包只能在那一刻之前设置它，宿主进程若先导入 `torch`，包就来得太晚。若这类宿主自己在启动前导出该变量，回退实际可以生效；包看不到这一点，因此把状态报告为未知，而不会声称未受保护。在 MPS 上运行时，只要状态不是 `ARMED` 就会警告一次：`DISABLED` 提示变量被显式关闭，`UNKNOWN` 提示本进程无法确认开关是否生效，而不会断言操作者没有设置。
+
 ### `--seed`
 
 **默认值：** `42`
@@ -364,12 +366,14 @@ PyTorch/MKL 使用的 CPU 线程数。
 `logs/instant_metrics.pretrain.csv` 增加了每轮恒定的 `ssl_method`、`dino_centering`、`koleo_weight` 设置，以及新的 CLS 诊断、加权分量损失与 KoLeo 状态/计数。这是本次发布中唯一变更的表结构；`metrics.pretrain.csv`（每 epoch 指标）与微调即时指标保持原有列。
 
 - 迁移后行上的空白 `ssl_method` 表示未知/未记录，而不是“relational”：续跑时的调用参数不会回填到历史行。
-- 在已记录方法下，空白的不适用设置表示 N/A（例如 relational 下的 `dino_centering`，或 `koleo_weight=0` 时留空的 KoLeo 损失单元），JSON 形式记为 `null`，而不是观测到的 0。
+- 在已记录方法下，空白的不适用设置表示 N/A（例如 relational 下的 `dino_centering`），JSON 形式记为 `null`，而不是观测到的 0。`koleo_weight` 是共享设置，因此新行都会以数值记录，包括 `0`；正则项禁用时 KoLeo 损失单元保持空白。
 - `teacher_center_norm` 与 `cosine_similarity` 仅属于 relational；DINO 记录 `cls_center_norm`（仅 EMA）并显示 `COS=N/A`，启动时的 `[Info] Initial cosine similarity` 仍然打印。
 - `global_loss_weighted` 与 `global_loss` 有意相等，因为不存在全局权重；`local_loss_weighted` 则包含 `lambda_local`。
 - `cls_prototype_perplexity` 只描述教师分配边缘分布：Sinkhorn-Knopp 部分强加了平衡，完全相同的均匀预测也可能看起来“平衡”，因此它既不能证明没有塌缩，也不是学到形态结构的证据。
 
-KoLeo 数值带符号，其贡献不具备通常意义上的正损失占比；一旦 `koleo_weight > 0`，旧的 `patch_loss_fraction_of_total` 列在整轮运行中都记为 N/A，包括因批量过小跳过 KoLeo 的批次。KoLeo 禁用或处于 relational 时，保留原有的正占比含义。
+KoLeo 数值带符号，其贡献不具备通常意义上的正损失占比；一旦 `koleo_weight > 0`，旧的 `patch_loss_fraction_of_total` 列在整轮运行中都记为 N/A，包括因批量过小跳过 KoLeo 的批次。KoLeo 禁用时保留原有的正占比含义。
+
+两种方法的 KoLeo 状态都是 `active`、`disabled` 与 `skipped`。默认的 relational 运行现在写入 `koleo_weight=0` 与状态 `disabled`，而历史行写的是空白权重与 `not-applicable`；这是有意的报表变化，历史行不会被重写或回填。权重为 0 时它不改变任何训练数值，也不新增检查点键。
 
 续跑后的即时指标文件可以同时包含历史空白身份行与当前带标签的行，绘图两者都会保留。外部合并分析必须保留这些未知分组（例如 `dropna=False`）而不能自行推断；损失量级也不可在不同方法或不同目标机制之间当作同一目标来比较。
 
