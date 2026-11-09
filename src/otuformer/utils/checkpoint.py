@@ -229,10 +229,11 @@ _SSL_PROJECTOR_LAYOUT = (
 
 # Config keys that describe an active DINO recipe. A relational identity that
 # still records them (or DINO training state) has contradictory metadata.
+# KoLeo is not one of them: it is a shared pretrain regularizer, so a relational
+# payload may record the four keys when its weight is positive.
 _DINO_ONLY_CONFIG_KEYS = (
     "dino_prototypes",
     "dino_centering",
-    "koleo_weight",
     "dino_hidden_dim",
     "dino_mlp_init_std",
     "dino_mlp_init_bias",
@@ -242,9 +243,6 @@ _DINO_ONLY_CONFIG_KEYS = (
     "dino_target_dtype",
     "dino_center_momentum",
     "dino_sinkhorn_iterations",
-    "koleo_normalize_eps",
-    "koleo_distance_eps",
-    "koleo_log_eps",
 )
 
 

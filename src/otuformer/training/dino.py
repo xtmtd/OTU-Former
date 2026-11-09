@@ -29,16 +29,15 @@ DINO_FIXED_CONFIG = {
     "dino_prototype_scale": 1.0,
     "dino_freeze_last_layer_epochs": 1,
     "dino_target_dtype": "float32",
-    "koleo_normalize_eps": 1e-8,
-    "koleo_distance_eps": 1e-8,
-    "koleo_log_eps": 1e-8,
 }
 
-# Operator-configurable DINO settings: inherited on resume when omitted.
+# Operator-configurable DINO settings: inherited on resume when omitted. KoLeo is
+# absent on purpose: it is a shared pretrain regularizer whose single definition
+# lives in ``pretrain_recipe`` (KOLEO_FIXED_CONFIG / KOLEO_DEFAULT_WEIGHT), which
+# cannot be imported here without a cycle.
 DINO_DEFAULTS = {
     "dino_prototypes": 64,
     "dino_centering": "ema",
-    "koleo_weight": 0.0,
 }
 
 # Earlier releases recorded the deprecated torch.nn.utils.weight_norm helper.
