@@ -23,6 +23,18 @@ from otuformer.cli import (
     requested_display,
 )
 from otuformer.cli.constraints import validate_pseudo_options
+
+
+def prepare_pseudo_round(*args, **kwargs):
+    """Resolve the pseudo round lazily so the CLI stays importable without torch.
+
+    The training dependency is imported at call time (schema export must not pull
+    torch in), while the name stays on this module so a caller can patch it here,
+    where the call happens.
+    """
+    from otuformer.training.finetune_support import prepare_pseudo_round as impl
+
+    return impl(*args, **kwargs)
 from otuformer.constants import ARCFACE_FAMILY_LOSSES, MAX_SUBCENTERS, MIN_SUBCENTERS
 
 # Every finetune CLI parameter is classified so that pseudo-mode inheritance and
@@ -262,25 +274,29 @@ def finetune(
         "",
         "--checkpoint",
         help=(
-            "Initialization checkpoint used when --resume is not set. An SSL "
-            "pretrain checkpoint installs a fresh embedding head; a "
-            "fine-tune checkpoint with a matching head keeps its trained "
-            "projector."
+            "Initialization when not using --resume: SSL installs a fresh "
+            "embedding head; a matching fine-tune head keeps its projector. "
+            "See --pseudo-label-from for round 2 initialization."
         ),
+        rich_help_panel="Input, output, and initialization",
     ),
     train_data: Path = typer.Option(
-        ..., "--train-data", help="CSV with 'image' and 'label' columns."
+        ..., "--train-data", help="CSV with 'image' and 'label' columns.",
+        rich_help_panel="Input, output, and initialization",
     ),
     input_images_dir: Path = typer.Option(
-        ..., "--input-images-dir", help="Root image directory."
+        ..., "--input-images-dir", help="Root image directory.",
+        rich_help_panel="Input, output, and initialization",
     ),
     out_dir: Path = typer.Option(
-        Path("runs/finetune"), "--out-dir", help="Output directory."
+        Path("runs/finetune"), "--out-dir", help="Output directory.",
+        rich_help_panel="Input, output, and initialization",
     ),
     model_name: str = typer.Option(
         "vit_tiny_patch16_224",
         "--model-name",
         help="timm backbone name for metric-learning encoder.",
+        rich_help_panel="Model",
     ),
     metric_embed_dim: int | None = typer.Option(
         None,
@@ -291,45 +307,17 @@ def finetune(
             "CLS dimension). Default: the checkpoint's recorded metric "
             "dimension, else the pretrained projector dimension."
         ),
-    ),
-    finetune_epochs: int = typer.Option(
-        20, "--finetune-epochs", help="Total fine-tuning epochs."
-    ),
-    finetune_lr: float = typer.Option(
-        1e-4,
-        "--finetune-lr",
-        help="Learning rate for the fine-tuned backbone.",
-    ),
-    metric_head_lr: float | None = typer.Option(
-        None,
-        "--metric-head-lr",
-        help=(
-            "Learning rate for the embedding head and, for prototype losses, the "
-            "classifier; defaults to --finetune-lr."
-        ),
-    ),
-    weight_decay: float = typer.Option(
-        1e-4,
-        "--weight-decay",
-        help="AdamW weight decay for fine-tuning; pass 0.05 for the legacy script's setting.",
-    ),
-    freeze_ratio: float = typer.Option(
-        0.7,
-        "--freeze-ratio",
-        help=(
-            "Fraction of backbone blocks to freeze (0.0=none, 1.0=all). Must "
-            "match the saved value on --resume."
-        ),
+        rich_help_panel="Model",
     ),
     loss: str = typer.Option(
         "arcface",
         "--loss",
         help=(
-            "Metric-learning loss: arcface (default), supcon, subcenter-arcface, "
-            "or subcenter-arcface-compact. Rejected before any output when the "
-            "name is unknown. On --resume an omitted --loss inherits the "
-            "recorded mode; an explicit conflicting value fails."
+            "Metric loss: arcface (default), supcon, subcenter-arcface, or "
+            "subcenter-arcface-compact. Unknown names fail before output setup. "
+            "On --resume, omit to inherit; explicit conflicts fail."
         ),
+        rich_help_panel="Metric objective",
     ),
     subcenters: int = typer.Option(
         2,
@@ -339,6 +327,7 @@ def finetune(
             f"subcenter-arcface-compact: an integer from {MIN_SUBCENTERS} to "
             f"{MAX_SUBCENTERS}. arcface and supcon reject this flag."
         ),
+        rich_help_panel="Metric objective",
     ),
     compact_weight: float = typer.Option(
         0.1,
@@ -348,6 +337,7 @@ def finetune(
             "subcenter-arcface-compact (cap is fixed at 0.5). Rejected for other "
             "loss modes."
         ),
+        rich_help_panel="Metric objective",
     ),
     supcon_temperature: float = typer.Option(
         0.07,
@@ -356,6 +346,7 @@ def finetune(
             "Temperature for --loss supcon; must be > 0. Rejected for other loss "
             "modes."
         ),
+        rich_help_panel="Metric objective",
     ),
     long_tail: str = typer.Option(
         "none",
@@ -365,6 +356,7 @@ def finetune(
             "Reweighting over the ArcFace-family cross-entropy term). Rejected for "
             "--loss supcon, and must match between pseudo rounds."
         ),
+        rich_help_panel="Metric objective",
     ),
     pseudo_label_from: str = typer.Option(
         "",
@@ -377,6 +369,7 @@ def finetune(
             "finetune#1 resolved values instead of the new-run defaults; explicit "
             f"conflicts fail. See {docs_url('finetune')}."
         ),
+        rich_help_panel="Pseudo-label round",
     ),
     pseudo_similarity_floor: float = typer.Option(
         0.75,
@@ -386,6 +379,7 @@ def finetune(
             "in [-1, 1]. This is not a probability. Higher rejects more; lower "
             "accepts more. [default: 0.75]"
         ),
+        rich_help_panel="Pseudo-label round",
     ),
     pseudo_min_gap: float = typer.Option(
         0.10,
@@ -394,6 +388,7 @@ def finetune(
             "Minimum winning-score minus runner-up-score gap in [0, 2]. Higher "
             "rejects more ambiguous candidates; lower accepts more. [default: 0.10]"
         ),
+        rich_help_panel="Pseudo-label round",
     ),
     pseudo_neighbors: int = typer.Option(
         15,
@@ -403,6 +398,7 @@ def finetune(
             "check. Smaller is usually more local and stricter; larger is usually "
             "broader and more permissive (data-dependent). [default: 15]"
         ),
+        rich_help_panel="Pseudo-label round",
     ),
     pseudo_cap_multiplier: int = typer.Option(
         3,
@@ -412,6 +408,7 @@ def finetune(
             "most min(multiplier * expert_seed_count, absolute_cap) rows after the "
             "floor/gap/mutual-kNN rules. Must be >= 1. [default: 3]"
         ),
+        rich_help_panel="Pseudo-label round",
     ),
     pseudo_absolute_cap: int = typer.Option(
         50,
@@ -420,6 +417,7 @@ def finetune(
             "Absolute per-class pseudo-label cap, applied after the multiplier. "
             "Must be >= 1. [default: 50]"
         ),
+        rich_help_panel="Pseudo-label round",
     ),
     trace_batch_ids: bool = typer.Option(
         False,
@@ -429,6 +427,7 @@ def finetune(
             "image IDs of every training batch. Can be large; morphology is "
             "never read."
         ),
+        rich_help_panel="Pseudo-label round",
     ),
     augmentation: str | None = typer.Option(
         None,
@@ -440,6 +439,7 @@ def finetune(
             "to `none`. Omit to inherit the saved profile on --resume. See "
             f"{docs_url('training-augmentation')}."
         ),
+        rich_help_panel="Views and augmentation",
     ),
     orientation_policy: str | None = typer.Option(
         None,
@@ -451,22 +451,53 @@ def finetune(
             "initialization to inherit the checkpoint policy. See "
             f"{docs_url('training-augmentation')}."
         ),
+        rich_help_panel="Views and augmentation",
     ),
-    batch_size: int = typer.Option(32, "--batch-size", help="Batch size."),
-    num_workers: int = typer.Option(4, "--num-workers", help="DataLoader workers."),
-    cpus: int = typer.Option(12, "--cpus", help="CPU threads for PyTorch/MKL."),
-    device: str = typer.Option(
-        "auto", "--device", help="Device: auto | cpu | cuda | mps."
+    finetune_epochs: int = typer.Option(
+        20, "--finetune-epochs", help="Total fine-tuning epochs.",
+        rich_help_panel="Optimization",
     ),
-    seed: int = typer.Option(42, "--seed", help="Random seed."),
+    finetune_lr: float = typer.Option(
+        1e-4,
+        "--finetune-lr",
+        help="Learning rate for the fine-tuned backbone.",
+        rich_help_panel="Optimization",
+    ),
+    metric_head_lr: float | None = typer.Option(
+        None,
+        "--metric-head-lr",
+        help=(
+            "Learning rate for the embedding head and, for prototype losses, the "
+            "classifier; defaults to --finetune-lr."
+        ),
+        rich_help_panel="Optimization",
+    ),
+    weight_decay: float = typer.Option(
+        1e-4,
+        "--weight-decay",
+        help="AdamW weight decay for fine-tuning; pass 0.05 for the legacy script's setting.",
+        rich_help_panel="Optimization",
+    ),
+    freeze_ratio: float = typer.Option(
+        0.7,
+        "--freeze-ratio",
+        help=(
+            "Fraction of backbone blocks to freeze (0.0=none, 1.0=all). Must "
+            "match the saved value on --resume."
+        ),
+        rich_help_panel="Optimization",
+    ),
     log_every_n_steps: int = typer.Option(
-        50, "--log-every-n-steps", help="Log metrics every N iterations."
+        50, "--log-every-n-steps", help="Log metrics every N iterations.",
+        rich_help_panel="Evaluation and reporting",
     ),
     save_every_epochs: int = typer.Option(
-        10, "--save-every-epochs", help="Save checkpoint every N epochs."
+        10, "--save-every-epochs", help="Save checkpoint every N epochs.",
+        rich_help_panel="Evaluation and reporting",
     ),
     keep_last_checkpoints: int = typer.Option(
-        10, "--keep-last-checkpoints", help="Keep only last N checkpoints."
+        10, "--keep-last-checkpoints", help="Keep only last N checkpoints.",
+        rich_help_panel="Evaluation and reporting",
     ),
     # Visualisation / embedding metrics (mirror pretrain)
     visualize_data: Path | None = typer.Option(
@@ -476,6 +507,7 @@ def finetune(
             "CSV with an 'image' column and optional 'label' for periodic metrics + UMAP. "
             "Without labels, only UMAP is generated. If omitted, --train-data is reused."
         ),
+        rich_help_panel="Evaluation and reporting",
     ),
     extract_size: str = typer.Option(
         "auto",
@@ -485,25 +517,31 @@ def finetune(
             "'auto' uses the model's img_size. "
             f"{SIZE_EXAMPLES}"
         ),
+        rich_help_panel="Evaluation and reporting",
     ),
     metrics_sample_size: int = typer.Option(
         10000,
         "--metrics-sample-size",
         help="Max samples for periodic metrics and UMAP (<=0 means no cap).",
+        rich_help_panel="Evaluation and reporting",
     ),
     umap_n_neighbors: int = typer.Option(
-        15, "--umap-n-neighbors", help="UMAP n_neighbors."
+        15, "--umap-n-neighbors", help="UMAP n_neighbors.",
+        rich_help_panel="Evaluation and reporting",
     ),
-    umap_min_dist: float = typer.Option(0.1, "--umap-min-dist", help="UMAP min_dist."),
+    umap_min_dist: float = typer.Option(0.1, "--umap-min-dist", help="UMAP min_dist.",
+        rich_help_panel="Evaluation and reporting",),
     umap_metric: str = typer.Option(
         "cosine",
         "--umap-metric",
         help="Distance metric for UMAP projection. Common choices: cosine, euclidean.",
+        rich_help_panel="Evaluation and reporting",
     ),
     visualize_class_number: int = typer.Option(
         20,
         "--visualize-class-number",
         help="Max classes to show in UMAP plot.",
+        rich_help_panel="Evaluation and reporting",
     ),
     disable_embedding_metrics: bool = typer.Option(
         False,
@@ -512,7 +550,20 @@ def finetune(
             "Disable periodic embedding metrics + UMAP generation during fine-tuning "
             "to reduce runtime overhead."
         ),
+        rich_help_panel="Evaluation and reporting",
     ),
+    batch_size: int = typer.Option(32, "--batch-size", help="Batch size.",
+        rich_help_panel="Runtime and reproducibility",),
+    num_workers: int = typer.Option(4, "--num-workers", help="DataLoader workers.",
+        rich_help_panel="Runtime and reproducibility",),
+    cpus: int = typer.Option(12, "--cpus", help="CPU threads for PyTorch/MKL.",
+        rich_help_panel="Runtime and reproducibility",),
+    device: str = typer.Option(
+        "auto", "--device", help="Device: auto | cpu | cuda | mps.",
+        rich_help_panel="Runtime and reproducibility",
+    ),
+    seed: int = typer.Option(42, "--seed", help="Random seed.",
+        rich_help_panel="Runtime and reproducibility",),
     resume: str = typer.Option(
         "",
         "--resume",
@@ -521,16 +572,15 @@ def finetune(
             "state; saved optimizer settings override the LR and weight-decay "
             "options)."
         ),
+        rich_help_panel="Recovery and safety",
     ),
     overwrite: bool = typer.Option(
-        False, "--overwrite", help="Clear an existing non-empty output directory."
+        False, "--overwrite", help="Clear an existing non-empty output directory.",
+        rich_help_panel="Recovery and safety",
     ),
 ) -> None:
     if ctx.invoked_subcommand is not None:
         return
-
-    if device in {"mps", "auto"}:
-        os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
     from otuformer.utils.logging import TeeLogger
     from otuformer.utils.io import prepare_output_dir
@@ -567,14 +617,13 @@ def finetune(
         absolute_cap=pseudo_absolute_cap,
         explicit_options=explicit_options,
     )
-    from otuformer.training.trainer import (
+    from otuformer.training.finetune_support import (
         _assert_pseudo_source_identity,
         _classify_finetune_source,
         _resolve_finetune_loss_config,
         _sha256_file,
         _validate_finetune_resume_source,
         preflight_finetune_source,
-        prepare_pseudo_round,
         pseudo_cli_identity,
         resolve_pseudo_ssl_source,
     )
@@ -889,7 +938,9 @@ def finetune(
                 print(line)
         print("-" * 80)
 
-        from otuformer.training.trainer import run_finetune
+        # Import the module, not the function: tests and callers patch the run
+        # entry point on its owner, and a direct alias would bypass that.
+        from otuformer.training import finetune_loop as finetune_loop_module
 
         # Hand over the checkpoint the preflight already read; passing it only
         # when present keeps direct callers (and their mocks) unchanged.
@@ -898,7 +949,7 @@ def finetune(
             if source_checkpoint is not None
             else {}
         )
-        run_finetune(ns, explicit_options=explicit_options, **extra)
+        finetune_loop_module.run_finetune(ns, explicit_options=explicit_options, **extra)
     except Exception:
         traceback.print_exc(file=tee)
         raise

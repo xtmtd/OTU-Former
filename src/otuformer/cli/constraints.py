@@ -118,10 +118,13 @@ _CONSTRAINTS: dict[str, dict[str, dict[str, Any]]] = {
         "koleo_weight": {
             "numeric": "float",
             "bounds": {"min": 0.0},
-            "applies_to": ["dino"],
+            # Shared pretrain regularizer: applies to both methods, but is not
+            # a fine-tune option.
+            "applies_to": ["relational", "dino"],
             "unresolved": [
-                "an omitted --koleo-weight is inherited if the saved method "
-                "matches; a static card cannot confirm the checkpoint's method",
+                "an omitted --koleo-weight is inherited from a resume "
+                "checkpoint; relational checkpoints without the four-key "
+                "bundle stay disabled, which a static card cannot confirm",
             ],
         },
         "teacher_temp_warmup_ratio": {
@@ -503,7 +506,8 @@ def validate_pretrain_ssl_applicability(
             "DINO-only SSL options apply only if the resumed checkpoint uses "
             "--ssl-method dino; the saved method is not known before execution"
         ]
-    dino_only = ("dino_prototypes", "dino_centering", "koleo_weight")
+    # KoLeo is shared; only these two remain DINO-exclusive.
+    dino_only = ("dino_prototypes", "dino_centering")
     if method == "relational":
         for name in dino_only:
             if name in explicit_options:

@@ -430,7 +430,9 @@ _PRETRAIN_RESUME_INHERITED = frozenset(
 
 # DINO-only/width settings whose inheritance depends on the saved method: only
 # DINO resume inherits them, relational keeps the invocation/default value.
-_SSL_CONDITIONAL_OPTIONS = ("out_dim", "dino_prototypes", "dino_centering", "koleo_weight")
+# KoLeo is *not* one of them: it is a shared pretrain regularizer, so an omitted
+# weight is inherited on any resume.
+_SSL_CONDITIONAL_OPTIONS = ("out_dim", "dino_prototypes", "dino_centering")
 
 _INHERITED_PARAMETERS = {
     "pretrain": _PRETRAIN_RESUME_INHERITED,
@@ -678,15 +680,26 @@ def _apply_ssl_conditional_provenance(
     Static generation never reads a checkpoint: an omitted method stays
     conditional, and an explicit method labels expected resolution only.
     """
+    # KoLeo is shared by both methods, so a resume inherits it whatever the
+    # saved method turns out to be: the static card cannot call it a default.
+    if "koleo_weight" not in explicit_values:
+        provenance["koleo_weight"] = "omitted-inherited"
+        unresolved.append(
+            "an omitted --koleo-weight inherits the weight the checkpoint "
+            "records, for either method; a relational checkpoint that records no "
+            "four-key bundle stays disabled at 0, which the static card cannot "
+            "confirm"
+        )
+
     method = explicit_values.get("ssl_method")
     if method is None:
         for name in _SSL_CONDITIONAL_OPTIONS:
             if name not in explicit_values:
                 provenance[name] = "omitted-conditional"
         unresolved.append(
-            "omitted out_dim/dino_prototypes/dino_centering/koleo_weight are "
-            "inherited only if the saved method matches; the resume checkpoint "
-            "is not read during static validation"
+            "omitted out_dim/dino_prototypes/dino_centering are inherited only "
+            "if the saved method matches; the resume checkpoint is not read "
+            "during static validation"
         )
         return
     if method == "dino":

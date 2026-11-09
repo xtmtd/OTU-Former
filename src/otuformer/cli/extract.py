@@ -413,10 +413,6 @@ def extract(
         print(json.dumps(params, ensure_ascii=False, indent=2, sort_keys=True))
         print("-" * 80)
 
-        # Enable MPS fallback for ops not yet supported on MPS
-        if device in {"mps", "auto"}:
-            os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
-
         df = extract_embeddings(
             checkpoint_path=checkpoint,
             images_dir=input_images_dir,

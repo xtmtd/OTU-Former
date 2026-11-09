@@ -91,17 +91,21 @@ def pretrain(
             "Optional CSV with an 'image' column (paths relative to --input-images-dir). "
             "If omitted, all images under --input-images-dir are used recursively."
         ),
+        rich_help_panel="Input and output",
     ),
     input_images_dir: Path = typer.Option(
-        ..., "--input-images-dir", help="Root image directory."
+        ..., "--input-images-dir", help="Root image directory.",
+        rich_help_panel="Input and output",
     ),
     out_dir: Path = typer.Option(
-        Path("runs/pretrain"), "--out-dir", help="Output directory."
+        Path("runs/pretrain"), "--out-dir", help="Output directory.",
+        rich_help_panel="Input and output",
     ),
     model_name: str = typer.Option(
         "vit_tiny_patch16_224",
         "--model-name",
         help="timm backbone name used for student/teacher encoders.",
+        rich_help_panel="Model",
     ),
     register_tokens: str = typer.Option(
         "none",
@@ -115,6 +119,7 @@ def pretrain(
             "CLS-free backbone. Explicit values are rejected on native-register "
             "backbones."
         ),
+        rich_help_panel="Model",
     ),
     out_dim: int = typer.Option(
         256,
@@ -124,22 +129,54 @@ def pretrain(
             "projection width; in DINO it is the bottleneck width that "
             "--use-projector-output extracts, never the prototype count K."
         ),
+        rich_help_panel="Model",
     ),
     ssl_method: str = typer.Option(
         "relational",
         "--ssl-method",
         help=(
-            "CLS distillation objective: 'relational' (default; the relational "
-            "target recipe — a synchronized student/teacher pair with weak "
-            "teacher views and cross/full pairing) or 'dino' (prototype "
-            "distribution distillation with an explicit prototype layer). "
-            "Applies to global-to-global and local-to-global pairs, not a "
-            "complete training recipe. The patch objective is selected "
-            "independently by --patch-loss; both objectives share the encoder "
-            "and teacher temperature (used by ibot). DINO is opt-in and is not "
-            "a resume of a relational run. Omit to inherit the saved method "
-            "on --resume; a cross-method resume is rejected."
+            "CLS objective for global-to-global and local-to-global pairs: "
+            "relational (default; weak teacher targets, cross/full pairing) or "
+            "dino (prototype distillation). Not a complete training recipe. "
+            "Select --patch-loss independently; both share the encoder and "
+            "teacher temperature (ibot). On --resume, omit to inherit; "
+            "switching methods is rejected."
         ),
+        rich_help_panel="CLS objective",
+    ),
+    relational_teacher_views: str | None = typer.Option(
+        None,
+        "--relational-teacher-views",
+        help=(
+            "Teacher images used for relational target features: weak or "
+            "ordinary. Effective default for a new run: weak. Omit to inherit "
+            "the saved value on --resume."
+        ),
+        autocompletion=relational_teacher_view_choices,
+        rich_help_panel="Relational targets",
+    ),
+    relational_center_source: str | None = typer.Option(
+        None,
+        "--relational-center-source",
+        help=(
+            "Teacher feature population that updates the running CLS center: "
+            "weak or ordinary. Omit to inherit the saved value on --resume; a "
+            "new run defaults to the teacher-view source, and ordinary teacher "
+            "views require an ordinary center."
+        ),
+        autocompletion=relational_center_source_choices,
+        rich_help_panel="Relational targets",
+    ),
+    relational_pairing: str | None = typer.Option(
+        None,
+        "--relational-pairing",
+        help=(
+            "Relational global pairs: cross (A-to-B and B-to-A; new-run "
+            "default) or full (all four). On --resume, omit to inherit. "
+            "Replaces the removed disable-cross-view-loss switch."
+        ),
+        autocompletion=relational_pairing_choices,
+        rich_help_panel="Relational targets",
     ),
     dino_prototypes: int = typer.Option(
         64,
@@ -151,6 +188,7 @@ def pretrain(
             "species or OTU counts; prototype indices are not OTUs. DINO-only: "
             "rejected under relational. Not applicable to other methods."
         ),
+        rich_help_panel="DINO targets",
     ),
     dino_centering: str = typer.Option(
         "ema",
@@ -162,46 +200,78 @@ def pretrain(
             "center). These are alternatives, never two stacked operations. "
             "DINO-only and not switchable on resume."
         ),
+        rich_help_panel="DINO targets",
     ),
     koleo_weight: float = typer.Option(
         0.0,
         "--koleo-weight",
         help=(
-            "Weight for the optional KoLeo regularizer on normalized backbone "
-            "CLS features. 0 (default) disables it and skips all neighbor "
-            "search; any finite value > 0 enables it. Experimental: it spreads "
-            "the CLS space but also repels same-species and near-duplicate "
-            "specimens, batches smaller than 2 skip it, and repeated records "
-            "can dominate the total. DINO-only and not changeable on resume."
+            "Shared relational/DINO KoLeo weight on normalized backbone CLS; "
+            "finite and >= 0. Default 0 skips neighbor search; batches < 2 skip "
+            "KoLeo. Experimental: also repels same-species/near-duplicate "
+            "samples; repeats can dominate. On --resume, omit to inherit; "
+            "changing the weight requires a new run."
         ),
+        rich_help_panel="Shared regularization",
     ),
-    max_epochs: int = typer.Option(
-        50, "--max-epochs", help="Total SSL pretraining epochs."
-    ),
-    lr: float = typer.Option(
-        5e-4,
-        "--lr",
-        help="Base learning rate before warmup/cosine scheduling.",
-    ),
-    weight_decay: float = typer.Option(
-        0.05, "--weight-decay", help="AdamW weight decay coefficient."
-    ),
-    no_norm_bias_weight_decay: bool = typer.Option(
-        False,
-        "--no-norm-bias-weight-decay",
+    patch_loss: str = typer.Option(
+        "consistency",
+        "--patch-loss",
         help=(
-            "Skip weight decay for biases and normalization affine parameters. "
-            "Omitted keeps the historical uniform --weight-decay on every "
-            "trainable parameter. Applies to both SSL methods and keeps one "
-            "joint gradient-norm clipping. Omit to inherit the saved policy on "
-            "--resume; a different requested --weight-decay is not applied, and "
-            "a changed policy is rejected."
+            "Patch objective: none; consistency (default; visible "
+            "same-position cosine regression, no input masking); "
+            "masked-feature (masked input, teacher final-four-block feature "
+            "targets); or ibot (experimental prototype prediction). Select "
+            "--ssl-method independently; both share the encoder and teacher "
+            "temperature (ibot)."
         ),
+        rich_help_panel="Patch objective",
     ),
-    warmup_epochs: int = typer.Option(
-        3,
-        "--warmup-epochs",
-        help="Warmup epochs before cosine LR decay.",
+    masking_strategy: str = typer.Option(
+        "random",
+        "--masking-strategy",
+        help=(
+            "Masking geometry for masked-feature/ibot only. 'random' samples "
+            "independent patch positions; 'blockwise' merges bounded rectangular "
+            "regions; 'hybrid' takes half blockwise and half random positions. "
+            "Not applicable to none/consistency; the exact geometry limits are "
+            f"documented at {docs_url('pretrain')}."
+        ),
+        rich_help_panel="Patch objective",
+    ),
+    mask_ratio: str = typer.Option(
+        "auto",
+        "--mask-ratio",
+        help=(
+            "'auto' or a float in (0, 1). Fraction of patch positions used by "
+            "the selected patch objective. A new run resolves 'auto' to 0.30 "
+            "(v0.6.x used a 0.50 default). Used as the visible same-position "
+            "share for consistency and as the masked student-input fraction "
+            "for masked-feature/ibot."
+        ),
+        rich_help_panel="Patch objective",
+    ),
+    ibot_prototypes: int = typer.Option(
+        512,
+        "--ibot-prototypes",
+        help=(
+            "Prototype dictionary size for the experimental ibot mode: any "
+            "integer >= 2, default 512. Larger dictionaries suit larger "
+            "datasets (for example 4096 or 16384); powers of two are a "
+            "convenient habit, not a requirement. Not applicable to other "
+            "patch modes."
+        ),
+        rich_help_panel="Patch objective",
+    ),
+    lambda_mask: float = typer.Option(
+        1.0,
+        "--lambda-mask",
+        help=(
+            "Weight for the patch-loss term. ibot's cross-entropy is on a "
+            "different scale from the cosine patch losses, so lower it (for "
+            "example 0.25-0.5) when using --patch-loss ibot."
+        ),
+        rich_help_panel="Patch objective",
     ),
     augmentation: str | None = typer.Option(
         None,
@@ -214,6 +284,7 @@ def pretrain(
             "pattern, or metallic sheen; legacy reproduces 0.2.1 and keeps its "
             f"historical transforms. See {docs_url('training-augmentation')}."
         ),
+        rich_help_panel="Views and augmentation",
     ),
     orientation_policy: str | None = typer.Option(
         None,
@@ -224,6 +295,7 @@ def pretrain(
             "sensitive. Default for a new run: sensitive. Omit to inherit the "
             f"saved policy on --resume. See {docs_url('training-augmentation')}."
         ),
+        rich_help_panel="Views and augmentation",
     ),
     global_crop_size: str = typer.Option(
         "auto",
@@ -233,6 +305,7 @@ def pretrain(
             "input size on a new run, or the checkpoint's recorded size on "
             f"--resume. {SIZE_EXAMPLES}"
         ),
+        rich_help_panel="Views and augmentation",
     ),
     local_crop_size: int | None = typer.Option(
         None,
@@ -242,6 +315,7 @@ def pretrain(
             "the checkpoint value on --resume. Must be divisible by the "
             "backbone patch size (e.g. 98 or 112 for patch-14 models)."
         ),
+        rich_help_panel="Views and augmentation",
     ),
     local_crops: int | None = typer.Option(
         None,
@@ -250,75 +324,56 @@ def pretrain(
             "Number of local crops. Omit to use 6 for a new run or inherit "
             "the checkpoint value on --resume."
         ),
-    ),
-    patch_loss: str = typer.Option(
-        "consistency",
-        "--patch-loss",
-        help=(
-            "Patch-level objective. 'none', 'consistency' (default; selects "
-            "visible same-position patches for normalized cosine regression, "
-            "i.e. masked-position consistency, never input masking), "
-            "'masked-feature' (true continuous masked feature prediction "
-            "of the teacher's final-four-block patch target) or 'ibot' "
-            "(experimental prototype-distribution prediction). The CLS "
-            "distillation objective is selected independently by --ssl-method; "
-            "both objectives share the encoder and teacher temperature "
-            "(used by ibot)."
-        ),
-    ),
-    masking_strategy: str = typer.Option(
-        "random",
-        "--masking-strategy",
-        help=(
-            "Masking geometry for masked-feature/ibot only. 'random' samples "
-            "independent patch positions; 'blockwise' merges bounded rectangular "
-            "regions; 'hybrid' takes half blockwise and half random positions. "
-            "Not applicable to none/consistency; the exact geometry limits are "
-            f"documented at {docs_url('pretrain')}."
-        ),
-    ),
-    mask_ratio: str = typer.Option(
-        "auto",
-        "--mask-ratio",
-        help=(
-            "'auto' or a float in (0, 1). Fraction of patch positions used by "
-            "the selected patch objective. A new run resolves 'auto' to 0.30 "
-            "(v0.6.x used a 0.50 default). Used as the visible same-position "
-            "share for consistency and as the masked student-input fraction "
-            "for masked-feature/ibot."
-        ),
-    ),
-    ibot_prototypes: int = typer.Option(
-        512,
-        "--ibot-prototypes",
-        help=(
-            "Prototype dictionary size for the experimental ibot mode: any "
-            "integer >= 2, default 512. Larger dictionaries suit larger "
-            "datasets (for example 4096 or 16384); powers of two are a "
-            "convenient habit, not a requirement. Not applicable to other "
-            "patch modes."
-        ),
+        rich_help_panel="Views and augmentation",
     ),
     lambda_local: float = typer.Option(
-        1.5, "--lambda-local", help="Weight for local-crop SSL loss term."
+        1.5, "--lambda-local", help="Weight for local-crop SSL loss term.",
+        rich_help_panel="Views and augmentation",
     ),
-    lambda_mask: float = typer.Option(
-        1.0,
-        "--lambda-mask",
+    max_epochs: int = typer.Option(
+        50, "--max-epochs", help="Total SSL pretraining epochs.",
+        rich_help_panel="Optimization and teacher",
+    ),
+    lr: float = typer.Option(
+        5e-4,
+        "--lr",
+        help="Base learning rate before warmup/cosine scheduling.",
+        rich_help_panel="Optimization and teacher",
+    ),
+    weight_decay: float = typer.Option(
+        0.05, "--weight-decay", help="AdamW weight decay coefficient.",
+        rich_help_panel="Optimization and teacher",
+    ),
+    no_norm_bias_weight_decay: bool = typer.Option(
+        False,
+        "--no-norm-bias-weight-decay",
         help=(
-            "Weight for the patch-loss term. ibot's cross-entropy is on a "
-            "different scale from the cosine patch losses, so lower it (for "
-            "example 0.25-0.5) when using --patch-loss ibot."
+            "Skip weight decay for biases and normalization affine parameters. "
+            "Omitted keeps the historical uniform --weight-decay on every "
+            "trainable parameter. Applies to both SSL methods and keeps one "
+            "joint gradient-norm clipping. Omit to inherit the saved policy on "
+            "--resume; a different requested --weight-decay is not applied, and "
+            "a changed policy is rejected."
         ),
+        rich_help_panel="Optimization and teacher",
+    ),
+    warmup_epochs: int = typer.Option(
+        3,
+        "--warmup-epochs",
+        help="Warmup epochs before cosine LR decay.",
+        rich_help_panel="Optimization and teacher",
     ),
     teacher_momentum: float = typer.Option(
-        0.995, "--teacher-momentum", help="Initial EMA momentum."
+        0.995, "--teacher-momentum", help="Initial EMA momentum.",
+        rich_help_panel="Optimization and teacher",
     ),
     teacher_momentum_end: float = typer.Option(
-        0.999, "--teacher-momentum-end", help="Final EMA momentum."
+        0.999, "--teacher-momentum-end", help="Final EMA momentum.",
+        rich_help_panel="Optimization and teacher",
     ),
     student_temp: float = typer.Option(
-        0.1, "--student-temp", help="Student temperature."
+        0.1, "--student-temp", help="Student temperature.",
+        rich_help_panel="Optimization and teacher",
     ),
     teacher_temp_start: float | None = typer.Option(
         None,
@@ -328,6 +383,7 @@ def pretrain(
             "Omit to inherit the saved value on --resume. Shared by the global "
             "and local relational losses and by ibot target sharpening."
         ),
+        rich_help_panel="Optimization and teacher",
     ),
     teacher_temp_end: float | None = typer.Option(
         None,
@@ -336,6 +392,7 @@ def pretrain(
             "Final teacher temperature. Effective default for a new run: 0.11. "
             "Omit to inherit the saved value on --resume."
         ),
+        rich_help_panel="Optimization and teacher",
     ),
     teacher_temp_warmup_ratio: float = typer.Option(
         0.7,
@@ -345,46 +402,19 @@ def pretrain(
             "from start to end, in the closed range [0, 1]. 0 disables the ramp "
             "and 1 leaves no plateau. Omit to inherit the saved value on --resume."
         ),
-    ),
-    relational_teacher_views: str | None = typer.Option(
-        None,
-        "--relational-teacher-views",
-        help=(
-            "Teacher images used for relational target features: weak or "
-            "ordinary. Effective default for a new run: weak. Omit to inherit "
-            "the saved value on --resume."
-        ),
-        autocompletion=relational_teacher_view_choices,
-    ),
-    relational_center_source: str | None = typer.Option(
-        None,
-        "--relational-center-source",
-        help=(
-            "Teacher feature population that updates the running CLS center: "
-            "weak or ordinary. Omit to inherit the saved value on --resume; a "
-            "new run defaults to the teacher-view source, and ordinary teacher "
-            "views require an ordinary center."
-        ),
-        autocompletion=relational_center_source_choices,
-    ),
-    relational_pairing: str | None = typer.Option(
-        None,
-        "--relational-pairing",
-        help=(
-            "Global student/teacher view pairs averaged in the relational loss: "
-            "cross (A-to-B and B-to-A) or full (all four). Effective default for "
-            "a new run: cross. Replaces the removed disable-cross-view-loss switch."
-        ),
-        autocompletion=relational_pairing_choices,
+        rich_help_panel="Optimization and teacher",
     ),
     log_every_n_steps: int = typer.Option(
-        50, "--log-every-n-steps", help="Log metrics every N iterations."
+        50, "--log-every-n-steps", help="Log metrics every N iterations.",
+        rich_help_panel="Evaluation and reporting",
     ),
     save_every_epochs: int = typer.Option(
-        10, "--save-every-epochs", help="Save checkpoint every N epochs."
+        10, "--save-every-epochs", help="Save checkpoint every N epochs.",
+        rich_help_panel="Evaluation and reporting",
     ),
     keep_last_checkpoints: int = typer.Option(
-        10, "--keep-last-checkpoints", help="Keep only last N checkpoints."
+        10, "--keep-last-checkpoints", help="Keep only last N checkpoints.",
+        rich_help_panel="Evaluation and reporting",
     ),
     visualize_data: Path | None = typer.Option(
         None,
@@ -393,6 +423,7 @@ def pretrain(
             "CSV with an 'image' column and optional 'label' for periodic embedding metrics/UMAP. "
             "Without labels, only UMAP is generated. If omitted, --train-data is reused when available."
         ),
+        rich_help_panel="Evaluation and reporting",
     ),
     extract_size: str = typer.Option(
         "auto",
@@ -402,27 +433,33 @@ def pretrain(
             "'auto' uses the model's img_size. "
             f"{SIZE_EXAMPLES}"
         ),
+        rich_help_panel="Evaluation and reporting",
     ),
     metrics_sample_size: int = typer.Option(
         10000,
         "--metrics-sample-size",
         help="Max samples for periodic metrics and UMAP (<=0 means no cap).",
+        rich_help_panel="Evaluation and reporting",
     ),
     umap_n_neighbors: int = typer.Option(
-        15, "--umap-n-neighbors", help="UMAP n_neighbors."
+        15, "--umap-n-neighbors", help="UMAP n_neighbors.",
+        rich_help_panel="Evaluation and reporting",
     ),
-    umap_min_dist: float = typer.Option(0.1, "--umap-min-dist", help="UMAP min_dist."),
+    umap_min_dist: float = typer.Option(0.1, "--umap-min-dist", help="UMAP min_dist.",
+        rich_help_panel="Evaluation and reporting",),
     umap_metric: str = typer.Option(
         "cosine",
         "--umap-metric",
         help=(
             "Distance metric for UMAP projection. Common choices: cosine, euclidean."
         ),
+        rich_help_panel="Evaluation and reporting",
     ),
     visualize_class_number: int = typer.Option(
         20,
         "--visualize-class-number",
         help="Max classes to show in UMAP plot.",
+        rich_help_panel="Evaluation and reporting",
     ),
     disable_embedding_metrics: bool = typer.Option(
         False,
@@ -431,28 +468,33 @@ def pretrain(
             "Disable periodic embedding metrics + UMAP generation during pretraining "
             "to reduce runtime overhead."
         ),
+        rich_help_panel="Evaluation and reporting",
     ),
-    batch_size: int = typer.Option(32, "--batch-size", help="Batch size."),
-    num_workers: int = typer.Option(4, "--num-workers", help="DataLoader workers."),
-    cpus: int = typer.Option(12, "--cpus", help="CPU threads for PyTorch/MKL."),
+    batch_size: int = typer.Option(32, "--batch-size", help="Batch size.",
+        rich_help_panel="Runtime and reproducibility",),
+    num_workers: int = typer.Option(4, "--num-workers", help="DataLoader workers.",
+        rich_help_panel="Runtime and reproducibility",),
+    cpus: int = typer.Option(12, "--cpus", help="CPU threads for PyTorch/MKL.",
+        rich_help_panel="Runtime and reproducibility",),
     device: str = typer.Option(
-        "auto", "--device", help="Device: auto | cpu | cuda | mps."
+        "auto", "--device", help="Device: auto | cpu | cuda | mps.",
+        rich_help_panel="Runtime and reproducibility",
     ),
-    seed: int = typer.Option(42, "--seed", help="Random seed."),
+    seed: int = typer.Option(42, "--seed", help="Random seed.",
+        rich_help_panel="Runtime and reproducibility",),
     resume: str = typer.Option(
         "",
         "--resume",
         help="Checkpoint path for resuming interrupted pretraining.",
+        rich_help_panel="Recovery and safety",
     ),
     overwrite: bool = typer.Option(
-        False, "--overwrite", help="Clear an existing non-empty output directory."
+        False, "--overwrite", help="Clear an existing non-empty output directory.",
+        rich_help_panel="Recovery and safety",
     ),
 ) -> None:
     if ctx.invoked_subcommand is not None:
         return
-
-    if device in {"mps", "auto"}:
-        os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
     from otuformer.utils.logging import TeeLogger
     from otuformer.utils.io import prepare_output_dir
@@ -511,7 +553,7 @@ def pretrain(
     # json.dumps cannot serialise tensors.
     resume_state: dict | None = None
     if resume:
-        from otuformer.training.trainer import preflight_pretrain_resume
+        from otuformer.training.pretrain_recipe import preflight_pretrain_resume
         from otuformer.utils.checkpoint import load_checkpoint
 
         try:
@@ -607,19 +649,18 @@ def pretrain(
         device=device,
         seed=seed,
     )
-    from otuformer.training.trainer import (
-        _resolve_pretrain_recipe,
-        preflight_pretrain_run,
-        resolve_pretrain_settings,
-        resolve_pretrain_ssl_config,
-        run_pretrain,
-    )
+    from otuformer.training.pretrain_recipe import resolve_pretrain_ssl_config
+    # Resolve through the loop module: it owns the run and is where a caller
+    # patches these three, so a direct alias would bypass the patch.
+    from otuformer.training import pretrain_loop as pretrain_loop_module
 
     try:
         # One resolution feeds the preflight, the run and the saved recipe.
-        settings = resolve_pretrain_settings(ns, resume_state)
-        preflight_pretrain_run(ns, settings)
-        recipe = _resolve_pretrain_recipe(ns, resume_state, settings=settings)
+        settings = pretrain_loop_module.resolve_pretrain_settings(ns, resume_state)
+        pretrain_loop_module.preflight_pretrain_run(ns, settings)
+        recipe = pretrain_loop_module._resolve_pretrain_recipe(
+            ns, resume_state, settings=settings
+        )
         # The SSL recipe is resolved before --overwrite can clear anything.
         ssl_config_effective = resolve_pretrain_ssl_config(ns, resume_state)
     except (ValueError, KeyError, OSError, RuntimeError) as exc:
@@ -675,11 +716,15 @@ def pretrain(
         print("-" * 80)
 
         if resume_state is not None:
+            # The entry only accepts the payload for the path it was loaded from,
+            # so the path travels with it; otherwise it reloads and validates
+            # against a possibly different file.
             ns.resume_state = resume_state
+            ns.resume_state_path = str(resume)
         ns.pretrain_settings = settings
         # In-memory handoff, added after ``Parameters:`` so it is never saved.
         ns.ssl_config_effective = ssl_config_effective
-        run_pretrain(ns, pretrain_recipe=recipe)
+        pretrain_loop_module.run_pretrain(ns, pretrain_recipe=recipe)
     except Exception:
         traceback.print_exc(file=tee)
         raise
