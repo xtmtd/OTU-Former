@@ -77,6 +77,17 @@ _CONSTRAINTS: dict[str, dict[str, dict[str, Any]]] = {
             "choices": list(RELATIONAL_CENTER_SOURCE_CHOICES)
         },
         "relational_pairing": {"choices": list(RELATIONAL_PAIRING_CHOICES)},
+        "relational_queue_size": {
+            "numeric": "int",
+            "bounds": {"min": 0},
+            "applies_to": ["relational"],
+            "unresolved": [
+                "an omitted --relational-queue-size is inherited from a resume "
+                "checkpoint that records a positive capacity, and stays disabled "
+                "when it records none; the saved queue state is only read at "
+                "execution",
+            ],
+        },
         "teacher_temp_warmup_ratio": {
             "numeric": "float",
             "bounds": {"min": 0.0, "max": 1.0},
@@ -520,6 +531,9 @@ def validate_pretrain_ssl_applicability(
         "relational_teacher_views",
         "relational_center_source",
         "relational_pairing",
+        # Any explicit queue value, including an explicit zero, is a relational
+        # request: DINO has no queue state at all, so "inactive" is omission.
+        "relational_queue_size",
     )
     for name in relational_only:
         if name in explicit_options:

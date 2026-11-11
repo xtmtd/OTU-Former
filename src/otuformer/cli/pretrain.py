@@ -178,6 +178,23 @@ def pretrain(
         autocompletion=relational_pairing_choices,
         rich_help_panel="Relational targets",
     ),
+    relational_queue_size: int | None = typer.Option(
+        None,
+        "--relational-queue-size",
+        help=(
+            "Optional relational FIFO capacity, a count of image records "
+            "(minimum 0). Omit for a new run to keep the batch-only loss; a "
+            "positive integer keeps the current batch candidates and adds that "
+            "many recent teacher observations. On --resume, omit to inherit the "
+            "saved capacity (a checkpoint without queue state stays disabled), "
+            "and pass the recorded value to confirm it; any other value is "
+            "rejected. Relational-only: rejected with --ssl-method dino. "
+            "Enabled runs hash the whole selected dataset before any probe, "
+            "require one CSV row per in-root image identity, and need a "
+            "queue-capable version for training resume."
+        ),
+        rich_help_panel="Relational targets",
+    ),
     dino_prototypes: int = typer.Option(
         64,
         "--dino-prototypes",
@@ -540,6 +557,8 @@ def pretrain(
             "dino_centering",
             "koleo_weight",
             "no_norm_bias_weight_decay",
+            "relational_queue_size",
+            "batch_size",
         )
     }
     requested_global_crop_size = _parse_size(
@@ -553,7 +572,6 @@ def pretrain(
     # json.dumps cannot serialise tensors.
     resume_state: dict | None = None
     if resume:
-        from otuformer.training.pretrain_recipe import preflight_pretrain_resume
         from otuformer.utils.checkpoint import load_checkpoint
 
         try:
@@ -562,6 +580,36 @@ def pretrain(
             raise typer.BadParameter(
                 f"Could not read resume checkpoint {resume}: {exc}"
             ) from exc
+    # The queue request is model-free, so it is resolved from the already-loaded
+    # payload before any probe: enabled data identity, the batch/steps locks and
+    # the applicability of a DINO request are all settled here. Queue-off runs
+    # prepare nothing and keep their original probe order.
+    from otuformer.training.pretrain_recipe import (
+        prepare_pretrain_relational_queue,
+    )
+
+    early_request = argparse.Namespace(
+        train_data=str(train_data) if train_data is not None else "",
+        input_images_dir=str(input_images_dir),
+        resume=resume,
+        ssl_method=ssl_method,
+        ssl_method_explicit=explicit_sources["ssl_method"],
+        relational_queue_size=relational_queue_size,
+        relational_queue_size_explicit=explicit_sources["relational_queue_size"],
+        batch_size=batch_size,
+        batch_size_explicit=explicit_sources["batch_size"],
+        device=device,
+        max_epochs=max_epochs,
+    )
+    try:
+        relational_queue_preparation = prepare_pretrain_relational_queue(
+            early_request, resume_state
+        )
+    except (ValueError, KeyError, OSError, RuntimeError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    if resume:
+        from otuformer.training.pretrain_recipe import preflight_pretrain_resume
+
         try:
             preflight_pretrain_resume(
                 resume_state, model_name, requested_register_tokens, model_name_explicit
@@ -643,7 +691,10 @@ def pretrain(
         umap_metric=umap_metric,
         visualize_class_number=visualize_class_number,
         compute_embedding_metrics=not disable_embedding_metrics,
+        relational_queue_size=relational_queue_size,
+        relational_queue_size_explicit=explicit_sources["relational_queue_size"],
         batch_size=batch_size,
+        batch_size_explicit=explicit_sources["batch_size"],
         num_workers=num_workers,
         cpus=cpus,
         device=device,
@@ -659,17 +710,33 @@ def pretrain(
         settings = pretrain_loop_module.resolve_pretrain_settings(ns, resume_state)
         pretrain_loop_module.preflight_pretrain_run(ns, settings)
         recipe = pretrain_loop_module._resolve_pretrain_recipe(
-            ns, resume_state, settings=settings
+            ns,
+            resume_state,
+            settings=settings,
+            relational_queue_preparation=relational_queue_preparation,
         )
         # The SSL recipe is resolved before --overwrite can clear anything.
-        ssl_config_effective = resolve_pretrain_ssl_config(ns, resume_state)
+        ssl_config_effective = resolve_pretrain_ssl_config(
+            ns,
+            resume_state,
+            relational_queue_preparation=relational_queue_preparation,
+        )
     except (ValueError, KeyError, OSError, RuntimeError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     try:
         from otuformer.training.dataset import resolve_dataset_image_paths
 
         protected = [input_images_dir, train_data, resume]
-        if overwrite and out_dir.exists() and (train_data is None or train_data.exists()):
+        if (
+            overwrite
+            and out_dir.exists()
+            and relational_queue_preparation.active
+            and relational_queue_preparation.data is not None
+        ):
+            # The enabled run protects exactly the selection it identity-checked,
+            # never a second, possibly different resolution.
+            protected.extend(relational_queue_preparation.data.image_paths)
+        elif overwrite and out_dir.exists() and (train_data is None or train_data.exists()):
             protected.extend(resolve_dataset_image_paths(train_data, input_images_dir))
         if (
             overwrite and out_dir.exists() and not disable_embedding_metrics
@@ -722,7 +789,8 @@ def pretrain(
             ns.resume_state = resume_state
             ns.resume_state_path = str(resume)
         ns.pretrain_settings = settings
-        # In-memory handoff, added after ``Parameters:`` so it is never saved.
+        # In-memory handoffs, added after ``Parameters:`` so they are never saved.
+        ns.relational_queue_preparation = relational_queue_preparation
         ns.ssl_config_effective = ssl_config_effective
         pretrain_loop_module.run_pretrain(ns, pretrain_recipe=recipe)
     except Exception:

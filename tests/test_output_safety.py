@@ -1,5 +1,6 @@
 """Cleanup must preserve every input dependency before any output is changed."""
 
+import re
 from pathlib import Path
 
 import pandas as pd
@@ -479,3 +480,182 @@ def test_finetune_protects_accepted_pseudo_images(tmp_path, checkpoint, monkeypa
     assert result.exit_code == 2, (result.output, repr(result.exception))
     assert any(message in " ".join(result.output.replace("│", " ").split()) for message in ("holds the input", "contains protected input", "is reached through"))
     assert real.exists()
+
+
+# --- Relational FIFO: enabled resume rejects before touching outputs --------
+
+
+def _fifo_output_payload(tmp_path, *, capacity=2, batch=2):
+    """An enabled queue checkpoint whose optimizer layout is the real one."""
+    import random
+
+    import numpy as np
+
+    from otuformer.data.provenance import canonical_digest, snapshot_bytes
+    from otuformer.training.model import OTUFormerEncoder, PatchObjective
+    from otuformer.training.pretrain_recipe import _pretrain_optimizer_groups
+
+    student = OTUFormerEncoder(
+        model_name="vit_tiny_patch16_224", out_dim=8, pretrained=False, img_size=64
+    )
+    student.validate_pretrain_backbone()
+    patch = PatchObjective("none", student.backbone.num_features)
+    groups = _pretrain_optimizer_groups(
+        student, patch, None, weight_decay=0.05, norm_bias_weight_decay=True
+    )
+    optimizer = torch.optim.AdamW(groups, lr=0.001, weight_decay=0.05)
+    optimizer_state = optimizer.state_dict()
+    for index, parameter in enumerate(
+        [param for group in groups for param in group["params"]]
+    ):
+        optimizer_state["state"][index] = {
+            "step": torch.tensor(1.0),
+            "exp_avg": torch.zeros_like(parameter),
+            "exp_avg_sq": torch.zeros_like(parameter),
+        }
+
+    names = [f"img_{index}.jpg" for index in range(4)]
+    for index, name in enumerate(names):
+        Image.new("RGB", (64, 64), color=(index * 20, 5, 5)).save(tmp_path / name)
+    csv = tmp_path / "images.csv"
+    pd.DataFrame({"image": names}).to_csv(csv, index=False)
+    rows = []
+    for name in names:
+        _data, snapshot = snapshot_bytes(tmp_path / name)
+        rows.append(
+            {
+                "image_key": name,
+                "size_bytes": int(snapshot.size_bytes),
+                "sha256": snapshot.sha256,
+            }
+        )
+    schedule = {
+        "steps_per_epoch": len(names) // batch,
+        "total_steps": len(names) // batch,
+        "warmup_steps": 0,
+        "original_max_epochs": 1,
+        "last_lr": 0.001,
+        "final_lr": 0.0001,
+    }
+    iteration = schedule["steps_per_epoch"]
+    keys = names[: min(capacity, batch)]
+    payload = {
+        "config": {
+            "model_name": "vit_tiny_patch16_224",
+            "out_dim": 8,
+            "image_size": 64,
+            "ssl_method": "relational",
+            "ssl_head": "projection_mlp_2048",
+            "relational_queue_config": {"version": 1, "capacity": capacity},
+        },
+        "epoch": 0,
+        "iteration": iteration,
+        "schedule": schedule,
+        "args": {
+            "batch_size": batch,
+            "max_epochs": 1,
+            "relational_queue_size": capacity,
+            "requested_relational_queue_size": None,
+        },
+        "optimizer": optimizer_state,
+        "student": student.state_dict(),
+        "teacher": student.state_dict(),
+        "patch_objective": patch.state_dict(),
+        "center": torch.zeros(1, 8),
+        "rng_state": {
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "torch": torch.get_rng_state(),
+        },
+        "relational_queue": {
+            "version": 1,
+            "keys": list(keys),
+            "features": torch.zeros(len(keys), 2, 8),
+            "observed_steps": [iteration - 1] * len(keys),
+            "completed_steps": iteration,
+            "data_fingerprint": canonical_digest(rows),
+            "data_image_count": len(names),
+            "data_size_bytes": sum(
+                (tmp_path / name).stat().st_size for name in names
+            ),
+        },
+    }
+    return payload, csv, names
+
+
+def _clear_optimizer_state(payload):
+    payload["optimizer"]["state"] = {}
+
+
+def _negative_second_moment(payload):
+    first = payload["optimizer"]["state"][0]
+    first["exp_avg_sq"] = torch.full_like(first["exp_avg_sq"], -1.0)
+
+
+def _impossible_tail(payload):
+    payload["relational_queue"]["observed_steps"] = [0, 0]
+
+
+def _truncated_history(payload):
+    payload["relational_queue"]["keys"] = ["img_0.jpg"]
+    payload["relational_queue"]["features"] = torch.zeros(1, 2, 8)
+    payload["relational_queue"]["observed_steps"] = [0]
+
+
+def _non_finite_center(payload):
+    payload["center"] = torch.full((1, 8), float("nan"))
+
+
+def _missing_teacher_key(payload):
+    payload["teacher"].pop("backbone.blocks.0.attn.qkv.weight")
+
+
+@pytest.mark.parametrize(
+    "mutate, match",
+    [
+        (_clear_optimizer_state, "participating parameter"),
+        (_negative_second_moment, "negative"),
+        (_impossible_tail, "latest successful batch"),
+        (_truncated_history, "truncated history"),
+        (_non_finite_center, "non-finite"),
+        (_missing_teacher_key, "does not match the rebuilt encoder"),
+    ],
+)
+def test_fifo_enabled_resume_corruption_preserves_outputs(
+    tmp_path, mutate, match
+):
+    payload, csv, _names = _fifo_output_payload(tmp_path)
+    mutate(payload)
+    checkpoint = tmp_path / "corrupt.pth"
+    torch.save(payload, checkpoint)
+
+    out = tmp_path / "out"
+    out.mkdir()
+    keep = out / "keep.txt"
+    keep.write_text("keep", encoding="utf-8")
+    (out / "logs").mkdir()
+    log = out / "logs" / "pretrain.log"
+    log.write_text("existing log\n", encoding="utf-8")
+    before = {path.name: path.read_bytes() for path in out.rglob("*") if path.is_file()}
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "pretrain",
+            "--train-data", str(csv),
+            "--input-images-dir", str(tmp_path),
+            "--out-dir", str(out),
+            "--resume", str(checkpoint),
+            "--device", "cpu",
+            "--batch-size", "2",
+            "--out-dim", "8",
+        ],
+    )
+    assert result.exit_code != 0
+    # Rich wraps the panel and draws borders inside the text; reduce the output
+    # to plain words so the rejection message is comparable.
+    flat = " ".join(re.sub(r"[^A-Za-z0-9_.:\-]+", " ", result.output).split())
+    assert match in flat
+    assert keep.read_text(encoding="utf-8") == "keep"
+    after = {path.name: path.read_bytes() for path in out.rglob("*") if path.is_file()}
+    assert after == before

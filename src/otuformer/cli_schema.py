@@ -691,6 +691,24 @@ def _apply_ssl_conditional_provenance(
             "confirm"
         )
 
+    # The queue capacity and the batch size are only inherited by a resume whose
+    # saved queue is enabled (G2), which the static card cannot decide.
+    if "relational_queue_size" not in explicit_values:
+        provenance["relational_queue_size"] = "omitted-conditional"
+        unresolved.append(
+            "an omitted --relational-queue-size is inherited from a resume "
+            "checkpoint only when it records a positive capacity; a checkpoint "
+            "with no queue state keeps the queue disabled, and enabling history "
+            "later is rejected"
+        )
+    if "batch_size" not in explicit_values:
+        provenance["batch_size"] = "omitted-conditional"
+        unresolved.append(
+            "an omitted --batch-size is inherited from the checkpoint only for a "
+            "queue-enabled resume, which also locks the saved steps-per-epoch; a "
+            "queue-disabled resume keeps its existing loader-length behaviour"
+        )
+
     method = explicit_values.get("ssl_method")
     if method is None:
         for name in _SSL_CONDITIONAL_OPTIONS:

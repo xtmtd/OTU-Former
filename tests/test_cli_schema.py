@@ -1384,10 +1384,13 @@ def test_pretrain_resume_provenance_is_not_blanket() -> None:
         "device",
         "num_workers",
         "cpus",
-        "batch_size",
         "max_epochs",
     ):
         assert provenance[name] == "omitted-default", name
+    # G2: an omitted batch size is inherited only by a queue-enabled resume, so
+    # the static card labels it conditional instead of a blanket default.
+    assert provenance["batch_size"] == "omitted-conditional"
+    assert provenance["relational_queue_size"] == "omitted-conditional"
     assert provenance["train_data"] == "explicit"
     for name in ("patch_loss", "augmentation", "orientation_policy", "weight_decay"):
         assert provenance[name] == "omitted-inherited", name

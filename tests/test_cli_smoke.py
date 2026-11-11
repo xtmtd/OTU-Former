@@ -5624,3 +5624,352 @@ def test_pretrain_relational_log_separates_requests_and_resolved_recipe(tmp_path
     assert '"teacher_temp_warmup_ratio": 0.7' in log
     assert '"include_weak_teacher_views"' not in log
     assert '"pretrain_recipe"' not in log
+
+
+# --- Relational FIFO: CLI option, ordering and schema provenance ------------
+
+
+def _fifo_cli_payload(tmp_path, *, capacity=2, batch=2, ssl_method="relational"):
+    """A minimal enabled queue checkpoint: identity plus one epoch of state."""
+    import random
+
+    import numpy as np
+
+    from otuformer.training.model import OTUFormerEncoder
+
+    model = OTUFormerEncoder(
+        model_name="vit_tiny_patch16_224", out_dim=8, pretrained=False, img_size=64
+    )
+    names = [f"img_{index}.jpg" for index in range(4)]
+    for index, name in enumerate(names):
+        Image.new("RGB", (64, 64), color=(index * 20, 5, 5)).save(tmp_path / name)
+    csv = tmp_path / "images.csv"
+    pd.DataFrame({"image": names}).to_csv(csv, index=False)
+    from otuformer.data.provenance import canonical_digest, snapshot_bytes
+
+    rows = []
+    for name in names:
+        _data, snapshot = snapshot_bytes(tmp_path / name)
+        rows.append(
+            {
+                "image_key": name,
+                "size_bytes": int(snapshot.size_bytes),
+                "sha256": snapshot.sha256,
+            }
+        )
+    schedule = {
+        "steps_per_epoch": len(names) // batch,
+        "total_steps": len(names) // batch,
+        "warmup_steps": 0,
+        "original_max_epochs": 1,
+        "last_lr": 0.001,
+        "final_lr": 0.0001,
+    }
+    iteration = schedule["steps_per_epoch"]
+    keys = names[: min(capacity, batch)]
+    payload = {
+        "config": {
+            "model_name": "vit_tiny_patch16_224",
+            "out_dim": 8,
+            "image_size": 64,
+            "ssl_method": ssl_method,
+            "ssl_head": (
+                "projection_mlp_2048"
+                if ssl_method == "relational"
+                else "dino_mlp_2048"
+            ),
+            "relational_queue_config": {"version": 1, "capacity": capacity},
+        },
+        "epoch": 0,
+        "iteration": iteration,
+        "schedule": schedule,
+        "args": {
+            "batch_size": batch,
+            "max_epochs": 1,
+            "relational_queue_size": capacity,
+            "requested_relational_queue_size": None,
+        },
+        "optimizer": {"param_groups": [{"params": [], "lr": 0.001}], "state": {}},
+        "student": model.state_dict(),
+        "teacher": model.state_dict(),
+        "center": torch.zeros(1, 8),
+        "rng_state": {
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "torch": torch.get_rng_state(),
+        },
+        "relational_queue": {
+            "version": 1,
+            "keys": list(keys),
+            "features": torch.zeros(len(keys), 2, 8),
+            "observed_steps": [iteration - 1] * len(keys),
+            "completed_steps": iteration,
+            "data_fingerprint": canonical_digest(rows),
+            "data_image_count": len(names),
+            "data_size_bytes": sum(
+                (tmp_path / name).stat().st_size for name in names
+            ),
+        },
+    }
+    path = tmp_path / "queue_source.pth"
+    torch.save(payload, path)
+    return path, csv, names
+
+
+def test_fifo_cli_resume_preparation_precedes_register_probe(tmp_path, monkeypatch):
+    from otuformer.training.dataset import MultiCropDataset
+
+    checkpoint, csv, _names = _fifo_cli_payload(tmp_path)
+    order: list[str] = []
+    real_prepare = pretrain_recipe_module.prepare_relational_data
+
+    def prepare(*args, **kwargs):
+        result = real_prepare(*args, **kwargs)
+        order.append("prepare")
+        return result
+
+    monkeypatch.setattr(pretrain_recipe_module, "prepare_relational_data", prepare)
+    monkeypatch.setattr(
+        pretrain_recipe_module,
+        "preflight_pretrain_resume",
+        lambda *a, **k: order.append("register") or ("new", 0),
+    )
+    settings = pretrain_recipe_module.PretrainSettings(
+        model_name="vit_tiny_patch16_224",
+        global_crop_size=64,
+        local_crop_size=16,
+        local_crops=0,
+        patch_config={
+            "patch_loss": "none",
+            "masking_strategy": None,
+            "mask_ratio_requested": None,
+            "mask_ratio_resolved": None,
+            "ibot_prototypes": None,
+            "patch_target_layers": None,
+            "patch_center_momentum": None,
+        },
+    )
+    monkeypatch.setattr(
+        pretrain_loop_module, "resolve_pretrain_settings", lambda *a, **k: settings
+    )
+    monkeypatch.setattr(
+        pretrain_loop_module,
+        "preflight_pretrain_run",
+        lambda *a, **k: order.append("architecture"),
+    )
+    monkeypatch.setattr(
+        pretrain_loop_module,
+        "_resolve_pretrain_recipe",
+        lambda *a, **k: types.SimpleNamespace(
+            settings=settings,
+            relational_target_config={
+                "version": 1,
+                "relational_teacher_views": "weak",
+                "relational_pairing": "cross",
+                "relational_center_source": "weak",
+                "teacher_temp_start": 0.08,
+                "teacher_temp_end": 0.11,
+                "weak_teacher_augmentation_config": None,
+            },
+            teacher_temp_warmup_ratio=0.7,
+            augmentation_config={},
+            warnings=(),
+            relational_queue_preparation=k.get("relational_queue_preparation"),
+        ),
+    )
+    monkeypatch.setattr(
+        pretrain_recipe_module,
+        "resolve_pretrain_ssl_config",
+        lambda *a, **k: {
+            "ssl_method": "relational",
+            "ssl_head": "projection_mlp_2048",
+            "out_dim": 8,
+            "koleo_weight": 0.0,
+            **pretrain_recipe_module.KOLEO_FIXED_CONFIG,
+            "teacher_temp_warmup_ratio": 0.7,
+            "norm_bias_weight_decay": True,
+        },
+    )
+    seen = {}
+
+    def spy(args, *, pretrain_recipe=None):
+        handoff = pretrain_recipe_module.take_pretrain_handoff(args)
+        seen["preparation"] = handoff.relational_queue_preparation
+        seen["recipe_preparation"] = pretrain_recipe.relational_queue_preparation
+
+    monkeypatch.setattr(pretrain_loop_module, "run_pretrain", spy)
+
+    result = runner.invoke(
+        app,
+        [
+            "pretrain",
+            "--train-data", str(csv),
+            "--input-images-dir", str(tmp_path),
+            "--out-dir", str(tmp_path / "out"),
+            "--resume", str(checkpoint),
+            "--device", "cpu",
+            "--batch-size", "2",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    # The enabled data preparation finishes before the register-layout probe and
+    # before the architecture probe.
+    assert order == ["prepare", "register", "architecture"]
+    preparation = seen["preparation"]
+    assert preparation.active and preparation.capacity == 2
+    assert preparation.batch_size_source == "explicit"
+    assert seen["recipe_preparation"] is preparation
+    # The trainer emits the resolved record; the CLI prints only the raw request.
+    assert "Relational queue config:" not in result.output
+
+
+def test_fifo_cli_rejects_conflicts_before_any_encoder(tmp_path, monkeypatch):
+    calls: list[str] = []
+
+    def spy_encoder(*args, **kwargs):
+        calls.append("encoder")
+        raise AssertionError("no encoder may be constructed")
+
+    for module in (
+        pretrain_recipe_module,
+        pretrain_loop_module,
+        augmentation_module,
+        dataset_module,
+    ):
+        if hasattr(module, "OTUFormerEncoder"):
+            monkeypatch.setattr(module, "OTUFormerEncoder", spy_encoder)
+    for module in (pretrain_recipe_module, augmentation_module):
+        if hasattr(module, "_resume_register_plan"):
+            monkeypatch.setattr(
+                module,
+                "_resume_register_plan",
+                lambda *a, **k: calls.append("register") or ("new", 0),
+            )
+
+    # A saved DINO payload with an explicit queue option is rejected up front.
+    dino_checkpoint, csv, _names = _fifo_cli_payload(tmp_path, ssl_method="dino")
+    result = runner.invoke(
+        app,
+        [
+            "pretrain",
+            "--train-data", str(csv),
+            "--input-images-dir", str(tmp_path),
+            "--out-dir", str(tmp_path / "out_dino"),
+            "--resume", str(dino_checkpoint),
+            "--relational-queue-size", "0",
+            "--device", "cpu",
+        ],
+    )
+    assert result.exit_code != 0
+    assert "relational" in result.output
+    assert calls == []
+
+    # A fingerprint conflict is rejected before any encoder construction too.
+    checkpoint, csv2, names = _fifo_cli_payload(tmp_path)
+    Image.new("RGB", (64, 64), color=(1, 2, 3)).save(tmp_path / names[0])
+    result = runner.invoke(
+        app,
+        [
+            "pretrain",
+            "--train-data", str(csv2),
+            "--input-images-dir", str(tmp_path),
+            "--out-dir", str(tmp_path / "out_conflict"),
+            "--resume", str(checkpoint),
+            "--device", "cpu",
+        ],
+    )
+    assert result.exit_code != 0
+    assert "data_fingerprint" in result.output
+    assert calls == []
+    assert not (tmp_path / "out_conflict").exists()
+
+
+def test_fifo_cli_option_and_explicit_sources(tmp_path, monkeypatch):
+    csv = tmp_path / "images.csv"
+    pd.DataFrame({"image": ["img_0.jpg"]}).to_csv(csv, index=False)
+    Image.new("RGB", (64, 64)).save(tmp_path / "img_0.jpg")
+    seen = {}
+
+    def spy(args, **kwargs):
+        seen["queue"] = args.relational_queue_size
+        seen["queue_explicit"] = args.relational_queue_size_explicit
+        seen["batch_explicit"] = args.batch_size_explicit
+
+    monkeypatch.setattr(pretrain_loop_module, "run_pretrain", spy)
+    result = runner.invoke(
+        app,
+        [
+            "pretrain",
+            "--train-data", str(csv),
+            "--input-images-dir", str(tmp_path),
+            "--out-dir", str(tmp_path / "out"),
+            "--device", "cpu",
+            "--relational-queue-size", "0",
+            "--disable-embedding-metrics",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert seen["queue"] == 0
+    assert seen["queue_explicit"] is True
+
+    negative = runner.invoke(
+        app,
+        [
+            "pretrain",
+            "--train-data", str(csv),
+            "--input-images-dir", str(tmp_path),
+            "--out-dir", str(tmp_path / "out_negative"),
+            "--device", "cpu",
+            "--relational-queue-size", "-1",
+        ],
+    )
+    assert negative.exit_code != 0
+    assert "--relational-queue-size" in negative.output
+
+
+def test_fifo_schema_conditional_resume_and_argv(tmp_path):
+    from otuformer import cli_schema as schema_module
+
+    schema = schema_module.export_cli_schema("pretrain")
+    entry = {
+        item["name"]: item for item in schema["commands"]["pretrain"]["parameters"]
+    }["relational_queue_size"]
+    assert entry["opts"] == ["--relational-queue-size"]
+    # Declared omission is not the effective fresh zero.
+    assert entry["default"] == {"kind": "null"}
+    assert entry["bounds"] is None
+    assert entry["shared_bounds"] == {"min": 0}
+
+    validation = schema_module.validate_parameters(
+        "pretrain",
+        {
+            "train_data": "e.csv",
+            "input_images_dir": "images",
+            "out_dir": "runs/x",
+            "resume": "runs/x/SSL_latest.pth",
+        },
+    )
+    card = validation["provenance"]
+    assert card["relational_queue_size"] == "omitted-conditional"
+    assert card["batch_size"] == "omitted-conditional"
+    assert any("relational-queue-size" in note for note in validation["unresolved"])
+    argv = schema_module.build_argv(
+        "pretrain",
+        {"train_data": "e.csv", "input_images_dir": "images", "out_dir": "runs/x"},
+        executable=["otuformer"],
+    )
+    # An omitted request never materializes as an inferred effective value.
+    assert "--relational-queue-size" not in argv
+    assert "--batch-size" not in argv
+
+    with pytest.raises(ValueError, match="relational"):
+        schema_module.validate_parameters(
+            "pretrain",
+            {
+                "train_data": "e.csv",
+                "input_images_dir": "images",
+                "out_dir": "runs/x",
+                "ssl_method": "dino",
+                "relational_queue_size": 0,
+            },
+        )
