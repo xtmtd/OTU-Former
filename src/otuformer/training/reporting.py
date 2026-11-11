@@ -102,10 +102,109 @@ _PRETRAIN_SSL_METRIC_FIELDS = [
 ]
 
 
-_PRETRAIN_CURRENT_FIELDS = (
+# A literal snapshot of the pre-FIFO 43-column instant schema. It is written
+# out rather than derived so a simultaneous schema mistake cannot silently widen
+# the recognized predecessor and rewrite an unrelated file.
+_PRETRAIN_PRE_FIFO_FIELDS = [
+    "iteration",
+    "epoch",
+    "step",
+    "loss",
+    "global_loss",
+    "local_loss",
+    "mask_loss",
+    "lr",
+    "teacher_temp",
+    "grad_norm",
+    "feature_std",
+    "embedding_norm_mean",
+    "cls_token_norm_mean",
+    "teacher_center_norm",
+    "cosine_similarity",
+    "patch_loss_raw",
+    "patch_loss_weighted",
+    "patch_loss_fraction_of_total",
+    "requested_mask_ratio",
+    "selected_patch_ratio",
+    "actual_mask_ratio_mean",
+    "actual_mask_ratio_min",
+    "actual_mask_ratio_max",
+    "prototype_perplexity",
+    "active_prototype_ratio",
+    "assignment_entropy",
+    "max_prototype_occupancy",
+    "patch_center_norm",
+    "ssl_method",
+    "dino_centering",
+    "koleo_weight",
+    "cls_center_norm",
+    "global_loss_weighted",
+    "local_loss_weighted",
+    "cls_assignment_entropy",
+    "cls_prototype_perplexity",
+    "cls_active_prototype_ratio",
+    "cls_max_prototype_occupancy",
+    "koleo_loss_raw",
+    "koleo_loss_weighted",
+    "koleo_status",
+    "koleo_eligible_samples",
+    "koleo_skipped_samples",
+]
+
+_RELATIONAL_TEACHER_STAT_NAMES = (
+    "self_mass",
+    "other_current_mass",
+    "history_mass",
+    "entropy",
+    "nonself_effective",
+)
+
+_RELATIONAL_STUDENT_STAT_NAMES = (
+    "self_mass",
+    "other_current_mass",
+    "history_mass",
+)
+
+_RELATIONAL_BRANCH_SUFFIXES = ("global", "local")
+
+
+_PRETRAIN_RELATIONAL_QUEUE_FIELDS = (
+    [
+        "relational_queue_capacity",
+        "relational_queue_occupancy",
+        "relational_queue_eligible",
+        "relational_candidate_count",
+        "relational_history_age_mean",
+        "relational_history_age_max",
+        "relational_queue_refreshed",
+        "relational_queue_evicted",
+    ]
+    + [
+        f"relational_teacher_{name}_{suffix}"
+        for name in _RELATIONAL_TEACHER_STAT_NAMES
+        for suffix in _RELATIONAL_BRANCH_SUFFIXES
+    ]
+    + [
+        f"relational_student_{name}_{suffix}"
+        for name in _RELATIONAL_STUDENT_STAT_NAMES
+        for suffix in _RELATIONAL_BRANCH_SUFFIXES
+    ]
+)
+
+
+if list(_PRETRAIN_PRE_FIFO_FIELDS) != list(
     _PRETRAIN_V070_FIELDS
     + _PRETRAIN_SSL_SETTING_FIELDS
     + _PRETRAIN_SSL_METRIC_FIELDS
+):  # pragma: no cover - import-time schema guard
+    raise RuntimeError(
+        "The pre-FIFO instant schema snapshot no longer matches the composed "
+        "pretrain fields."
+    )
+
+
+_PRETRAIN_CURRENT_FIELDS = tuple(_PRETRAIN_PRE_FIFO_FIELDS) + tuple(
+    _PRETRAIN_RELATIONAL_QUEUE_FIELDS
 )
 
 
@@ -182,6 +281,7 @@ class InstantMetricsLogger:
         if self.mode == "pretrain" and header in (
             _PRETRAIN_LEGACY_FIELDS,
             _PRETRAIN_V070_FIELDS,
+            _PRETRAIN_PRE_FIFO_FIELDS,
         ):
             self._migrate_pretrain_schema(header, rows)
             return
@@ -1023,6 +1123,56 @@ def _mask_ratio_diagnostics(
 
 
 @torch.no_grad()
+def _relational_queue_metrics(
+    *,
+    capacity: int,
+    occupancy: int,
+    eligible: int,
+    candidate_count: int,
+    ages: tuple[int, ...],
+    refreshed: int | None,
+    evicted: int | None,
+    teacher_stats: dict[str, torch.Tensor] | None,
+    student_stats: list[dict[str, torch.Tensor]] | None,
+) -> dict[str, object]:
+    """Instant FIFO coverage/update/statistics fields for one log step.
+
+    Occupancy, eligibility and ages describe the *pre-step* candidate snapshot;
+    the refresh/eviction counts are the successful post-step commit. Unavailable
+    measurements stay blank instead of falling back to zero, and no similarity or
+    loss is recomputed here.
+    """
+    metrics: dict[str, object] = {
+        "relational_queue_capacity": int(capacity),
+        "relational_queue_occupancy": int(occupancy),
+        "relational_queue_eligible": int(eligible),
+        "relational_candidate_count": int(candidate_count),
+        "relational_history_age_mean": (
+            float(sum(ages)) / len(ages) if ages else None
+        ),
+        "relational_history_age_max": (int(max(ages)) if ages else None),
+        "relational_queue_refreshed": (
+            None if refreshed is None else int(refreshed)
+        ),
+        "relational_queue_evicted": None if evicted is None else int(evicted),
+    }
+    for suffix in _RELATIONAL_BRANCH_SUFFIXES:
+        for name in _RELATIONAL_TEACHER_STAT_NAMES:
+            value = (teacher_stats or {}).get(name)
+            metrics[f"relational_teacher_{name}_{suffix}"] = (
+                None if value is None else float(value.item())
+            )
+    by_branch = list(student_stats or [])
+    for index, suffix in enumerate(_RELATIONAL_BRANCH_SUFFIXES):
+        branch = by_branch[index] if index < len(by_branch) else {}
+        for name in _RELATIONAL_STUDENT_STAT_NAMES:
+            value = branch.get(name)
+            metrics[f"relational_student_{name}_{suffix}"] = (
+                None if value is None else float(value.item())
+            )
+    return metrics
+
+
 def _compute_instant_metrics(
     model: OTUFormerEncoder,
     sample_view: torch.Tensor,

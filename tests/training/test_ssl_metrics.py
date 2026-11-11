@@ -553,3 +553,116 @@ def test_singleton_batch_reports_feature_std_as_missing():
         encoder, torch.zeros(2, 3, 64, 64), torch.device("cpu")
     )
     assert math.isfinite(batched["feature_std"])
+
+
+def test_fifo_metrics_resume_current_43_column_log(tmp_path):
+    path = tmp_path / "instant.csv"
+    old_header = (
+        "iteration epoch step loss global_loss local_loss mask_loss lr teacher_temp "
+        "grad_norm feature_std embedding_norm_mean cls_token_norm_mean teacher_center_norm "
+        "cosine_similarity patch_loss_raw patch_loss_weighted patch_loss_fraction_of_total "
+        "requested_mask_ratio selected_patch_ratio actual_mask_ratio_mean actual_mask_ratio_min "
+        "actual_mask_ratio_max prototype_perplexity active_prototype_ratio assignment_entropy "
+        "max_prototype_occupancy patch_center_norm ssl_method dino_centering koleo_weight "
+        "cls_center_norm global_loss_weighted local_loss_weighted cls_assignment_entropy "
+        "cls_prototype_perplexity cls_active_prototype_ratio cls_max_prototype_occupancy "
+        "koleo_loss_raw koleo_loss_weighted koleo_status koleo_eligible_samples koleo_skipped_samples"
+    ).split()
+    assert len(old_header) == 43
+    _write(path, old_header, [["1"] * len(old_header)])
+    pretrain_loop_module.InstantMetricsLogger(path, mode="pretrain").log(
+        iteration=2, relational_queue_capacity=128
+    )
+    rows = list(csv.DictReader(path.open(newline="")))
+    assert all(rows[0][name] == "1" for name in old_header)
+    assert rows[0]["relational_queue_capacity"] == ""
+    assert rows[1]["relational_queue_capacity"] == "128"
+    assert rows[1]["loss"] == ""
+    assert rows[1]["koleo_status"] == ""
+    # The widened header is exactly the current schema, in order.
+    assert list(rows[0]) == list(reporting_module._PRETRAIN_CURRENT_FIELDS)
+
+
+def test_fifo_metrics_unknown_and_duplicate_headers_stay_rejected(tmp_path):
+    current = list(reporting_module._PRETRAIN_CURRENT_FIELDS)
+    duplicate = tmp_path / "duplicate.csv"
+    _write(duplicate, current + [current[0]], [["1"] * (len(current) + 1)])
+    original = duplicate.read_bytes()
+    with pytest.raises(ValueError, match="duplicate columns"):
+        pretrain_loop_module.InstantMetricsLogger(duplicate, mode="pretrain")
+    assert duplicate.read_bytes() == original
+
+    unknown = tmp_path / "unknown.csv"
+    header = list(current)
+    header[5] = "mystery_loss"
+    _write(unknown, header, [["1"] * len(header)])
+    original = unknown.read_bytes()
+    with pytest.raises(ValueError, match="Unrecognized instant-metrics schema"):
+        pretrain_loop_module.InstantMetricsLogger(unknown, mode="pretrain")
+    assert unknown.read_bytes() == original
+
+
+def test_fifo_queue_metrics_leave_unavailable_cells_blank():
+    metrics = reporting_module._relational_queue_metrics(
+        capacity=4,
+        occupancy=2,
+        eligible=0,
+        candidate_count=4,
+        ages=(),
+        refreshed=0,
+        evicted=0,
+        teacher_stats=None,
+        student_stats=None,
+    )
+    assert metrics["relational_queue_capacity"] == 4
+    assert metrics["relational_queue_occupancy"] == 2
+    assert metrics["relational_queue_eligible"] == 0
+    assert metrics["relational_candidate_count"] == 4
+    assert metrics["relational_history_age_mean"] is None
+    assert metrics["relational_history_age_max"] is None
+    for name in reporting_module._PRETRAIN_RELATIONAL_QUEUE_FIELDS:
+        if name.startswith("relational_teacher") or name.startswith(
+            "relational_student"
+        ):
+            assert metrics[name] is None, name
+
+
+def test_fifo_queue_metrics_report_ages_and_branch_statistics():
+    teacher = {
+        "self_mass": torch.tensor(0.5),
+        "other_current_mass": torch.tensor(0.25),
+        "history_mass": torch.tensor(0.25),
+        "entropy": torch.tensor(1.0),
+        "nonself_effective": torch.tensor(1.5),
+    }
+    student = [
+        {
+            "self_mass": torch.tensor(0.4),
+            "other_current_mass": torch.tensor(0.4),
+            "history_mass": torch.tensor(0.2),
+        },
+        {
+            "self_mass": torch.tensor(0.3),
+            "other_current_mass": torch.tensor(0.5),
+            "history_mass": torch.tensor(0.2),
+        },
+    ]
+    metrics = reporting_module._relational_queue_metrics(
+        capacity=8,
+        occupancy=3,
+        eligible=2,
+        candidate_count=6,
+        ages=(2, 1),
+        refreshed=2,
+        evicted=1,
+        teacher_stats=teacher,
+        student_stats=student,
+    )
+    assert metrics["relational_history_age_mean"] == 1.5
+    assert metrics["relational_history_age_max"] == 2
+    assert metrics["relational_queue_refreshed"] == 2
+    assert metrics["relational_queue_evicted"] == 1
+    assert metrics["relational_teacher_self_mass_global"] == pytest.approx(0.5)
+    assert metrics["relational_teacher_self_mass_local"] == pytest.approx(0.5)
+    assert metrics["relational_student_self_mass_global"] == pytest.approx(0.4)
+    assert metrics["relational_student_self_mass_local"] == pytest.approx(0.3)
