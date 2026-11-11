@@ -227,6 +227,12 @@ _SSL_PROJECTOR_LAYOUT = (
     (4, "bias", None, None),
 )
 
+# Training-only relational queue metadata. It belongs to relational payloads
+# only; a read-only consumer never reconstructs the queue, but the shared
+# identity validator still rejects it on a DINO identity.
+_QUEUE_CONFIG_KEY = "relational_queue_config"
+_QUEUE_STATE_KEY = "relational_queue"
+
 # Config keys that describe an active DINO recipe. A relational identity that
 # still records them (or DINO training state) has contradictory metadata.
 # KoLeo is not one of them: it is a shared pretrain regularizer, so a relational
@@ -358,6 +364,21 @@ def resolve_checkpoint_ssl_identity(
                     f"{pair} but also carries DINO-only state "
                     f"({', '.join(recorded) or 'dino_objective'}); a relational "
                     "payload must not record DINO config or objective tensors."
+                )
+        else:
+            # The relational history queue is relational-only state. Readers
+            # ignore its tensors, but a DINO identity claiming them is
+            # contradictory metadata, not an additive field.
+            recorded = [
+                name
+                for name in (_QUEUE_CONFIG_KEY, _QUEUE_STATE_KEY)
+                if (name in cfg if name == _QUEUE_CONFIG_KEY else name in checkpoint)
+            ]
+            if recorded:
+                raise ValueError(
+                    f"Checkpoint records SSL identity {pair} but also carries "
+                    f"relational queue metadata ({', '.join(recorded)}); the "
+                    "queue is relational-only and cannot belong to a DINO run."
                 )
         return pair
 

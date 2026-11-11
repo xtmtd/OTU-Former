@@ -77,13 +77,27 @@ def make_checkpoint(
             },
         }
     ckpt = {"model_state_dict": model.state_dict(), "config": config}
+    if annotated:
+        # The same payload shape an enabled queue run writes: training-only
+        # tensors a read-only consumer must ignore without reconstructing them.
+        config["relational_queue_config"] = {"version": 1, "capacity": 2}
+        ckpt["relational_queue"] = {
+            "version": 1,
+            "keys": ["img_0.png", "img_1.png"],
+            "features": torch.zeros(2, 2, out_dim),
+            "observed_steps": [0, 0],
+            "completed_steps": 1,
+            "data_fingerprint": "b" * 64,
+            "data_image_count": 2,
+            "data_size_bytes": 2048,
+        }
     p = tmp_path / name
     torch.save(ckpt, p)
     return p
 
 
 def test_export_accepts_an_injected_relational_bundle(tmp_path: Path):
-    """The additive SSL recipe metadata must not disturb export.
+    """The additive recipe and queue metadata must not disturb export.
 
     One export per test: the ONNX version converter is not reliable twice in a
     process, which is unrelated to this metadata.

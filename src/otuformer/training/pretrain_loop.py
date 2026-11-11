@@ -75,8 +75,13 @@ from .objectives import (
     _compute_local_loss,
     _dino_cls_diagnostics,
     _koleo_instant_metrics,
+    _make_relational_step_targets,
     _update_patch_center,
     _update_teacher_center,
+)
+from .relational_queue import (
+    RelationalQueue,
+    queue_config_bundle,
 )
 from .patch_objective import (
     _sample_patch_masks,
@@ -99,9 +104,13 @@ from .pretrain_recipe import (
     _validate_pretrain_optimizer_layout,
     KOLEO_STORED_KEYS,
     preflight_pretrain_run,
+    prepare_pretrain_relational_queue,
+    RELATIONAL_QUEUE_CONFIG_KEY,
+    RELATIONAL_QUEUE_STATE_KEY,
     RELATIONAL_TARGET_CONFIG_KEY,
     resolve_pretrain_settings,
     resume_payload_for,
+    verify_relational_queue_preparation,
 )
 from .reporting import (
     EnhancedMetricsLogger,
@@ -111,6 +120,7 @@ from .reporting import (
     _compute_instant_metrics,
     _ibot_diagnostics,
     _mask_ratio_diagnostics,
+    _relational_queue_metrics,
 )
 from .runtime import (
     _capture_rng_state,
@@ -123,6 +133,47 @@ from .runtime import (
     warn_if_mps_fallback_unarmed,
     update_teacher,
 )
+
+def _unpack_pretrain_batch(
+    batch: object, *, queue_enabled: bool
+) -> tuple[list[torch.Tensor], tuple[str, ...] | None]:
+    """Split one loader batch into its views and (enabled only) image keys.
+
+    A queue-off run keeps the historical list-of-views contract; an enabled run
+    requires the keyed mapping and never falls back to a silent list.
+    """
+    if not queue_enabled:
+        if isinstance(batch, dict) or not isinstance(batch, (list, tuple)):
+            raise ValueError(
+                "The pretraining loader produced an unexpected batch envelope; a "
+                "queue-disabled run reads a list of view tensors."
+            )
+        return list(batch), None
+    if not isinstance(batch, dict):
+        raise ValueError(
+            "An enabled relational queue requires the keyed batch envelope from "
+            "MultiCropDataset(prepared_relational_data=...); the loader produced "
+            f"{type(batch).__name__} instead."
+        )
+    if set(batch) != {"views", "image_key"}:
+        raise ValueError(
+            "An enabled relational queue requires exactly the batch keys "
+            f"'views' and 'image_key', got {sorted(batch)}."
+        )
+    views = list(batch["views"])
+    keys = batch["image_key"]
+    if isinstance(keys, (str, bytes)):
+        raise ValueError("The enabled batch envelope must carry image-key strings.")
+    resolved_keys = tuple(str(key) for key in keys)
+    for view in views:
+        if int(view.shape[0]) != len(resolved_keys):
+            raise ValueError(
+                "The enabled batch envelope must align one image key per row: "
+                f"{len(resolved_keys)} key(s) for {int(view.shape[0])} view "
+                "rows."
+            )
+    return views, resolved_keys
+
 
 def run_pretrain(
     args: argparse.Namespace,
@@ -148,6 +199,13 @@ def run_pretrain(
     # Bound to the *current* resume path: changing args.resume must not keep
     # serving a previously loaded checkpoint.
     resume_ckpt = resume_payload_for(args, handoff)
+    # The queue preparation is model-free and runs before every probe: enabled
+    # data identity, the batch/steps-per-epoch locks and the strict recovery
+    # checks are all settled before a probe encoder exists. The CLI usually
+    # hands it over; a direct-core caller resolves it here.
+    preparation = verify_relational_queue_preparation(
+        handoff.relational_queue_preparation, args, resume_ckpt
+    )
     settings = handoff.settings
     if pretrain_recipe is not None and settings is None:
         raise ValueError(
@@ -159,23 +217,58 @@ def run_pretrain(
         preflight_pretrain_run(args, settings)
     if pretrain_recipe is None:
         pretrain_recipe = _resolve_pretrain_recipe(
-            args, resume_ckpt, settings=settings
+            args,
+            resume_ckpt,
+            settings=settings,
+            relational_queue_preparation=preparation,
         )
     elif pretrain_recipe.settings is not settings:
         raise ValueError(
             "pretrain_recipe was resolved from a different PretrainSettings "
             "object; resolve the recipe once and pass both."
         )
+    elif (
+        preparation.active
+        and pretrain_recipe.relational_queue_preparation is not preparation
+    ):
+        raise ValueError(
+            "The supplied pretrain_recipe was resolved from a different "
+            "relational queue preparation; resolve the recipe and the "
+            "preparation from the same request."
+        )
+    # Effective versus requested: the raw request stays in the printed
+    # ``Parameters:`` record while the run and the saved args read the effective
+    # values. Queue-off runs keep their existing batch handling untouched.
+    effective_batch_size = preparation.effective_batch_size
+    if preparation.ssl_method == "relational":
+        args.relational_queue_size = preparation.capacity
+        args.requested_relational_queue_size = preparation.requested_capacity
+        args.relational_queue_size_explicit = (
+            preparation.capacity_source == "explicit"
+        )
+    if preparation.active:
+        args.batch_size = effective_batch_size
+        args.requested_batch_size = preparation.requested_batch_size
+        args.batch_size_explicit = preparation.batch_size_source == "explicit"
     _set_seed(args.seed)
     _set_cpus(args.cpus)
-    device = _resolve_device(args.device)
+    device = (
+        preparation.resolved_device
+        if preparation.resolved_device is not None
+        else _resolve_device(args.device)
+    )
     warn_if_mps_fallback_unarmed(device)
     print(f"Resolved device: {device}")
 
     # Effective SSL config must be resolved before any output mutation; the CLI
     # usually supplies it, and a direct caller resolves it here exactly once.
     # It validates the payload this invocation already loaded, never a re-read.
-    ssl_config = _effective_pretrain_ssl_config(args, handoff, resume_ckpt)
+    ssl_config = _effective_pretrain_ssl_config(
+        args,
+        handoff,
+        resume_ckpt,
+        relational_queue_preparation=preparation,
+    )
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -236,6 +329,12 @@ def run_pretrain(
         "Relational target config: "
         + json.dumps(pretrain_recipe.relational_target_config, sort_keys=True)
     )
+    # Display-only: requested, effective and inactive values stay separate from
+    # the raw ``Parameters:`` request record.
+    print(
+        "Relational queue config: "
+        + json.dumps(preparation.resolved_log(), sort_keys=True)
+    )
     print(
         "Teacher temperature schedule: "
         + json.dumps(
@@ -289,10 +388,13 @@ def run_pretrain(
             if include_weak_teacher_views
             else None
         ),
+        prepared_relational_data=(
+            preparation.data if preparation.active else None
+        ),
     )
     loader = DataLoader(
         ds,
-        batch_size=args.batch_size,
+        batch_size=effective_batch_size,
         shuffle=True,
         num_workers=args.num_workers,
         drop_last=True,
@@ -488,6 +590,34 @@ def run_pretrain(
         print(
             f"[Info] Resume from {resume_path} at epoch {start_epoch}, iteration {global_step}"
         )
+    queue: RelationalQueue | None = None
+    if preparation.active:
+        data = preparation.data
+        assert data is not None  # an enabled preparation always prepares data
+        if resume_ckpt is None:
+            queue = RelationalQueue(
+                int(preparation.capacity), effective_out_dim, device=device
+            )
+        else:
+            # Reconstruct exactly once, on the resolved device, from the state
+            # the preflight already validated against this prepared selection.
+            queue = RelationalQueue.from_state_dict(
+                preparation.resume_queue_state,
+                capacity=int(preparation.capacity),
+                out_dim=effective_out_dim,
+                completed_steps=int(resume_ckpt["iteration"]),
+                allowed_keys=frozenset(data.image_keys),
+                data_fingerprint=data.data_fingerprint,
+                data_image_count=len(data.image_keys),
+                data_size_bytes=data.data_size_bytes,
+                device=device,
+            )
+            if queue.completed_steps != global_step:
+                raise ValueError(
+                    "The restored relational queue counts "
+                    f"{queue.completed_steps} completed step(s) but the "
+                    f"checkpoint resumes at iteration {global_step}."
+                )
     _phase_done("objective, optimizer and recovery", phase)
 
     niter_per_epoch = max(1, len(loader))
@@ -523,7 +653,12 @@ def run_pretrain(
     with torch.no_grad():
         phase = _phase_start("first batch and initial forwards")
         sample_batch = next(iter(loader))
-        sample_views = [v.to(device) for v in sample_batch[:2]]
+        # The startup sample never populates the queue: it is a compatibility
+        # probe, not a successful optimization step.
+        sample_views, _sample_keys = _unpack_pretrain_batch(
+            sample_batch, queue_enabled=queue is not None
+        )
+        sample_views = [v.to(device) for v in sample_views[:2]]
         s_out, _ = student(sample_views[0])
         t_out, _ = teacher(sample_views[0])
         _phase_done("first batch and initial forwards", phase)
@@ -539,10 +674,15 @@ def run_pretrain(
             f"[Info] Starting/Resuming with learning rate: {float(lr_schedule[min(global_step, total_steps - 1)]):.6f}"
         )
 
-    pending_rng_restore = (
-        resume_ckpt.get("rng_state") if resume_ckpt is not None else None
-    )
-    if resume_ckpt is not None and not pending_rng_restore:
+    if queue is not None:
+        # Never bypass the validated copy: restoring the raw payload again could
+        # apply streams the target-aware validation explicitly excluded.
+        pending_rng_restore = preparation.rng_state_to_restore
+    else:
+        pending_rng_restore = (
+            resume_ckpt.get("rng_state") if resume_ckpt is not None else None
+        )
+    if queue is None and resume_ckpt is not None and not pending_rng_restore:
         print(
             "[Warning] Legacy checkpoint has no RNG state; the random sequence "
             "cannot continue exactly. Mask sampling and the main-process shuffle "
@@ -559,8 +699,19 @@ def run_pretrain(
         cosine_sim = 0.0
         student.train()
         pbar = tqdm(loader, desc=f"Epoch {epoch + 1}/{args.max_epochs}", ncols=150)
-        for step, views in enumerate(pbar):
+        for step, batch in enumerate(pbar):
+            views, batch_keys = _unpack_pretrain_batch(
+                batch, queue_enabled=queue is not None
+            )
             views = [v.to(device) for v in views]
+            # One immutable candidate snapshot per step, taken before any model
+            # work: every global/local term of this iteration shares it.
+            queue_occupancy_before = 0 if queue is None else len(queue)
+            queue_snapshot = (
+                queue.snapshot(batch_keys, step=global_step)
+                if queue is not None
+                else None
+            )
             # DINO keeps the two global views only; the weak relational views
             # are relational-only.
             expected_views = (
@@ -593,6 +744,9 @@ def run_pretrain(
             teacher_logits: list[torch.Tensor] = []
             prefix = student.backbone.num_prefix_tokens
             center_before = teacher.center
+            # Detached pre-center A/B teacher observations, cached for a
+            # success-only queue commit; nothing is stored before the step wins.
+            observation_pair: torch.Tensor | None = None
             with torch.no_grad():
                 # Ordinary forwards serve the patch objective, the ordinary
                 # center population and the ordinary-A diagnostic cosine.
@@ -635,6 +789,10 @@ def run_pretrain(
                         center_before, torch.cat(center_inputs, dim=0)
                     )
                     teacher_global = relational_teacher
+                    if queue is not None:
+                        observation_pair = torch.stack(
+                            [out.cls.detach() for out in relational_outputs], dim=1
+                        )
                 else:
                     teacher_global = []
                 for t_out in ordinary_outputs:
@@ -652,8 +810,29 @@ def run_pretrain(
             temp_student = float(temp_student_schedule[iter_idx])
             temp_teacher = float(teacher_temp_schedule[iter_idx])
 
+            # Rectangular current-plus-history candidates and their teacher
+            # targets are built once per step from the same snapshot and the
+            # *pre-step* center. Diagnostics only reduce on log steps.
+            relational_targets = None
+            if queue_snapshot is not None:
+                relational_targets = _make_relational_step_targets(
+                    teacher_global,
+                    queue_snapshot.features,
+                    center_before,
+                    temp_teacher,
+                    collect_diagnostics=(
+                        global_step % max(1, args.log_every_n_steps) == 0
+                    ),
+                )
+                if observation_pair is None:  # pragma: no cover - defensive
+                    raise ValueError(
+                        "The enabled relational queue needs the current teacher "
+                        "observations to commit after a successful step."
+                    )
+
             dino_teacher_logits: list[torch.Tensor] = []
             dino_teacher_targets: list[torch.Tensor] = []
+            student_stats: list[dict[str, torch.Tensor]] = []
             if dino_objective is None:
                 loss_global = _compute_global_loss(
                     student_global,
@@ -661,6 +840,10 @@ def run_pretrain(
                     temp_student,
                     temp_teacher,
                     relational_pairing=relational_pairing,
+                    relational_targets=relational_targets,
+                    student_stats=(
+                        student_stats if relational_targets is not None else None
+                    ),
                 )
             else:
                 with torch.no_grad():
@@ -755,7 +938,14 @@ def run_pretrain(
                 local_student_projs.append(l_proj)
             if dino_objective is None:
                 loss_local = _compute_local_loss(
-                    local_student_projs, teacher_global, temp_student, temp_teacher
+                    local_student_projs,
+                    teacher_global,
+                    temp_student,
+                    temp_teacher,
+                    relational_targets=relational_targets,
+                    student_stats=(
+                        student_stats if relational_targets is not None else None
+                    ),
                 )
             else:
                 loss_local = _compute_dino_local_loss(
@@ -842,6 +1032,13 @@ def run_pretrain(
                     objective.patch_center,
                     torch.cat(center_logits, dim=0),
                 )
+
+            queue_commit: dict[str, int] | None = None
+            if queue is not None:
+                # Success boundary: every finite check, the backward pass,
+                # clipping, the optimizer step and the EMA/patch-center updates
+                # have already succeeded.
+                queue_commit = queue.commit(batch_keys, observation_pair, step=global_step)
 
             if dino_objective is None:
                 with torch.no_grad():
@@ -932,6 +1129,37 @@ def run_pretrain(
                             torch.cat(ibot_probs, dim=0), objective.patch_center
                         )
                     )
+                # Coverage/age describe the pre-step snapshot; the refresh and
+                # eviction counts are this step's successful commit. Queue-off
+                # and DINO rows leave every cell blank.
+                queue_metrics: dict[str, object] = {}
+                if queue is not None:
+                    snapshot_keys = (
+                        () if queue_snapshot is None else queue_snapshot.keys
+                    )
+                    queue_metrics = _relational_queue_metrics(
+                        capacity=queue.capacity,
+                        occupancy=queue_occupancy_before,
+                        eligible=len(snapshot_keys),
+                        candidate_count=len(snapshot_keys) + len(batch_keys or ()),
+                        ages=(
+                            ()
+                            if queue_snapshot is None
+                            else queue_snapshot.ages_at(global_step)
+                        ),
+                        refreshed=(
+                            None if queue_commit is None else queue_commit["refreshed"]
+                        ),
+                        evicted=(
+                            None if queue_commit is None else queue_commit["evicted"]
+                        ),
+                        teacher_stats=(
+                            None
+                            if relational_targets is None
+                            else relational_targets.teacher_stats
+                        ),
+                        student_stats=student_stats,
+                    )
                 instant_logger.log(
                     iteration=global_step,
                     epoch=epoch,
@@ -954,6 +1182,7 @@ def run_pretrain(
                     **instant_metrics,
                     **patch_metrics,
                     **ssl_metrics,
+                    **queue_metrics,
                 )
 
             if step % 10 == 0 or step == len(loader) - 1:
@@ -1046,6 +1275,20 @@ def run_pretrain(
                 # DINO owns the K-dimensional center inside dino_objective and
                 # writes no top-level center.
                 ckpt["dino_objective"] = dino_objective.state_dict()
+            if queue is not None:
+                # Enabled runs persist the closed config bundle and the logical
+                # queue state at the existing epoch boundary. A disabled run
+                # omits both rather than writing a fake enabled marker.
+                data = preparation.data
+                assert data is not None  # guaranteed by an active preparation
+                ckpt["config"][RELATIONAL_QUEUE_CONFIG_KEY] = queue_config_bundle(
+                    queue.capacity
+                )
+                ckpt[RELATIONAL_QUEUE_STATE_KEY] = queue.state_dict(
+                    data_fingerprint=data.data_fingerprint,
+                    data_image_count=len(data.image_keys),
+                    data_size_bytes=data.data_size_bytes,
+                )
             ckpt_path = out_dir / f"SSL_epoch_{epoch + 1:04d}.pth"
             save_checkpoint(ckpt, ckpt_path)
             shutil.copy(str(ckpt_path), out_dir / "SSL_latest.pth")

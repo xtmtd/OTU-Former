@@ -437,11 +437,24 @@ def test_run_cam_accepts_an_injected_relational_bundle(tmp_path, monkeypatch):
     torch.save(
         {
             "model_state_dict": encoder.state_dict(),
+            # Training-only queue tensors: CAM ignores them and resolves only
+            # the encoder/head identity.
+            "relational_queue": {
+                "version": 1,
+                "keys": ["img_0.jpg"],
+                "features": torch.zeros(1, 2, 8),
+                "observed_steps": [0],
+                "completed_steps": 1,
+                "data_fingerprint": "c" * 64,
+                "data_image_count": 1,
+                "data_size_bytes": 512,
+            },
             "config": {
                 "model_name": "tiny-vit",
                 "out_dim": 8,
                 "image_size": 48,
                 "register_tokens": 4,
+                "relational_queue_config": {"version": 1, "capacity": 1},
                 RELATIONAL_TARGET_CONFIG_KEY: {
                     "version": 1,
                     "relational_teacher_views": "weak",

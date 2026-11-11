@@ -834,3 +834,52 @@ def test_relational_identity_rejects_dino_only_state():
     for corrupt in (with_objective, with_config):
         with pytest.raises(ValueError, match="relational|DINO|inconsistent"):
             resolve_checkpoint(corrupt, "vit_tiny_patch16_224")
+
+
+def test_relational_queue_metadata_is_relational_only():
+    """The queue guard is a shared identity rule, not a training import."""
+    import torch
+
+    from otuformer.training.model import OTUFormerEncoder
+    from otuformer.utils.checkpoint import resolve_checkpoint_ssl_identity
+
+    model = OTUFormerEncoder(
+        model_name="vit_tiny_patch16_224", out_dim=8, pretrained=False, img_size=64
+    )
+    state = model.state_dict()
+    base = {
+        "ssl_method": "dino",
+        "ssl_head": "dino_mlp_2048",
+        "model_name": "vit_tiny_patch16_224",
+        "out_dim": 8,
+        "dino_prototypes": 4,
+        "dino_centering": "ema",
+    }
+    for extra_config, extra_key in (
+        ({"relational_queue_config": {"version": 1, "capacity": 2}}, None),
+        ({}, "relational_queue"),
+    ):
+        checkpoint = {
+            "student": state,
+            "config": {**base, **extra_config},
+        }
+        if extra_key is not None:
+            checkpoint[extra_key] = {"version": 1}
+        with pytest.raises(ValueError, match="relational queue metadata"):
+            resolve_checkpoint_ssl_identity(checkpoint, state)
+
+    relational = {
+        "student": state,
+        "relational_queue": {"version": 1},
+        "config": {
+            "ssl_method": "relational",
+            "ssl_head": "projection_mlp_2048",
+            "model_name": "vit_tiny_patch16_224",
+            "out_dim": 8,
+            "relational_queue_config": {"version": 1, "capacity": 2},
+        },
+    }
+    assert resolve_checkpoint_ssl_identity(relational, state) == (
+        "relational",
+        "projection_mlp_2048",
+    )

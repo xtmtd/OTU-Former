@@ -35,11 +35,34 @@ def relational_bundle() -> dict:
     }
 
 
+def relational_queue_bundles(out_dim: int = 64, keys: tuple[str, ...] = ()) -> dict:
+    """A valid enabled queue bundle pair, as an enabled pretrain run writes it."""
+    from otuformer.training.relational_queue import QUEUE_CONFIG_KEY
+
+    state = {
+        "version": 1,
+        "keys": list(keys),
+        "features": torch.zeros(len(keys), 2, int(out_dim)),
+        "observed_steps": [0] * len(keys),
+        "completed_steps": 1,
+        "data_fingerprint": "a" * 64,
+        "data_image_count": max(len(keys), 1),
+        "data_size_bytes": 1024,
+    }
+    return {
+        "config": {
+            QUEUE_CONFIG_KEY: {"version": 1, "capacity": max(len(keys), 1)}
+        },
+        "state": state,
+    }
+
+
 def make_checkpoint(
     tmp_path: Path,
     out_dim: int = 64,
     *,
     annotated: bool = False,
+    queue: bool = False,
     name: str = "ckpt.pt",
 ) -> Path:
     from otuformer.training.model import OTUFormerEncoder
@@ -50,9 +73,38 @@ def make_checkpoint(
     if annotated:
         config[RELATIONAL_TARGET_CONFIG_KEY] = relational_bundle()
     ckpt = {"model_state_dict": model.state_dict(), "config": config}
+    if queue:
+        bundles = relational_queue_bundles(out_dim)
+        config.update(bundles["config"])
+        ckpt["relational_queue"] = bundles["state"]
     p = tmp_path / name
     torch.save(ckpt, p)
     return p
+
+
+def test_extract_accepts_a_queue_enabled_relational_checkpoint(tmp_path):
+    """Training-only queue tensors are ignored by the read-only reader."""
+    plain = make_checkpoint(tmp_path, annotated=True, name="plain_bundle.pt")
+    enabled = make_checkpoint(
+        tmp_path, annotated=True, queue=True, name="queue_bundle.pt"
+    )
+    img_dir = tmp_path / "queue_bundle_images"
+    make_images(img_dir, n=2)
+    left = extract_embeddings(
+        checkpoint_path=plain,
+        images_dir=img_dir,
+        device="cpu",
+        batch_size=2,
+        token_mode="cls",
+    )
+    right = extract_embeddings(
+        checkpoint_path=enabled,
+        images_dir=img_dir,
+        device="cpu",
+        batch_size=2,
+        token_mode="cls",
+    )
+    assert np.array_equal(np.asarray(left), np.asarray(right))
 
 
 def test_extract_ignores_an_injected_relational_bundle(tmp_path):

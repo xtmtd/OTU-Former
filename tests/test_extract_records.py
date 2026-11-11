@@ -1421,6 +1421,24 @@ def test_extract_provenance_preserves_ssl_identity(tmp_path):
     assert "ssl_method" not in historical_effective
     assert "ssl_source_method" not in historical_effective
 
+    # A queue-enabled relational payload keeps the same encoder identity: the
+    # training-only queue tensors are ignored by provenance resolution.
+    queued = tiny_checkpoint(
+        tmp_path,
+        out_dim=4,
+        name="queued.ckpt",
+        config={
+            "ssl_method": "relational",
+            "ssl_head": "projection_mlp_2048",
+            "relational_queue_config": {"version": 1, "capacity": 2},
+        },
+    )
+    queued_effective = _extract_embeddings_result(
+        queued, images, device="cpu", records=bundle, num_workers=0
+    ).effective["checkpoint"]
+    assert queued_effective["ssl_method"] == "relational"
+    assert queued_effective["ssl_head"] == "projection_mlp_2048"
+
     # A metric descendant exposes only its recorded source pair.
     metric = metric_checkpoint(
         tmp_path,

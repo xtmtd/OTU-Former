@@ -1276,8 +1276,8 @@ def _run_tiny_pretrain(tmp_path, monkeypatch, label="", on_first_step=None, **ov
         teacher_momentum=0.9,
         teacher_momentum_end=0.99,
         student_temp=0.1,
-        log_every_n_steps=1,
-        keep_last_checkpoints=1,
+        log_every_n_steps=settings.pop("log_every_n_steps", 1),
+        keep_last_checkpoints=settings.pop("keep_last_checkpoints", 1),
         visualize_data="",
         extract_size=None,
         metrics_sample_size=100,
@@ -1286,13 +1286,13 @@ def _run_tiny_pretrain(tmp_path, monkeypatch, label="", on_first_step=None, **ov
         umap_metric="cosine",
         visualize_class_number=20,
         compute_embedding_metrics=False,
-        batch_size=4,
+        batch_size=settings.pop("batch_size", 4),
         num_workers=0,
         cpus=2,
         # CPU: this run uses smaller local crops, whose positional
         # interpolation needs the antialiased bicubic backward that is
         # unimplemented on MPS (device policy: retained CPU exception).
-        device="cpu",
+        device=settings.pop("device", "cpu"),
         seed=42,
         **settings,
     )
@@ -1953,12 +1953,16 @@ def test_legacy_pretrain_schema_is_migrated_atomically(tmp_path):
         + _NEW_PRETRAIN_FIELDS
         + reporting_module._PRETRAIN_SSL_SETTING_FIELDS
         + reporting_module._PRETRAIN_SSL_METRIC_FIELDS
+        + reporting_module._PRETRAIN_RELATIONAL_QUEUE_FIELDS
     )
     assert list(migrated.columns) == expected_fields
     assert migrated.iloc[0]["iteration"] == 0
     assert migrated.iloc[1]["iteration"] == 1
-    for field in _NEW_PRETRAIN_FIELDS + reporting_module._PRETRAIN_SSL_SETTING_FIELDS + (
-        reporting_module._PRETRAIN_SSL_METRIC_FIELDS
+    for field in (
+        _NEW_PRETRAIN_FIELDS
+        + reporting_module._PRETRAIN_SSL_SETTING_FIELDS
+        + reporting_module._PRETRAIN_SSL_METRIC_FIELDS
+        + reporting_module._PRETRAIN_RELATIONAL_QUEUE_FIELDS
     ):
         assert migrated[field].isna().all(), field
     assert list(tmp_path.glob("*.tmp")) == []
@@ -2577,3 +2581,533 @@ def test_relational_out_of_band_endpoint_survives_two_hops(tmp_path, monkeypatch
         "teacher_temp_start"
     ] == 0.0009
     assert second["args"]["teacher_temp_start"] == 0.0009
+
+
+# --- Relational FIFO: loop integration, persistence and strict recovery -----
+
+
+def _fifo_resume_run(tmp_path, monkeypatch, bad_path, *, label="_bad", **overrides):
+    return _run_tiny_pretrain(
+        tmp_path,
+        monkeypatch,
+        label=label,
+        resume=str(bad_path),
+        max_epochs=2,
+        save_every_epochs=1,
+        relational_queue_size=2,
+        relational_queue_size_explicit=True,
+        **overrides,
+    )
+
+
+def _fifo_source_run(tmp_path, monkeypatch, **overrides):
+    return _run_tiny_pretrain(
+        tmp_path,
+        monkeypatch,
+        label="_src",
+        max_epochs=1,
+        save_every_epochs=1,
+        relational_queue_size=2,
+        relational_queue_size_explicit=True,
+        **overrides,
+    )
+
+
+def _load_fifo_checkpoint(path):
+    import torch
+
+    return torch.load(path, map_location="cpu", weights_only=False)
+
+
+def _save_fifo_checkpoint(payload, path):
+    import torch
+
+    torch.save(payload, path)
+    return path
+
+
+def test_fifo_epoch_checkpoint_uses_enabled_bundles(tmp_path, monkeypatch):
+    obs = _run_tiny_pretrain(
+        tmp_path,
+        monkeypatch,
+        relational_queue_size=2,
+        relational_queue_size_explicit=True,
+    )
+    import torch
+
+    saved = torch.load(
+        obs["out_dir"] / "SSL_latest.pth", map_location="cpu", weights_only=False
+    )
+    assert saved["config"]["relational_queue_config"] == {
+        "version": 1,
+        "capacity": 2,
+    }
+    state = saved["relational_queue"]
+    assert state["completed_steps"] == saved["iteration"]
+    assert state["features"].shape == (2, 2, 8)
+    assert saved["args"]["relational_queue_size"] == 2
+    assert saved["args"]["requested_relational_queue_size"] == 2
+    # The closed relational target bundle keeps its own version-1 key set.
+    assert "relational_queue_config" not in saved["config"]["relational_target_config"]
+
+
+def test_fifo_step_reuses_snapshot_and_commits_pre_ema_features(
+    tmp_path, monkeypatch
+):
+    import torch
+
+    calls = {"snapshot": [], "commit": [], "order": []}
+    real_snapshot = pretrain_loop_module.RelationalQueue.snapshot
+    real_commit = pretrain_loop_module.RelationalQueue.commit
+
+    def spy_snapshot(self, batch_keys, *, step):
+        calls["snapshot"].append((tuple(batch_keys), step))
+        calls["order"].append("snapshot")
+        return real_snapshot(self, batch_keys, step=step)
+
+    def spy_commit(self, batch_keys, features, *, step):
+        calls["commit"].append(
+            (tuple(batch_keys), step, features.clone().detach())
+        )
+        calls["order"].append("commit")
+        return real_commit(self, batch_keys, features, step=step)
+
+    monkeypatch.setattr(
+        pretrain_loop_module.RelationalQueue, "snapshot", spy_snapshot
+    )
+    monkeypatch.setattr(
+        pretrain_loop_module.RelationalQueue, "commit", spy_commit
+    )
+    obs = _run_tiny_pretrain(
+        tmp_path,
+        monkeypatch,
+        relational_queue_size=2,
+        relational_queue_size_explicit=True,
+        max_epochs=2,
+        save_every_epochs=5,
+        batch_size=2,
+    )
+    assert [entry[1] for entry in calls["snapshot"]] == [0, 1, 2, 3]
+    assert [entry[1] for entry in calls["commit"]] == [0, 1, 2, 3]
+    # One snapshot per step, never a second read for a later term.
+    assert len(calls["snapshot"]) == len(calls["commit"])
+    # Snapshots precede their own commit, and each step commits exactly once.
+    assert calls["order"] == ["snapshot", "commit"] * 4
+    # Committed features are detached, normalized *pre-center* projector
+    # outputs: the center is not subtracted, so unit norms survive.
+    committed = calls["commit"][0][2]
+    assert committed.shape == (2, 2, 8)
+    assert not committed.requires_grad
+    norms = committed.norm(dim=-1)
+    assert torch.allclose(norms, torch.ones_like(norms), atol=1e-5)
+
+
+def test_fifo_aborted_step_does_not_mutate_queue_or_save_epoch(
+    tmp_path, monkeypatch
+):
+    import pytest
+    import torch
+
+    real_loss = pretrain_loop_module._compute_global_loss
+    state = {"calls": 0}
+
+    def poisonous(*args, **kwargs):
+        state["calls"] += 1
+        if state["calls"] == 2:
+            return torch.full((), float("nan"))
+        return real_loss(*args, **kwargs)
+
+    monkeypatch.setattr(pretrain_loop_module, "_compute_global_loss", poisonous)
+    with pytest.raises(ValueError, match="non-finite"):
+        _run_tiny_pretrain(
+            tmp_path,
+            monkeypatch,
+            label="_abort",
+            relational_queue_size=2,
+            relational_queue_size_explicit=True,
+            max_epochs=2,
+            save_every_epochs=1,
+        )
+    out_dir = tmp_path / "out_abort"
+    saved = [
+        path.name for path in sorted(out_dir.glob("SSL_epoch_*.pth"))
+    ]
+    # The aborted step wrote no epoch checkpoint; epoch 1's state stands.
+    assert saved == ["SSL_epoch_0001.pth"]
+    payload = _load_fifo_checkpoint(out_dir / "SSL_epoch_0001.pth")
+    # The aborted step never entered the queue: the saved count is the one
+    # completed step and every record predates the failed iteration.
+    assert payload["relational_queue"]["completed_steps"] == 1
+    assert all(
+        step < 1 for step in payload["relational_queue"]["observed_steps"]
+    )
+
+
+def test_fifo_disabled_preserves_legacy_trajectory(tmp_path, monkeypatch):
+    import torch
+
+    omitted = _run_tiny_pretrain(tmp_path, monkeypatch, label="_off")
+    explicit_zero = _run_tiny_pretrain(
+        tmp_path,
+        monkeypatch,
+        label="_zero",
+        relational_queue_size=0,
+        relational_queue_size_explicit=True,
+    )
+    first = _load_fifo_checkpoint(omitted["out_dir"] / "SSL_latest.pth")
+    second = _load_fifo_checkpoint(explicit_zero["out_dir"] / "SSL_latest.pth")
+    assert "relational_queue_config" not in first["config"]
+    assert "relational_queue" not in first
+    assert "relational_queue_config" not in second["config"]
+    assert "relational_queue" not in second
+    for key in ("student", "teacher"):
+        for name, tensor in first[key].items():
+            assert torch.equal(tensor, second[key][name]), name
+    assert torch.equal(first["center"], second["center"])
+
+
+def test_fifo_empty_history_and_cross_epoch_retention(tmp_path, monkeypatch):
+    import csv
+
+    obs = _run_tiny_pretrain(
+        tmp_path,
+        monkeypatch,
+        relational_queue_size=2,
+        relational_queue_size_explicit=True,
+        max_epochs=2,
+        save_every_epochs=5,
+        batch_size=2,
+    )
+    path = obs["out_dir"] / "logs" / "instant_metrics.pretrain.csv"
+    rows = list(csv.DictReader(path.open(newline="")))
+    assert len(rows) == 4
+    # Four images in two batches: the current batch is always excluded, so the
+    # first step has no history and later steps read the retained records,
+    # including across the epoch boundary.
+    assert rows[0]["relational_queue_eligible"] == "0"
+    assert rows[0]["relational_history_age_mean"] == ""
+    # Within an epoch the second batch is disjoint, so both stored records are
+    # eligible; the queue is retained across the epoch boundary.
+    assert rows[1]["relational_queue_eligible"] == "2"
+    assert rows[3]["relational_queue_eligible"] == "2"
+    assert all(row["relational_queue_occupancy"] == "2" for row in rows[1:])
+    assert float(rows[1]["relational_history_age_mean"]) == 1.0
+    assert float(rows[3]["relational_history_age_mean"]) == 1.0
+    assert any(
+        float(row["relational_teacher_history_mass_global"]) > 0.0
+        for row in rows[2:]
+    )
+    for row in rows:
+        assert row["relational_queue_capacity"] == "2"
+
+
+def test_fifo_epoch_resume_matches_uninterrupted_cpu(tmp_path, monkeypatch):
+    import pytest
+    import torch
+
+    uninterrupted = _run_tiny_pretrain(
+        tmp_path,
+        monkeypatch,
+        label="_whole",
+        relational_queue_size=2,
+        relational_queue_size_explicit=True,
+        max_epochs=2,
+        save_every_epochs=1,
+        keep_last_checkpoints=5,
+        batch_size=2,
+    )
+    # The interrupted run keeps the *same* total schedule; it stops only after a
+    # real scheduled epoch save, so the resumed schedule is the same rectangle.
+    with monkeypatch.context() as stop:
+        real_loss = pretrain_loop_module._compute_global_loss
+        calls = {"count": 0}
+
+        def stop_after_first_epoch(*args, **kwargs):
+            calls["count"] += 1
+            if calls["count"] == 3:
+                raise ValueError("stopped after the first scheduled epoch save")
+            return real_loss(*args, **kwargs)
+
+        stop.setattr(
+            pretrain_loop_module, "_compute_global_loss", stop_after_first_epoch
+        )
+        with pytest.raises(ValueError, match="stopped after the first"):
+            _run_tiny_pretrain(
+                tmp_path,
+                monkeypatch,
+                label="_first",
+                relational_queue_size=2,
+                relational_queue_size_explicit=True,
+                max_epochs=2,
+                save_every_epochs=1,
+                keep_last_checkpoints=5,
+                batch_size=2,
+            )
+    staged = {"out_dir": tmp_path / "out_first"}
+    assert sorted(
+        path.name for path in staged["out_dir"].glob("SSL_epoch_*.pth")
+    ) == ["SSL_epoch_0001.pth"]
+    resumed = _fifo_resume_run(
+        tmp_path,
+        monkeypatch,
+        staged["out_dir"] / "SSL_epoch_0001.pth",
+        label="_second",
+        batch_size=2,
+    )
+    whole = _load_fifo_checkpoint(uninterrupted["out_dir"] / "SSL_latest.pth")
+    joined = _load_fifo_checkpoint(resumed["out_dir"] / "SSL_latest.pth")
+    for key in ("student", "teacher"):
+        for name, tensor in whole[key].items():
+            assert torch.equal(tensor, joined[key][name]), (key, name)
+    assert torch.equal(whole["center"], joined["center"])
+    for index, group in enumerate(whole["optimizer"]["param_groups"]):
+        for name in ("lr", "weight_decay"):
+            assert group[name] == joined["optimizer"]["param_groups"][index][name]
+    assert (
+        whole["relational_queue"]["keys"] == joined["relational_queue"]["keys"]
+    )
+    assert torch.equal(
+        whole["relational_queue"]["features"], joined["relational_queue"]["features"]
+    )
+    assert (
+        whole["relational_queue"]["observed_steps"]
+        == joined["relational_queue"]["observed_steps"]
+    )
+    assert whole["iteration"] == joined["iteration"] == 4
+    assert whole["schedule"] == joined["schedule"]
+    # Both the epoch file and its latest copy carry the same enabled state.
+    epoch_two = _load_fifo_checkpoint(
+        uninterrupted["out_dir"] / "SSL_epoch_0002.pth"
+    )
+    assert epoch_two["config"]["relational_queue_config"] == {
+        "version": 1,
+        "capacity": 2,
+    }
+    assert epoch_two["relational_queue"]["keys"] == whole["relational_queue"]["keys"]
+    assert torch.equal(
+        epoch_two["relational_queue"]["features"],
+        whole["relational_queue"]["features"],
+    )
+    # The resumed teacher is never overwritten with the student weights.
+    assert not torch.equal(joined["teacher"]["backbone.cls_token"], joined["student"]["backbone.cls_token"])
+
+
+@pytest.mark.parametrize(
+    "mutate, match",
+    [
+        (
+            lambda ckpt: ckpt["optimizer"].update({"state": None}),
+            "records no tensor state",
+        ),
+        (
+            lambda ckpt: ckpt["optimizer"].update({"state": {}}),
+            "no moments for participating parameter",
+        ),
+        (
+            lambda ckpt: ckpt["optimizer"]["state"][0]["exp_avg"].resize_(1),
+            "shape",
+        ),
+        (
+            lambda ckpt: ckpt["optimizer"]["state"][0].update({"step": 0}),
+            "outside",
+        ),
+        (
+            lambda ckpt: ckpt["optimizer"]["state"][0]["exp_avg"].fill_(
+                float("nan")
+            ),
+            "not finite",
+        ),
+        (
+            lambda ckpt: ckpt["optimizer"]["state"][0]["exp_avg_sq"].fill_(-1.0),
+            "negative",
+        ),
+    ],
+)
+def test_fifo_resume_rejects_missing_or_malformed_adamw_state(
+    tmp_path, monkeypatch, mutate, match
+):
+    import pytest
+
+    source = _fifo_source_run(tmp_path, monkeypatch, patch_loss="none")
+    payload = _load_fifo_checkpoint(source["out_dir"] / "SSL_epoch_0001.pth")
+    mutate(payload)
+    bad = _save_fifo_checkpoint(payload, tmp_path / "bad.pth")
+    with pytest.raises(ValueError, match=match):
+        _fifo_resume_run(tmp_path, monkeypatch, bad, patch_loss="none")
+    assert not (tmp_path / "out_bad" / "logs").exists()
+
+
+@pytest.mark.parametrize(
+    "mutate, match",
+    [
+        (
+            lambda ckpt: ckpt["patch_objective"].pop("predictor.1.weight"),
+            "patch_objective state is malformed",
+        ),
+        (
+            lambda ckpt: ckpt["patch_objective"]["predictor.1.weight"].resize_(
+                1, 1
+            ),
+            "patch_objective state is malformed",
+        ),
+        (lambda ckpt: ckpt.pop("patch_objective"), "no patch_objective state"),
+    ],
+)
+def test_fifo_resume_rejects_invalid_patch_objective_before_outputs(
+    tmp_path, monkeypatch, mutate, match
+):
+    import pytest
+
+    source = _fifo_source_run(tmp_path, monkeypatch, patch_loss="masked-feature")
+    payload = _load_fifo_checkpoint(source["out_dir"] / "SSL_epoch_0001.pth")
+    mutate(payload)
+    bad = _save_fifo_checkpoint(payload, tmp_path / "bad.pth")
+    with pytest.raises(ValueError, match=match):
+        _fifo_resume_run(
+            tmp_path, monkeypatch, bad, patch_loss="masked-feature"
+        )
+    assert not (tmp_path / "out_bad" / "logs").exists()
+
+
+@pytest.mark.parametrize(
+    "mutate, match",
+    [
+        (
+            lambda ckpt: ckpt["student"].pop("projector.net.4.weight"),
+            "does not match the rebuilt encoder",
+        ),
+        (
+            lambda ckpt: ckpt["teacher"].pop("backbone.blocks.1.attn.qkv.weight"),
+            "does not match the rebuilt encoder",
+        ),
+        (
+            lambda ckpt: ckpt["student"].update(
+                {
+                    "projector.net.4.weight": torch.zeros(3, 2048)
+                }
+            ),
+            "shape",
+        ),
+        (
+            lambda ckpt: [
+                tensor.fill_(float("nan"))
+                for name, tensor in ckpt["student"].items()
+                if name.endswith("blocks.0.norm1.weight")
+            ],
+            "non-finite",
+        ),
+        (lambda ckpt: ckpt.pop("student"), "saved student encoder state"),
+        (lambda ckpt: ckpt.pop("teacher"), "saved teacher encoder state"),
+        (lambda ckpt: ckpt.pop("center"), "saved relational center"),
+        (
+            lambda ckpt: ckpt.update({"center": torch.zeros(8)}),
+            r"exact shape \[1, 8\]",
+        ),
+        (
+            lambda ckpt: ckpt.update({"center": ckpt["center"].fill_(float("inf"))}),
+            "non-finite",
+        ),
+    ],
+)
+def test_fifo_resume_rejects_incomplete_or_nonfinite_encoders_and_center(
+    tmp_path, monkeypatch, mutate, match
+):
+    import pytest
+    import torch
+
+    source = _fifo_source_run(tmp_path, monkeypatch, patch_loss="none")
+    payload = _load_fifo_checkpoint(source["out_dir"] / "SSL_epoch_0001.pth")
+    mutate(payload)
+    bad = _save_fifo_checkpoint(payload, tmp_path / "bad.pth")
+    with pytest.raises(ValueError, match=match):
+        _fifo_resume_run(tmp_path, monkeypatch, bad, patch_loss="none")
+    assert not (tmp_path / "out_bad" / "logs").exists()
+
+
+def test_fifo_resolved_log_separates_requested_and_effective(
+    tmp_path, monkeypatch, capsys
+):
+    import csv
+    import json
+
+    def records():
+        captured = capsys.readouterr().out
+        found = [
+            json.loads(line.split("Relational queue config:", 1)[1])
+            for line in captured.splitlines()
+            if "Relational queue config:" in line
+        ]
+        return found
+
+    fresh = _run_tiny_pretrain(
+        tmp_path,
+        monkeypatch,
+        label="_fresh",
+        relational_queue_size=2,
+        relational_queue_size_explicit=True,
+        max_epochs=1,
+    )
+    fresh_records = records()
+    assert len(fresh_records) == 1
+    assert fresh_records[0] == {
+        "applicability": "active",
+        "requested_capacity": 2,
+        "effective_capacity": 2,
+        "capacity_source": "explicit",
+        "requested_batch_size": 4,
+        "effective_batch_size": 4,
+        "batch_size_source": "explicit",
+    }
+
+    resumed = _run_tiny_pretrain(
+        tmp_path,
+        monkeypatch,
+        label="_resumed",
+        resume=str(fresh["out_dir"] / "SSL_epoch_0001.pth"),
+        max_epochs=2,
+        save_every_epochs=1,
+        # A direct core caller carries parser defaults: without the explicitness
+        # marker a present batch value would read as an override.
+        batch_size_explicit=False,
+    )
+    inherited = records()
+    assert len(inherited) == 1
+    # Raw batch/capacity requests were omitted; the effective values are the
+    # saved ones, and the record never presents them as fresh requests.
+    assert inherited[0]["requested_capacity"] is None
+    assert inherited[0]["effective_capacity"] == 2
+    assert inherited[0]["capacity_source"] == "inherited"
+    assert inherited[0]["requested_batch_size"] == 4
+    assert inherited[0]["batch_size_source"] == "inherited"
+    rows = list(
+        csv.DictReader(
+            (resumed["out_dir"] / "logs" / "instant_metrics.pretrain.csv").open(
+                newline=""
+            )
+        )
+    )
+    assert rows and all(row["relational_queue_capacity"] == "2" for row in rows)
+
+    disabled = _run_tiny_pretrain(
+        tmp_path,
+        monkeypatch,
+        label="_disabled",
+        relational_queue_size=0,
+        relational_queue_size_explicit=True,
+        max_epochs=1,
+    )
+    disabled_records = records()
+    assert len(disabled_records) == 1
+    assert disabled_records[0]["applicability"] == "disabled"
+    assert disabled_records[0]["requested_capacity"] == 0
+    assert disabled_records[0]["effective_capacity"] == 0
+    disabled_rows = list(
+        csv.DictReader(
+            (disabled["out_dir"] / "logs" / "instant_metrics.pretrain.csv").open(
+                newline=""
+            )
+        )
+    )
+    assert disabled_rows
+    for name in reporting_module._PRETRAIN_RELATIONAL_QUEUE_FIELDS:
+        assert all(row[name] == "" for row in disabled_rows), name
