@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Callable, NamedTuple
 import torch
 import torch.nn.functional as F
@@ -26,6 +27,203 @@ _RELATIONAL_PAIR_SETS: dict[str, tuple[tuple[int, int], ...]] = {
 }
 
 
+@dataclass(frozen=True)
+class _RelationalStepTargets:
+    """This step's rectangular relational candidates and teacher targets.
+
+    ``candidates`` holds one ``[B + E, D]`` detached matrix per teacher slot in
+    current-batch-first order; ``teacher_probs`` holds the matching ``[B, B + E]``
+    detached targets. ``teacher_stats`` is already averaged over the contributing
+    slots, and unavailable measurements are omitted rather than NaN.
+    """
+
+    candidates: tuple[torch.Tensor, torch.Tensor]
+    teacher_probs: tuple[torch.Tensor, torch.Tensor]
+    teacher_stats: dict[str, torch.Tensor] | None
+
+
+def _mean_or_none(values: list[torch.Tensor]) -> torch.Tensor | None:
+    stacked = torch.stack(values)
+    return stacked.mean()
+
+
+def _teacher_row_statistics(
+    logits: torch.Tensor,
+    probabilities: torch.Tensor,
+    current_count: int,
+) -> dict[str, torch.Tensor]:
+    """Per-slot teacher target structure, reduced to detached scalars.
+
+    Entropy uses the stable log-softmax of the same logits; the conditional
+    nonself perplexity is the mean per-row perplexity over the nonself cells and
+    is omitted when a row has no nonself candidate at all.
+    """
+    rows = int(probabilities.shape[0])
+    columns = int(probabilities.shape[1])
+    log_probabilities = F.log_softmax(logits, dim=1)
+    with torch.no_grad():
+        index = torch.arange(rows, device=probabilities.device)
+        self_mass = probabilities[index, index]
+        current_only = torch.zeros_like(probabilities)
+        current_only[:, :current_count] = probabilities[:, :current_count]
+        current_only[index, index] = 0.0
+        other_current = current_only.sum(dim=1)
+        history = probabilities[:, current_count:].sum(dim=1)
+        entropy = -(probabilities * log_probabilities).sum(dim=1)
+
+        nonself_mask = torch.ones_like(probabilities, dtype=torch.bool)
+        nonself_mask[index, index] = False
+        nonself_mass = (probabilities * nonself_mask).sum(dim=1)
+        stats: dict[str, torch.Tensor] = {
+            "self_mass": self_mass.mean().detach(),
+            "other_current_mass": other_current.mean().detach(),
+            "history_mass": history.mean().detach(),
+            "entropy": entropy.mean().detach(),
+        }
+        if columns < 2:
+            return stats
+        usable = nonself_mass > 0.0
+        if not bool(usable.any()):
+            return stats
+        safe_mass = torch.where(
+            usable, nonself_mass, torch.ones_like(nonself_mass)
+        )
+        conditional = torch.where(
+            nonself_mask,
+            probabilities / safe_mass.unsqueeze(1),
+            torch.zeros_like(probabilities),
+        )
+        conditional_log = torch.where(
+            nonself_mask,
+            log_probabilities - safe_mass.clamp_min(1e-30).log().unsqueeze(1),
+            torch.zeros_like(probabilities),
+        )
+        row_perplexity = torch.exp(
+            -(conditional * conditional_log).sum(dim=1)
+        )
+        stats["nonself_effective"] = row_perplexity[usable].mean().detach()
+    return stats
+
+
+def _make_relational_step_targets(
+    teacher_global: list[torch.Tensor],
+    history_features: torch.Tensor,
+    center_before: torch.Tensor,
+    temp_teacher: float,
+    *,
+    collect_diagnostics: bool,
+) -> _RelationalStepTargets:
+    """Build current-first candidates and teacher targets for both slots once.
+
+    ``teacher_global`` is this step's already centered/normalized teacher output
+    per slot; ``history_features`` is ``[E, 2, D]`` pre-center float32 history.
+    History is recentered with the *pre-step* center once per slot, and the
+    current batch stays first, so every slot holds ``B + E`` columns.
+    """
+    if len(teacher_global) != 2:
+        raise ValueError(
+            "relational targets need exactly two teacher slot features, got "
+            f"{len(teacher_global)}."
+        )
+    candidates: list[torch.Tensor] = []
+    probabilities: list[torch.Tensor] = []
+    slot_stats: list[dict[str, torch.Tensor]] = []
+    for slot in range(2):
+        current = teacher_global[slot]
+        if history_features.numel():
+            history = F.normalize(
+                history_features[:, slot].detach().to(current.dtype) - center_before,
+                dim=-1,
+            )
+            slot_candidates = torch.cat([current, history], dim=0)
+        else:
+            slot_candidates = current
+        detached_candidates = slot_candidates.detach()
+        with torch.no_grad():
+            logits = current.detach() @ detached_candidates.T / temp_teacher
+            logits = logits - logits.mean(dim=1, keepdim=True)
+            probs = F.softmax(logits, dim=1)
+            if collect_diagnostics:
+                slot_stats.append(
+                    _teacher_row_statistics(
+                        logits, probs, int(current.shape[0])
+                    )
+                )
+        candidates.append(detached_candidates)
+        probabilities.append(probs.detach())
+    teacher_stats: dict[str, torch.Tensor] | None = None
+    if collect_diagnostics:
+        keys = set(slot_stats[0])
+        for stats in slot_stats[1:]:
+            keys &= set(stats)
+        teacher_stats = {
+            key: _mean_or_none([stats[key] for stats in slot_stats])
+            for key in sorted(keys)
+        }
+    return _RelationalStepTargets(
+        candidates=(candidates[0], candidates[1]),
+        teacher_probs=(probabilities[0], probabilities[1]),
+        teacher_stats=teacher_stats,
+    )
+
+
+def _student_row_statistics(
+    logits: torch.Tensor, probabilities: torch.Tensor, current_count: int
+) -> dict[str, torch.Tensor]:
+    """Detached student mass allocation over the candidate columns."""
+    rows = int(probabilities.shape[0])
+    index = torch.arange(rows, device=probabilities.device)
+    with torch.no_grad():
+        detached = probabilities.detach()
+        self_mass = detached[index, index]
+        current_only = torch.zeros_like(detached)
+        current_only[:, :current_count] = detached[:, :current_count]
+        current_only[index, index] = 0.0
+        return {
+            "self_mass": self_mass.mean(),
+            "other_current_mass": current_only.sum(dim=1).mean(),
+            "history_mass": detached[:, current_count:].sum(dim=1).mean(),
+        }
+
+
+def _merge_student_statistics(
+    collected: list[dict[str, torch.Tensor]], target: list[dict[str, torch.Tensor]]
+) -> None:
+    """Average per-pair student statistics and append them to ``target``."""
+    if not collected:
+        return
+    keys = set(collected[0])
+    for stats in collected[1:]:
+        keys &= set(stats)
+    target.append(
+        {key: _mean_or_none([stats[key] for stats in collected]) for key in sorted(keys)}
+    )
+
+
+def _relational_pair_loss(
+    student_out: torch.Tensor,
+    slot: int,
+    targets: _RelationalStepTargets,
+    temp_student: float,
+    collected: list[dict[str, torch.Tensor]] | None = None,
+) -> torch.Tensor:
+    """One student query against one slot's rectangular candidate matrix."""
+    candidates = targets.candidates[slot]
+    teacher_probs = targets.teacher_probs[slot]
+    student_logits = student_out @ candidates.T / temp_student
+    log_probs = F.log_softmax(student_logits, dim=1)
+    loss = -(teacher_probs * log_probs).sum(dim=1).mean()
+    if collected is not None:
+        collected.append(
+            _student_row_statistics(
+                student_logits,
+                F.softmax(student_logits.detach(), dim=1),
+                int(student_out.shape[0]),
+            )
+        )
+    return loss
+
+
 def _compute_global_loss(
     student_global: list[torch.Tensor],
     teacher_global: list[torch.Tensor],
@@ -33,12 +231,16 @@ def _compute_global_loss(
     temp_teacher: float,
     *,
     relational_pairing: str,
+    relational_targets: _RelationalStepTargets | None = None,
+    student_stats: list[dict[str, torch.Tensor]] | None = None,
 ) -> torch.Tensor:
     """Average the selected global student/teacher view pairs.
 
     ``cross`` averages A-to-B and B-to-A, ``full`` averages the whole Cartesian
     product, and the internal ``same`` pairing keeps the historical
-    matching-index terms for legacy checkpoints.
+    matching-index terms for legacy checkpoints. With ``relational_targets`` the
+    pair selects its matching slot's rectangular candidate matrix instead of the
+    batch-only teacher-output relation.
     """
     pairs = _RELATIONAL_PAIR_SETS.get(relational_pairing)
     if pairs is None:
@@ -52,13 +254,25 @@ def _compute_global_loss(
             f"features, got {len(student_global)} and {len(teacher_global)}."
         )
     loss = torch.tensor(0.0, device=student_global[0].device)
+    collected: list[dict[str, torch.Tensor]] = []
     for student_index, teacher_index in pairs:
+        if relational_targets is not None:
+            loss = loss + _relational_pair_loss(
+                student_global[student_index],
+                teacher_index,
+                relational_targets,
+                temp_student,
+                collected if student_stats is not None else None,
+            )
+            continue
         loss = loss + _ssl_loss(
             student_global[student_index],
             teacher_global[teacher_index],
             temp_student,
             temp_teacher,
         )
+    if student_stats is not None:
+        _merge_student_statistics(collected, student_stats)
     return loss / len(pairs)
 
 
@@ -67,18 +281,36 @@ def _compute_local_loss(
     teacher_global: list[torch.Tensor],
     temp_student: float,
     temp_teacher: float,
+    *,
+    relational_targets: _RelationalStepTargets | None = None,
+    student_stats: list[dict[str, torch.Tensor]] | None = None,
 ) -> torch.Tensor:
     """Compute local-to-global distillation loss following ref/ibot20260115.py.
 
-    Averages over all local_student x teacher_global pairs.
+    Averages over all local_student x teacher_global pairs. Local views are
+    student queries only: with ``relational_targets`` each teacher slot keeps its
+    current-plus-history candidate matrix, and the student statistics are
+    aggregated per contributing pair.
     """
     if not local_views_student:
         return torch.tensor(0.0, device=teacher_global[0].device)
     device = local_views_student[0].device
     loss = torch.tensor(0.0, device=device)
+    collected: list[dict[str, torch.Tensor]] = []
     for lv in local_views_student:
-        for t in teacher_global:
+        for slot, t in enumerate(teacher_global):
+            if relational_targets is not None:
+                loss = loss + _relational_pair_loss(
+                    lv,
+                    slot,
+                    relational_targets,
+                    temp_student,
+                    collected if student_stats is not None else None,
+                )
+                continue
             loss += _ssl_loss(lv, t, temp_student, temp_teacher)
+    if student_stats is not None:
+        _merge_student_statistics(collected, student_stats)
     loss /= max(1, len(local_views_student) * len(teacher_global))
     return loss
 
@@ -230,7 +462,35 @@ def _ssl_loss(
     teacher_out: torch.Tensor,
     temp_student: float,
     temp_teacher: float,
+    *,
+    candidates: torch.Tensor | None = None,
+    teacher_probs: torch.Tensor | None = None,
+    stats: dict[str, torch.Tensor] | None = None,
 ) -> torch.Tensor:
+    """Batch-only relational loss, or its rectangular candidate extension.
+
+    ``candidates`` (``[B + E, D]``) and ``teacher_probs`` (``[B, B + E]``) must
+    be supplied together; omitting both keeps the historical body unchanged.
+    ``stats`` collects detached student mass from exactly the logits used here.
+    """
+    if (candidates is None) != (teacher_probs is None):
+        raise ValueError(
+            "candidates and teacher_probs must be supplied together; got "
+            f"candidates={'set' if candidates is not None else None} and "
+            f"teacher_probs={'set' if teacher_probs is not None else None}."
+        )
+    if candidates is not None:
+        student_sim = student_out @ candidates.T / temp_student
+        student_log_probs = F.log_softmax(student_sim, dim=1)
+        if stats is not None:
+            stats.update(
+                _student_row_statistics(
+                    student_sim,
+                    F.softmax(student_sim.detach(), dim=1),
+                    int(student_out.shape[0]),
+                )
+            )
+        return -(teacher_probs * student_log_probs).sum(dim=1).mean()
     student_sim = student_out @ teacher_out.T / temp_student
     with torch.no_grad():
         teacher_sim = teacher_out @ teacher_out.T / temp_teacher
