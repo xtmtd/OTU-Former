@@ -587,3 +587,33 @@ def test_extract_documents_the_shared_data_path() -> None:
         assert "running" in text
     assert "strict" in en.lower()
     assert "严格" in cn
+
+
+def test_fifo_user_command_docs_state_opt_in_and_recovery() -> None:
+    """The queue is optional, identity-locked and recovery-restricted."""
+    for suffix in ("md", "cn.md"):
+        text = (COMMAND_DOCS / f"pretrain.{suffix}").read_text(encoding="utf-8")
+        assert "--relational-queue-size" in text
+        assert "SHA-256" in text
+        start = text.index("### `--relational-queue-size`")
+        section = text[start : text.index("### `--log-every-n-steps`")]
+        # Opt-in default, inherited capacity and the enabled-recovery warning are
+        # stated in both languages, without promising old-code resume.
+        assert "queue-capable" in section or "支持队列的版本" in section
+        assert "0" in section
+    en = (COMMAND_DOCS / "pretrain.md").read_text(encoding="utf-8")
+    assert "effective new-run default `0`" in en
+    assert "stays disabled" in en
+
+    spec = (
+        ROOT
+        / "docs"
+        / "superpowers"
+        / "specs"
+        / "2026-11-10-relational-fifo-design.md"
+    ).read_text(encoding="utf-8")
+    assert "queue-capable" in spec
+    master = (
+        ROOT / "docs" / "superpowers" / "specs" / "2026-03-29-otuformer-design.md"
+    ).read_text(encoding="utf-8")
+    assert "2026-11-10-relational-fifo-design.md" in master

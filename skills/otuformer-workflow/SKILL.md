@@ -59,7 +59,14 @@ step at a time. Never run an analysis because this Skill was loaded.
    states, and no negative mask or trusted background may be inferred. Treat
    `data_validation.json`, `data_records.jsonl` and `run_provenance.json` by their
    recorded status: `running` or a missing pair is not a completed extraction.
-8. **Interpretation stays honest.** Distinguish morphOTUs from verified species,
+8. **Keep opt-in pre-training history opt-in.** `--relational-queue-size`
+   (relational pre-training only) is default-off: show it exactly as the
+   discovered schema declares it, never as a recommended default, and never add
+   it to a proposal the operator did not ask for. When it is proposed with a
+   positive value, state in the card that the run hashes the whole selected
+   dataset before any model probe, requires one CSV row per in-root image
+   identity, and needs a queue-capable version for training resume.
+9. **Interpretation stays honest.** Distinguish morphOTUs from verified species,
    label classes from ecological samples, morphological trees from established
    phylogenies, and raw-feature gradient CAM from validated attribution.
 

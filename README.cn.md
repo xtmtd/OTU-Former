@@ -171,7 +171,7 @@ otuformer -v
 | `otuformer cam` | 生成 GradCAM 等热图。 | [docs/commands/cam.cn.md](docs/commands/cam.cn.md) |
 | `otuformer export` | 导出 ONNX 模型。 | [docs/commands/export.cn.md](docs/commands/export.cn.md) |
 
-两份跨命令契约有独立文档：[训练数据增强](docs/commands/training-augmentation.cn.md)（`pretrain` 与 `finetune` 共享的 `--augmentation` 与 `--orientation-policy` 行为）与 [嵌入指标](docs/commands/embedding-metrics.cn.md)（`pretrain`、`finetune` 与 `extract` 共享的指标）。新的 `pretrain` 运行还会从同步的学生/教师编码器配对出发，默认使用弱增强教师全局视图、`cross` 配对与 `0.08`–`0.11` 教师温度。该默认每个样本多两组弱增强裁剪，且在补丁目标激活时每步执行四次教师前向而不是两次；`--relational-teacher-views ordinary` 可恢复历史成本。断点续训沿用记录中的配方，因此改变配方需要重新开跑。`otuformer extract` 还支持 v2 共享数据路径（`--label-csv`、`--coco-*`）：选择器只严格解析一次，并新增 `data_records.jsonl`、`data_validation.json` 与 `run_provenance.json`（[详见](docs/commands/extract.cn.md)）。
+两份跨命令契约有独立文档：[训练数据增强](docs/commands/training-augmentation.cn.md)（`pretrain` 与 `finetune` 共享的 `--augmentation` 与 `--orientation-policy` 行为）与 [嵌入指标](docs/commands/embedding-metrics.cn.md)（`pretrain`、`finetune` 与 `extract` 共享的指标）。新的 `pretrain` 运行还会从同步的学生/教师编码器配对出发，默认使用弱增强教师全局视图、`cross` 配对与 `0.08`–`0.11` 教师温度。该默认每个样本多两组弱增强裁剪，且在补丁目标激活时每步执行四次教师前向而不是两次；`--relational-teacher-views ordinary` 可恢复历史成本。关系损失默认只使用当前 batch；需要显式开启 `--relational-queue-size` 才会保留最近的教师观测、在启动前哈希已选数据集，并在续训时锁定 batch 大小与 RNG 状态，因此这类检查点需要支持队列的版本才能继续预训练。断点续训沿用记录中的配方，因此改变配方需要重新开跑。`otuformer extract` 还支持 v2 共享数据路径（`--label-csv`、`--coco-*`）：选择器只严格解析一次，并新增 `data_records.jsonl`、`data_validation.json` 与 `run_provenance.json`（[详见](docs/commands/extract.cn.md)）。
 
 ## 许可证
 

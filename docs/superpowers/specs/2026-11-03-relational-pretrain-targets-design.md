@@ -275,3 +275,15 @@ The companion implementation plan is revised with this design and must be audite
 - Dataset interface: weak slots appended after locals; bounded slices; config-driven transform authority with argument-conflict rejection; historical direct-caller default preserved. Weak normalization is explicit new metadata, ordinary normalization stays unchanged.
 - Diagnostics: `cosine_similarity` pinned to ordinary A; `teacher_center_norm` labelled by center source.
 - Preflight baseline: reuse implemented `f959d3b` settings and single actual-size probe; no repeated native-size, patch or geometry resolution.
+
+
+## Extension note — 2026-11-11
+
+This design's **no-queue** boundary remains the default and is unchanged: a
+relational run with capacity zero takes the batch-only loss, data path and
+reporting it describes here. The later [relational FIFO design](2026-11-10-relational-fifo-design.md)
+adds an opt-in, explicitly enabled extension — `--relational-queue-size` with a
+positive capacity — that keeps the current batch candidates and appends recent
+teacher observations. Where that feature is enabled it also adds an enabled-only
+input identity contract, strict epoch recovery and extra instant-metric columns;
+none of those apply to a disabled run, and this document is not rewritten.

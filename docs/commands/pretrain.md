@@ -238,6 +238,16 @@ Teacher feature population that updates the running CLS center: weak or ordinary
 
 Relational global pairs: cross (A-to-B and B-to-A; new-run default) or full (all four). On --resume, omit to inherit. Replaces the removed disable-cross-view-loss switch.
 
+### `--relational-queue-size`
+
+**Default:** unset (`null`); effective new-run default `0` (disabled)
+
+Optional relational FIFO capacity, a count of image records (minimum 0). Omit for a new run to keep the batch-only loss; a positive integer keeps the current batch candidates and adds that many recent teacher observations. On --resume, omit to inherit the saved capacity (a checkpoint without queue state stays disabled), and pass the recorded value to confirm it; any other value is rejected. Relational-only: rejected with --ssl-method dino. Enabled runs hash the whole selected dataset before any probe, require one CSV row per in-root image identity, and need a queue-capable version for training resume.
+
+The capacity is fixed for the run: no `auto` mode, no dataset-derived default, no resizing, no age cutoff and no confidence weighting. The current batch, including the aligned-image candidate, always stays first, and every relation has `B + E` candidate columns instead of `B`.
+
+The selection is identity-checked with a SHA-256 manifest digest, so renaming, reordering, adding or removing rows, or changing image bytes invalidates an enabled resume while relocating the image root does not. History is kept across epochs, and paired slot storage is about `2 * M * D * 4` bytes at occupancy `M`.
+
 ### `--log-every-n-steps`
 
 **Default:** `50`

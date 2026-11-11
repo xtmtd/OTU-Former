@@ -62,6 +62,16 @@ The `--relational-teacher-views`, `--relational-center-source` and
 keeps ordinary global views as its inputs. Use the runtime-derived parameter
 cards for the accepted values and declared defaults instead of quoting them here.
 
+`--relational-queue-size` is a default-off extension of the same relational loss:
+the batch candidates stay first and a positive capacity adds up to that many
+recent teacher observations. Never propose it as a default. Before approving an
+enabled run, state the three consequences: startup hashes the whole selected
+dataset, queue-enabled input needs one CSV row per in-root image identity
+(duplicates, outside-root images and unreadable files are rejected), and an
+enabled checkpoint locks the batch size, steps-per-epoch and RNG state, so a
+queue-capable version is required for training resume. Discover whether the
+installed schema even exposes the option; do not invent it for an older install.
+
 The CLS method is explicit: a new run defaults to `--ssl-method relational`
 (unchanged batch-relative distillation), while `--ssl-method dino` adds a
 DINO-style prototype objective with `--dino-prototypes` (default 64,

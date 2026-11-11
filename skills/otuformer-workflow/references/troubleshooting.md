@@ -84,6 +84,24 @@ recorded method stays supported, including a DINO payload.
   numerically unusable at this run's batch size. Increase the temperature in a
   new run; do not bypass the guard.
 
+Queue-enabled pretraining adds its own enabled-only rejections, none of which is a
+workaround target:
+
+- `one CSV row per image identity` — two selected rows share one in-root key.
+  Remove the duplicate row, or run with `--relational-queue-size 0` and explain
+  that this keeps the legacy batch-only input contract.
+- `inside the declared image root` / `decodable images` — the enabled input
+  contract needs in-root, readable images. Do not move files or edit the CSV
+  mid-investigation on the operator's behalf.
+- `Cannot change --batch-size` / `Cannot change --relational-queue-size` — an
+  enabled queue resume locks the saved recipe. A different recipe needs a new run.
+- `truncated history` / `latest successful batch` — the saved queue state is
+  incomplete. Do not truncate, resize or silently recreate history; resume from an
+  intact checkpoint or start a new run.
+- `requires the saved rng_state` / `records no CUDA RNG` — an enabled queue resume
+  never substitutes a fresh random sequence. Report it as an unsupported recovery
+  target rather than seeding one.
+
 `--disable-cross-view-loss` was removed: use `--relational-pairing` instead. The
 internal historical `same` pairing is only ever inherited from a legacy
 checkpoint and is not a request value.

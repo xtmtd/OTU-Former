@@ -158,6 +158,13 @@ All parameters migrated from `ref/ibot20260115.py` `get_parser()`, mode=pretrain
   resolves documented defaults, and an explicit value that conflicts with the
   recorded one fails. `cosine_similarity` stays the ordinary student-A versus
   centered ordinary teacher-A cosine.
+- `--relational-queue-size` extends that contract with an opt-in, image-keyed
+  history of teacher observations. The default stays batch-only (capacity zero);
+  an enabled run follows the enabled-only input identity, strict epoch recovery
+  and reporting contract in
+  [the relational FIFO design](2026-11-10-relational-fifo-design.md). It is a
+  bounded extension of the existing relational objective, not a new method, and
+  it changes no architecture, default or read-only consumer layout.
 - `--patch-loss` : patch-level objective — `none`, `consistency` (default; visible same-position cosine consistency, not input masking), `masked-feature` (A+; continuous masked feature prediction), or `ibot` (experimental prototype prediction)
 - `--masking-strategy` : real-masking geometry for `masked-feature`/`ibot` — `random` (default), `blockwise`, or `hybrid`
 - `--model-name` : a `vit_*` name alone does not establish compatibility (see Section 4.9)
