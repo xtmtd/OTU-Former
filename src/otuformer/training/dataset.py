@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import copy
+import io
 import math
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -434,6 +436,136 @@ def resolve_dataset_image_paths(
     ):
         by_relative, by_name = _build_recursive_index(images_root)
     return [_resolve_image_path(images_root, ref, by_relative, by_name) for ref in refs]
+
+
+@dataclass(frozen=True)
+class PreparedRelationalData:
+    """One ordered, identity-checked selection for an enabled queue run.
+
+    ``image_keys`` is the row identity carried with each training sample; the
+    image count is ``len(image_keys)``. Only the compact digest and the two
+    dataset summaries are persisted, never the ordered manifest or the bytes.
+    """
+
+    image_paths: tuple[Path, ...]
+    image_keys: tuple[str, ...]
+    data_fingerprint: str
+    data_size_bytes: int
+
+
+def _selected_identity_key(images_root: Path, path: Path) -> str:
+    """Root-relative key for one already-selected path, without re-selecting.
+
+    The written spelling of the selected path is handed to the shared
+    ``resolve_reference`` semantics, so lexical folding keeps the key the
+    reference reaches (``link/../one.png`` addresses ``a/one.png``) and a
+    distinct internal symlink alias stays a distinct key.
+    """
+    from otuformer.data.paths import normalize_key, resolve_reference
+
+    written = path if path.is_absolute() else Path.cwd() / path
+    key, _ = resolve_reference(images_root, str(written), basename_fallback=False)
+    return normalize_key(key)
+
+
+def prepare_relational_data(
+    csv_path: Path | None, images_dir: Path, *, batch_size: int
+) -> PreparedRelationalData:
+    """Resolve, identity-check and hash the exact selected images once.
+
+    Enabled-only: queue-off runs keep the legacy selection untouched. Rejects
+    escaped/missing/corrupt images, two rows sharing one normalized key, and a
+    selection with no complete batch under ``drop_last=True`` before any model
+    is built. The manifest digest covers keys, sizes and content in row order.
+    """
+    from otuformer.data.paths import ReferenceError
+    from otuformer.data.provenance import canonical_digest, snapshot_bytes
+    from otuformer.training.runtime import _phase_done, _phase_start
+
+    images_root = Path(images_dir)
+    resolved_batch = int(batch_size)
+    if resolved_batch < 1:
+        raise ValueError(
+            f"batch_size must be a positive integer, got {batch_size!r}."
+        )
+
+    paths = resolve_dataset_image_paths(csv_path, images_root)
+    if not paths:
+        raise ValueError(
+            "The relational queue needs at least one selected image; the CSV or "
+            f"image root {images_root} selected none."
+        )
+
+    keys: list[str] = []
+    for path in paths:
+        try:
+            key = _selected_identity_key(images_root, Path(path))
+        except ReferenceError as exc:
+            if exc.code in ("root_escape", "unsupported_reference"):
+                raise ValueError(
+                    "Queue-enabled pretraining requires every selected image to "
+                    f"stay inside the declared image root; rejected {path}: {exc}"
+                ) from exc
+            raise ValueError(
+                "Queue-enabled pretraining could not read the selected image "
+                f"{path}: {exc}"
+            ) from exc
+        if key in keys:
+            raise ValueError(
+                "Queue-enabled pretraining requires one CSV row per image "
+                f"identity; two selected rows map to the key {key!r}. Remove the "
+                "duplicate row, or run with --relational-queue-size 0 to keep "
+                "the legacy input contract."
+            )
+        keys.append(key)
+
+    if len(keys) < resolved_batch:
+        raise ValueError(
+            f"Queue-enabled pretraining needs a complete batch: {len(keys)} "
+            "selected image(s) with drop_last=True and batch_size="
+            f"{resolved_batch}."
+        )
+
+    started = _phase_start(
+        f"relational queue data preparation ({len(keys)} images)"
+    )
+    rows: list[dict[str, object]] = []
+    for key, path in zip(keys, paths):
+        try:
+            data, snapshot = snapshot_bytes(Path(path))
+        except OSError as exc:
+            raise ValueError(
+                "Queue-enabled pretraining could not read the selected image "
+                f"{key!r}: {exc}"
+            ) from exc
+        try:
+            with Image.open(io.BytesIO(data)) as handle:
+                handle.verify()
+        except (OSError, ValueError) as exc:
+            raise ValueError(
+                "Queue-enabled pretraining requires decodable images; "
+                f"{key!r} is unreadable: {exc}"
+            ) from exc
+        rows.append(
+            {
+                "image_key": key,
+                "size_bytes": int(snapshot.size_bytes),
+                "sha256": snapshot.sha256,
+            }
+        )
+    fingerprint = canonical_digest(rows)
+    total_bytes = sum(int(row["size_bytes"]) for row in rows)
+    _phase_done(
+        "relational queue data preparation "
+        f"({len(keys)} images, {total_bytes} bytes)",
+        started,
+    )
+    return PreparedRelationalData(
+        image_paths=tuple(Path(path) for path in paths),
+        image_keys=tuple(keys),
+        data_fingerprint=fingerprint,
+        data_size_bytes=total_bytes,
+    )
 
 
 def _random_apply(transform: Any, probability: float) -> Any:
@@ -960,9 +1092,19 @@ class MultiCropDataset(Dataset):
         include_weak_teacher_views: bool = False,
         augmentation_config: dict[str, object] | None = None,
         weak_teacher_augmentation_config: dict[str, object] | None = None,
+        prepared_relational_data: PreparedRelationalData | None = None,
     ) -> None:
         images_root = Path(images_dir)
-        self.image_paths = resolve_dataset_image_paths(csv_path, images_root)
+        # Prepared state is the enabled-only handoff: when present it is the one
+        # resolution of the selection, so the dataset never re-resolves a path
+        # the run already identity-checked.
+        self.prepared_relational_data = prepared_relational_data
+        if prepared_relational_data is None:
+            self.image_paths = resolve_dataset_image_paths(csv_path, images_root)
+            self.image_keys: tuple[str, ...] | None = None
+        else:
+            self.image_paths = list(prepared_relational_data.image_paths)
+            self.image_keys = tuple(prepared_relational_data.image_keys)
         self.global_crop_size = int(global_crop_size)
         self.local_crop_size = int(local_crop_size)
         self.local_crops = int(local_crops)
@@ -1042,7 +1184,7 @@ class MultiCropDataset(Dataset):
         _validate_view_shape(view, expected_size, view_name)
         return view
 
-    def __getitem__(self, idx: int) -> list[torch.Tensor]:
+    def __getitem__(self, idx: int) -> list[torch.Tensor] | dict[str, object]:
         with Image.open(self.image_paths[idx]) as im:
             img = im.convert("RGB")
         if self._estimate_edge_fill:
@@ -1083,6 +1225,10 @@ class MultiCropDataset(Dataset):
                     "weak_teacher_B",
                 )
             )
+        if self.image_keys is not None:
+            # Enabled envelope: one key per row, aligned with the view list so
+            # native collation keeps keys and views in the same row order.
+            return {"views": views, "image_key": self.image_keys[idx]}
         return views
 
 

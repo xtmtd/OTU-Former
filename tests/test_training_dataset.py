@@ -22,6 +22,7 @@ from otuformer.training.dataset import (
     build_finetune_augmentation_config,
     build_pretrain_augmentation_config,
     center_crop_eval_transform,
+    prepare_relational_data,
     whole_specimen_pad_transform,
 )
 
@@ -1177,3 +1178,202 @@ def test_resolve_dataset_image_paths_matches_the_loader(tmp_path):
     # The symlink is reported where it lives; resolving it reaches the target.
     assert resolved[1] == images / "link.jpg"
     assert resolved[1].resolve() == (outside / "real.jpg").resolve()
+
+
+# --- Relational FIFO: enabled-only prepared selection and keyed views ------
+
+
+def _make_png(path: Path, color: tuple[int, int, int] = (10, 20, 30)) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", (16, 16), color=color).save(path)
+
+
+def _write_csv(path: Path, rows: list[str], extra_columns: str = "") -> Path:
+    header = "image" + extra_columns
+    lines = [header]
+    for index, row in enumerate(rows):
+        if extra_columns:
+            lines.append(f"{row},label_{index % 2}")
+        else:
+            lines.append(row)
+    path.write_text("\n".join(lines) + "\n")
+    return path
+
+
+def test_fifo_preparation_keeps_two_internal_aliases(tmp_path):
+    from PIL import Image
+
+    Image.new("RGB", (8, 8)).save(tmp_path / "one.png")
+    (tmp_path / "alias.png").symlink_to("one.png")
+    csv = tmp_path / "images.csv"
+    csv.write_text("image\none.png\nalias.png\n")
+    data = prepare_relational_data(csv, tmp_path, batch_size=2)
+    assert data.image_keys == ("one.png", "alias.png")
+    assert len(data.data_fingerprint) == 64
+
+
+def test_fifo_preparation_preserves_selected_paths_and_alias_keys(tmp_path):
+    _make_png(tmp_path / "one.png", (10, 20, 30))
+    _make_png(tmp_path / "a" / "one.png", (1, 2, 3))
+    _make_png(tmp_path / "a" / "x.png", (4, 5, 6))
+    (tmp_path / "a" / "x").mkdir()
+    (tmp_path / "lnk").symlink_to("a/x")
+    (tmp_path / "link.png").symlink_to("a/one.png")
+
+    # `a/../one.png` and `one.png` open one file and share one identity.
+    collision = _write_csv(
+        tmp_path / "collision.csv", ["one.png", "a/../one.png"]
+    )
+    with pytest.raises(ValueError, match="one CSV row per image identity"):
+        prepare_relational_data(collision, tmp_path, batch_size=1)
+
+    # A lexical fold never invents an identity: the link's `..` addresses a/x.
+    folded = _write_csv(tmp_path / "folded.csv", ["lnk/../one.png"])
+    folded_data = prepare_relational_data(folded, tmp_path, batch_size=1)
+    assert folded_data.image_keys == ("a/one.png",)
+    assert folded_data.image_paths == (tmp_path / "lnk" / ".." / "one.png",)
+
+    # Two valid internal aliases of one file stay two identities.
+    aliases = _write_csv(tmp_path / "aliases.csv", ["a/one.png", "link.png"])
+    alias_data = prepare_relational_data(aliases, tmp_path, batch_size=2)
+    assert alias_data.image_keys == ("a/one.png", "link.png")
+
+    # A legacy recursive basename match keeps the location it actually opened.
+    basename = _write_csv(tmp_path / "basename.csv", ["x.png"])
+    basename_data = prepare_relational_data(basename, tmp_path, batch_size=1)
+    assert basename_data.image_keys == ("a/x.png",)
+    assert basename_data.image_paths == (tmp_path / "a" / "x.png",)
+
+
+def test_fifo_preparation_content_order_and_relocation(tmp_path):
+    _make_png(tmp_path / "one.png", (10, 20, 30))
+    _make_png(tmp_path / "two.png", (40, 50, 60))
+    csv = _write_csv(tmp_path / "images.csv", ["one.png", "two.png"])
+    base = prepare_relational_data(csv, tmp_path, batch_size=2)
+    assert len(base.data_fingerprint) == 64
+    assert base.data_size_bytes == sum(
+        (tmp_path / name).stat().st_size for name in ("one.png", "two.png")
+    )
+
+    # Labels and other CSV columns are not part of the training-data identity.
+    labeled = _write_csv(
+        tmp_path / "labeled.csv", ["one.png", "two.png"], extra_columns=",label"
+    )
+    assert (
+        prepare_relational_data(labeled, tmp_path, batch_size=2).data_fingerprint
+        == base.data_fingerprint
+    )
+
+    # A relocated root keeps keys, bytes and row order: the digest is stable.
+    moved = tmp_path / "moved"
+    moved.mkdir()
+    for name in ("one.png", "two.png"):
+        (moved / name).write_bytes((tmp_path / name).read_bytes())
+    relocated = prepare_relational_data(csv, moved, batch_size=2)
+    assert relocated.data_fingerprint == base.data_fingerprint
+    assert relocated.image_keys == base.image_keys
+    assert all(path.parent == moved for path in relocated.image_paths)
+
+    # Row order is identity: shuffle indices address that order.
+    reordered = _write_csv(tmp_path / "reordered.csv", ["two.png", "one.png"])
+    assert (
+        prepare_relational_data(reordered, tmp_path, batch_size=2).data_fingerprint
+        != base.data_fingerprint
+    )
+
+    # Renaming (same bytes) and changed content both invalidate the lock.
+    _make_png(tmp_path / "three.png", (40, 50, 60))
+    (tmp_path / "two.png").unlink()
+    renamed = _write_csv(tmp_path / "renamed.csv", ["one.png", "three.png"])
+    renamed_fingerprint = prepare_relational_data(
+        renamed, tmp_path, batch_size=2
+    ).data_fingerprint
+    assert renamed_fingerprint != base.data_fingerprint
+
+    _make_png(tmp_path / "three.png", (40, 50, 61))
+    changed = prepare_relational_data(renamed, tmp_path, batch_size=2)
+    assert changed.data_fingerprint != renamed_fingerprint
+
+
+def test_fifo_preparation_rejects_invalid_inputs(tmp_path):
+    outside = tmp_path / "outside"
+    _make_png(outside / "ext.png", (1, 1, 1))
+    root = tmp_path / "root"
+    _make_png(root / "one.png")
+    _make_png(root / "two.png")
+
+    absolute = _write_csv(tmp_path / "absolute.csv", [str(outside / "ext.png")])
+    with pytest.raises(ValueError, match="inside the declared image root"):
+        prepare_relational_data(absolute, root, batch_size=1)
+
+    (root / "escape.png").symlink_to(outside / "ext.png")
+    escaping = _write_csv(tmp_path / "escaping.csv", ["escape.png"])
+    with pytest.raises(ValueError, match="inside the declared image root"):
+        prepare_relational_data(escaping, root, batch_size=1)
+
+    missing = _write_csv(tmp_path / "missing.csv", ["nope.png"])
+    with pytest.raises(ValueError, match="could not read"):
+        prepare_relational_data(missing, root, batch_size=1)
+
+    (root / "corrupt.png").write_bytes(b"not an image")
+    corrupt = _write_csv(tmp_path / "corrupt.csv", ["corrupt.png"])
+    with pytest.raises(ValueError, match="decodable"):
+        prepare_relational_data(corrupt, root, batch_size=1)
+
+    duplicated = _write_csv(tmp_path / "duplicated.csv", ["one.png", "./one.png"])
+    with pytest.raises(ValueError, match="one CSV row per image identity"):
+        prepare_relational_data(duplicated, root, batch_size=1)
+
+    incomplete = _write_csv(tmp_path / "incomplete.csv", ["one.png"])
+    with pytest.raises(ValueError, match="complete batch"):
+        prepare_relational_data(incomplete, root, batch_size=4)
+
+
+def test_fifo_keyed_batches_preserve_view_rng_and_alignment(tmp_path):
+    from torch.utils.data import DataLoader
+
+    for index in range(4):
+        _make_png(tmp_path / f"img_{index}.png", (index * 40, 20, 10))
+    csv = _write_csv(
+        tmp_path / "images.csv",
+        [f"img_{index}.png" for index in range(4)],
+        extra_columns=",label",
+    )
+    prepared = prepare_relational_data(csv, tmp_path, batch_size=2)
+
+    common = dict(
+        csv_path=csv,
+        images_dir=tmp_path,
+        global_crop_size=32,
+        local_crop_size=16,
+        local_crops=2,
+    )
+    legacy = MultiCropDataset(**common)
+    keyed = MultiCropDataset(prepared_relational_data=prepared, **common)
+    assert legacy.image_keys is None
+    assert keyed.image_keys == prepared.image_keys
+
+    torch.manual_seed(7)
+    legacy_views = legacy[0]
+    torch.manual_seed(7)
+    keyed_sample = keyed[0]
+    assert isinstance(legacy_views, list)
+    assert set(keyed_sample) == {"views", "image_key"}
+    assert keyed_sample["image_key"] == "img_0.png"
+    assert len(keyed_sample["views"]) == len(legacy_views)
+    for produced, expected in zip(keyed_sample["views"], legacy_views):
+        assert torch.equal(produced, expected)
+    assert torch.get_rng_state().tolist() != []
+
+    loader = DataLoader(keyed, batch_size=2, shuffle=False, num_workers=0)
+    batch = next(iter(loader))
+    assert set(batch) == {"views", "image_key"}
+    assert tuple(batch["image_key"]) == ("img_0.png", "img_1.png")
+    assert len(batch["views"]) == len(legacy_views)
+    assert all(view.shape[0] == 2 for view in batch["views"])
+
+    worker_loader = DataLoader(keyed, batch_size=2, shuffle=False, num_workers=2)
+    worker_batch = next(iter(worker_loader))
+    assert set(worker_batch) == {"views", "image_key"}
+    assert tuple(worker_batch["image_key"]) == ("img_0.png", "img_1.png")
+    assert all(view.shape[0] == 2 for view in worker_batch["views"])
