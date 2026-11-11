@@ -33,6 +33,7 @@ def _request(tmp_path, csv, **overrides):
         batch_size_explicit=False,
         device="cpu",
         model_name="vit_tiny_patch16_224",
+        out_dim=8,
         global_crop_size=64,
         local_crop_size=16,
         local_crops=1,
@@ -125,8 +126,8 @@ def _enabled_payload(
             "image_size": 64,
             "ssl_method": "relational",
             "ssl_head": "projection_mlp_2048",
-            **recipe.KOLEO_FIXED_CONFIG,
-            "koleo_weight": 0.0,
+            # A disabled KoLeo regularizer is encoded by *absence*, exactly as a
+            # zero-weight relational run writes it.
             "relational_queue_config": {"version": 1, "capacity": capacity},
         },
         "epoch": epoch,
@@ -152,6 +153,30 @@ def _enabled_payload(
     for key in drop:
         payload.pop(key, None)
     return payload
+
+
+def test_fifo_data_identity_precedes_optimizer_execution_probe(tmp_path, monkeypatch):
+    csv, _ = _write_images(tmp_path)
+    events = []
+    prepare_data = recipe.prepare_relational_data
+    validate_optimizer = recipe._validate_queue_optimizer_precision
+
+    def prepare(*args, **kwargs):
+        result = prepare_data(*args, **kwargs)
+        events.append("complete_identity")
+        return result
+
+    def validate(*args, **kwargs):
+        assert events == ["complete_identity"]
+        events.append("optimizer_probe")
+        return validate_optimizer(*args, **kwargs)
+
+    monkeypatch.setattr(recipe, "prepare_relational_data", prepare)
+    monkeypatch.setattr(recipe, "_validate_queue_optimizer_precision", validate)
+    recipe.prepare_pretrain_relational_queue(
+        _request(tmp_path, csv, relational_queue_size=2, weight_decay=0.04), None,
+    )
+    assert events == ["complete_identity", "optimizer_probe"]
 
 
 def test_fifo_direct_omission_stays_legacy_off():
@@ -383,6 +408,647 @@ def test_fifo_bundles_must_be_complete(tmp_path):
         recipe.prepare_pretrain_relational_queue(
             _request(tmp_path, csv, resume="runs/x/SSL_latest.pth"), without_config
         )
+
+
+def test_fifo_resume_rejects_incomplete_or_nonfinite_schedule(tmp_path):
+    csv, names = _write_images(tmp_path)
+    resume = "runs/x/SSL_epoch_0001.pth"
+    request = _request(
+        tmp_path, csv, resume=resume, batch_size=2, batch_size_explicit=True
+    )
+
+    payload = _enabled_payload(tmp_path, names, capacity=2, batch=2)
+    recipe.prepare_pretrain_relational_queue(request, payload)
+
+    for mutate, match in (
+        (lambda p: p["schedule"].pop("final_lr"), r"schedule\.final_lr"),
+        (lambda p: p["schedule"].pop("last_lr"), r"schedule\.last_lr"),
+        (lambda p: p["schedule"].pop("warmup_steps"), r"schedule\.warmup_steps"),
+        (
+            lambda p: p["schedule"].update({"final_lr": float("nan")}),
+            r"schedule final_lr to be finite",
+        ),
+        (
+            lambda p: p["schedule"].update({"last_lr": float("inf")}),
+            r"schedule last_lr to be finite",
+        ),
+        (
+            lambda p: p["schedule"].update({"last_lr": -1e-05}),
+            "last_lr to be non-negative",
+        ),
+        # Python-finite but not finite at the float32 schedule precision.
+        (
+            lambda p: p["schedule"].update({"last_lr": 1e100}),
+            "survive the float32 schedule precision",
+        ),
+        (
+            lambda p: p["schedule"].update({"final_lr": 1e100}),
+            "survive the float32 schedule precision",
+        ),
+        (
+            lambda p: p["schedule"].update({"total_steps": 1}),
+            "beyond the recorded",
+        ),
+        (
+            lambda p: p["schedule"].update({"original_max_epochs": 0}),
+            "positive saved schedule.original_max_epochs",
+        ),
+    ):
+        broken = _enabled_payload(tmp_path, names, capacity=2, batch=2)
+        mutate(broken)
+        with pytest.raises(ValueError, match=match):
+            recipe.prepare_pretrain_relational_queue(request, broken)
+
+    # The invocation's own --lr enters the same float32 schedule.
+    broken = _enabled_payload(tmp_path, names, capacity=2, batch=2)
+    with pytest.raises(ValueError, match=r"--lr to survive the float32"):
+        recipe.prepare_pretrain_relational_queue(
+            _request(
+                tmp_path,
+                csv,
+                resume=resume,
+                batch_size=2,
+                batch_size_explicit=True,
+                lr=1e100,
+            ),
+            broken,
+        )
+
+
+def test_fifo_resume_accepts_a_zero_learning_rate_writer_state(tmp_path):
+    """--lr 0 is a legal run, so a zero endpoint must be readable."""
+    csv, names = _write_images(tmp_path, count=14)
+    schedule_args = argparse.Namespace(
+        max_epochs=1,
+        lr=0.0,
+        warmup_epochs=3,
+        teacher_momentum=0.9,
+        teacher_momentum_end=0.99,
+        student_temp=0.1,
+        teacher_temp_start=0.04,
+        teacher_temp_end=0.07,
+    )
+    lr_schedule, _, _, _, metadata = recipe._build_pretrain_schedules(
+        schedule_args, None, steps_per_epoch=7, global_step=0, completed_epochs=0
+    )
+    assert metadata["last_lr"] == 0.0 and metadata["final_lr"] == 0.0
+    # The real optimizer uses this schedule and keeps finite parameters.
+    parameter = torch.nn.Parameter(torch.ones(3))
+    optimizer = torch.optim.AdamW([parameter], lr=float(lr_schedule[0]))
+    for step in range(7):
+        optimizer.param_groups[0]["lr"] = float(lr_schedule[step])
+        parameter.grad = torch.ones(3)
+        optimizer.step()
+    assert torch.isfinite(parameter).all()
+    assert float(optimizer.param_groups[0]["lr"]) == 0.0
+
+    request = _request(
+        tmp_path,
+        csv,
+        resume="runs/x/SSL_epoch_0001.pth",
+        batch_size=2,
+        batch_size_explicit=True,
+        max_epochs=1,
+        lr=0.0,
+    )
+    payload = _enabled_payload(
+        tmp_path,
+        names,
+        capacity=2,
+        batch=2,
+        keys=names[:2],
+        observed=[6, 6],
+        schedule_overrides=metadata,
+    )
+    assert recipe.prepare_pretrain_relational_queue(request, payload).capacity == 2
+
+    # Values that collapse toward zero at float32 stay finite schedules.
+    for tiny in (1e-44, 1e-46):
+        payload = _enabled_payload(
+            tmp_path,
+            names,
+            capacity=2,
+            batch=2,
+            keys=names[:2],
+            observed=[6, 6],
+            schedule_overrides={**metadata, "last_lr": tiny, "final_lr": tiny},
+        )
+        assert (
+            recipe.prepare_pretrain_relational_queue(request, payload).capacity == 2
+        )
+
+
+def test_fifo_resume_accepts_the_writers_clamped_warmup(tmp_path):
+    """The writer records warmup_steps the scheduler itself clamps."""
+    csv, names = _write_images(tmp_path, count=14)
+    schedule_args = argparse.Namespace(
+        max_epochs=1,
+        lr=0.001,
+        warmup_epochs=3,
+        teacher_momentum=0.9,
+        teacher_momentum_end=0.99,
+        student_temp=0.1,
+        teacher_temp_start=0.04,
+        teacher_temp_end=0.07,
+    )
+    _, _, _, _, metadata = recipe._build_pretrain_schedules(
+        schedule_args, None, steps_per_epoch=7, global_step=0, completed_epochs=0
+    )
+    # 1 epoch of 7 steps with --warmup-epochs 3: recorded 21, clamped to 7.
+    assert metadata["warmup_steps"] == 21
+    assert metadata["total_steps"] == 7
+    payload = _enabled_payload(
+        tmp_path,
+        names,
+        capacity=2,
+        batch=2,
+        keys=names[:2],
+        observed=[6, 6],
+        schedule_overrides=metadata,
+    )
+    extension = _request(
+        tmp_path,
+        csv,
+        resume="runs/x/SSL_epoch_0001.pth",
+        batch_size=2,
+        batch_size_explicit=True,
+        max_epochs=3,
+    )
+    preparation = recipe.prepare_pretrain_relational_queue(extension, payload)
+    assert preparation.capacity == 2 and preparation.active
+
+
+def test_fifo_resume_rejects_a_schedule_shorter_than_the_plan(tmp_path):
+    """A short total_steps would under-size the rebuilt temperature array."""
+    csv, names = _write_images(tmp_path, count=14)
+    request = _request(
+        tmp_path,
+        csv,
+        resume="runs/x/SSL_epoch_0001.pth",
+        batch_size=2,
+        batch_size_explicit=True,
+        max_epochs=3,
+    )
+    for total_steps in (7, 8):
+        payload = _enabled_payload(
+            tmp_path,
+            names,
+            capacity=2,
+            batch=2,
+            keys=names[:2],
+            observed=[6, 6],
+            schedule_overrides={
+                "steps_per_epoch": 7,
+                "total_steps": total_steps,
+                "original_max_epochs": 3,
+                "warmup_steps": 21,
+                "last_lr": 0.001,
+                "final_lr": 1e-05,
+            },
+        )
+        with pytest.raises(ValueError, match="inconsistent saved schedule"):
+            recipe.prepare_pretrain_relational_queue(request, payload)
+    # The matching rectangle is accepted.
+    payload = _enabled_payload(
+        tmp_path,
+        names,
+        capacity=2,
+        batch=2,
+        keys=names[:2],
+        observed=[6, 6],
+        schedule_overrides={
+            "steps_per_epoch": 7,
+            "total_steps": 21,
+            "original_max_epochs": 3,
+            "warmup_steps": 21,
+            "last_lr": 0.001,
+            "final_lr": 1e-05,
+        },
+    )
+    assert (
+        recipe.prepare_pretrain_relational_queue(request, payload).capacity == 2
+    )
+
+
+def test_fifo_preparation_checks_the_requested_lr(tmp_path):
+    """A fresh enabled run uses --lr as the schedule base, so it is checked too."""
+    csv, names = _write_images(tmp_path)
+    fresh = _request(
+        tmp_path,
+        csv,
+        relational_queue_size=2,
+        relational_queue_size_explicit=True,
+    )
+    with pytest.raises(ValueError, match=r"--lr to survive the float32"):
+        recipe.prepare_pretrain_relational_queue(
+            argparse.Namespace(**{**vars(fresh), "lr": 1e100}), None
+        )
+    with pytest.raises(ValueError, match="--lr to be non-negative"):
+        recipe.prepare_pretrain_relational_queue(
+            argparse.Namespace(**{**vars(fresh), "lr": -1.0}), None
+        )
+    # Zero stays legal, and a disabled run is not asked about its LR at all.
+    assert (
+        recipe.prepare_pretrain_relational_queue(
+            argparse.Namespace(**{**vars(fresh), "lr": 0.0}), None
+        ).active
+    )
+    # A reused preparation re-checks this invocation's LR.
+    preparation = recipe.prepare_pretrain_relational_queue(
+        argparse.Namespace(**{**vars(fresh), "lr": 0.0}), None
+    )
+    with pytest.raises(ValueError, match=r"--lr to survive the float32"):
+        recipe.verify_relational_queue_preparation(
+            preparation,
+            argparse.Namespace(**{**vars(fresh), "lr": 1e100}),
+            None,
+        )
+
+
+def test_fifo_center_validation_uses_the_restore_cast():
+    """Validation must describe the cast the restore really performs."""
+    payload = torch.zeros(1, 8, dtype=torch.float64) + 0.5
+    recipe._validate_fifo_center(payload, 8)  # finite float64 is restorable
+    with pytest.raises(ValueError, match="not finite at float32"):
+        recipe._validate_fifo_center(
+            torch.full((1, 8), 1e100, dtype=torch.float64), 8
+        )
+    with pytest.raises(ValueError, match=r"exact shape \[1, 8\]"):
+        recipe._validate_fifo_center(torch.zeros(8, dtype=torch.float64), 8)
+
+
+def _optimizer_group(**flags):
+    return {
+        "param_groups": [
+            {
+                "params": [],
+                "lr": 0.001,
+                "betas": [0.9, 0.999],
+                "eps": 1e-8,
+                "weight_decay": 0.0,
+                "amsgrad": False,
+                **flags,
+            }
+        ],
+        "state": {},
+    }
+
+
+def _restore_and_step(flags: dict, device: torch.device) -> str:
+    """The trainer's real path: default construct, load, backward, step."""
+    parameter = torch.nn.Parameter(torch.ones(4, device=device))
+    optimizer = torch.optim.AdamW([parameter], lr=0.1)
+    saved = optimizer.state_dict()
+    saved["param_groups"][0].update(flags)
+    for index in range(len(saved["param_groups"][0]["params"])):
+        saved["state"][index] = {
+            "step": torch.tensor(1.0),
+            "exp_avg": torch.zeros_like(parameter, device="cpu"),
+            "exp_avg_sq": torch.zeros_like(parameter, device="cpu"),
+        }
+    try:
+        optimizer.load_state_dict(saved)
+        parameter.grad = torch.ones(4, device=device)
+        optimizer.step()
+    except Exception as exc:  # noqa: BLE001 - the point is that it fails
+        return f"{type(exc).__name__}"
+    return "ok" if bool(torch.isfinite(parameter).all()) else "nonfinite"
+
+
+@pytest.mark.parametrize(
+    "coefficients, match",
+    [
+        (
+            {"weight_decay": 1e100},
+            "optimizer update is unusable",
+        ),
+        ({"eps": 1e-100}, "optimizer update is unusable"),
+        ({"eps": 0.0}, "finite AdamW eps"),
+        ({"betas": [1 - 1e-12, 0.999], "differentiable": True}, "optimizer update is unusable"),
+        ({"betas": [0.9, 1.0]}, "AdamW betas"),
+        ({"betas": [0.9, -0.1]}, "AdamW betas"),
+        ({"weight_decay": -0.1}, "finite AdamW weight_decay"),
+        ({"eps": float("nan")}, "finite AdamW eps"),
+    ],
+)
+def test_fifo_optimizer_coefficients_follow_the_execution_branch(coefficients, match):
+    group = {
+        "params": [],
+        "lr": 0.001,
+        "eps": 1e-8,
+        "betas": [0.9, 0.999],
+        "weight_decay": 0.0,
+        **coefficients,
+    }
+    with pytest.raises(ValueError, match=match):
+        recipe._validate_queue_optimizer_coefficients(
+            group, group_index=0, lr_bound=0.001
+        )
+
+
+def _restored_update(flags: dict, coefficients: dict, steps: int = 3) -> bool:
+    """Restore a saved state into a default AdamW and run real steps."""
+    parameter = torch.nn.Parameter(torch.ones(4))
+    optimizer = torch.optim.AdamW([parameter], lr=0.001)
+    saved = optimizer.state_dict()
+    saved["param_groups"][0].update(
+        {
+            "eps": 1e-8,
+            "betas": (0.9, 0.999),
+            "weight_decay": 0.0,
+            **flags,
+            **coefficients,
+        }
+    )
+    saved["state"][0] = {
+        "step": torch.tensor(1.0),
+        "exp_avg": torch.zeros_like(parameter),
+        "exp_avg_sq": torch.zeros_like(parameter),
+    }
+    optimizer.load_state_dict(saved)
+    for _ in range(steps):
+        parameter.grad = torch.ones(4)
+        optimizer.step()
+    return bool(torch.isfinite(parameter).all())
+
+
+@pytest.mark.parametrize(
+    "flags, coefficients",
+    [
+        # Decoupled decay: lr * weight_decay overflows the update precision.
+        ({}, {"weight_decay": 1e100}),
+        # The differentiable branch computes in float32, so a beta that rounds
+        # to one zeroes the bias correction.
+        ({"differentiable": True}, {"betas": (1 - 1e-12, 0.999)}),
+    ],
+)
+def test_fifo_optimizer_coefficients_match_the_real_update(flags, coefficients):
+    """The guarded values really do leave a non-finite model."""
+    base = {"eps": 1e-8, "betas": (0.9, 0.999), "weight_decay": 0.0}
+    assert _restored_update(flags, base)
+    assert not _restored_update(flags, coefficients)
+    with pytest.raises(ValueError):
+        recipe._validate_queue_optimizer_coefficients(
+            {"params": [], "lr": 0.001, **base, **flags, **coefficients},
+            group_index=0,
+            lr_bound=0.001,
+        )
+
+
+def test_fifo_optimizer_eps_underflow_fails_the_zero_gradient_probe():
+    """A float32-zero eps fails with zero moments and zero gradients."""
+    base = {"eps": 1e-100, "betas": (0.9, 0.999), "weight_decay": 0.0}
+    with pytest.raises(ValueError, match="optimizer update is unusable"):
+        recipe._validate_queue_optimizer_coefficients(
+            {"params": [], "lr": 0.001, **base}, group_index=0, lr_bound=0.001
+        )
+
+
+def test_fifo_amsgrad_is_judged_per_group():
+    """One AMSGrad group must not impose max_exp_avg_sq on the others."""
+    first = torch.nn.Parameter(torch.ones(2))
+    second = torch.nn.Parameter(torch.ones(2))
+    optimizer = torch.optim.AdamW(
+        [{"params": [first], "amsgrad": True}, {"params": [second], "amsgrad": False}],
+        lr=0.001,
+    )
+    saved = optimizer.state_dict()
+    saved["state"] = {
+        0: {
+            "step": torch.tensor(1.0),
+            "exp_avg": torch.zeros(2),
+            "exp_avg_sq": torch.zeros(2),
+            "max_exp_avg_sq": torch.zeros(2),
+        },
+        1: {
+            "step": torch.tensor(1.0),
+            "exp_avg": torch.zeros(2),
+            "exp_avg_sq": torch.zeros(2),
+        },
+    }
+    # Accepted: only the AMSGrad group needs the maximum second moment.
+    recipe._validate_fifo_adamw_state(
+        optimizer, saved, completed_steps=2, label="pretrain resume"
+    )
+    # And the same state really does restore and step.
+    for parameter in (first, second):
+        parameter.grad = torch.ones(2)
+    optimizer.load_state_dict(saved)
+    for parameter in (first, second):
+        parameter.grad = torch.ones(2)
+    optimizer.step()
+    assert torch.isfinite(first).all() and torch.isfinite(second).all()
+
+    # The AMSGrad group itself must still carry it.
+    broken = {
+        "param_groups": saved["param_groups"],
+        "state": {0: dict(saved["state"][0]), 1: saved["state"][1]},
+    }
+    broken["state"][0].pop("max_exp_avg_sq")
+    with pytest.raises(ValueError, match="max_exp_avg_sq"):
+        recipe._validate_fifo_adamw_state(
+            optimizer, broken, completed_steps=2, label="pretrain resume"
+        )
+
+
+def test_fifo_optimizer_decay_product_overflow():
+    """Each factor can be representable while their product is not."""
+    with pytest.raises(ValueError, match="optimizer update is unusable"):
+        recipe._validate_queue_optimizer_coefficients(
+            {"params": [], "lr": 1e10, "eps": 1e-8, "betas": [0.9, 0.999],
+             "weight_decay": 1e30},
+            group_index=0,
+            lr_bound=1e10,
+        )
+    # The same weight decay is fine at a modest learning rate.
+    recipe._validate_queue_optimizer_coefficients(
+        {"params": [], "lr": 0.001, "eps": 1e-8, "betas": [0.9, 0.999],
+         "weight_decay": 1e30},
+        group_index=0,
+        lr_bound=0.001,
+    )
+
+
+@pytest.mark.parametrize(
+    "step_spec, flags, match",
+    [
+        # A tensor step the foreach path rejects (its dtype check).
+        (("int64", 0), {"foreach": True}, "rejects"),
+        (("float16", 0), {"foreach": True}, "rejects"),
+        # Differentiable needs a scalar; a shaped step is CPU-only and 2-D never.
+        (("float32", 2), {"differentiable": True}, "shaped step only on CPU"),
+        # Only the differentiable branch rejects requires_grad on its counter.
+        (("float32", 0, True), {"differentiable": True}, "requires_grad"),
+    ],
+)
+def test_fifo_optimizer_step_format_matches_the_branch(step_spec, flags, match):
+    name, dims = step_spec[0], step_spec[1]
+    requires_grad = len(step_spec) > 2 and step_spec[2]
+    dtype = getattr(torch, name)
+    shape = () if dims == 0 else (1,) * dims
+    step = torch.ones(shape, dtype=dtype)
+    step.requires_grad_(requires_grad)
+    with pytest.raises(ValueError, match=match):
+        recipe._validate_fifo_step_format(
+            step, flags={**{
+                "capturable": False,
+                "fused": False,
+                "foreach": False,
+                "differentiable": False,
+            }, **flags}, target_device=torch.device("cpu"),
+            label="optimizer step for parameter 0",
+        )
+
+
+@pytest.mark.parametrize(
+    "flags, runs",
+    [
+        ({}, True),
+        ({"differentiable": True}, True),
+        ({"foreach": True}, True),
+        ({"fused": True}, True),
+        ({"fused": True, "foreach": True}, True),
+        ({"fused": True, "capturable": True}, True),
+        ({"fused": True, "capturable": True, "foreach": True}, True),
+        ({"foreach": True, "differentiable": True}, False),
+        ({"fused": True, "differentiable": True}, False),
+        ({"capturable": True}, False),
+        ({"capturable": True, "foreach": True}, False),
+        ({"capturable": True, "differentiable": True}, False),
+    ],
+)
+def test_fifo_optimizer_flags_match_the_restored_optimizer(flags, runs):
+    """The rules must agree with construct -> load -> step on the real device."""
+    for device in (torch.device("cpu"), torch.device("mps")):
+        if device.type == "mps" and not torch.backends.mps.is_available():
+            continue
+        observed = _restore_and_step(flags, device)
+        if runs:
+            assert observed == "ok", (device, flags, observed)
+            recipe._validate_fifo_optimizer_execution_flags(
+                _optimizer_group(**flags), target_device=device
+            )
+        else:
+            assert observed != "ok", (device, flags, observed)
+            with pytest.raises(ValueError):
+                recipe._validate_fifo_optimizer_execution_flags(
+                    _optimizer_group(**flags), target_device=device
+                )
+
+    # A CUDA target accepts every single flag as a *rule*: no CUDA hardware was
+    # exercised here, so this is not evidence that those steps run.
+    for name in ("capturable", "fused", "foreach", "differentiable"):
+        recipe._validate_fifo_optimizer_execution_flags(
+            _optimizer_group(**{name: True}), target_device=torch.device("cuda")
+        )
+    # The device-independent conflict stays rejected for CUDA as well.
+    with pytest.raises(ValueError, match="differentiable=True"):
+        recipe._validate_fifo_optimizer_execution_flags(
+            _optimizer_group(foreach=True, differentiable=True),
+            target_device=torch.device("cuda"),
+        )
+
+
+def test_fifo_reuse_is_bound_to_the_epoch_target(tmp_path):
+    csv, names = _write_images(tmp_path, count=14)
+    resume = "runs/x/SSL_epoch_0001.pth"
+    payload = _enabled_payload(
+        tmp_path,
+        names,
+        capacity=2,
+        batch=2,
+        keys=names[:2],
+        observed=[6, 6],
+        schedule_overrides={
+            "steps_per_epoch": 7,
+            "total_steps": 7,
+            "original_max_epochs": 3,
+            "warmup_steps": 21,
+            "last_lr": 0.001,
+            "final_lr": 1e-05,
+        },
+    )
+    payload["epoch"] = 0
+    payload["iteration"] = 7
+    payload["args"] = {**payload["args"], "batch_size": 2, "max_epochs": 3}
+    extension = _request(
+        tmp_path,
+        csv,
+        resume=resume,
+        batch_size=2,
+        batch_size_explicit=True,
+        max_epochs=4,
+    )
+    preparation = recipe.prepare_pretrain_relational_queue(extension, payload)
+    same_plan = _request(
+        tmp_path,
+        csv,
+        resume=resume,
+        batch_size=2,
+        batch_size_explicit=True,
+        max_epochs=3,
+    )
+    with pytest.raises(ValueError, match="different request"):
+        recipe.verify_relational_queue_preparation(
+            preparation, same_plan, payload
+        )
+    with pytest.raises(ValueError, match="inconsistent saved schedule"):
+        recipe._validate_queue_schedule_coverage(
+            payload, requested_max_epochs=3
+        )
+
+
+def test_fifo_resume_rejects_conflicting_capacity_representations(tmp_path):
+    csv, names = _write_images(tmp_path)
+    resume = "runs/x/SSL_epoch_0001.pth"
+    request = _request(
+        tmp_path, csv, resume=resume, batch_size=2, batch_size_explicit=True
+    )
+    payload = _enabled_payload(tmp_path, names, capacity=2, batch=2)
+    recipe.prepare_pretrain_relational_queue(request, payload)
+
+    for mutate, match in (
+        (
+            lambda p: p["args"].update({"relational_queue_size": 4}),
+            "Queue config/args conflict",
+        ),
+        (
+            lambda p: p["args"].update({"relational_queue_size": 2.0}),
+            "non-integer",
+        ),
+        (
+            lambda p: p["args"].update({"relational_queue_size": "2"}),
+            "non-integer",
+        ),
+        (
+            lambda p: p["args"].update({"requested_relational_queue_size": 4}),
+            "Queue request/config conflict",
+        ),
+        (
+            lambda p: p["args"].update({"requested_relational_queue_size": 2.5}),
+            "malformed",
+        ),
+        (
+            lambda p: p["args"].update({"requested_relational_queue_size": "2"}),
+            "malformed",
+        ),
+        (
+            lambda p: p["args"].update({"requested_relational_queue_size": -1}),
+            "negative",
+        ),
+    ):
+        broken = _enabled_payload(tmp_path, names, capacity=2, batch=2)
+        mutate(broken)
+        with pytest.raises(ValueError, match=match):
+            recipe.prepare_pretrain_relational_queue(request, broken)
+
+    # An omitted request marker stays valid when the bundle is complete.
+    omitted_request = _enabled_payload(tmp_path, names, capacity=2, batch=2)
+    omitted_request["args"]["requested_relational_queue_size"] = None
+    assert (
+        recipe.prepare_pretrain_relational_queue(request, omitted_request).capacity
+        == 2
+    )
 
 
 def test_fifo_resume_locks_exact_batch_not_only_loader_length(tmp_path):

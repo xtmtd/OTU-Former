@@ -324,10 +324,10 @@ class InstantMetricsLogger:
             os.replace(temp_path, self.path)
             temp_path = None
         finally:
+            # Only this call's own temporary file may be removed: a wildcard
+            # sweep would delete an unrelated sidecar that existed beforehand.
             if temp_path is not None and temp_path.exists():
                 temp_path.unlink(missing_ok=True)
-            for leftover in self.path.parent.glob(self.path.name + ".*.tmp"):
-                leftover.unlink(missing_ok=True)
 
     def log(self, **kwargs: Any) -> None:
         row = {k: kwargs.get(k, "") for k in self.fieldnames}
@@ -1041,10 +1041,10 @@ class EnhancedMetricsLogger:
             os.replace(temp_path, self.path)
             temp_path = None
         finally:
+            # Only this call's own temporary file may be removed: a wildcard
+            # sweep would delete an unrelated sidecar that existed beforehand.
             if temp_path is not None and temp_path.exists():
                 temp_path.unlink(missing_ok=True)
-            for leftover in self.path.parent.glob(self.path.name + ".*.tmp"):
-                leftover.unlink(missing_ok=True)
 
     def log(self, epoch: int, split: str, metrics: dict[str, Any]) -> None:
         row = {"epoch": epoch, "split": split}
@@ -1134,6 +1134,7 @@ def _relational_queue_metrics(
     evicted: int | None,
     teacher_stats: dict[str, torch.Tensor] | None,
     student_stats: list[dict[str, torch.Tensor]] | None,
+    has_local: bool = True,
 ) -> dict[str, object]:
     """Instant FIFO coverage/update/statistics fields for one log step.
 
@@ -1156,7 +1157,14 @@ def _relational_queue_metrics(
         ),
         "relational_queue_evicted": None if evicted is None else int(evicted),
     }
+    # The teacher target is one per step, so its ``global`` columns always
+    # apply; a run without local views never computed a local branch and must
+    # not report the global numbers as local observations.
     for suffix in _RELATIONAL_BRANCH_SUFFIXES:
+        if suffix == "local" and not has_local:
+            for name in _RELATIONAL_TEACHER_STAT_NAMES:
+                metrics[f"relational_teacher_{name}_{suffix}"] = None
+            continue
         for name in _RELATIONAL_TEACHER_STAT_NAMES:
             value = (teacher_stats or {}).get(name)
             metrics[f"relational_teacher_{name}_{suffix}"] = (

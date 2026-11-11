@@ -1,5 +1,6 @@
 """Cleanup must preserve every input dependency before any output is changed."""
 
+import csv as csv_module
 import re
 from pathlib import Path
 
@@ -14,6 +15,7 @@ from otuformer.utils.io import prepare_output_dir
 import otuformer.cli.finetune as finetune_module
 import otuformer.training.finetune_loop as finetune_loop_module
 import otuformer.training.pretrain_loop as pretrain_loop_module
+import otuformer.training.reporting as reporting_module
 
 
 @pytest.mark.parametrize("layout", ["direct", "link", "chain", "directory_target", "dotdot", "target_dotdot", "cycle", "long_chain"])
@@ -617,7 +619,7 @@ def _missing_teacher_key(payload):
         (_negative_second_moment, "negative"),
         (_impossible_tail, "latest successful batch"),
         (_truncated_history, "truncated history"),
-        (_non_finite_center, "non-finite"),
+        (_non_finite_center, "not finite at float32"),
         (_missing_teacher_key, "does not match the rebuilt encoder"),
     ],
 )
@@ -636,7 +638,39 @@ def test_fifo_enabled_resume_corruption_preserves_outputs(
     (out / "logs").mkdir()
     log = out / "logs" / "pretrain.log"
     log.write_text("existing log\n", encoding="utf-8")
-    before = {path.name: path.read_bytes() for path in out.rglob("*") if path.is_file()}
+    # A real prior run leaves a metrics CSV in the current schema and epoch
+    # checkpoints here. A rejected resume must not migrate the CSV, rewrite a
+    # checkpoint or replace its largest copy.
+    metrics_csv = out / "logs" / "instant_metrics.pretrain.csv"
+    pre_fifo_header = list(reporting_module._PRETRAIN_PRE_FIFO_FIELDS)
+    assert len(pre_fifo_header) == 43
+    with metrics_csv.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv_module.writer(handle)
+        writer.writerow(pre_fifo_header)
+        writer.writerow(["1"] * len(pre_fifo_header))
+    previous = {
+        "epoch": 0,
+        "iteration": 1,
+        "student": torch.zeros(1),
+        "config": {"model_name": "prior"},
+    }
+    torch.save(previous, out / "SSL_epoch_0001.pth")
+    torch.save(previous, out / "SSL_latest.pth")
+
+    def snapshot() -> dict[str, bytes]:
+        return {
+            path.relative_to(out).as_posix(): path.read_bytes()
+            for path in out.rglob("*")
+            if path.is_file()
+        }
+
+    before = snapshot()
+    # The declared inputs are read-only too: a rejected resume must not rewrite
+    # the source CSV or the checkpoint it was asked to continue from.
+    input_before = {
+        "csv": csv.read_bytes(),
+        "checkpoint": checkpoint.read_bytes(),
+    }
 
     result = CliRunner().invoke(
         app,
@@ -657,5 +691,12 @@ def test_fifo_enabled_resume_corruption_preserves_outputs(
     flat = " ".join(re.sub(r"[^A-Za-z0-9_.:\-]+", " ", result.output).split())
     assert match in flat
     assert keep.read_text(encoding="utf-8") == "keep"
-    after = {path.name: path.read_bytes() for path in out.rglob("*") if path.is_file()}
-    assert after == before
+    assert snapshot() == before
+    # The metrics CSV was neither migrated nor appended to: it still carries the
+    # pre-FIFO 43-column header and its single historical row.
+    with metrics_csv.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv_module.reader(handle))
+    assert len(rows) == 2
+    assert rows[0] == pre_fifo_header
+    assert csv.read_bytes() == input_before["csv"]
+    assert checkpoint.read_bytes() == input_before["checkpoint"]

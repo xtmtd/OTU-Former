@@ -1,5 +1,6 @@
 import json
 import pickle
+import time
 from pathlib import Path
 
 import numpy as np
@@ -9,6 +10,7 @@ import torch
 from PIL import Image
 from torchvision import transforms
 
+import otuformer.training.dataset as dataset_module
 from otuformer.training.dataset import (
     EVAL_TRANSFORMS,
     FINETUNE_AUGMENTATIONS,
@@ -1327,6 +1329,56 @@ def test_fifo_preparation_rejects_invalid_inputs(tmp_path):
     incomplete = _write_csv(tmp_path / "incomplete.csv", ["one.png"])
     with pytest.raises(ValueError, match="complete batch"):
         prepare_relational_data(incomplete, root, batch_size=4)
+
+
+def test_fifo_preparation_rejects_a_truncated_but_parseable_image(tmp_path):
+    """A header check is not a decode check: the training path must open it."""
+    import io
+
+    buffer = io.BytesIO()
+    Image.new("RGB", (32, 32), (10, 20, 30)).save(buffer, format="JPEG")
+    truncated = buffer.getvalue()[:-2]
+    # The header still parses, so only a real decode can reject this file.
+    with Image.open(io.BytesIO(truncated)) as handle:
+        handle.verify()
+    (tmp_path / "cut.jpg").write_bytes(truncated)
+    _make_png(tmp_path / "fine.png")
+    csv = _write_csv(tmp_path / "images.csv", ["cut.jpg", "fine.png"])
+    with pytest.raises(ValueError, match="decodable"):
+        prepare_relational_data(csv, tmp_path, batch_size=2)
+
+
+def test_fifo_preparation_deduplicates_in_linear_time(tmp_path, monkeypatch):
+    """Membership must not rescan the growing key list."""
+    count = 100_000
+    paths = [f"img_{index}.png" for index in range(count)]
+    monkeypatch.setattr(
+        dataset_module,
+        "resolve_dataset_image_paths",
+        lambda *args, **kwargs: list(paths),
+    )
+    monkeypatch.setattr(
+        dataset_module, "_selected_identity_key", lambda root, path: str(path)
+    )
+
+    started = time.monotonic()
+    with pytest.raises(ValueError, match="could not read"):
+        prepare_relational_data(None, tmp_path, batch_size=2)
+    elapsed_unique = time.monotonic() - started
+    # The list-membership form needs ~22s for this input; the set form ~0.6s.
+    assert elapsed_unique < 8.0, elapsed_unique
+
+    # Duplicates are still rejected, before any image is read.
+    duplicated = paths + [paths[0]]
+    monkeypatch.setattr(
+        dataset_module,
+        "resolve_dataset_image_paths",
+        lambda *args, **kwargs: list(duplicated),
+    )
+    started = time.monotonic()
+    with pytest.raises(ValueError, match="one CSV row per image identity"):
+        prepare_relational_data(None, tmp_path, batch_size=2)
+    assert time.monotonic() - started < 8.0
 
 
 def test_fifo_keyed_batches_preserve_view_rng_and_alignment(tmp_path):

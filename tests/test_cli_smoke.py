@@ -5823,6 +5823,92 @@ def test_fifo_cli_resume_preparation_precedes_register_probe(tmp_path, monkeypat
     assert "Relational queue config:" not in result.output
 
 
+def test_fifo_cli_rejects_a_non_finite_schedule_lr(tmp_path, monkeypatch):
+    """Both real entry paths validate --lr before any output change."""
+    checkpoint, csv, names = _fifo_cli_payload(tmp_path)
+
+    # Fresh enabled run: --lr is the schedule base.
+    fresh_out = tmp_path / "out_fresh_lr"
+    result = runner.invoke(
+        app,
+        [
+            "pretrain",
+            "--train-data", str(csv),
+            "--input-images-dir", str(tmp_path),
+            "--out-dir", str(fresh_out),
+            "--relational-queue-size", "2",
+            "--batch-size", "2",
+            "--lr", "1e100",
+            "--device", "cpu",
+        ],
+    )
+    assert result.exit_code != 0
+    assert "survive the float32 schedule precision" in result.output
+    assert not fresh_out.exists()
+
+    # Same-plan resume: the rebuilt cosine schedule starts from --lr again.
+    resume_out = tmp_path / "out_resume_lr"
+    resume_out.mkdir()
+    keep = resume_out / "keep.txt"
+    keep.write_text("keep", encoding="utf-8")
+    (resume_out / "logs").mkdir()
+    log = resume_out / "logs" / "pretrain.log"
+    log.write_text("existing log\n", encoding="utf-8")
+    before = {
+        path.relative_to(resume_out).as_posix(): path.read_bytes()
+        for path in resume_out.rglob("*")
+        if path.is_file()
+    }
+    result = runner.invoke(
+        app,
+        [
+            "pretrain",
+            "--train-data", str(csv),
+            "--input-images-dir", str(tmp_path),
+            "--out-dir", str(resume_out),
+            "--resume", str(checkpoint),
+            "--relational-queue-size", "2",
+            "--batch-size", "2",
+            "--out-dim", "8",
+            "--max-epochs", "1",
+            "--lr", "1e100",
+            "--device", "cpu",
+        ],
+    )
+    assert result.exit_code != 0
+    assert "survive the float32 schedule precision" in result.output
+    assert keep.read_text(encoding="utf-8") == "keep"
+    assert {
+        path.relative_to(resume_out).as_posix(): path.read_bytes()
+        for path in resume_out.rglob("*")
+        if path.is_file()
+    } == before
+
+    # With a legal zero learning rate the LR gate does not fire; this fixture's
+    # minimal optimizer envelope is what rejects next, which is the proof that
+    # zero is allowed. The full acceptance path for a zero-LR writer state is
+    # covered by test_fifo_resume_accepts_a_zero_learning_rate_writer_state.
+    zero = runner.invoke(
+        app,
+        [
+            "pretrain",
+            "--train-data", str(csv),
+            "--input-images-dir", str(tmp_path),
+            "--out-dir", str(tmp_path / "out_zero_lr"),
+            "--resume", str(checkpoint),
+            "--relational-queue-size", "2",
+            "--batch-size", "2",
+            "--out-dim", "8",
+            "--max-epochs", "1",
+            "--lr", "0",
+            "--device", "cpu",
+            "--disable-embedding-metrics",
+        ],
+    )
+    assert "survive the float32 schedule precision" not in zero.output
+    assert "AdamW parameter group" in zero.output
+
+
 def test_fifo_cli_rejects_conflicts_before_any_encoder(tmp_path, monkeypatch):
     calls: list[str] = []
 

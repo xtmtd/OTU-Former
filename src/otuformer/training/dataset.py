@@ -497,6 +497,9 @@ def prepare_relational_data(
         )
 
     keys: list[str] = []
+    # Order is identity, but membership must not rescan the growing list: with
+    # 100k selected images the list form is quadratic.
+    seen: set[str] = set()
     for path in paths:
         try:
             key = _selected_identity_key(images_root, Path(path))
@@ -510,13 +513,14 @@ def prepare_relational_data(
                 "Queue-enabled pretraining could not read the selected image "
                 f"{path}: {exc}"
             ) from exc
-        if key in keys:
+        if key in seen:
             raise ValueError(
                 "Queue-enabled pretraining requires one CSV row per image "
                 f"identity; two selected rows map to the key {key!r}. Remove the "
                 "duplicate row, or run with --relational-queue-size 0 to keep "
                 "the legacy input contract."
             )
+        seen.add(key)
         keys.append(key)
 
     if len(keys) < resolved_batch:
@@ -540,7 +544,12 @@ def prepare_relational_data(
             ) from exc
         try:
             with Image.open(io.BytesIO(data)) as handle:
-                handle.verify()
+                # A header check is not enough: a truncated JPEG passes
+                # ``verify()`` and then fails the training path's own decode.
+                # Decode the same bytes the run will read, all the way to the
+                # RGB conversion the dataset performs.
+                handle.load()
+                handle.convert("RGB")
         except (OSError, ValueError) as exc:
             raise ValueError(
                 "Queue-enabled pretraining requires decodable images; "

@@ -134,6 +134,45 @@ from .runtime import (
     update_teacher,
 )
 
+def _fifo_cast_state(
+    module: nn.Module, saved_state: object
+) -> dict[str, object]:
+    """Cast saved tensors to this module's dtype before loading them.
+
+    ``load_state_dict`` moves a float64 source tensor to the target device as
+    float64, which backends without float64 (MPS) reject. Casting on the CPU
+    first keeps the restore expression identical to what the enabled preflight
+    validates.
+    """
+    if not isinstance(saved_state, dict):
+        return {}
+    target = module.state_dict()
+    cast: dict[str, object] = {}
+    for key, value in saved_state.items():
+        reference = target.get(key)
+        if (
+            isinstance(value, torch.Tensor)
+            and isinstance(reference, torch.Tensor)
+            and value.is_floating_point()
+            and reference.is_floating_point()
+        ):
+            cast[key] = value.to(dtype=reference.dtype)
+        else:
+            cast[key] = value
+    return cast
+
+
+def _restore_relational_center(
+    center: torch.Tensor, reference: torch.Tensor, device: torch.device
+) -> None:
+    """Restore the saved center into the live float32 buffer.
+
+    The cast happens before the device move: ``.to(device)`` alone would carry a
+    float64 payload onto a backend that does not support float64.
+    """
+    reference.copy_(center.to(dtype=reference.dtype).to(device=device))
+
+
 def _unpack_pretrain_batch(
     batch: object, *, queue_enabled: bool
 ) -> tuple[list[torch.Tensor], tuple[str, ...] | None]:
@@ -530,7 +569,16 @@ def run_pretrain(
     )
 
     if resume_ckpt is not None:
-        if dino_objective is not None:
+        if preparation.active:
+            # Enabled recovery loads the states the preparation already validated,
+            # cast on the CPU so a float64 payload cannot reach the device.
+            student.load_state_dict(
+                _fifo_cast_state(student, resume_ckpt["student"]), strict=True
+            )
+            teacher.load_state_dict(
+                _fifo_cast_state(teacher, resume_ckpt["teacher"]), strict=True
+            )
+        elif dino_objective is not None:
             # DINO never leaves random state behind: the preflight already
             # validated complete encoder states, so this load is strict.
             student.load_state_dict(resume_ckpt["student"], strict=True)
@@ -551,7 +599,9 @@ def run_pretrain(
             )
         if isinstance(saved_patch_state, dict) and saved_patch_state:
             try:
-                objective.load_state_dict(saved_patch_state, strict=True)
+                objective.load_state_dict(
+                    _fifo_cast_state(objective, saved_patch_state), strict=True
+                )
             except RuntimeError as exc:
                 raise ValueError(
                     "Cannot resume: patch_objective state is malformed or "
@@ -584,7 +634,9 @@ def run_pretrain(
                 label="pretrain resume",
             )
         if "center" in resume_ckpt:
-            teacher.center.copy_(resume_ckpt["center"].to(device))
+            _restore_relational_center(
+                resume_ckpt["center"], teacher.center, device
+            )
         start_epoch = int(resume_ckpt.get("epoch", -1)) + 1
         global_step = int(resume_ckpt.get("iteration", start_epoch * max(1, len(loader))))
         print(
@@ -812,7 +864,9 @@ def run_pretrain(
 
             # Rectangular current-plus-history candidates and their teacher
             # targets are built once per step from the same snapshot and the
-            # *pre-step* center. Diagnostics only reduce on log steps.
+            # *pre-step* center. Both diagnostic families reduce only on log
+            # steps, so an ordinary step pays no extra statistics.
+            diagnostics_step = global_step % max(1, args.log_every_n_steps) == 0
             relational_targets = None
             if queue_snapshot is not None:
                 relational_targets = _make_relational_step_targets(
@@ -820,9 +874,7 @@ def run_pretrain(
                     queue_snapshot.features,
                     center_before,
                     temp_teacher,
-                    collect_diagnostics=(
-                        global_step % max(1, args.log_every_n_steps) == 0
-                    ),
+                    collect_diagnostics=diagnostics_step,
                 )
                 if observation_pair is None:  # pragma: no cover - defensive
                     raise ValueError(
@@ -832,7 +884,9 @@ def run_pretrain(
 
             dino_teacher_logits: list[torch.Tensor] = []
             dino_teacher_targets: list[torch.Tensor] = []
-            student_stats: list[dict[str, torch.Tensor]] = []
+            student_stats: list[dict[str, torch.Tensor]] | None = (
+                [] if relational_targets is not None and diagnostics_step else None
+            )
             if dino_objective is None:
                 loss_global = _compute_global_loss(
                     student_global,
@@ -841,9 +895,7 @@ def run_pretrain(
                     temp_teacher,
                     relational_pairing=relational_pairing,
                     relational_targets=relational_targets,
-                    student_stats=(
-                        student_stats if relational_targets is not None else None
-                    ),
+                    student_stats=student_stats,
                 )
             else:
                 with torch.no_grad():
@@ -943,9 +995,7 @@ def run_pretrain(
                     temp_student,
                     temp_teacher,
                     relational_targets=relational_targets,
-                    student_stats=(
-                        student_stats if relational_targets is not None else None
-                    ),
+                    student_stats=student_stats,
                 )
             else:
                 loss_local = _compute_dino_local_loss(
@@ -1010,6 +1060,14 @@ def run_pretrain(
                     "check does not."
                 ) from exc
             optimizer.step()
+            if queue is not None and not bool(torch.stack([
+                torch.isfinite(parameter).all() for parameter in trainable_params
+            ]).all()):
+                raise ValueError(
+                    "The pretraining optimizer update became non-finite at "
+                    f"iteration {global_step}; refusing to advance the FIFO or "
+                    "save a checkpoint. Check the optimizer coefficients."
+                )
 
             m = float(momentum_schedule[iter_idx])
             update_teacher(student, teacher, m)
@@ -1159,6 +1217,7 @@ def run_pretrain(
                             else relational_targets.teacher_stats
                         ),
                         student_stats=student_stats,
+                        has_local=bool(local_views),
                     )
                 instant_logger.log(
                     iteration=global_step,

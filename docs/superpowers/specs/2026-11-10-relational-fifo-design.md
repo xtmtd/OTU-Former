@@ -2,7 +2,7 @@
 
 Date: 2026-11-10
 Revision: 2026-11-11 — source-verified audit corrections; G1/G2 and the complete revised design approved on 2026-11-11.
-Status: Approved for execution-plan authoring on 2026-11-11 (§12, Design decision). G1/G2 were separately approved (§12, Gate decision). The execution plan requires separate review and approval; implementation, new research training, commit, push, version change, tag, and release remain unauthorized.
+Status: The complete design, G1/G2 and execution plan were approved on 2026-11-11 (§12). The eight implementation checkpoint commits underwent seven independent audit rounds; the plan records their findings and cumulative corrections. On 2026-11-11 the user explicitly authorized fixing the remaining four findings, creating a local closing commit and pushing this branch to GitHub. New research training, dependency/version changes, tags and releases remain outside that authorization.
 Baseline: branch `OTU-Former-dense`, HEAD `3d69d1812a1b5d6941c49bf070f1037c1304d83d`, package version 0.12.0. The working tree was clean before this document was created. Source inspection and the separately authorized self-relation spike are evidence, not implementation of FIFO.
 
 ## 1. Intent and constraints
@@ -349,6 +349,8 @@ gate evidence. Observable boundaries:
 - Reporting adds the FIFO columns, recognizes the pre-FIFO 43-column header, and the
   trainer emits the resolved `Relational queue config:` record once.
 
-Certification scope: full-suite correctness evidence on CPU plus model-free request
-tests. No accelerator acceptance, research training or quality claim follows from
-it, and CUDA RNG continuation is unverified on this host.
+Verification scope: full-suite correctness tests plus targeted actual CPU/MPS
+optimizer and recovery cases; see the plan for dated results and their limits.
+The closing corrections are author-verified, not another independent audit.
+CUDA execution/RNG continuation, production-scale performance, research training
+and morphology quality gains remain unverified on this host.

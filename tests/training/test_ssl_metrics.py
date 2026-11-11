@@ -94,6 +94,35 @@ def test_ssl_metrics_failed_migration_preserves_bytes(tmp_path, monkeypatch):
     assert list(tmp_path.glob("*.tmp")) == []
 
 
+def test_fifo_migration_keeps_preexisting_sidecar_files(tmp_path, monkeypatch):
+    """Only this call's own temporary file may be removed."""
+    sidecar = tmp_path / "instant_metrics.pretrain.csv.keep.tmp"
+    sidecar.write_bytes(b"preexisting sidecar")
+
+    # Successful migration of the pre-FIFO 43-column header keeps it.
+    path = tmp_path / "instant_metrics.pretrain.csv"
+    header = list(reporting_module._PRETRAIN_PRE_FIFO_FIELDS)
+    assert len(header) == 43
+    _write(path, header, [["1"] * len(header)])
+    pretrain_loop_module.InstantMetricsLogger(path, mode="pretrain")
+    assert sidecar.read_bytes() == b"preexisting sidecar"
+    assert list(path.parent.glob("instant_metrics.pretrain.csv.*.tmp")) == [sidecar]
+
+    # A failed replacement keeps it too, and still leaves no temp of its own.
+    _write(path, header, [["1"] * len(header)])
+    original = path.read_bytes()
+
+    def boom(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr("os.replace", boom)
+    with pytest.raises(OSError):
+        pretrain_loop_module.InstantMetricsLogger(path, mode="pretrain")
+    assert path.read_bytes() == original
+    assert sidecar.read_bytes() == b"preexisting sidecar"
+    assert list(path.parent.glob("instant_metrics.pretrain.csv.*.tmp")) == [sidecar]
+
+
 def test_ssl_metrics_reject_unknown_or_duplicate_header(tmp_path):
     unknown = tmp_path / "unknown.csv"
     _write(unknown, ["iteration", "mystery"], [["0", "1"]])
@@ -664,5 +693,24 @@ def test_fifo_queue_metrics_report_ages_and_branch_statistics():
     assert metrics["relational_queue_evicted"] == 1
     assert metrics["relational_teacher_self_mass_global"] == pytest.approx(0.5)
     assert metrics["relational_teacher_self_mass_local"] == pytest.approx(0.5)
+    # A run without local views never computed a local branch, so the global
+    # teacher numbers are not reported as local observations.
+    no_locals = reporting_module._relational_queue_metrics(
+        capacity=8,
+        occupancy=3,
+        eligible=2,
+        candidate_count=6,
+        ages=(2, 1),
+        refreshed=2,
+        evicted=1,
+        teacher_stats=teacher,
+        student_stats=[student[0]],
+        has_local=False,
+    )
+    assert no_locals["relational_teacher_self_mass_global"] == pytest.approx(0.5)
+    for name in reporting_module._RELATIONAL_TEACHER_STAT_NAMES:
+        assert no_locals[f"relational_teacher_{name}_local"] is None, name
+    for name in reporting_module._RELATIONAL_STUDENT_STAT_NAMES:
+        assert no_locals[f"relational_student_{name}_local"] is None, name
     assert metrics["relational_student_self_mass_global"] == pytest.approx(0.4)
     assert metrics["relational_student_self_mass_local"] == pytest.approx(0.3)

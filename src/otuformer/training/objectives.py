@@ -73,7 +73,6 @@ def _teacher_row_statistics(
 
         nonself_mask = torch.ones_like(probabilities, dtype=torch.bool)
         nonself_mask[index, index] = False
-        nonself_mass = (probabilities * nonself_mask).sum(dim=1)
         stats: dict[str, torch.Tensor] = {
             "self_mass": self_mass.mean().detach(),
             "other_current_mass": other_current.mean().detach(),
@@ -82,26 +81,22 @@ def _teacher_row_statistics(
         }
         if columns < 2:
             return stats
-        usable = nonself_mass > 0.0
-        if not bool(usable.any()):
-            return stats
-        safe_mass = torch.where(
-            usable, nonself_mass, torch.ones_like(nonself_mass)
-        )
+        # The conditional distribution is the softmax over the nonself logits
+        # only. Normalizing the full softmax by the remaining nonself mass is
+        # algebraically equal but numerically useless: at a low temperature the
+        # self mass rounds to one and the renormalization explodes or vanishes.
+        masked_logits = logits.masked_fill(~nonself_mask, float("-inf"))
+        conditional_log = F.log_softmax(masked_logits, dim=1)
         conditional = torch.where(
             nonself_mask,
-            probabilities / safe_mass.unsqueeze(1),
-            torch.zeros_like(probabilities),
+            conditional_log.exp(),
+            torch.zeros_like(conditional_log),
         )
-        conditional_log = torch.where(
-            nonself_mask,
-            log_probabilities - safe_mass.clamp_min(1e-30).log().unsqueeze(1),
-            torch.zeros_like(probabilities),
+        safe_log = torch.where(
+            nonself_mask, conditional_log, torch.zeros_like(conditional_log)
         )
-        row_perplexity = torch.exp(
-            -(conditional * conditional_log).sum(dim=1)
-        )
-        stats["nonself_effective"] = row_perplexity[usable].mean().detach()
+        row_perplexity = torch.exp(-(conditional * safe_log).sum(dim=1))
+        stats["nonself_effective"] = row_perplexity.mean().detach()
     return stats
 
 

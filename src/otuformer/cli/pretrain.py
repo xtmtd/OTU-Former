@@ -600,6 +600,11 @@ def pretrain(
         batch_size_explicit=explicit_sources["batch_size"],
         device=device,
         max_epochs=max_epochs,
+        # The enabled queue preflight validates the schedule endpoints,
+        # including the requested optimizer coefficients, before output changes.
+        lr=lr,
+        weight_decay=weight_decay,
+        warmup_epochs=warmup_epochs,
     )
     try:
         relational_queue_preparation = prepare_pretrain_relational_queue(

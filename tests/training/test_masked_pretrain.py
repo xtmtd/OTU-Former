@@ -2587,16 +2587,15 @@ def test_relational_out_of_band_endpoint_survives_two_hops(tmp_path, monkeypatch
 
 
 def _fifo_resume_run(tmp_path, monkeypatch, bad_path, *, label="_bad", **overrides):
+    settings = {
+        "max_epochs": 2,
+        "save_every_epochs": 1,
+        "relational_queue_size": 2,
+        "relational_queue_size_explicit": True,
+    }
+    settings.update(overrides)
     return _run_tiny_pretrain(
-        tmp_path,
-        monkeypatch,
-        label=label,
-        resume=str(bad_path),
-        max_epochs=2,
-        save_every_epochs=1,
-        relational_queue_size=2,
-        relational_queue_size_explicit=True,
-        **overrides,
+        tmp_path, monkeypatch, label=label, resume=str(bad_path), **settings
     )
 
 
@@ -2700,6 +2699,34 @@ def test_fifo_step_reuses_snapshot_and_commits_pre_ema_features(
     assert not committed.requires_grad
     norms = committed.norm(dim=-1)
     assert torch.allclose(norms, torch.ones_like(norms), atol=1e-5)
+
+
+def test_fifo_student_diagnostics_follow_the_log_step_gate(tmp_path, monkeypatch):
+    import otuformer.training.objectives as objectives_module
+
+    calls = {"count": 0}
+    real = objectives_module._student_row_statistics
+
+    def spy(logits, probabilities, current_count):
+        calls["count"] += 1
+        return real(logits, probabilities, current_count)
+
+    monkeypatch.setattr(objectives_module, "_student_row_statistics", spy)
+    _run_tiny_pretrain(
+        tmp_path,
+        monkeypatch,
+        label="_gate",
+        relational_queue_size=2,
+        relational_queue_size_explicit=True,
+        max_epochs=2,
+        save_every_epochs=5,
+        batch_size=2,
+        log_every_n_steps=2,
+    )
+    # 4 steps, two of them log steps. Each log step reduces the four ``full``
+    # global pairs and one local view against two teacher slots; a non-log step
+    # must reduce none.
+    assert calls["count"] == 2 * (4 + 2)
 
 
 def test_fifo_aborted_step_does_not_mutate_queue_or_save_epoch(
@@ -2921,6 +2948,111 @@ def test_fifo_epoch_resume_matches_uninterrupted_cpu(tmp_path, monkeypatch):
             lambda ckpt: ckpt["optimizer"]["state"][0]["exp_avg_sq"].fill_(-1.0),
             "negative",
         ),
+        (
+            # A saved execution mode the recovery target cannot run: the flag
+            # would only fail on the first optimizer step, after the CSV opened.
+            lambda ckpt: ckpt["optimizer"]["param_groups"][0].update(
+                {"capturable": True}
+            ),
+            "capturable=True",
+        ),
+        (
+            # A pair PyTorch rejects on every device, so no target is exempt.
+            lambda ckpt: ckpt["optimizer"]["param_groups"][0].update(
+                {"fused": True, "differentiable": True}
+            ),
+            "fused=True and differentiable=True",
+        ),
+        (
+            # Python-finite but not finite at the float32 schedule precision.
+            lambda ckpt: ckpt["schedule"].update({"last_lr": 1e100}),
+            "survive the float32 schedule precision",
+        ),
+        (
+            # Decoupled decay: lr * weight_decay overflows the update precision
+            # and would save a non-finite model with exit status 0.
+            lambda ckpt: ckpt["optimizer"]["param_groups"][0].update(
+                {"weight_decay": 1e100}
+            ),
+            "optimizer update is unusable",
+        ),
+        (
+            # eps that underflows to zero at float32 leaves a zero denominator.
+            lambda ckpt: ckpt["optimizer"]["param_groups"][0].update(
+                {"eps": 1e-100}
+            ),
+            "optimizer update is unusable",
+        ),
+        (
+            # A beta that rounds to one at float32 zeroes the bias correction
+            # of the differentiable branch.
+            lambda ckpt: ckpt["optimizer"]["param_groups"][0].update(
+                {"betas": [1 - 1e-12, 0.999], "differentiable": True}
+            ),
+            "optimizer update is unusable",
+        ),
+        (
+            # A tensor step the foreach path rejects at load.
+            lambda ckpt: ckpt["optimizer"].update(
+                {
+                    "param_groups": [
+                        {
+                            **ckpt["optimizer"]["param_groups"][0],
+                            "foreach": True,
+                        }
+                    ],
+                    "state": {
+                        index: {
+                            **entry,
+                            "step": torch.tensor(1, dtype=torch.int64),
+                        }
+                        for index, entry in ckpt["optimizer"]["state"].items()
+                    },
+                }
+            ),
+            "the foreach path rejects",
+        ),
+        (
+            # differentiability needs a scalar step; (1, 1) broadcast-fails.
+            lambda ckpt: ckpt["optimizer"].update(
+                {
+                    "param_groups": [
+                        {
+                            **ckpt["optimizer"]["param_groups"][0],
+                            "differentiable": True,
+                        }
+                    ],
+                    "state": {
+                        index: {
+                            **entry,
+                            "step": torch.ones(1, 1),
+                        }
+                        for index, entry in ckpt["optimizer"]["state"].items()
+                    },
+                }
+            ),
+            "shaped step only on CPU",
+        ),
+        (
+            lambda ckpt: (
+                ckpt["optimizer"]["param_groups"][0].update(differentiable=True),
+                ckpt["optimizer"]["state"][0]["step"].requires_grad_(True),
+            ),
+            "requires_grad",
+        ),
+        (
+            # Finite at float64, Inf once the float32 training tensor loads it.
+            lambda ckpt: ckpt["optimizer"]["state"][0].update(
+                {
+                    "exp_avg": torch.full_like(
+                        ckpt["optimizer"]["state"][0]["exp_avg"],
+                        1e100,
+                        dtype=torch.float64,
+                    )
+                }
+            ),
+            "not finite at torch.float32",
+        ),
     ],
 )
 def test_fifo_resume_rejects_missing_or_malformed_adamw_state(
@@ -2937,35 +3069,249 @@ def test_fifo_resume_rejects_missing_or_malformed_adamw_state(
     assert not (tmp_path / "out_bad" / "logs").exists()
 
 
+def test_fifo_resume_restores_a_float64_center_into_the_float32_buffer(
+    tmp_path, monkeypatch
+):
+    """A finite float64 payload must survive the restore on any backend."""
+    import torch
+
+    from otuformer.training.pretrain_loop import _restore_relational_center
+
+    source = _fifo_source_run(tmp_path, monkeypatch, patch_loss="none")
+    payload = _load_fifo_checkpoint(source["out_dir"] / "SSL_epoch_0001.pth")
+    payload["center"] = payload["center"].to(torch.float64) * 0.5
+    converted = _save_fifo_checkpoint(payload, tmp_path / "float64_center.pth")
+
+    # The restore expression the preflight validates: cast first, then move.
+    buffer = torch.zeros(1, 8)
+    _restore_relational_center(payload["center"], buffer, torch.device("cpu"))
+    assert buffer.dtype == torch.float32
+    assert torch.equal(buffer, payload["center"].to(torch.float32))
+
+    # The encoder payload may be float64 too: the cast happens before the load,
+    # so the restored parameters stay float32.
+    payload["student"] = {
+        name: tensor.to(torch.float64) for name, tensor in payload["student"].items()
+    }
+    payload["teacher"] = {
+        name: tensor.to(torch.float64) for name, tensor in payload["teacher"].items()
+    }
+    converted = _save_fifo_checkpoint(payload, tmp_path / "float64_state.pth")
+
+    resumed = _fifo_resume_run(
+        tmp_path, monkeypatch, converted, label="_float64", patch_loss="none"
+    )
+    saved = _load_fifo_checkpoint(resumed["out_dir"] / "SSL_latest.pth")
+    assert saved["center"].dtype == torch.float32
+    assert saved["student"]["backbone.cls_token"].dtype == torch.float32
+
+
+@pytest.mark.skipif(
+    not torch.backends.mps.is_available(), reason="MPS is not available here"
+)
+def test_fifo_center_restore_casts_before_the_mps_move():
+    """The real device rejects float64, which is why the cast comes first."""
+    from otuformer.training.pretrain_loop import _restore_relational_center
+
+    saved_center = torch.full((1, 8), 0.5, dtype=torch.float64)
+    buffer = torch.zeros(1, 8, dtype=torch.float32, device="mps")
+    _restore_relational_center(saved_center, buffer, buffer.device)
+    assert buffer.dtype == torch.float32
+    assert buffer.device.type == "mps"
+    assert torch.equal(buffer.cpu(), saved_center.to(torch.float32))
+    # The previous expression moved the payload without casting it.
+    with pytest.raises(TypeError):
+        saved_center.to(device="mps")
+
+
+def test_fifo_sparse_two_hop_resume_matches_uninterrupted_cpu(tmp_path, monkeypatch):
+    """Sparse saves, two resume hops, and the full state including moments."""
+    import pytest
+    import torch
+
+    total_epochs = 6
+
+    uninterrupted = _run_tiny_pretrain(
+        tmp_path,
+        monkeypatch,
+        label="_sparse_whole",
+        relational_queue_size=2,
+        relational_queue_size_explicit=True,
+        max_epochs=total_epochs,
+        save_every_epochs=2,
+        keep_last_checkpoints=10,
+        batch_size=2,
+    )
+
+    def stop_after(epochs_in_this_run: int):
+        """Interrupt *this* invocation after its scheduled epoch saves.
+
+        Each hop is its own process-equivalent run, so the counter starts at
+        zero there; only the schedule is shared.
+        """
+        calls = {"count": 0}
+        real_loss = pretrain_loop_module._compute_global_loss
+
+        def stop(*args, **kwargs):
+            calls["count"] += 1
+            if calls["count"] > epochs_in_this_run * 2:
+                raise ValueError("interrupted after a scheduled epoch save")
+            return real_loss(*args, **kwargs)
+
+        return stop
+
+    # Hop 1: stop after epoch 2 (two steps per epoch).
+    with monkeypatch.context() as stop:
+        stop.setattr(
+            pretrain_loop_module, "_compute_global_loss", stop_after(2)
+        )
+        with pytest.raises(ValueError, match="interrupted after"):
+            _run_tiny_pretrain(
+                tmp_path,
+                monkeypatch,
+                label="_sparse_first",
+                relational_queue_size=2,
+                relational_queue_size_explicit=True,
+                max_epochs=total_epochs,
+                save_every_epochs=2,
+                keep_last_checkpoints=10,
+                batch_size=2,
+            )
+    first = tmp_path / "out_sparse_first"
+    assert sorted(p.name for p in first.glob("SSL_epoch_*.pth")) == [
+        "SSL_epoch_0002.pth"
+    ]
+
+    # Hop 2: resume from epoch 2 and stop after epoch 4.
+    with monkeypatch.context() as stop:
+        stop.setattr(
+            pretrain_loop_module, "_compute_global_loss", stop_after(2)
+        )
+        with pytest.raises(ValueError, match="interrupted after"):
+            _fifo_resume_run(
+                tmp_path,
+                monkeypatch,
+                first / "SSL_epoch_0002.pth",
+                label="_sparse_second",
+                max_epochs=total_epochs,
+                save_every_epochs=2,
+                keep_last_checkpoints=10,
+                batch_size=2,
+            )
+    second = tmp_path / "out_sparse_second"
+    assert sorted(p.name for p in second.glob("SSL_epoch_*.pth")) == [
+        "SSL_epoch_0004.pth"
+    ]
+
+    # Hop 3: finish the run from epoch 4.
+    resumed = _fifo_resume_run(
+        tmp_path,
+        monkeypatch,
+        second / "SSL_epoch_0004.pth",
+        label="_sparse_third",
+        max_epochs=total_epochs,
+        save_every_epochs=2,
+        keep_last_checkpoints=10,
+        batch_size=2,
+    )
+
+    whole = _load_fifo_checkpoint(uninterrupted["out_dir"] / "SSL_latest.pth")
+    joined = _load_fifo_checkpoint(resumed["out_dir"] / "SSL_latest.pth")
+    for key in ("student", "teacher"):
+        for name, tensor in whole[key].items():
+            assert torch.equal(tensor, joined[key][name]), (key, name)
+    assert torch.equal(whole["center"], joined["center"])
+    # Optimizer moments, not only the group hyper-parameters.
+    assert whole["optimizer"]["state"].keys() == joined["optimizer"]["state"].keys()
+    for index, entry in whole["optimizer"]["state"].items():
+        other = joined["optimizer"]["state"][index]
+        assert torch.equal(entry["step"], other["step"]), index
+        assert torch.equal(entry["exp_avg"], other["exp_avg"]), index
+        assert torch.equal(entry["exp_avg_sq"], other["exp_avg_sq"]), index
+    # Queue order, features, ages and completed count.
+    assert whole["relational_queue"]["keys"] == joined["relational_queue"]["keys"]
+    assert torch.equal(
+        whole["relational_queue"]["features"], joined["relational_queue"]["features"]
+    )
+    assert (
+        whole["relational_queue"]["observed_steps"]
+        == joined["relational_queue"]["observed_steps"]
+    )
+    assert whole["iteration"] == joined["iteration"] == 12
+    assert whole["schedule"] == joined["schedule"]
+    # The saved RNG streams continue exactly.
+    assert torch.equal(whole["rng_state"]["torch"], joined["rng_state"]["torch"])
+    assert whole["rng_state"]["python"] == joined["rng_state"]["python"]
+    whole_numpy = whole["rng_state"]["numpy"]
+    joined_numpy = joined["rng_state"]["numpy"]
+    assert whole_numpy[0] == joined_numpy[0]
+    assert torch.equal(
+        torch.as_tensor(whole_numpy[1]), torch.as_tensor(joined_numpy[1])
+    )
+    assert whole_numpy[2:] == joined_numpy[2:]
+
+
 @pytest.mark.parametrize(
-    "mutate, match",
+    "patch_loss, mutate, match",
     [
         (
+            "masked-feature",
             lambda ckpt: ckpt["patch_objective"].pop("predictor.1.weight"),
             "patch_objective state is malformed",
         ),
         (
+            "masked-feature",
             lambda ckpt: ckpt["patch_objective"]["predictor.1.weight"].resize_(
                 1, 1
             ),
             "patch_objective state is malformed",
         ),
-        (lambda ckpt: ckpt.pop("patch_objective"), "no patch_objective state"),
+        (
+            "masked-feature",
+            lambda ckpt: ckpt.pop("patch_objective"),
+            "no patch_objective state",
+        ),
+        (
+            "ibot",
+            lambda ckpt: ckpt["patch_objective"]["student_ibot_head.3.weight"].resize_(
+                1, 1
+            ),
+            "patch_objective state is malformed",
+        ),
+        (
+            "ibot",
+            lambda ckpt: ckpt["patch_objective"]["teacher_ibot_head.3.bias"].resize_(
+                1
+            ),
+            "patch_objective state is malformed",
+        ),
+        (
+            "ibot",
+            lambda ckpt: ckpt["patch_objective"]["patch_center"].fill_(
+                float("nan")
+            ),
+            "patch_objective.patch_center contains non-finite",
+        ),
+        (
+            "ibot",
+            lambda ckpt: ckpt["patch_objective"]["mask_token"].fill_(
+                float("inf")
+            ),
+            "patch_objective.mask_token contains non-finite",
+        ),
     ],
 )
 def test_fifo_resume_rejects_invalid_patch_objective_before_outputs(
-    tmp_path, monkeypatch, mutate, match
+    tmp_path, monkeypatch, patch_loss, mutate, match
 ):
     import pytest
 
-    source = _fifo_source_run(tmp_path, monkeypatch, patch_loss="masked-feature")
+    source = _fifo_source_run(tmp_path, monkeypatch, patch_loss=patch_loss)
     payload = _load_fifo_checkpoint(source["out_dir"] / "SSL_epoch_0001.pth")
     mutate(payload)
     bad = _save_fifo_checkpoint(payload, tmp_path / "bad.pth")
     with pytest.raises(ValueError, match=match):
-        _fifo_resume_run(
-            tmp_path, monkeypatch, bad, patch_loss="masked-feature"
-        )
+        _fifo_resume_run(tmp_path, monkeypatch, bad, patch_loss=patch_loss)
     assert not (tmp_path / "out_bad" / "logs").exists()
 
 
@@ -3007,6 +3353,30 @@ def test_fifo_resume_rejects_invalid_patch_objective_before_outputs(
             lambda ckpt: ckpt.update({"center": ckpt["center"].fill_(float("inf"))}),
             "non-finite",
         ),
+        (
+            # Finite at float64, Inf in the restored float32 center buffer.
+            lambda ckpt: ckpt.update(
+                {
+                    "center": torch.full(
+                        tuple(ckpt["center"].shape), 1e100, dtype=torch.float64
+                    )
+                }
+            ),
+            "not finite at float32",
+        ),
+        (
+            # A float64 weight just above the float32 range becomes Inf on load.
+            lambda ckpt: ckpt["student"].update(
+                {
+                    "backbone.blocks.0.norm1.weight": torch.full_like(
+                        ckpt["student"]["backbone.blocks.0.norm1.weight"],
+                        1e100,
+                        dtype=torch.float64,
+                    )
+                }
+            ),
+            "not finite at torch.float32 after loading",
+        ),
     ],
 )
 def test_fifo_resume_rejects_incomplete_or_nonfinite_encoders_and_center(
@@ -3022,6 +3392,38 @@ def test_fifo_resume_rejects_incomplete_or_nonfinite_encoders_and_center(
     with pytest.raises(ValueError, match=match):
         _fifo_resume_run(tmp_path, monkeypatch, bad, patch_loss="none")
     assert not (tmp_path / "out_bad" / "logs").exists()
+
+
+def test_fifo_without_local_views_leaves_the_local_teacher_cells_blank(
+    tmp_path, monkeypatch
+):
+    import csv
+
+    obs = _run_tiny_pretrain(
+        tmp_path,
+        monkeypatch,
+        label="_no_locals",
+        relational_queue_size=2,
+        relational_queue_size_explicit=True,
+        max_epochs=1,
+        save_every_epochs=5,
+        local_crops=0,
+    )
+    rows = list(
+        csv.DictReader(
+            (obs["out_dir"] / "logs" / "instant_metrics.pretrain.csv").open(
+                newline=""
+            )
+        )
+    )
+    assert rows
+    for row in rows:
+        for name in reporting_module._RELATIONAL_TEACHER_STAT_NAMES:
+            assert row[f"relational_teacher_{name}_global"] != "", name
+            assert row[f"relational_teacher_{name}_local"] == "", name
+        for name in reporting_module._RELATIONAL_STUDENT_STAT_NAMES:
+            assert row[f"relational_student_{name}_global"] != "", name
+            assert row[f"relational_student_{name}_local"] == "", name
 
 
 def test_fifo_resolved_log_separates_requested_and_effective(

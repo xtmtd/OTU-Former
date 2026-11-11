@@ -215,6 +215,29 @@ def test_fifo_probability_partitions_and_nonself_perplexity():
     assert "nonself_effective" not in single.teacher_stats
 
 
+def test_fifo_nonself_perplexity_survives_a_low_temperature():
+    """The conditional distribution comes from the nonself logits themselves."""
+    from otuformer.training.objectives import _teacher_row_statistics
+
+    for temperature in (0.1, 0.025, 0.01):
+        # Column 0 is the self candidate and it must *dominate*: with a dominant
+        # self logit the self mass rounds to one at a low temperature, which is
+        # exactly the regime where renormalizing the full softmax breaks (it
+        # returned ~55406 or nothing at all there). The two equal nonself
+        # candidates keep the exact answer at 2.
+        logits = torch.tensor([[1.0, -1.0, -1.0]]) / temperature
+        probs = F.softmax(logits - logits.mean(dim=1, keepdim=True), dim=1)
+        stats = _teacher_row_statistics(logits, probs, 1)
+        assert float(stats["self_mass"]) == pytest.approx(1.0)
+        assert float(stats["nonself_effective"]) == pytest.approx(2.0)
+        total = (
+            float(stats["self_mass"])
+            + float(stats["other_current_mass"])
+            + float(stats["history_mass"])
+        )
+        assert total == pytest.approx(1.0)
+
+
 def test_fifo_diagnostics_are_detached_and_log_step_only():
     center, current, history = _fixture()
     quiet = _make_relational_step_targets(

@@ -11,7 +11,7 @@
 **Spec:** [Approved FIFO design](../specs/2026-11-10-relational-fifo-design.md), [master design](../specs/2026-03-29-otuformer-design.md), [development testing policy](../specs/2026-11-07-development-testing-policy.md) and [training ownership design](../specs/2026-11-07-training-modularity-cli-testing-design.md). Read the feature spec and this plan together.
 
 **Date:** 2026-11-11. Retain the 2026-11-10 filename required by the design.
-**Status:** Implemented and verified on 2026-11-11 against the approved design (Tasks 1-8). Implementation steps are checked because they have executed evidence; every commit checkpoint stays unticked because no commit permission was given. No research training, dependency change, version change, tag or release happened, and nothing was pushed.
+**Status:** Tasks 1-8 were implemented on 2026-11-11 as eight checkpoint commits. Seven independent audit rounds followed. The user has now authorized correcting the four remaining findings, committing the cumulative audit corrections as one closing change, and pushing `OTU-Former-dense` to GitHub. The closing verification and delivery record is below. No research training, dependency/version change, tag or release is part of this authorization.
 
 ## Global Constraints
 
@@ -87,7 +87,7 @@ def test_fifo_preparation_keeps_two_internal_aliases(tmp_path):
 - [x] **Step 3 — Implement selection and fingerprint.** Call `resolve_dataset_image_paths()` exactly once; derive identity from each already-selected path using `resolve_reference(root, absolute_written_selected_path, basename_fallback=False)` and `normalize_key`, without `.resolve()` or `normpath` on that spelling first. Require containment without changing the shared helper semantics. Never re-resolve the original CSV reference or replace legacy basename selection.
 - [x] **Step 4 — Validate then hash once.** Reject path/key/count conflicts before reading all image bytes. For each selected image, use `snapshot_bytes()` once, validate that the bytes are a decodable image with the existing Pillow stack, append an ordered `{image_key, size_bytes, sha256}` row, and discard its bytes. Use `canonical_digest(rows)`; labels, absolute roots and other CSV columns are excluded. Announce the phase before file reads using existing phase helpers and report image count, byte count and elapsed time. Do not hash an off run. Preparation consumes no augmentation RNG.
 - [x] **Step 5 — Verify keyed/off envelopes.** Run `python -m pytest tests/test_training_dataset.py -q`. Require fixed-seed crop tensors, crop-call order and RNG state to equal the old dataset for the same selected files; test worker-zero and a small multi-worker aligned batch without promising exact cross-worker replay. Root relocation keeps the digest; renaming, content or row-order changes do not. Two equal-content keys remain distinct. In `test_fifo_keyed_batches_preserve_view_rng_and_alignment`, assert both `set(sample) == {'views', 'image_key'}` and `set(batch) == {'views', 'image_key'}`, including with a label-bearing input CSV; any label or extra key fails. No labels enter the relation target.
-- [ ] **Step 6 — Conditional commit checkpoint.** With explicit commit permission only, stage the two named files and commit `feat(pretrain): prepare FIFO image identities without changing legacy views`.
+- [x] **Step 6 — Conditional commit checkpoint.** With explicit commit permission only, stage the two named files and commit `feat(pretrain): prepare FIFO image identities without changing legacy views`.
 
 ## Task 2: Implement Paired FIFO State and a Strict Logical Codec
 
@@ -117,7 +117,7 @@ def test_fifo_snapshot_excludes_current_without_refresh():
 - [x] **Step 3 — Implement the minimum state owner.** No dataset/CLI imports, recentering, model forwards or global queue. Snapshots and inserted pairs must not alias mutable model outputs or each other across a commit; mutating a snapshot in a test must not change stored queue features. Reading at epoch boundaries is ordinary reading. Storage grows only with occupancy; do not allocate `K` empty vectors.
 - [x] **Step 4 — Test strict serialization.** Add `test_fifo_codec_rejects_malformed_state` parametrized over unexpected/missing keys, bool integers, bad version/capacity, duplicate/outside keys, wrong shape/dtype, non-finite features, timestamps outside `[0, iteration)`, reversed timestamps, count/digest mismatch, and empty state after positive completed steps. Reject `requires_grad=True` features at the persisted trust boundary. An empty step-zero state and CPU round trip are valid. The latest successful batch's required tail depends on effective B; Task 3 validates it in the recovery layer rather than adding batch metadata to this codec.
 - [x] **Step 5 — Run green.** `python -m pytest tests/training/test_relational_queue.py -q`; round trip must preserve keys, features, ages, count and next eviction, with detached float32 CPU serialization and no source tensor aliasing.
-- [ ] **Step 6 — Conditional commit checkpoint.** Stage only the new module/test, commit `feat(pretrain): add image-keyed paired relational FIFO state`.
+- [x] **Step 6 — Conditional commit checkpoint.** Stage only the new module/test, commit `feat(pretrain): add image-keyed paired relational FIFO state`.
 
 ## Task 3: Resolve Enabled Requests, Data and Recovery Before Probes
 
@@ -155,7 +155,7 @@ def test_fifo_dino_explicit_zero_is_rejected():
 - [x] **Step 4d — Validate both full encoders and relational center.** In the strict-FIFO probe branch derive the full expected state after the same training setup, including `validate_pretrain_backbone(require_intermediates=...)` and only its actually registered `_pretrain_final_norm.*` aliases. Check saved student and teacher independently: exact complete key sets, Tensor values, exact shapes and finite floating parameters/buffers (backbone, projector and encoder center). Existing backbone/projector-layout helpers and zero-register permissive loading are insufficient. Require the top-level relational `center` Tensor to be finite with exact `[1, D]` shape; scalar or `[D]` broadcasting is invalid. Handle training aliases from the actual encoder structure and reject conflicting saved values for aliases of one live tensor. Do not substitute teacher/model_state_dict for missing student state. Add `test_fifo_resume_rejects_incomplete_or_nonfinite_encoders_and_center`: complete teacher with missing student projector, missing teacher weight, wrong projector shape, NaN/Inf backbone/projector/buffer, missing/scalar/`[D]`/non-finite top-level center, and valid training aliases. Cover zero-register and registered layouts; keep queue-off behavior unchanged.
 - [x] **Step 5 — Pin preflight and numerical guards.** Add `test_fifo_preparation_rejects_before_any_probe`, `test_fifo_handoff_is_consumed_once_and_retry_is_clean`, `test_fifo_resume_locks_exact_batch_not_only_loader_length`, `test_fifo_rng_validation_does_not_change_caller_rng` and `test_fifo_temperature_admission_uses_expanded_candidates`. Spy on every actual encoder-constructor lookup used by resume/register, architecture and optimizer preflights (`training.augmentation`, `training.pretrain_recipe`, and the relevant trainer lookup), not only `preflight_pretrain_run`. Add the real CLI-resume test `test_fifo_cli_resume_preparation_precedes_register_probe` in Task 7: a fingerprint conflict or saved-DINO explicit queue option must produce no encoder construction at all; a valid enabled resume must finish preparation before the first register-layout probe. CLI/direct handoff is hashed once; changed resume path/request invalidates reused preparation. Add `test_fifo_resume_rejects_impossible_latest_commit_tail` here: B=4, K=8, g=10 with only two records stamped 8 must fail, as must a nonempty queue lacking its four latest records stamped 9; valid K<B, K>N and refreshed/repeated-image trajectories must pass. Add `test_fifo_epoch_resume_rejects_truncated_history_with_valid_tail`: N=100, B=10, K=64, g=10 with only the last ten keys stamped 9 passes the tail test but must fail the epoch occupancy bound; a valid 64-record state passes. Test N not divisible by B and K greater than N to avoid requiring the dropped remainder or artificial full capacity. Task 5/7 output-safety tests also cover the AdamW and patch corruptions above and compare original log/CSV/checkpoint bytes. Test a float32 temperature admitted at B but rejected at `B + min(K, N-B)`, student and teacher endpoints, while normal temperatures remain accepted. For effective admission and existing validators that read `args.batch_size`, use a shallow namespace copy with only its batch size replaced by the preparation's effective value; never mutate the raw Parameters request before logging. On the trainer side, apply effective batch/capacity only after validating the request binding and retaining requested values.
 - [x] **Step 6 — Run green.** `python -m pytest tests/training/test_relational_queue_recipe.py tests/training/test_pretrain_alignment.py -q`. Retain existing same-plan, historical-zero, target-bundle, pairing and temperature tests. Detailed saved RNG validation must catch malformed Python/NumPy/torch states, including the target-aware CUDA cases, without consuming caller RNG. Add `test_fifo_rng_target_matrix`: CPU source without cuda → CPU succeeds; missing/None/empty CUDA state → CUDA fails; count mismatch → CUDA fails; valid matching states → CUDA restores all streams; CUDA-shaped payload → non-CUDA is structurally checked, omitted from the restore copy and reported; malformed provided payload fails even on CPU. Use mocked backend/restore spies for control-flow coverage without a GPU, and record real-CUDA restoration as unverified unless actually exercised on CUDA. Do not claim the mocked branch proves GPU RNG usability.
-- [ ] **Step 7 — Conditional commit checkpoint.** Stage the recipe and the two named tests; commit `feat(pretrain): resolve FIFO data and strict resume recipe before probes`.
+- [x] **Step 7 — Conditional commit checkpoint.** Stage the recipe and the two named tests; commit `feat(pretrain): resolve FIFO data and strict resume recipe before probes`.
 
 ## Task 4: Extend Relational Distributions and Reuse Loss-Side Statistics
 
@@ -188,7 +188,7 @@ def test_fifo_rectangular_loss_keeps_student_gradient():
 - [x] **Step 3 — Implement targets and scalar losses.** Keep original teacher row-mean subtraction, selected global pair sets and local averaging. Normalization and target construction are not extra model forwards. Empty eligible history is the same formula with E=0, not a forced additional branch; capacity zero never constructs targets.
 - [x] **Step 4 — Add diagnostic/parity tests.** `test_fifo_empty_history_matches_loss_gradient_and_rng`, `test_fifo_current_history_share_pre_step_center`, `test_fifo_probability_partitions_and_nonself_perplexity` and `test_fifo_diagnostics_are_detached_and_log_step_only`. Per row, self + other-current + history = 1; empty history mass=0. Teacher full entropy uses stable logs; conditional-nonself perplexity is `exp(-sum(r*log(r)))`, average per-row perplexities, with `0log0=0` and nonself logits used when self mass rounds to 1. No nonself candidates → unavailable, not NaN. No locals → unavailable local fields. No diagnostics request → no extra entropy/stat reductions, host conversions or feature dumps. Teacher stats are computed once per slot and reused for both branches.
 - [x] **Step 5 — Run green.** `python -m pytest tests/training/test_relational_queue_objectives.py tests/training/test_pretrain_alignment.py -q`. E=0 matches old numerical/gradient/RNG results, and enabled diagnostics on/off leave loss and gradients unchanged.
-- [ ] **Step 6 — Conditional commit checkpoint.** Stage objectives and the new test; commit `feat(pretrain): extend relational targets across current and FIFO candidates`.
+- [x] **Step 6 — Conditional commit checkpoint.** Stage objectives and the new test; commit `feat(pretrain): extend relational targets across current and FIFO candidates`.
 
 ## Task 5: Integrate Successful-Step State and Epoch Recovery
 
@@ -221,7 +221,7 @@ Existing saves place `SSL_latest.pth` directly under `obs['out_dir']`; no checkp
 - [x] **Step 4 — Add strict controlled resume evidence.** `test_fifo_epoch_resume_matches_uninterrupted_cpu` compares an uninterrupted run with an epoch-saved stop/resume under identical total schedule, CPU and workers=0. Stop only after a real scheduled save, not by shortening max_epochs and changing schedules. Compare student, teacher, optimizer, centers, schedule/progress, queue keys/features/ages and saved RNG; exercise a sparse save interval and two resume hops. Require both `SSL_epoch_*.pth` and `SSL_latest.pth` to carry equivalent state. Resumed teacher must not be overwritten with student weights.
 - [x] **Step 5 — Add failed-preflight and consumer tests.** Queue metadata attached to active DINO identity must fail through shared identity resolution; read-only relational consumers must not require dataset/RNG/queue reconstruction. Parameterize the existing injected-relational-bundle tests in `test_extractor.py`, `test_cam.py` and `test_export.py` with a valid enabled queue checkpoint; extend `test_extract_provenance_preserves_ssl_identity` in `test_extract_records.py` and existing fine-tune initialization/save checks in `test_pretrain_alignment.py`. No reader may hash files or allocate a queue just to load weights. Verify fine-tune saves do not copy top-level queue state. The shared checkpoint guard rejects queue config or state on active DINO before encoder construction, without importing training/queue/dataset; relational data/RNG/queue-codec validation remains in the training recipe, not read-only consumers. In `tests/test_output_safety.py`, add enabled malformed-payload/conflict cases using the existing `keep.txt` sentinel convention, including cleared AdamW state, malformed/negative second moments, missing predictor, wrong iBOT-head shape, invalid patch center, impossible latest-commit tail, truncated epoch occupancy, target-incomplete CUDA RNG and all Step 4d encoder/top-level-center corruptions. Assert sentinel and original log, CSV and checkpoint bytes remain unchanged; exercise actual CLI resume rejection and direct-core preflight, without stubbing away the validator under test. Keep queue-state assertions in training tests rather than duplicating a weaker output fixture there. For non-finite loss and gradient injections catch existing ValueError: queue unchanged, no new epoch save; center rollback is not asserted.
 - [x] **Step 6 — Run the focused real gates.** `python -m pytest tests/training/test_masked_pretrain.py tests/training/test_dino_pretrain.py tests/test_checkpoint_utils.py tests/test_extractor.py tests/test_cam.py tests/test_export.py tests/test_extract_records.py tests/test_output_safety.py tests/training/test_pretrain_alignment.py -q`. Cover relational patch `none/consistency/masked-feature/ibot`, nonzero shared KoLeo, ordinary/weak teacher with appropriate center populations, local crops and no locals, and all saved pair modes without changing patch inputs or gradient/EMA order. Keep ordinary loops on auto/native-size views; smaller-local patch matrix and exact replay remain explicitly CPU with policy reasons. Record selected device.
-- [ ] **Step 7 — Conditional commit checkpoint.** Stage only the named trainer/checkpoint files and affected integration/consumer tests explicitly; commit `feat(pretrain): persist FIFO only after successful updates and restore exact state`.
+- [x] **Step 7 — Conditional commit checkpoint.** Stage only the named trainer/checkpoint files and affected integration/consumer tests explicitly; commit `feat(pretrain): persist FIFO only after successful updates and restore exact state`.
 
 ## Task 6: Add Resolved Logs and Backward-Compatible Instant Metrics
 
@@ -269,7 +269,7 @@ This literal fixture is independent of the new production constant; importing th
 - [x] **Step 3 — Wire logger and log ownership.** Use existing atomic migration and existing loss/metric plots; do not add a chart family. Preserve finetune and enhanced epoch schemas. Blank queue-off/DINO columns and no-local statistics; do not compute queue statistics merely to fill columns. Mean/max age unavailable at E=0, refresh distinct from insertion, resolved fixed recipe capacity distinct from occupancy. Assert inherited enabled rows have `relational_queue_capacity == 128` even when the raw invocation omitted the option.
 - [x] **Step 4 — Add four resolved-log integration assertions.** `test_fifo_resolved_log_separates_requested_and_effective` covers fresh enabled, inherited resume (raw batch/capacity 32/None, effective saved 64/128), explicit 0 on a compatible disabled run and omitted DINO inactive. Assert one trainer record and no extra probability/teacher forward. CLI-stub absence is tested in Task 7, not implemented by printing during preflight.
 - [x] **Step 5 — Run green.** `python -m pytest tests/training/test_ssl_metrics.py -q` and `python -m pytest tests/training/test_masked_pretrain.py -q -k 'fifo or schema or migrated'`. Check probability groups, perplexity and log-step-only computation against Task 4 tests; old loss plots retain valid history and no required numeric fields are silently missing on enabled log rows.
-- [ ] **Step 6 — Conditional commit checkpoint.** Stage the two source/two test files and commit `feat(reporting): log FIFO coverage with safe pre-FIFO CSV migration`.
+- [x] **Step 6 — Conditional commit checkpoint.** Stage the two source/two test files and commit `feat(reporting): log FIFO coverage with safe pre-FIFO CSV migration`.
 
 ## Task 7: Expose Source-Aware CLI, Schema and Parameter Cards
 
@@ -296,7 +296,7 @@ Use the existing schema fixture for required input paths and its installed-schem
 - [x] **Step 2 — Run red.** `python -m pytest tests/test_cli_smoke.py tests/test_cli_schema.py -q -k fifo`; expected missing option/metadata.
 - [x] **Step 3 — Implement callback, constraints and card provenance.** Preserve named callback callers and panel order. Reject conflicts before `prepare_output_dir` or logger migration; no early whole SSL preflight and no second checkpoint load. Extend `test_training_selected_images_survive_cleanup` in `tests/test_output_safety.py` with an enabled pretrain case whose selected image remains within the declared root but lies under the overwritten output (root=tmp_path and image=tmp_path/out/pixels.png, with a CSV selecting it and `--batch-size 1` so a complete batch exists). It must pass G1 path validation and then fail output protection; an escaping-link/G1 failure alone does not prove prepared-selection protection. Spy that training selection is prepared once and protected without re-resolution; preserve existing queue-off, visualize-data and downstream-input cases. No models, outputs, hashing or downloads during help/schema/card generation.
 - [x] **Step 4 — Run green and startup guard.** `python -m pytest tests/test_cli_schema.py tests/test_cli_startup.py -q` and `python -m pytest tests/test_cli_smoke.py -q -k 'fifo or relational'`; also run `python -m pytest tests/test_output_safety.py tests/test_docs.py -q`. Inspect the installed console entrypoint `otuformer pretrain --help` and `otuformer --help` for the option, default/resume distinction and relational grouping; this package has no `otuformer.__main__` module. Automated rendered-help assertions use the existing `tests/test_docs.py` `help_output()` / `compact()` path to tolerate Rich wrapping; do not add a module entrypoint or infer the root cause of earlier environment-specific failures. Actual callback and generated argv must match; subprocess import guards retain absence of torch/pandas/training in static discovery.
-- [ ] **Step 5 — Conditional commit checkpoint.** Stage the three source/three test files and commit `feat(cli): expose opt-in FIFO with conditional resume provenance`.
+- [x] **Step 5 — Conditional commit checkpoint.** Stage the three source/three test files and commit `feat(cli): expose opt-in FIFO with conditional resume provenance`.
 
 ## Task 8: Synchronize Documentation, Review Coverage and Run Acceptance Gates
 
@@ -322,7 +322,7 @@ The existing doc-suite root fixture should resolve these paths, not the caller's
 - [x] **Step 5 — Run the required full gate on the final candidate.** `python -m pytest --durations=25`. This feature changes shared step mechanics and checkpoint/recovery identity, so focused passes alone do not accept compatibility. Record interpreter/dependencies/source import path, baseline SHA/dirty state, exact command/exit status, selected device and evidence path under a new ignored `runs/fifo_acceptance_<date>/` directory. Use a valid comparable baseline or collect one necessary baseline, not repeated full runs per local edit. If blocked or failing, keep acceptance open and report it; do not weaken assertions or hide slow tests.
 - [x] **Step 6 — Measure enabled data preparation cost without training.** Once plan execution/data access are explicitly authorized, call Task 1 preparation on the actual approved selected dataset without model creation or a training loop. Record selected image count, total bytes (and GB with the divisor stated), elapsed seconds, storage/cache context and exact invocation. No cost estimate counts as measured evidence; use a new run artifact, not the existing diagnostic spike outputs. This is a startup-cost check, not permission for capacity sweeps or paired-seed training.
 - [x] **Step 7 — Record correctness separately from research.** Update spec/plan with task and gate results plus limitations; leave any unrun tests/measurements open. Research capacities `0 / 32 / 128`, paired seeds, larger grouped data and dense-morphology evaluation remain a separately authorized follow-up, with the already-fixed teacher temperatures/augmentation/pairing/weights and full favorable/unfavorable metrics. No quality or speedup/default claim follows from correctness tests.
-- [ ] **Step 8 — Conditional commit checkpoint.** With explicit commit permission, stage the exact changed documentation/skill/test paths (not `git add -A`, not ignored runs/ref files) and commit `docs(pretrain): document FIFO contracts and verified recovery boundaries`. No automatic push, tag or release.
+- [x] **Step 8 — Conditional commit checkpoint.** With explicit commit permission, stage the exact changed documentation/skill/test paths (not `git add -A`, not ignored runs/ref files) and commit `docs(pretrain): document FIFO contracts and verified recovery boundaries`. No automatic push, tag or release.
 
 ## Acceptance Map and Handoff
 
@@ -366,3 +366,167 @@ The existing doc-suite root fixture should resolve these paths, not the caller's
 **Enabled data-preparation cost (measured, no training).** `prepare_relational_data(None, "examples/Epidorcus/images", batch_size=32)` on the shipped example set: **230 selected images, 6,789,679 bytes ≈ 0.0068 GB (0.00632 GiB), 0.053 s, ≈4375 images/s**, SHA-256 digest prefix `45b22c104877e58e`. This is a local-checkout startup-cost measurement, not a large-corpus estimate; hashing cost grows linearly with selected bytes.
 
 **Open items.** No commit, tag, push or release was performed. No research training (capacity `0 / 32 / 128`, paired seeds, larger grouped data, dense-morphology evaluation) was run: that remains separately authorized work, and nothing here is a quality, speed or default claim. CUDA RNG restoration is covered only by mocked control-flow tests — real CUDA continuation is unverified on this host.
+
+### Independent audit follow-up — 2026-11-11
+
+A read-only audit of the eight checkpoint commits found seven issues, all
+addressed here before re-acceptance:
+
+1. **Strict schedule preflight (was P1).** `_validate_relational_queue_resume` now requires the four saved schedule integers and both float endpoints (`last_lr`, `final_lr`) to be present, correctly typed, finite and positive, plus `total_steps >= iteration` and a `warmup_steps` bound. A missing or NaN `final_lr` used to survive every real preflight and then fail — or produce a non-finite learning rate — only after the CSV and log were open. Tests: `test_fifo_resume_rejects_incomplete_or_nonfinite_schedule`.
+2. **Real decode of the prepared images (was P1).** Preparation now decodes the same bytes it read (`load()` plus the `convert("RGB")` the dataset performs) instead of a header-only `verify()`. A truncated JPEG that passes `verify()` is rejected before any output. Test: `test_fifo_preparation_rejects_a_truncated_but_parseable_image`.
+3. **Stable conditional-nonself perplexity (was P2).** The statistic is taken from the softmax over the nonself logits themselves, not from a full softmax renormalized by the remaining nonself mass (whose clamp distorted or dropped it at low temperature). Two equal nonself candidates now report exactly 2 at any temperature. Test: `test_fifo_nonself_perplexity_survives_a_low_temperature`.
+4. **Strict capacity representations on recovery (was P2).** A recorded `args.relational_queue_size`/`requested_relational_queue_size` must be a real integer and must equal the effective capacity; `32.5`, `"32"` and request/effective conflicts are rejected. Test: `test_fifo_resume_rejects_conflicting_capacity_representations`.
+5. **Student diagnostics follow the log-step gate (was P2).** Both diagnostic families reduce only on `--log-every-n-steps` rows; an ordinary step no longer runs the per-pair student softmax/statistics. Test: `test_fifo_student_diagnostics_follow_the_log_step_gate`.
+6. **No-local runs leave the local teacher cells blank (was P2).** The reporter gates the `_local` teacher columns on the local branch actually contributing. Tests: `test_fifo_without_local_views_leaves_the_local_teacher_cells_blank` and the reporting helper case.
+7. **Evidence depth.** Added `test_fifo_sparse_two_hop_resume_matches_uninterrupted_cpu` (sparse `save_every_epochs=2`, two resume hops, comparing optimizer moment tensors, queue state and saved Python/NumPy/torch RNG), iBOT-head/patch-center/mask-token corruption cases in the patch preflight test, and source CSV/checkpoint byte preservation in the CLI output-protection test.
+
+### Second audit round — 2026-11-11
+
+A second read-only review found five remaining issues; all are fixed:
+
+1. **The warmup bound rejected our own checkpoints (was P1).** `--warmup-epochs 3` with a one-epoch, seven-step plan records `warmup_steps=21` while `_cosine_scheduler` clamps it to the seven real steps. The read-side upper bound added in the first round therefore rejected a checkpoint this code writes and would have blocked extending that run. The bound is removed; the field still has to be a non-negative integer. Test: `test_fifo_resume_accepts_the_writers_clamped_warmup` builds the schedule with the real builder and resumes it.
+2. **Cross-field schedule coverage (was P1).** A same-plan resume rebuilds the learning-rate array from the recorded rectangle but the teacher-temperature array from `schedule.total_steps`; a payload recording 7 or 8 instead of 21 therefore survived every preflight and then raised `IndexError` once training started, after the CSV was open. `_validate_queue_schedule_coverage` now requires the rectangle for a same-plan target and leaves the extension branch (which fills every array to one length) to the recorded-progress bound. Test: `test_fifo_resume_rejects_a_schedule_shorter_than_the_plan`.
+3. **Availability at the training dtype (was P1).** Finiteness was checked at the *recorded* precision. A float64 weight, moment or center of `1e100` is finite there and becomes `Inf` when it loads into the float32 training tensor. The encoder check now inspects the loaded tensors, the AdamW and center checks cast to the target dtype first. Tests: the float64 corpus added to the AdamW, encoder and center corruption matrices.
+4. **The low-temperature regression did not reproduce the bug (was P2).** The fixture made the *self* column negligible, which the old implementation handled correctly. It now uses a dominant self logit (`[1, -1, -1]`), the regime where renormalizing the full softmax returned ~55406 or nothing, and also asserts `self_mass ≈ 1`.
+5. **Output-protection evidence (was P2).** The fixture now contains what a real prior run leaves behind — a pre-FIFO 43-column `logs/instant_metrics.pretrain.csv` and both epoch checkpoint copies — and compares every output file (by relative path) plus the source CSV and checkpoint bytes, asserting the metrics CSV was neither migrated nor appended to.
+
+Gate re-run after the first round: `python -m pytest --durations=15` → exit 0, **1880 passed, 1 skipped in 853.38s** (`runs/fifo_acceptance_2026-11-11/full_gate_after_audit.log`). After the second round the affected suites were re-run directly (relational queue, recipe, objectives, dataset, SSL metrics, masked/dino pretrain, alignment, checkpoint utils, CLI/schema/startup, docs, workflow skill, output safety) rather than a third full sweep, and every one passed. ### Third audit round — 2026-11-11
+
+Three further recovery-boundary issues, all fixed:
+
+1. **The restore carried the recorded dtype to the device (was P1).** The preflight checked the center at float32, but the trainer restored `center.to(device)`, which keeps a float64 payload float64 — a `TypeError` on MPS, after output setup. The restore now casts on the CPU and then moves (`_restore_relational_center`), the encoder and patch loads go through `_fifo_cast_state`, and the preflight validates exactly that cast. Tests: `test_fifo_center_validation_uses_the_restore_cast`, `test_fifo_resume_restores_a_float64_center_into_the_float32_buffer` (a real float64 center *and* float64 encoder payload resumed end to end) and `test_fifo_center_restore_casts_before_the_mps_move`, which runs the restore on the real MPS device and asserts the pre-fix expression raises.
+2. **Device-bound optimizer execution flags (was P1).** `load_state_dict` restores `capturable`/`fused`/`differentiable`; a payload recorded for a capturable device passes every other check and then asserts on the first CPU step, after the CSV opened. `_validate_fifo_optimizer_execution_flags` rejects them unless the recovery target is CUDA. Tests: the flag cases in the recipe module (CPU/MPS rejected, CUDA accepted, writer defaults accepted everywhere) and `capturable=True`/`fused=True` in the real-checkpoint corruption matrix.
+3. **The reusable handoff was not bound to the epoch target (was P2).** A preparation resolved for an extension could serve a same-plan request and bypass the new schedule-coverage rule. `--max-epochs` is now part of the request binding, and reuse re-runs the coverage check. Test: `test_fifo_reuse_is_bound_to_the_epoch_target`.
+
+Affected suites after this round: relational queue/recipe/objectives, dataset, SSL metrics, masked and DINO pretrain, DINO resume, alignment, SSL config, checkpoint utils, output safety, CLI/schema/startup, docs and workflow skill — **1172 passed, 1 skipped**. No third full sweep was run.
+
+### Fourth audit round — 2026-11-11
+
+Three further issues, all fixed:
+
+1. **Schedule precision, not Python precision (was P1).** A saved `last_lr`/`final_lr` of `1e100` is finite as a Python float and passed every check, but `_build_pretrain_schedules` builds float32 arrays, so it became `Inf`/`NaN` and drove finite gradients into non-finite parameters — after output setup, where the loss/gradient guards cannot help. `_validate_queue_schedule_endpoint` now also requires each saved endpoint (and the invocation's `--lr`) to survive the float32 schedule precision, which is sufficient because every rebuilt value is a convex combination of those endpoints. Tests: the `1e100` cases in `test_fifo_resume_rejects_incomplete_or_nonfinite_schedule` and the real-checkpoint `last_lr` case in the AdamW corruption matrix.
+2. **Zero learning rate was over-rejected (was P2).** `--lr 0` is legal for the CLI and for AdamW, and the cosine schedule then yields a finite all-zero array; the reader's "must be positive" rule rejected the writer's own output. Endpoints must now be finite and **non-negative**, so zero and values that collapse toward zero at float32 are readable. Test: `test_fifo_resume_accepts_a_zero_learning_rate_writer_state` builds the schedule with the real builder, runs seven AdamW updates on it, and resumes.
+3. **Optimizer flags follow their real device rules (was P2).** The previous "CUDA accepts everything, other targets accept nothing" rule was wrong in both directions: `fused=True` alone runs fine on CPU/MPS but was rejected, while `foreach=True` + `differentiable=True` was accepted for a CUDA target even though PyTorch's `_foreach` autograd assertion is device-independent. The check now rejects the pairs PyTorch rejects everywhere (`fused`+`foreach`, `fused`+`differentiable`, `foreach`+`differentiable`), keeps `capturable`/`differentiable` CUDA-only, and accepts standalone `fused`/`foreach`. Test: `test_fifo_optimizer_flags_follow_their_real_device_rules` proves the accepted standalone flags really step an optimizer on CPU and states explicitly that CUDA acceptance is a documented rule, not hardware evidence.
+
+Affected suites after this round: relational queue/recipe/objectives, dataset, SSL metrics, masked pretrain, alignment, checkpoint utils, output safety, DINO resume, SSL config, CLI/schema/startup, docs and workflow skill — **1153 passed, 1 skipped**.
+
+### Fifth audit round — 2026-11-11
+
+Four further findings across the full chain; all fixed:
+
+1. **The LR precision check had real-entry holes (was P1).** The CLI's early request namespace did not carry `--lr`, and preparation only checked it when a checkpoint was present, so a fresh enabled run and a same-plan resume both accepted `--lr 1e100` and later built an `Inf` schedule — after the log and CSV existed. The CLI now passes the requested `lr`, every active preparation (fresh, resume, and reuse) validates it before any output change, and reuse re-checks it because a legal reuse may change the rate. Tests: `test_fifo_preparation_checks_the_requested_lr` (fresh/resume/reuse, zero allowed) and `test_fifo_cli_rejects_a_non_finite_schedule_lr` through the real `CliRunner` for a fresh run and a same-plan resume, with zero shown to clear the gate.
+2. **Optimizer flags follow the restored optimizer, not the constructor (was P2).** The previous rules were derived from direct construction. Measured on the trainer's real path (default construct → `load_state_dict` → backward → step, CPU and MPS, all 16 combinations): standalone `differentiable`, `fused`+`foreach`, and `fused`+`capturable`(±`foreach`) all run; `differentiable` with `fused` or `foreach` fails everywhere; `capturable` **without** `fused` needs a CUDA-class device. The validator now encodes exactly that, and the test reproduces the process instead of asserting "no error on a `cuda` device".
+3. **CSV migration deleted unrelated sidecars (was P2).** The cleanup swept `instant_metrics.pretrain.csv.*.tmp`, removing files that existed before the call. Both the instant and the epoch migration now remove only their own temporary path. Test: `test_fifo_migration_keeps_preexisting_sidecar_files` covers the successful 43-column migration and an injected `os.replace` failure.
+4. **Quadratic key deduplication (was P3).** `key in keys` rescanned the growing list (~22s for 100k keys). Order is kept as the identity, membership uses a `seen` set. Test: `test_fifo_preparation_deduplicates_in_linear_time` (100k keys, generous wall-clock bound, duplicates still rejected before any read).
+
+Affected suites after this round: relational queue/recipe/objectives, dataset, SSL metrics, masked pretrain, output safety, CLI/schema/startup, alignment, SSL config, checkpoint utils, extractor, CAM, export, extract records, docs and workflow skill — **1255 passed, 1 skipped**.
+
+### Sixth audit round — 2026-11-11
+
+Three optimizer-state findings, all fixed; the first could previously save a
+non-finite model with exit status 0.
+
+1. **Optimizer coefficients are now checked where AdamW uses them (was P1).**
+   `eps`, `betas` and `weight_decay` were only validated as Python numbers, so
+   `weight_decay=1e100` (its `lr * weight_decay` product overflows), `eps=1e-100`
+   (float32 zero denominator) and a `beta1` that rounds to one at float32 (zero
+   bias correction) all passed the preflight, completed a full FIFO resume and
+   saved a non-finite model while loss and gradient checks stayed finite.
+   This round initially applied a universal float32 coefficient check. The
+   seventh audit found that scalar and tensor AdamW branches differ, and that
+   saved weight decay overrides the resume request. The closing corrections
+   below supersede that initial precision rule with target-device execution
+   probes and effective saved coefficients.
+2. **Step format is judged against the group's execution branch (was P2).**
+   `step` was only checked for being a single integer value. Measurements on the
+   real path show the foreach branch rejects integer/float16 tensor steps, the
+   differentiable branch needs a scalar step (`(1,)` is CPU-only and `(1, 1)`
+   broadcast-fails). This round's assertion that every branch rejects a step
+   requiring grad was incorrect: only the differentiable branch rejects it.
+   The seventh audit also established usable CPU foreach/bfloat16 steps; the
+   closing corrections below retain both executable forms.
+3. **AMSGrad is judged per group (was P2).** The cross-group `any(amsgrad)` made
+   one AMSGrad group demand `max_exp_avg_sq` from every parameter, rejecting a
+   mixed payload that real AdamW restores and steps fine. `_validate_fifo_adamw_state`
+   now walks the saved groups alongside the rebuilt ones, so AMSGrad, flags and
+   step format are all per-group decisions.
+
+Tests: the coefficient matrix plus a measured-update test (a full restore→step
+really does produce `-inf` for `weight_decay=1e100` and for the differentiable
+`beta1` case, while the guarded values are rejected), the decay-product overflow
+case, the per-group AMSGrad acceptance with a real two-group restore, the
+step-format matrix, and the same corruptions driven through full FIFO checkpoints
+in the AdamW corruption matrix (each asserting no output directory was created).
+
+Affected suites after this round: relational queue/recipe/objectives, masked and
+DINO pretrain, DINO resume, dataset, SSL metrics, alignment, SSL config, output
+safety, checkpoint utils, extractor, CAM, export, extract records, CLI/schema/
+startup, docs and workflow skill — **1371 passed, 1 skipped**.
+
+### Seventh audit and authorized closing corrections — 2026-11-11
+
+The independent seventh audit closed the sixth round's original counterexamples,
+ran **1933 passed, 1 skipped in 913.86s**, and reported four remaining categories.
+That result predates the closing changes and is not their verification result.
+The user explicitly requested fixing these findings, creating the local closing
+commit, and updating GitHub.
+
+1. **Output safety (P1).** CLI early preparation now includes weight decay and
+   warmup as well as LR. Fresh-run raw sign/range checks precede device arithmetic
+   and output cleanup, so `-1e-100` cannot disappear into negative zero. CLI
+   overwrite rejection preserves preexisting sentinel/log bytes.
+2. **Unsafe update arithmetic (P1).** After basic coefficient/flag validation,
+   isolated float32 AdamW probes use the target device, default construction,
+   restored group/counter state, and both zero and nonzero gradients. The probes
+   consume no RNG and mutate no saved tensors. They reject actual MPS subnormal
+   epsilon failures and differentiable zero-LR failures before output changes.
+   FIFO training additionally checks updated parameters before EMA/queue commit;
+   a nonfinite optimizer result cannot advance the FIFO or publish a checkpoint.
+3. **Effective coefficients and schedule (P2).** Resume validates saved weight
+   decay, keeping the existing notice for an overridden request. Python-scalar
+   near-one beta and large epsilon are accepted when the actual branch remains
+   finite. Saved-plan probes use the remaining cosine schedule's actual LR
+   extrema, including same-plan and extension rules, rather than an unused zero
+   endpoint. Ordinary zero-LR AdamW remains supported.
+4. **Executable counters (P2).** CPU foreach accepts bfloat16 singleton counters.
+   Non-differentiable default/foreach/fused paths accept counters requiring grad;
+   differentiable counters requiring grad still reject. Existing shape, dtype,
+   device, per-group AMSGrad and complete-state checks remain in effect.
+
+Ruling: validate backend arithmetic with small actual restored updates instead of
+adding another handwritten universal float32 whitelist. The probes check boundary
+combinations, not arbitrary future tensors; the enabled-only post-update finite
+check protects the queue/checkpoint success boundary for remaining numerical
+failures. This adds bounded startup work and a finite reduction to enabled steps.
+
+Regression evidence: the new boundary file was observed failing before the fixes.
+The schedule-endpoint counterexample was also observed failing, then passing.
+The focused CLI/recipe/checkpoint/output-protection selection returned
+**97 passed in 25.49s** after adding the G1 preparation-order regression. This
+includes real CPU/MPS tiny-model admission/rejection,
+complete CLI continuation with saved WD, bfloat16/requires-grad counters, and an
+injected nonfinite optimizer result with no commit or saved checkpoint.
+
+Closing full-suite verification on the final source/test candidate returned
+**1953 passed, 1 skipped in 903.91s (0:15:03), exit 0**. The full command was
+`PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -p no:cacheprovider --basetemp <temporary-directory> -q --tb=short --durations=15`,
+with inherited `FORCE_COLOR` and `CLICOLOR_FORCE` removed. An earlier gate was
+stopped after the G1 probe-order correction; that incomplete run is not counted.
+Source/tests stayed unchanged throughout the completed gate. Only this evidence
+record was updated afterward, followed by documentation checks.
+
+Additional actual-device checks found no admission/execution mismatches in 32
+CPU/MPS flag combinations or 480 flag/dtype/shape combinations; the eight
+requires-grad branch/device controls matched as well. Epsilon and zero/tiny-LR
+controls retained the safe CPU/MPS cases. Eight remaining-schedule comparisons
+matched the trainer's LR extrema. Python/NumPy/Torch/MPS RNG snapshots were
+unchanged by the probes. Complete CLI writer-to-resume diagnostics with the
+near-one scalar beta and `eps=1e100` finished finite without bypassing validation.
+
+Final review: author self-review of the cumulative diff, callers, tests and
+output/update ordering; no new independent reviewer was dispatched. Ruling:
+retain the existing eight checkpoint commits and create one task-sized closing
+fix commit for the accumulated audit corrections, then push the named branch as
+explicitly requested. No unrelated paths are staged. Actual CUDA,
+production-scale performance, research quality, version changes, tags and
+releases remain outside this work.

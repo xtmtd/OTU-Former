@@ -1787,6 +1787,7 @@ def _validate_relational_optimizer_preflight(
     effective: dict[str, Any],
     *,
     strict_fifo_state: bool = False,
+    target_device: torch.device | None = None,
 ) -> None:
     """Prove the saved optimizer groups map onto the rebuilt relational layout.
 
@@ -1856,11 +1857,15 @@ def _validate_relational_optimizer_preflight(
     completed_steps = resume_ckpt.get("iteration")
     if isinstance(completed_steps, bool) or not isinstance(completed_steps, int):
         completed_steps = 0
+    _validate_fifo_optimizer_execution_flags(
+        resume_ckpt.get("optimizer"), target_device=target_device
+    )
     _validate_fifo_adamw_state(
         probe_optimizer,
         resume_ckpt.get("optimizer"),
         completed_steps=completed_steps,
         label="pretrain resume",
+        target_device=target_device,
     )
     _validate_fifo_patch_state(
         probe_patch,
@@ -1954,6 +1959,11 @@ def resolve_pretrain_ssl_config(
                 strict_fifo_state=bool(
                     relational_queue_preparation is not None
                     and relational_queue_preparation.active
+                ),
+                target_device=(
+                    relational_queue_preparation.resolved_device
+                    if relational_queue_preparation is not None
+                    else None
                 ),
             )
     else:
@@ -2797,6 +2807,15 @@ QUEUE_REQUESTED_SIZE_ARGS_KEY = "requested_relational_queue_size"
 BATCH_SIZE_ARGS_KEY = "batch_size"
 QUEUE_REQUESTED_BATCH_ARGS_KEY = "requested_batch_size"
 
+#: Saved schedule fields the enabled resume rebuild reads directly.
+_QUEUE_REQUIRED_SCHEDULE_INTS = (
+    "original_max_epochs",
+    "total_steps",
+    "steps_per_epoch",
+    "warmup_steps",
+)
+_QUEUE_REQUIRED_SCHEDULE_FLOATS = ("last_lr", "final_lr")
+
 QUEUE_CAPACITY_SOURCES = ("explicit", "default", "inherited", "inactive")
 QUEUE_BATCH_SOURCES = ("explicit", "default", "inherited")
 
@@ -3004,6 +3023,9 @@ def _queue_binding(
         requested_batch,
         bool(batch_explicit),
         str(getattr(args, "device", "") or ""),
+        # The schedule-coverage rule depends on the epoch target, so a reused
+        # preparation must not serve a differently targeted request.
+        None if getattr(args, "max_epochs", None) is None else int(args.max_epochs),
         None if checkpoint is None else id(checkpoint),
     )
 
@@ -3119,6 +3141,13 @@ def prepare_pretrain_relational_queue(
         )
 
     active = capacity > 0
+    device = None
+    if active:
+        # The requested learning rate enters the float32 schedule on a fresh run
+        # and on a same-plan resume alike, so validate it whenever the queue is
+        # active — before any output changes.
+        _validate_queue_lr_precision(getattr(args, "lr", None))
+        device = _resolve_device(str(getattr(args, "device", "") or "auto"))
     if active and checkpoint is not None:
         effective_batch, batch_source = _enabled_resume_batch(
             saved_args,
@@ -3130,7 +3159,6 @@ def prepare_pretrain_relational_queue(
         batch_source = "explicit" if batch_explicit else "default"
 
     data: PreparedRelationalData | None = None
-    device: torch.device | None = None
     rng_state: dict[str, object] | None = None
     if active:
         train_data = getattr(args, "train_data", "")
@@ -3145,7 +3173,9 @@ def prepare_pretrain_relational_queue(
                 getattr(args, "max_epochs", None),
                 "Queue-enabled resume",
             )
-        device = _resolve_device(str(getattr(args, "device", "") or "auto"))
+            _validate_queue_schedule_coverage(
+                checkpoint, requested_max_epochs=getattr(args, "max_epochs", None)
+            )
 
     preparation = _RelationalQueuePreparation(
         ssl_method="relational",
@@ -3171,6 +3201,16 @@ def prepare_pretrain_relational_queue(
         from dataclasses import replace
 
         preparation = replace(preparation, rng_state_to_restore=rng_state)
+    if active:
+        # G1 hashes and decodes the complete selection before execution probes.
+        _validate_queue_optimizer_precision(
+            checkpoint,
+            requested_lr=getattr(args, "lr", None),
+            requested_weight_decay=getattr(args, "weight_decay", None),
+            target_device=device,
+            requested_max_epochs=getattr(args, "max_epochs", None),
+            warmup_epochs=getattr(args, "warmup_epochs", 0),
+        )
     return preparation
 
 
@@ -3211,9 +3251,115 @@ def verify_relational_queue_preparation(
         raise ValueError(
             "The supplied relational queue preparation was resolved for a "
             "different request (resume path, image root, data, method, queue "
-            "size, batch size or device changed); resolve it again before use."
+            "size, batch size, epoch target or device changed); resolve it "
+            "again before use."
         )
+    if preparation.active:
+        # Re-run the checks that depend on this invocation's request values: the
+        # binding already rejects a changed --max-epochs, and the learning rate
+        # is not part of the binding because a valid reuse may change it.
+        _validate_queue_lr_precision(getattr(args, "lr", None))
+        _validate_queue_optimizer_precision(
+            checkpoint,
+            requested_lr=getattr(args, "lr", None),
+            requested_weight_decay=getattr(args, "weight_decay", None),
+            target_device=preparation.resolved_device,
+            requested_max_epochs=getattr(args, "max_epochs", None),
+            warmup_epochs=getattr(args, "warmup_epochs", 0),
+        )
+        if checkpoint is not None:
+            _validate_queue_schedule_coverage(
+                checkpoint, requested_max_epochs=getattr(args, "max_epochs", None)
+            )
     return preparation
+
+
+def _validate_queue_schedule_endpoint(value: object, name: str) -> None:
+    """A saved learning-rate endpoint must be usable at schedule precision.
+
+    ``_build_pretrain_schedules`` builds float32 arrays, so a Python-finite
+    ``1e100`` becomes ``Inf``/``NaN`` there and produces non-finite parameters
+    while the loss and gradient checks still pass. Zero is legitimate: ``--lr 0``
+    is accepted by the CLI and by AdamW, and the cosine schedule then yields a
+    finite all-zero array.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(
+            "Queue-enabled resume requires the saved schedule "
+            f"{name} to be a number, got {value!r}."
+        )
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(
+            "Queue-enabled resume requires the saved schedule "
+            f"{name} to be finite, got {value!r}."
+        )
+    if number < 0.0:
+        raise ValueError(
+            "Queue-enabled resume requires the saved schedule "
+            f"{name} to be non-negative, got {value!r}."
+        )
+    with np.errstate(over="ignore", invalid="ignore"):
+        at_schedule_precision = np.float32(number)
+    if not bool(np.isfinite(at_schedule_precision)):
+        raise ValueError(
+            "Queue-enabled resume requires the saved schedule "
+            f"{name} to survive the float32 schedule precision; {value!r} "
+            f"becomes {at_schedule_precision!r}, which would drive the rebuilt "
+            "learning rate non-finite."
+        )
+
+
+def _validate_queue_lr_precision(requested_lr: object) -> None:
+    """The invocation's learning rate enters the same float32 schedule.
+
+    The saved endpoints are validated with the schedule state itself; this
+    covers the value this invocation adds to the cosine base.
+    """
+    if requested_lr is None:
+        return
+    _validate_queue_schedule_endpoint(requested_lr, "--lr")
+
+
+def _validate_queue_schedule_coverage(
+    checkpoint: dict[str, Any], *, requested_max_epochs: object
+) -> None:
+    """Prove the saved schedule covers the steps the rebuild will index.
+
+    A same-plan resume rebuilds the learning-rate array from the recorded
+    rectangle (``original_max_epochs * steps_per_epoch``) but the teacher
+    temperature array from ``schedule.total_steps``. Those two must describe the
+    same plan: a payload recording a shorter ``total_steps`` survives every other
+    preflight and then indexes past the shorter array once training starts, i.e.
+    after the logger has already created its CSV. An extension rebuild ignores
+    the recorded total and fills every array to the same length, so only the
+    recorded progress bound applies there.
+    """
+    if not isinstance(requested_max_epochs, int) or isinstance(
+        requested_max_epochs, bool
+    ):
+        return
+    schedule = checkpoint.get("schedule")
+    if not isinstance(schedule, dict):
+        return
+    fields = {}
+    for name in ("original_max_epochs", "total_steps", "steps_per_epoch"):
+        value = schedule.get(name)
+        if isinstance(value, bool) or not isinstance(value, int):
+            return
+        fields[name] = value
+    if requested_max_epochs != fields["original_max_epochs"]:
+        return
+    rectangle = fields["original_max_epochs"] * fields["steps_per_epoch"]
+    if fields["total_steps"] != rectangle:
+        raise ValueError(
+            "Queue-enabled resume found an inconsistent saved schedule: "
+            f"total_steps={fields['total_steps']} does not describe the recorded "
+            f"{fields['original_max_epochs']} epoch(s) of "
+            f"{fields['steps_per_epoch']} step(s) ({rectangle}). The rebuilt "
+            "learning-rate and teacher-temperature schedules would have "
+            "different lengths."
+        )
 
 
 def _enabled_resume_batch(
@@ -3280,20 +3426,39 @@ def _validate_relational_queue_resume(
     saved_args = checkpoint.get("args")
     saved_args = saved_args if isinstance(saved_args, dict) else {}
     recorded = saved_args.get(QUEUE_SIZE_ARGS_KEY)
-    if recorded is not None and int(recorded) != int(capacity):
-        raise ValueError(
-            "Queue config/args conflict: "
-            f"args.{QUEUE_SIZE_ARGS_KEY}={recorded!r} but the queue config "
-            f"records capacity {capacity}."
-        )
+    if recorded is not None:
+        if isinstance(recorded, bool) or not isinstance(recorded, int):
+            raise ValueError(
+                "The checkpoint records a non-integer "
+                f"args.{QUEUE_SIZE_ARGS_KEY}={recorded!r}; the effective capacity "
+                "is an integer count of image records."
+            )
+        if recorded != capacity:
+            raise ValueError(
+                "Queue config/args conflict: "
+                f"args.{QUEUE_SIZE_ARGS_KEY}={recorded!r} but the queue config "
+                f"records capacity {capacity}."
+            )
     requested = saved_args.get(QUEUE_REQUESTED_SIZE_ARGS_KEY)
-    if requested is not None and (
-        isinstance(requested, bool) or not isinstance(requested, int)
-    ):
-        raise ValueError(
-            "The checkpoint records a malformed "
-            f"args.{QUEUE_REQUESTED_SIZE_ARGS_KEY}={requested!r}."
-        )
+    if requested is not None:
+        if isinstance(requested, bool) or not isinstance(requested, int):
+            raise ValueError(
+                "The checkpoint records a malformed "
+                f"args.{QUEUE_REQUESTED_SIZE_ARGS_KEY}={requested!r}; a recorded "
+                "request is an integer count."
+            )
+        if requested < 0:
+            raise ValueError(
+                "The checkpoint records a negative "
+                f"args.{QUEUE_REQUESTED_SIZE_ARGS_KEY}={requested!r}."
+            )
+        if requested != capacity:
+            raise ValueError(
+                "Queue request/config conflict: the checkpoint records "
+                f"args.{QUEUE_REQUESTED_SIZE_ARGS_KEY}={requested!r} but the "
+                f"effective capacity is {capacity}. An enabled bundle must match "
+                "the recorded request."
+            )
 
     state = checkpoint.get(RELATIONAL_QUEUE_STATE_KEY)
     if not isinstance(state, dict):
@@ -3320,7 +3485,23 @@ def _validate_relational_queue_resume(
         raise ValueError(
             "Queue-enabled resume requires the saved schedule state."
         )
-    steps_per_epoch = schedule.get("steps_per_epoch")
+    # Every field the schedule rebuild reads must be present, integral and
+    # finite here: a missing ``final_lr`` or a NaN endpoint survives the rest of
+    # the preflight and then fails (or produces a non-finite learning rate) only
+    # after the logger has already opened its CSV.
+    for name in _QUEUE_REQUIRED_SCHEDULE_INTS:
+        if name not in schedule:
+            raise ValueError(
+                "Queue-enabled resume requires the saved "
+                f"schedule.{name}; the checkpoint's schedule state is incomplete."
+            )
+    for name in _QUEUE_REQUIRED_SCHEDULE_FLOATS:
+        if name not in schedule:
+            raise ValueError(
+                "Queue-enabled resume requires the saved "
+                f"schedule.{name}; the checkpoint's schedule state is incomplete."
+            )
+    steps_per_epoch = schedule["steps_per_epoch"]
     if (
         isinstance(steps_per_epoch, bool)
         or not isinstance(steps_per_epoch, int)
@@ -3331,12 +3512,28 @@ def _validate_relational_queue_resume(
             f"a positive integer, got {steps_per_epoch!r}."
         )
     for name in ("total_steps", "warmup_steps", "original_max_epochs"):
-        value = schedule.get(name)
+        value = schedule[name]
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise ValueError(
                 "Queue-enabled resume requires a valid saved schedule "
                 f"{name}, got {value!r}."
             )
+    for name in _QUEUE_REQUIRED_SCHEDULE_FLOATS:
+        _validate_queue_schedule_endpoint(schedule[name], name)
+    if int(schedule["original_max_epochs"]) < 1:
+        raise ValueError(
+            "Queue-enabled resume requires a positive saved "
+            f"schedule.original_max_epochs, got "
+            f"{schedule['original_max_epochs']!r}."
+        )
+    if int(schedule["total_steps"]) < 1 or int(schedule["total_steps"]) < int(
+        iteration
+    ):
+        raise ValueError(
+            "Queue-enabled resume found iteration="
+            f"{iteration} beyond the recorded schedule of "
+            f"{schedule['total_steps']} step(s)."
+        )
     if iteration != (epoch + 1) * steps_per_epoch:
         raise ValueError(
             "Queue-enabled resume requires the checkpoint to sit exactly on an "
@@ -3522,15 +3719,96 @@ def _validate_adamw_moment(
             f"{tuple(value.shape)} but the parameter is "
             f"{tuple(parameter.shape)}."
         )
-    if not value.is_floating_point() or not bool(torch.isfinite(value).all()):
+    if not value.is_floating_point():
         raise ValueError(
-            f"Cannot resume: optimizer state {name} for {label} is not finite."
+            f"Cannot resume: optimizer state {name} for {label} is not a "
+            "floating-point tensor."
         )
-    if name in ("exp_avg_sq", "max_exp_avg_sq") and bool((value < 0).any()):
+    # Finiteness at the recorded precision is not enough: a float64 moment just
+    # above the float32 range becomes Inf when the training parameter loads it.
+    try:
+        cast = value.to(dtype=parameter.dtype)
+    except (RuntimeError, TypeError) as exc:  # pragma: no cover - defensive
+        raise ValueError(
+            f"Cannot resume: optimizer state {name} for {label} cannot be "
+            f"loaded as {parameter.dtype}: {exc}"
+        ) from exc
+    if not bool(torch.isfinite(cast).all()):
+        raise ValueError(
+            f"Cannot resume: optimizer state {name} for {label} is not finite at "
+            f"{parameter.dtype}; a value that is finite at its recorded precision "
+            "can still overflow the training dtype."
+        )
+    if name in ("exp_avg_sq", "max_exp_avg_sq") and bool((cast < 0).any()):
         raise ValueError(
             f"Cannot resume: optimizer state {name} for {label} has negative "
             "values; a second moment is never negative."
         )
+
+
+def _validate_fifo_step_format(
+    step: object,
+    *,
+    flags: dict[str, bool],
+    target_device: torch.device | None,
+    label: str,
+) -> float:
+    """Validate one saved optimizer step against its group's execution branch.
+
+    The format the branch can consume is not uniform, measured on the trainer's
+    own path (default construct, load, step) on CPU and MPS:
+
+    * ``differentiable=True`` needs a scalar (0-dim) step; a ``(1,)`` tensor only
+      survives on CPU and a ``(1, 1)`` tensor broadcast-fails, while
+      ``requires_grad`` is rejected by the differentiable branch only.
+    * ``foreach=True`` (without ``fused``) accepts float32/float64 tensor steps,
+      plus bfloat16 on CPU. Float16 and integer tensors fail its dtype check.
+    * The default and ``fused`` paths accept every scalar form measured.
+    """
+    if isinstance(step, torch.Tensor):
+        if step.requires_grad and flags["differentiable"]:
+            raise ValueError(
+                f"Cannot resume: {label} sets requires_grad on the optimizer "
+                "step, which the differentiable AdamW path rejects."
+            )
+        if flags["differentiable"] and step.dim() != 0:
+            device_type = None if target_device is None else target_device.type
+            cpu_only = device_type == "cpu" and step.dim() == 1
+            if not cpu_only:
+                raise ValueError(
+                    f"Cannot resume: {label} has shape {tuple(step.shape)} but "
+                    "the differentiable path runs a shaped step only on CPU, "
+                    "with a single element; MPS rejects it and a (1, 1) step "
+                    "broadcast-fails everywhere."
+                )
+        if flags["foreach"] and not flags["fused"]:
+            cpu_bfloat16 = (
+                target_device is not None and target_device.type == "cpu"
+                and step.dtype == torch.bfloat16
+            )
+            if step.dtype not in (torch.float32, torch.float64) and not cpu_bfloat16:
+                raise ValueError(
+                    f"Cannot resume: {label} records a {step.dtype} step, which "
+                    "the foreach path rejects on this device (float32/float64, "
+                    "or bfloat16 on CPU, are supported)."
+                )
+        if step.numel() != 1:
+            raise ValueError(
+                f"Cannot resume: {label} holds {step.numel()} values; an "
+                "optimizer step is a single counter."
+            )
+        value = step.reshape(()).item()
+    else:
+        value = step
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(
+            f"Cannot resume: {label} is not an integer ({step!r})."
+        )
+    if not math.isfinite(float(value)) or float(value) != int(value):
+        raise ValueError(
+            f"Cannot resume: {label} is not a finite integer ({step!r})."
+        )
+    return float(value)
 
 
 def _validate_fifo_adamw_state(
@@ -3539,12 +3817,14 @@ def _validate_fifo_adamw_state(
     *,
     completed_steps: int,
     label: str,
+    target_device: torch.device | None = None,
 ) -> None:
     """Prove the usable per-parameter AdamW state, not only the group layout.
 
-    Every participating (trainable) parameter must already carry moments from
-    the saved recipe, with an integer step in ``[1, completed_steps]``, correctly
-    shaped finite moments and nonnegative second moments.
+    Walks the saved groups alongside the rebuilt ones so every check can use the
+    *group's own* flags (AMSGrad, execution mode) instead of a cross-group
+    summary: a mixed payload with one AMSGrad group and one plain group keeps
+    working, and the step format is judged against the branch that will run.
     """
     if not isinstance(saved_optimizer, dict):
         raise ValueError(f"Cannot resume: the {label} optimizer state is missing.")
@@ -3553,63 +3833,273 @@ def _validate_fifo_adamw_state(
         raise ValueError(
             f"Cannot resume: the {label} optimizer state records no tensor state."
         )
-    groups = saved_optimizer.get("param_groups")
-    groups = groups if isinstance(groups, list) else []
-    amsgrad = any(bool(group.get("amsgrad", False)) for group in groups)
-    parameters = [
-        parameter
-        for group in optimizer.param_groups
-        for parameter in group["params"]
-    ]
-    for index, parameter in enumerate(parameters):
-        entry = state.get(index)
-        if entry is None:
-            if parameter.requires_grad:
-                raise ValueError(
-                    f"Cannot resume: the saved {label} optimizer state has no "
-                    f"moments for participating parameter {index}; missing state "
-                    "is not proof of legitimate inactivity."
-                )
+    saved_groups = saved_optimizer.get("param_groups")
+    saved_groups = saved_groups if isinstance(saved_groups, list) else []
+    index = 0
+    for group_index, (saved_group, rebuilt_group) in enumerate(
+        zip(saved_groups, optimizer.param_groups)
+    ):
+        if not isinstance(saved_group, dict):  # pragma: no cover - guarded earlier
             continue
-        if not isinstance(entry, dict):
-            raise ValueError(
-                f"Cannot resume: optimizer state for parameter {index} is "
-                "malformed."
-            )
-        step = entry.get("step")
-        if isinstance(step, torch.Tensor):
-            if step.numel() != 1:
+        flags = {
+            name: bool(saved_group.get(name, False))
+            for name in ("capturable", "fused", "foreach", "differentiable")
+        }
+        amsgrad = bool(saved_group.get("amsgrad", False))
+        for parameter in rebuilt_group["params"]:
+            entry = state.get(index)
+            if entry is None:
+                if parameter.requires_grad:
+                    raise ValueError(
+                        f"Cannot resume: the saved {label} optimizer state has no "
+                        f"moments for participating parameter {index}; missing "
+                        "state is not proof of legitimate inactivity."
+                    )
+                index += 1
+                continue
+            if not isinstance(entry, dict):
                 raise ValueError(
-                    f"Cannot resume: optimizer step for parameter {index} is not "
-                    "a scalar."
+                    f"Cannot resume: optimizer state for parameter {index} is "
+                    "malformed."
                 )
-            step_value = step.reshape(()).item()
-        else:
-            step_value = step
-        if isinstance(step_value, bool) or not isinstance(
-            step_value, (int, float)
-        ):
-            raise ValueError(
-                f"Cannot resume: optimizer step for parameter {index} is not an "
-                f"integer ({step!r})."
+            step_value = _validate_fifo_step_format(
+                entry.get("step"),
+                flags=flags,
+                target_device=target_device,
+                label=f"optimizer step for parameter {index}",
             )
-        if float(step_value) != int(step_value):
-            raise ValueError(
-                f"Cannot resume: optimizer step for parameter {index} is not an "
-                f"integer ({step!r})."
-            )
-        if not 1 <= int(step_value) <= int(max(completed_steps, 1)):
-            raise ValueError(
-                f"Cannot resume: optimizer step for parameter {index} is "
-                f"{step_value}, outside [1, {completed_steps}]."
-            )
-        _validate_adamw_moment(entry, "exp_avg", parameter, label=f"parameter {index}")
-        _validate_adamw_moment(
-            entry, "exp_avg_sq", parameter, label=f"parameter {index}"
-        )
-        if amsgrad:
+            if not 1 <= int(step_value) <= int(max(completed_steps, 1)):
+                raise ValueError(
+                    f"Cannot resume: optimizer step for parameter {index} is "
+                    f"{step_value}, outside [1, {completed_steps}]."
+                )
             _validate_adamw_moment(
-                entry, "max_exp_avg_sq", parameter, label=f"parameter {index}"
+                entry, "exp_avg", parameter, label=f"parameter {index}"
+            )
+            _validate_adamw_moment(
+                entry, "exp_avg_sq", parameter, label=f"parameter {index}"
+            )
+            if amsgrad:
+                _validate_adamw_moment(
+                    entry, "max_exp_avg_sq", parameter, label=f"parameter {index}"
+                )
+            index += 1
+
+
+def _validate_queue_optimizer_coefficients(
+    group: object, *, group_index: int, lr_bound: float,
+    target_device: torch.device | None = None,
+    lr_min: float | None = None, step: object = None,
+) -> None:
+    """Check the real restored AdamW branch on isolated float32 parameters.
+
+    Python-scalar bias correction, tensor bias correction and device subnormal
+    handling differ. A tiny restore/update probe avoids treating them as one
+    float32 cast. It consumes no RNG and never touches the saved moments.
+    """
+    if not isinstance(group, dict):
+        return
+    device = target_device if target_device is not None else torch.device("cpu")
+    label = f"optimizer group {group_index}"
+    coefficients = {
+        "lr": lr_bound, "eps": 1e-8, "betas": (0.9, 0.999),
+        "weight_decay": 0.0,
+        **{name: group[name] for name in (
+            "eps", "betas", "weight_decay", "amsgrad", "maximize", "foreach",
+            "fused", "capturable", "differentiable", "decoupled_weight_decay",
+        ) if name in group},
+    }
+    _validate_adamw_param_group(coefficients, label)
+    _validate_fifo_optimizer_execution_flags(
+        {"param_groups": [coefficients]}, target_device=device
+    )
+    flags = {name: bool(coefficients.get(name, False)) for name in (
+        "capturable", "fused", "foreach", "differentiable"
+    )}
+    saved_step = torch.tensor(1.0) if step is None else step
+    _validate_fifo_step_format(
+        saved_step, flags=flags, target_device=device, label=f"{label} step"
+    )
+    rates = {float(lr_bound), float(lr_bound if lr_min is None else lr_min)}
+    for rate in rates:
+        for gradient in (0.0, 1.0):
+            parameter = nn.Parameter(torch.ones(4, device=device))
+            optimizer = torch.optim.AdamW([parameter], lr=rate)
+            saved = optimizer.state_dict()
+            saved["param_groups"][0].update({**coefficients, "lr": rate})
+            counter = saved_step.detach().clone() if isinstance(saved_step, torch.Tensor) else saved_step
+            if isinstance(counter, torch.Tensor):
+                counter.requires_grad_(saved_step.requires_grad)
+            entry = {
+                "step": counter, "exp_avg": torch.zeros(4),
+                "exp_avg_sq": torch.zeros(4),
+            }
+            if coefficients.get("amsgrad", False):
+                entry["max_exp_avg_sq"] = torch.zeros(4)
+            saved["state"][0] = entry
+            try:
+                optimizer.load_state_dict(saved)
+                parameter.grad = torch.full_like(parameter, gradient)
+                optimizer.step()
+                finite = bool(torch.isfinite(parameter).all()) and all(
+                    bool(torch.isfinite(value).all())
+                    for value in optimizer.state[parameter].values()
+                    if isinstance(value, torch.Tensor)
+                )
+                if not finite:
+                    raise ValueError("the restored update produced non-finite values")
+            except (ValueError, RuntimeError, TypeError, AssertionError) as exc:
+                raise ValueError(
+                    f"Cannot resume: {label} optimizer update is unusable on "
+                    f"{device} at lr={rate:g}, gradient={gradient:g}: {exc}."
+                ) from exc
+
+
+def _validate_queue_optimizer_precision(
+    checkpoint: dict[str, Any] | None,
+    *,
+    requested_lr: object,
+    requested_weight_decay: object,
+    target_device: torch.device | None = None,
+    requested_max_epochs: int | None = None,
+    warmup_epochs: float = 0,
+) -> None:
+    """Validate effective coefficients before outputs, including handoff reuse."""
+    base = float(requested_lr) if requested_lr is not None else 0.001
+    endpoints = [base, base * 0.01]
+    schedule = checkpoint.get("schedule") if isinstance(checkpoint, dict) else None
+    if isinstance(schedule, dict):
+        extension = requested_max_epochs != schedule.get("original_max_epochs")
+        names = _QUEUE_REQUIRED_SCHEDULE_FLOATS if extension else ("final_lr",)
+        endpoints = [] if extension else [base]
+        for name in _QUEUE_REQUIRED_SCHEDULE_FLOATS:
+            if name in schedule:
+                _validate_queue_schedule_endpoint(schedule[name], name)
+        for name in names:
+            if name in schedule:
+                endpoints.append(float(np.float32(schedule[name])))
+        if not extension and schedule.get("warmup_steps", 0) > 0:
+            endpoints.append(base * 0.1)
+    elif warmup_epochs > 0:
+        endpoints.append(base * 0.1)
+    rates = [float(np.float32(value)) for value in endpoints] or [base]
+    if isinstance(schedule, dict) and isinstance(requested_max_epochs, int):
+        fields = [schedule.get(name) for name in (
+            "original_max_epochs", "steps_per_epoch", "warmup_steps"
+        )]
+        iteration = checkpoint.get("iteration")
+        epoch = checkpoint.get("epoch")
+        if (
+            all(isinstance(value, int) and not isinstance(value, bool) for value in fields)
+            and fields[0] > 0 and fields[1] > 0 and fields[2] >= 0
+            and isinstance(iteration, int) and not isinstance(iteration, bool)
+            and isinstance(epoch, int) and not isinstance(epoch, bool)
+            and iteration >= 0 and requested_max_epochs > epoch + 1
+            and all(name in schedule for name in _QUEUE_REQUIRED_SCHEDULE_FLOATS)
+        ):
+            if requested_max_epochs == fields[0]:
+                remaining = _cosine_scheduler(
+                    base, float(schedule["final_lr"]), fields[0], fields[1],
+                    warmup_epochs=fields[2] / fields[1],
+                    start_warmup_value=base * 0.1,
+                )[iteration:]
+            else:
+                remaining = _cosine_scheduler(
+                    float(schedule["last_lr"]), float(schedule["final_lr"]),
+                    1, (requested_max_epochs - epoch - 1) * fields[1],
+                )
+            if remaining.size:
+                rates = [float(remaining.min()), float(remaining.max())]
+    groups = []
+    state = {}
+    if isinstance(checkpoint, dict):
+        optimizer = checkpoint.get("optimizer")
+        if isinstance(optimizer, dict):
+            groups = optimizer.get("param_groups") or []
+            state = optimizer.get("state") or {}
+    elif requested_weight_decay is not None:
+        groups = [{"weight_decay": requested_weight_decay}]
+    for index, group in enumerate(groups):
+        # Probe each distinct saved counter format/value once, not each weight.
+        counters = {}
+        if isinstance(group, dict) and isinstance(state, dict):
+            for parameter_id in group.get("params", []):
+                entry = state.get(parameter_id)
+                if not isinstance(entry, dict) or "step" not in entry:
+                    continue
+                step = entry["step"]
+                if isinstance(step, torch.Tensor):
+                    signature = (str(step.dtype), tuple(step.shape), step.requires_grad,
+                                 step.item() if step.numel() == 1 else None)
+                else:
+                    signature = (type(step).__name__, repr(step))
+                counters.setdefault(signature, step)
+        for step in counters.values() if counters else (None,):
+            _validate_queue_optimizer_coefficients(
+                group, group_index=index, lr_bound=max(rates), lr_min=min(rates),
+                target_device=target_device, step=step,
+            )
+
+
+#: AdamW flag pairs the restored optimizer rejects on every device. Measured on
+#: the trainer's own path (default construct -> load_state_dict -> step):
+#: ``differentiable`` fails with ``fused`` and with ``foreach``, everywhere.
+_QUEUE_DIFFERENTIABLE_CONFLICTS = (
+    ("fused", "`fused=True` does not support `differentiable=True`"),
+    (
+        "foreach",
+        "`_foreach` ops do not support autograd (`foreach=True` with "
+        "`differentiable=True`)",
+    ),
+)
+
+
+def _validate_fifo_optimizer_execution_flags(
+    saved_optimizer: object, *, target_device: torch.device | None
+) -> None:
+    """Reject saved AdamW execution flags the recovery target cannot run.
+
+    ``load_state_dict`` restores these flags, so the failure would only appear on
+    the first ``optimizer.step()`` — after the logger opened its CSV. The rules
+    follow the trainer's real path (default construct, load, backward, step),
+    measured on CPU and MPS: standalone ``differentiable``, standalone
+    ``foreach``/``fused`` and ``fused`` with ``foreach`` all run, so they are
+    accepted; ``differentiable`` with ``fused`` or ``foreach`` fails everywhere;
+    and ``capturable`` without ``fused`` needs a CUDA-class device because the
+    capturable path is the one that runs then. Accepting a flag for a CUDA target
+    is a rule, not evidence that a CUDA step was exercised.
+    """
+    if not isinstance(saved_optimizer, dict):
+        return
+    groups = saved_optimizer.get("param_groups")
+    if not isinstance(groups, list):
+        return
+    target = "unknown" if target_device is None else target_device.type
+    on_cuda = target_device is not None and target_device.type == "cuda"
+    for index, group in enumerate(groups):
+        if not isinstance(group, dict):
+            continue
+        flags = {
+            name: bool(group.get(name, False))
+            for name in ("capturable", "fused", "foreach", "differentiable")
+        }
+        if flags["differentiable"]:
+            for name, reason in _QUEUE_DIFFERENTIABLE_CONFLICTS:
+                if flags[name]:
+                    raise ValueError(
+                        f"Queue-enabled resume cannot restore optimizer group "
+                        f"{index} with {name}=True and differentiable=True: "
+                        f"{reason}. The saved execution mode is unusable on every "
+                        "device."
+                    )
+        if on_cuda:
+            continue
+        if flags["capturable"] and not flags["fused"]:
+            raise ValueError(
+                f"Queue-enabled resume cannot restore optimizer group {index} "
+                "with capturable=True (without fused=True): that execution path "
+                f"needs a CUDA-class device, but the recovery target is "
+                f"{target}. Start a new run on a compatible device."
             )
 
 
@@ -3681,6 +4171,15 @@ def _validate_fifo_encoder_state(
             f"Cannot resume: the saved {role} state cannot be loaded strictly: "
             f"{exc}"
         ) from exc
+    # Check the *loaded* tensors: a float64 parameter that is finite in its
+    # recorded precision can still overflow the float32 training parameter.
+    for key, tensor in expected.state_dict().items():
+        if tensor.is_floating_point() and not bool(torch.isfinite(tensor).all()):
+            raise ValueError(
+                f"Cannot resume: saved {role}.{key} is not finite at "
+                f"{tensor.dtype} after loading; a value that is finite at its "
+                "recorded precision can still overflow the training dtype."
+            )
 
 
 def _validate_fifo_center(center: object, out_dim: int) -> None:
@@ -3695,9 +4194,19 @@ def _validate_fifo_center(center: object, out_dim: int) -> None:
             f"[1, {out_dim}], got {tuple(center.shape)}. A broadcastable shape is "
             "not accepted."
         )
-    if not center.is_floating_point() or not bool(torch.isfinite(center).all()):
+    if not center.is_floating_point():
         raise ValueError(
-            "Cannot resume: the relational center contains non-finite values."
+            "Cannot resume: the relational center must be a floating-point "
+            f"tensor, got {center.dtype}."
+        )
+    # The restore casts on the CPU and then moves to the device (a float64
+    # payload cannot be moved to a float64-free backend like MPS), so the cast
+    # validated here is the one the trainer performs.
+    if not bool(torch.isfinite(center.to(dtype=torch.float32)).all()):
+        raise ValueError(
+            "Cannot resume: the relational center is not finite at float32; a "
+            "value that is finite at its recorded precision can still overflow "
+            "the restored buffer."
         )
 
 
