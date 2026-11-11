@@ -815,10 +815,20 @@ def _write_pretrain_checkpoint(
     args = {"global_crop_size": image_size}
     if args_extra:
         args.update(args_extra)
-    torch.save(
-        {"model_state_dict": encoder.state_dict(), "config": config, "args": args},
-        path,
-    )
+    payload = {"model_state_dict": encoder.state_dict(), "config": config, "args": args}
+    if config.get("relational_queue_config") is not None:
+        # An enabled queue source also carries its training-only queue state.
+        payload["relational_queue"] = {
+            "version": 1,
+            "keys": [],
+            "features": torch.zeros(0, 2, int(out_dim)),
+            "observed_steps": [],
+            "completed_steps": 0,
+            "data_fingerprint": "d" * 64,
+            "data_image_count": 1,
+            "data_size_bytes": 32,
+        }
+    torch.save(payload, path)
     return path
 
 
@@ -2488,6 +2498,22 @@ def test_finetune_records_provenance_and_effective_config(tmp_path):
         finetune_loop_module._sha256_file(finetune_path)
     )
     assert second_config["ssl_initialization_checkpoint_sha256"] == ssl_sha
+
+
+def test_finetune_from_a_queue_enabled_source_does_not_copy_queue_state(tmp_path):
+    """Fine-tuning resolves the encoder identity and drops training-only state."""
+    ssl = _write_pretrain_checkpoint(
+        tmp_path / "ssl_queue.pth",
+        image_size=32,
+        out_dim=16,
+        config_extra={"relational_queue_config": {"version": 1, "capacity": 2}},
+    )
+    saved = _run_frozen_finetune(tmp_path, ssl, "queue_source")
+    assert "relational_queue" not in saved
+    assert "relational_queue_config" not in saved["config"]
+    assert saved["config"]["ssl_initialization_checkpoint_sha256"] == (
+        finetune_loop_module._sha256_file(ssl)
+    )
 
 
 def test_finetune_new_run_can_switch_loss_without_inheriting_classifier(tmp_path):

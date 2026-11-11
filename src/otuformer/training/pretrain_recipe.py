@@ -34,6 +34,7 @@ from otuformer.training.dataset import (
     IndexedDataset,
     MetricDataset,
     MultiCropDataset,
+    PreparedRelationalData,
     _build_recursive_index,
     _resolve_image_path,
     _supports_recursive_lookup,
@@ -41,6 +42,7 @@ from otuformer.training.dataset import (
     build_pretrain_augmentation_config,
     build_weak_teacher_augmentation_config,
     center_crop_eval_transform,
+    prepare_relational_data,
 )
 from otuformer.training.dino import (
     DINOObjective,
@@ -1780,7 +1782,11 @@ def _validate_dino_resume_payload(
 
 
 def _validate_relational_optimizer_preflight(
-    resume_ckpt: dict[str, Any], model_name: str, effective: dict[str, Any]
+    resume_ckpt: dict[str, Any],
+    model_name: str,
+    effective: dict[str, Any],
+    *,
+    strict_fifo_state: bool = False,
 ) -> None:
     """Prove the saved optimizer groups map onto the rebuilt relational layout.
 
@@ -1841,10 +1847,39 @@ def _validate_relational_optimizer_preflight(
         ),
         label="pretrain resume",
     )
+    if not strict_fifo_state:
+        return
+    # Enabled recovery needs the usable state behind the layout: moments for the
+    # parameters that already participated, the independent patch tensors, both
+    # complete encoders and the exact relational center, all before any output
+    # exists.
+    completed_steps = resume_ckpt.get("iteration")
+    if isinstance(completed_steps, bool) or not isinstance(completed_steps, int):
+        completed_steps = 0
+    _validate_fifo_adamw_state(
+        probe_optimizer,
+        resume_ckpt.get("optimizer"),
+        completed_steps=completed_steps,
+        label="pretrain resume",
+    )
+    _validate_fifo_patch_state(
+        probe_patch,
+        resume_ckpt.get("patch_objective"),
+        str(patch_config["patch_loss"]),
+    )
+    expected.validate_pretrain_backbone(
+        require_intermediates=str(patch_config["patch_loss"]) == "masked-feature"
+    )
+    _validate_fifo_encoder_state("student", resume_ckpt.get("student"), expected)
+    _validate_fifo_encoder_state("teacher", resume_ckpt.get("teacher"), expected)
+    _validate_fifo_center(resume_ckpt.get("center"), out_dim)
 
 
 def resolve_pretrain_ssl_config(
-    args: argparse.Namespace, resume_ckpt: dict[str, Any] | None
+    args: argparse.Namespace,
+    resume_ckpt: dict[str, Any] | None,
+    *,
+    relational_queue_preparation: "_RelationalQueuePreparation | None" = None,
 ) -> dict[str, Any]:
     """Resolve the effective SSL recipe before any output is created.
 
@@ -1861,10 +1896,20 @@ def resolve_pretrain_ssl_config(
     # Shared by both methods and checked before any output is cleared: a zero or
     # non-finite student temperature reaches a division, not a validation error.
     requested_student_temp = getattr(args, "student_temp", None)
+    candidate_bound = (
+        relational_queue_preparation.candidate_bound
+        if relational_queue_preparation is not None
+        else None
+    )
+    admission_length = (
+        int(candidate_bound)
+        if candidate_bound is not None
+        else int(getattr(args, "batch_size", 2) or 2)
+    )
     if requested_student_temp is not None:
         student_temp_value = _admissible_temperature(
             _requested_float(requested_student_temp, "--student-temp"),
-            int(getattr(args, "batch_size", 2) or 2),
+            admission_length,
             "--student-temp",
         )
         if student_temp_value <= 0.0:
@@ -1903,7 +1948,13 @@ def resolve_pretrain_ssl_config(
             # saved groups are proven against a rebuilt parameter partition
             # before any output exists.
             _validate_relational_optimizer_preflight(
-                resume_ckpt, model_name, effective
+                resume_ckpt,
+                model_name,
+                effective,
+                strict_fifo_state=bool(
+                    relational_queue_preparation is not None
+                    and relational_queue_preparation.active
+                ),
             )
     else:
         effective = _resolve_dino_ssl_config(args, saved, resume_ckpt, model_name)
@@ -1957,6 +2008,7 @@ def take_pretrain_handoff(args: argparse.Namespace) -> "_PretrainHandoff":
     supplied = getattr(args, "ssl_config_effective", None)
     resume_state = getattr(args, "resume_state", None)
     resume_state_path = getattr(args, "resume_state_path", None)
+    preparation = vars(args).pop("relational_queue_preparation", None)
     settings = vars(args).pop("pretrain_settings", None)
     for name in ("ssl_config_effective", "resume_state", "resume_state_path"):
         setattr(args, name, None)
@@ -1965,6 +2017,11 @@ def take_pretrain_handoff(args: argparse.Namespace) -> "_PretrainHandoff":
         resume_state=resume_state,
         resume_state_path=resume_state_path,
         settings=settings,
+        relational_queue_preparation=(
+            preparation
+            if isinstance(preparation, _RelationalQueuePreparation)
+            else None
+        ),
     )
 
 
@@ -1974,6 +2031,7 @@ class _PretrainHandoff:
     resume_state: dict[str, Any] | None
     resume_state_path: str | None
     settings: "PretrainSettings | None"
+    relational_queue_preparation: "_RelationalQueuePreparation | None" = None
 
 
 def resume_payload_for(
@@ -2002,6 +2060,8 @@ def _effective_pretrain_ssl_config(
     args: argparse.Namespace,
     handoff: _PretrainHandoff | None = None,
     resume_ckpt: Any = _UNLOADED,
+    *,
+    relational_queue_preparation: "_RelationalQueuePreparation | None" = None,
 ) -> dict[str, Any]:
     """Use this invocation's handed-over recipe, else resolve before output.
 
@@ -2014,9 +2074,15 @@ def _effective_pretrain_ssl_config(
         handoff = take_pretrain_handoff(args)
     if handoff.ssl_config is not None:
         return handoff.ssl_config
+    if relational_queue_preparation is None:
+        relational_queue_preparation = handoff.relational_queue_preparation
     if resume_ckpt is _UNLOADED:
         resume_ckpt = resume_payload_for(args, handoff)
-    return resolve_pretrain_ssl_config(args, resume_ckpt)
+    return resolve_pretrain_ssl_config(
+        args,
+        resume_ckpt,
+        relational_queue_preparation=relational_queue_preparation,
+    )
 
 
 _UNSAVED_ARGS = frozenset(
@@ -2025,6 +2091,7 @@ _UNSAVED_ARGS = frozenset(
         "resume_state_path",
         "pretrain_settings",
         "ssl_config_effective",
+        "relational_queue_preparation",
     }
 )
 
@@ -2494,7 +2561,10 @@ def _resolve_saved_warmup_ratio(
 
 
 def _resolve_relational_target_config(
-    args: argparse.Namespace, checkpoint: dict[str, Any] | None
+    args: argparse.Namespace,
+    checkpoint: dict[str, Any] | None,
+    *,
+    candidate_count: int | None = None,
 ) -> tuple[dict[str, Any], float, tuple[str, ...]]:
     """Resolve the relational target bundle, the warmup ratio and warnings.
 
@@ -2571,7 +2641,14 @@ def _resolve_relational_target_config(
     ratio_explicit = bool(
         getattr(args, "teacher_temp_warmup_ratio_explicit", False)
     ) or ratio_request != HISTORICAL_TEACHER_TEMP_WARMUP_RATIO
-    batch_size = int(getattr(args, "batch_size", 1) or 1)
+    # Temperature admission covers the reduction length this run really uses:
+    # the effective batch, or the conservative ``B + min(K, N - B)`` bound when
+    # the queue is active. The parser default is never used for an enabled run.
+    batch_size = (
+        int(candidate_count)
+        if candidate_count is not None
+        else int(getattr(args, "batch_size", 1) or 1)
+    )
 
     if checkpoint is None:
         views = views_request or "weak"
@@ -2711,12 +2788,954 @@ def _resolve_legacy_temperatures(
     return resolved[0], resolved[1]
 
 
+RELATIONAL_QUEUE_CONFIG_KEY = "relational_queue_config"
+RELATIONAL_QUEUE_STATE_KEY = "relational_queue"
+
+#: Saved ``args`` keys that record the queue request and its effective value.
+QUEUE_SIZE_ARGS_KEY = "relational_queue_size"
+QUEUE_REQUESTED_SIZE_ARGS_KEY = "requested_relational_queue_size"
+BATCH_SIZE_ARGS_KEY = "batch_size"
+QUEUE_REQUESTED_BATCH_ARGS_KEY = "requested_batch_size"
+
+QUEUE_CAPACITY_SOURCES = ("explicit", "default", "inherited", "inactive")
+QUEUE_BATCH_SOURCES = ("explicit", "default", "inherited")
+
+
+@dataclass(frozen=True)
+class _RelationalQueuePreparation:
+    """One invocation's resolved queue applicability, data and recovery inputs.
+
+    Transient: it carries no mutable queue instance and never enters saved
+    ``args``. ``capacity`` is ``None`` only for an inactive DINO run; relational
+    with the option omitted resolves to the effective zero. Only a positive
+    capacity prepares data, resolves the device and validates saved RNG.
+    """
+
+    ssl_method: str
+    capacity: int | None
+    requested_capacity: int | None
+    capacity_source: str
+    effective_batch_size: int
+    requested_batch_size: int | None
+    batch_size_source: str
+    data: "PreparedRelationalData | None"
+    resume_queue_state: dict[str, Any] | None
+    resume_payload: dict[str, Any] | None
+    request_binding: tuple[object, ...]
+    resolved_device: torch.device | None
+    rng_state_to_restore: dict[str, object] | None
+
+    @property
+    def active(self) -> bool:
+        return bool(self.capacity)
+
+    @property
+    def image_count(self) -> int:
+        return 0 if self.data is None else len(self.data.image_keys)
+
+    @property
+    def candidate_bound(self) -> int | None:
+        """Conservative reduction length ``B + min(K, N - B)`` when enabled."""
+        if not self.active or self.data is None:
+            return None
+        batch = self.effective_batch_size
+        return batch + min(int(self.capacity), self.image_count - batch)
+
+    def resolved_log(self) -> dict[str, Any]:
+        """The display-only record the trainer emits once after resolution."""
+        if self.ssl_method == "dino":
+            applicability = "inactive"
+        else:
+            applicability = "active" if self.active else "disabled"
+        return {
+            "applicability": applicability,
+            "requested_capacity": self.requested_capacity,
+            "effective_capacity": self.capacity,
+            "capacity_source": self.capacity_source,
+            "requested_batch_size": self.requested_batch_size,
+            "effective_batch_size": self.effective_batch_size,
+            "batch_size_source": self.batch_size_source,
+        }
+
+
+def _queue_capacity_request(args: argparse.Namespace) -> tuple[int | None, bool]:
+    """The raw ``--relational-queue-size`` request and its explicitness.
+
+    A missing attribute means omission. A numeric value without an explicitness
+    marker comes from a direct-core caller and counts as an explicit override.
+    """
+    raw = getattr(args, "relational_queue_size", None)
+    if raw is None:
+        return None, False
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        raise ValueError(
+            "--relational-queue-size must be a non-negative integer, got "
+            f"{raw!r}."
+        )
+    if raw < 0:
+        raise ValueError(
+            f"--relational-queue-size must be >= 0, got {raw!r}."
+        )
+    marker = getattr(args, "relational_queue_size_explicit", None)
+    explicit = True if marker is None else bool(marker)
+    return int(raw), explicit
+
+
+def _queue_batch_request(args: argparse.Namespace) -> tuple[int | None, bool]:
+    """The raw batch-size request and its explicitness for enabled recovery."""
+    raw = getattr(args, "batch_size", None)
+    if raw is None:
+        return None, False
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        raise ValueError(f"--batch-size must be an integer, got {raw!r}.")
+    if raw < 1:
+        raise ValueError(f"--batch-size must be >= 1, got {raw!r}.")
+    marker = getattr(args, "batch_size_explicit", None)
+    explicit = True if marker is None else bool(marker)
+    return int(raw), explicit
+
+
+def _queue_enabled_request(args: argparse.Namespace) -> bool:
+    """True when this invocation explicitly asks for a positive capacity."""
+    requested, _explicit = _queue_capacity_request(args)
+    return bool(requested)
+
+
+def _queue_ssl_method(
+    args: argparse.Namespace, saved: "_SavedSSLState | None"
+) -> tuple[str, bool]:
+    """Resolve the effective method exactly as the SSL resolver will."""
+    requested = _ssl_option(args, "ssl_method", "relational")
+    if requested not in SSL_METHODS:
+        raise ValueError(
+            f"--ssl-method must be one of {', '.join(SSL_METHODS)}, got "
+            f"{requested!r}."
+        )
+    explicit = _ssl_explicit(args, "ssl_method")
+    saved_method = saved.identity[0] if saved is not None and saved.identity else None
+    if saved_method is None:
+        return str(requested), explicit
+    if explicit and requested != saved_method:
+        raise ValueError(
+            "Cannot change SSL method on resume: the checkpoint records "
+            f"ssl_method={saved_method!r}, got --ssl-method {requested!r}. Start "
+            "a new run instead."
+        )
+    return (str(requested) if explicit else str(saved_method)), explicit
+
+
+def _tolerant_saved_ssl_state(
+    checkpoint: dict[str, Any] | None,
+) -> tuple["_SavedSSLState | None", Exception | None]:
+    """Resolve the saved SSL state, keeping the failure for a deferred raise.
+
+    A payload without model weights cannot supply an identity; that is decided by
+    the model-constructing resume preflight. The queue layer only needs the
+    identity when the queue request or the saved bundles make it relevant.
+    """
+    if checkpoint is None:
+        return None, None
+    try:
+        return _saved_ssl_state(checkpoint), None
+    except (ValueError, KeyError, OSError, RuntimeError) as exc:
+        return None, exc
+
+
+def _checkpoint_queue_bundles(
+    checkpoint: dict[str, Any] | None,
+) -> tuple[dict[str, Any] | None, int | None]:
+    """Return the saved queue state and its capacity, or ``(None, None)``.
+
+    A one-sided bundle is contradictory, never silently repaired: queue metadata
+    only ever exists as the enabled version-1 config *and* its logical state.
+    """
+    from .relational_queue import validate_queue_config_bundle
+
+    if not isinstance(checkpoint, dict) or not checkpoint:
+        return None, None
+    config = checkpoint.get("config")
+    config = config if isinstance(config, dict) else {}
+    state = checkpoint.get(RELATIONAL_QUEUE_STATE_KEY)
+    has_config = RELATIONAL_QUEUE_CONFIG_KEY in config
+    if has_config != (state is not None):
+        present = RELATIONAL_QUEUE_CONFIG_KEY if has_config else RELATIONAL_QUEUE_STATE_KEY
+        missing = (
+            RELATIONAL_QUEUE_STATE_KEY
+            if has_config
+            else f"config.{RELATIONAL_QUEUE_CONFIG_KEY}"
+        )
+        raise ValueError(
+            "Cannot resume: the checkpoint carries "
+            f"{present} without {missing}. An enabled queue run persists both "
+            "bundles together; start a new run or resume from an intact "
+            "checkpoint."
+        )
+    if not has_config:
+        return None, None
+    capacity = validate_queue_config_bundle(config[RELATIONAL_QUEUE_CONFIG_KEY])
+    if not isinstance(state, dict):
+        raise ValueError(
+            "Cannot resume: relational_queue must be a mapping, got "
+            f"{type(state).__name__}."
+        )
+    return state, capacity
+
+
+def _queue_binding(
+    args: argparse.Namespace,
+    *,
+    method_requested: str,
+    method_explicit: bool,
+    requested_capacity: int | None,
+    capacity_explicit: bool,
+    requested_batch: int | None,
+    batch_explicit: bool,
+    checkpoint: dict[str, Any] | None,
+) -> tuple[object, ...]:
+    """Identity of the request a prepared handoff may be reused for."""
+    return (
+        str(getattr(args, "resume", "") or ""),
+        str(getattr(args, "input_images_dir", "") or ""),
+        str(getattr(args, "train_data", "") or ""),
+        str(method_requested),
+        bool(method_explicit),
+        requested_capacity,
+        bool(capacity_explicit),
+        requested_batch,
+        bool(batch_explicit),
+        str(getattr(args, "device", "") or ""),
+        None if checkpoint is None else id(checkpoint),
+    )
+
+
+def prepare_pretrain_relational_queue(
+    args: argparse.Namespace, checkpoint: dict[str, Any] | None
+) -> _RelationalQueuePreparation:
+    """Resolve queue applicability, capacity, batch lock and enabled data once.
+
+    Model-free and RNG-free: it runs before any architecture, register-layout or
+    optimizer preflight, so a conflicting or unreadable request is rejected
+    before output setup and before a probe encoder exists.
+    """
+    from otuformer.training.runtime import _resolve_device
+
+    requested_capacity, capacity_explicit = _queue_capacity_request(args)
+    requested_batch, batch_explicit = _queue_batch_request(args)
+    saved, saved_error = _tolerant_saved_ssl_state(checkpoint)
+    method, method_explicit = _queue_ssl_method(args, saved)
+    queue_state, saved_capacity = _checkpoint_queue_bundles(checkpoint)
+    if checkpoint is not None and saved is None and (
+        queue_state is not None or requested_capacity is not None
+    ):
+        raise ValueError(
+            "Cannot resolve the saved SSL identity this queue request must be "
+            f"checked against: {saved_error}"
+        )
+    saved_args = checkpoint.get("args") if isinstance(checkpoint, dict) else None
+    saved_args = saved_args if isinstance(saved_args, dict) else {}
+    binding = _queue_binding(
+        args,
+        method_requested=method,
+        method_explicit=method_explicit,
+        requested_capacity=requested_capacity,
+        capacity_explicit=capacity_explicit,
+        requested_batch=requested_batch,
+        batch_explicit=batch_explicit,
+        checkpoint=checkpoint,
+    )
+
+    if method == "dino":
+        if requested_capacity is not None:
+            raise ValueError(
+                "--relational-queue-size is not applicable to --ssl-method dino "
+                f"(got {requested_capacity!r}); it is a relational-only option. "
+                "Omit it or use --ssl-method relational."
+            )
+        if queue_state is not None:
+            raise ValueError(
+                "The resume checkpoint carries relational queue metadata on a "
+                "DINO SSL identity; those bundles belong to relational runs only."
+            )
+        claimed = saved_args.get(QUEUE_SIZE_ARGS_KEY)
+        if claimed not in (None, 0):
+            raise ValueError(
+                "The resume checkpoint records an active relational queue on a "
+                f"DINO SSL identity (args.{QUEUE_SIZE_ARGS_KEY}={claimed!r})."
+            )
+        return _RelationalQueuePreparation(
+            ssl_method="dino",
+            capacity=None,
+            requested_capacity=None,
+            capacity_source="inactive",
+            effective_batch_size=requested_batch or 32,
+            requested_batch_size=requested_batch,
+            batch_size_source="explicit" if batch_explicit else "default",
+            data=None,
+            resume_queue_state=None,
+            resume_payload=checkpoint,
+            request_binding=binding,
+            resolved_device=None,
+            rng_state_to_restore=None,
+        )
+
+    if checkpoint is None:
+        capacity = 0 if requested_capacity is None else int(requested_capacity)
+        capacity_source = "default" if requested_capacity is None else "explicit"
+    elif saved_capacity is not None:
+        if (
+            capacity_explicit
+            and requested_capacity is not None
+            and int(requested_capacity) != int(saved_capacity)
+        ):
+            raise ValueError(
+                "Cannot change --relational-queue-size on resume: the checkpoint "
+                f"records capacity {saved_capacity}, got {requested_capacity}. A "
+                "changed queue recipe requires a new run."
+            )
+        capacity = int(saved_capacity)
+        capacity_source = (
+            "explicit"
+            if capacity_explicit and requested_capacity is not None
+            else "inherited"
+        )
+    else:
+        # No queue bundle means the run was disabled; that stays true forever.
+        claimed = saved_args.get(QUEUE_SIZE_ARGS_KEY)
+        if claimed not in (None, 0):
+            raise ValueError(
+                "Cannot resume: "
+                f"args.{QUEUE_SIZE_ARGS_KEY}={claimed!r} claims an enabled queue "
+                "without the queue config and state bundles. Start a new run."
+            )
+        if requested_capacity:
+            raise ValueError(
+                "Cannot enable the relational queue on resume: this checkpoint "
+                "records no queue state, so history cannot be enabled later. "
+                "Start a new run with --relational-queue-size to use it."
+            )
+        capacity = 0
+        capacity_source = (
+            "explicit" if requested_capacity is not None else "inherited"
+        )
+
+    active = capacity > 0
+    if active and checkpoint is not None:
+        effective_batch, batch_source = _enabled_resume_batch(
+            saved_args,
+            requested_batch=requested_batch,
+            batch_explicit=batch_explicit,
+        )
+    else:
+        effective_batch = requested_batch or 32
+        batch_source = "explicit" if batch_explicit else "default"
+
+    data: PreparedRelationalData | None = None
+    device: torch.device | None = None
+    rng_state: dict[str, object] | None = None
+    if active:
+        train_data = getattr(args, "train_data", "")
+        data = prepare_relational_data(
+            Path(train_data) if train_data else None,
+            Path(args.input_images_dir),
+            batch_size=effective_batch,
+        )
+        if checkpoint is not None:
+            _validate_saved_progress(
+                checkpoint,
+                getattr(args, "max_epochs", None),
+                "Queue-enabled resume",
+            )
+        device = _resolve_device(str(getattr(args, "device", "") or "auto"))
+
+    preparation = _RelationalQueuePreparation(
+        ssl_method="relational",
+        capacity=int(capacity),
+        requested_capacity=requested_capacity,
+        capacity_source=capacity_source,
+        effective_batch_size=effective_batch,
+        requested_batch_size=requested_batch,
+        batch_size_source=batch_source,
+        data=data,
+        resume_queue_state=queue_state,
+        resume_payload=checkpoint,
+        request_binding=binding,
+        resolved_device=device,
+        rng_state_to_restore=None,
+    )
+    if active and checkpoint is not None:
+        _validate_relational_queue_resume(checkpoint, preparation)
+        rng_state = _validate_fifo_rng_state(
+            checkpoint.get("rng_state"), target_device=device
+        )
+    if rng_state is not None:
+        from dataclasses import replace
+
+        preparation = replace(preparation, rng_state_to_restore=rng_state)
+    return preparation
+
+
+def queue_request_binding(
+    args: argparse.Namespace, checkpoint: dict[str, Any] | None
+) -> tuple[object, ...]:
+    """Recompute the request identity a prepared handoff was bound to."""
+    requested_capacity, capacity_explicit = _queue_capacity_request(args)
+    requested_batch, batch_explicit = _queue_batch_request(args)
+    saved, _saved_error = _tolerant_saved_ssl_state(checkpoint)
+    method, method_explicit = _queue_ssl_method(args, saved)
+    return _queue_binding(
+        args,
+        method_requested=method,
+        method_explicit=method_explicit,
+        requested_capacity=requested_capacity,
+        capacity_explicit=capacity_explicit,
+        requested_batch=requested_batch,
+        batch_explicit=batch_explicit,
+        checkpoint=checkpoint,
+    )
+
+
+def verify_relational_queue_preparation(
+    preparation: _RelationalQueuePreparation | None,
+    args: argparse.Namespace,
+    checkpoint: dict[str, Any] | None,
+) -> _RelationalQueuePreparation:
+    """Prove a supplied preparation still describes this invocation's request."""
+    if preparation is None:
+        return prepare_pretrain_relational_queue(args, checkpoint)
+    if preparation.resume_payload is not checkpoint:
+        raise ValueError(
+            "The supplied relational queue preparation was resolved from a "
+            "different resume payload; resolve it again for this invocation."
+        )
+    if preparation.request_binding != queue_request_binding(args, checkpoint):
+        raise ValueError(
+            "The supplied relational queue preparation was resolved for a "
+            "different request (resume path, image root, data, method, queue "
+            "size, batch size or device changed); resolve it again before use."
+        )
+    return preparation
+
+
+def _enabled_resume_batch(
+    saved_args: dict[str, Any],
+    *,
+    requested_batch: int | None,
+    batch_explicit: bool,
+) -> tuple[int, str]:
+    """Inherit the saved batch on an enabled resume, or reject a conflict."""
+    saved_batch = saved_args.get(BATCH_SIZE_ARGS_KEY)
+    if (
+        isinstance(saved_batch, bool)
+        or not isinstance(saved_batch, int)
+        or saved_batch < 1
+    ):
+        raise ValueError(
+            "Cannot resume an enabled queue run: the checkpoint records no usable "
+            f"args.{BATCH_SIZE_ARGS_KEY} ({saved_batch!r}). Queue-enabled recovery "
+            "requires the saved batch size; start a new run."
+        )
+    if batch_explicit and requested_batch is not None:
+        if int(requested_batch) != int(saved_batch):
+            raise ValueError(
+                "Cannot change --batch-size on an enabled queue resume: the "
+                f"checkpoint records {saved_batch}, got {requested_batch}. The "
+                "queue, its steps-per-epoch and the loss candidates all depend on "
+                "the saved batch size; start a new run instead."
+            )
+        return int(requested_batch), "explicit"
+    return int(saved_batch), "inherited"
+
+
+def _required_queue_records(preparation: _RelationalQueuePreparation) -> int:
+    return min(int(preparation.capacity), preparation.effective_batch_size)
+
+
+def _validate_relational_queue_resume(
+    checkpoint: dict[str, Any], preparation: _RelationalQueuePreparation
+) -> None:
+    """Strict enabled-resume checks for the queue bundle, state and locks.
+
+    Runs before any output setup: the config/state pair, the codec against the
+    prepared selection, the exact batch/steps-per-epoch and schedule locks, the
+    latest-commit tail and the complete-epoch occupancy bound.
+    """
+    from .relational_queue import RelationalQueue, validate_queue_config_bundle
+
+    if not preparation.active or preparation.resume_payload is None:
+        return
+    config = checkpoint.get("config")
+    config = config if isinstance(config, dict) else {}
+    if RELATIONAL_QUEUE_CONFIG_KEY not in config:
+        raise ValueError(
+            "Cannot resume an enabled queue run: "
+            f"config.{RELATIONAL_QUEUE_CONFIG_KEY} is missing."
+        )
+    capacity = validate_queue_config_bundle(config[RELATIONAL_QUEUE_CONFIG_KEY])
+    if int(capacity) != int(preparation.capacity):
+        raise ValueError(
+            "Queue config/args conflict: "
+            f"config.{RELATIONAL_QUEUE_CONFIG_KEY}.capacity={capacity} but the "
+            f"resolved capacity is {preparation.capacity}."
+        )
+    saved_args = checkpoint.get("args")
+    saved_args = saved_args if isinstance(saved_args, dict) else {}
+    recorded = saved_args.get(QUEUE_SIZE_ARGS_KEY)
+    if recorded is not None and int(recorded) != int(capacity):
+        raise ValueError(
+            "Queue config/args conflict: "
+            f"args.{QUEUE_SIZE_ARGS_KEY}={recorded!r} but the queue config "
+            f"records capacity {capacity}."
+        )
+    requested = saved_args.get(QUEUE_REQUESTED_SIZE_ARGS_KEY)
+    if requested is not None and (
+        isinstance(requested, bool) or not isinstance(requested, int)
+    ):
+        raise ValueError(
+            "The checkpoint records a malformed "
+            f"args.{QUEUE_REQUESTED_SIZE_ARGS_KEY}={requested!r}."
+        )
+
+    state = checkpoint.get(RELATIONAL_QUEUE_STATE_KEY)
+    if not isinstance(state, dict):
+        raise ValueError(
+            "Cannot resume an enabled queue run: relational_queue is missing."
+        )
+    iteration = checkpoint.get("iteration")
+    epoch = checkpoint.get("epoch")
+    schedule = checkpoint.get("schedule")
+    if (
+        isinstance(iteration, bool)
+        or not isinstance(iteration, int)
+        or iteration < 0
+    ):
+        raise ValueError(
+            "Queue-enabled resume requires an integer iteration >= 0, got "
+            f"{iteration!r}."
+        )
+    if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 0:
+        raise ValueError(
+            f"Queue-enabled resume requires an integer epoch >= 0, got {epoch!r}."
+        )
+    if not isinstance(schedule, dict):
+        raise ValueError(
+            "Queue-enabled resume requires the saved schedule state."
+        )
+    steps_per_epoch = schedule.get("steps_per_epoch")
+    if (
+        isinstance(steps_per_epoch, bool)
+        or not isinstance(steps_per_epoch, int)
+        or steps_per_epoch < 1
+    ):
+        raise ValueError(
+            "Queue-enabled resume requires the saved schedule.steps_per_epoch as "
+            f"a positive integer, got {steps_per_epoch!r}."
+        )
+    for name in ("total_steps", "warmup_steps", "original_max_epochs"):
+        value = schedule.get(name)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(
+                "Queue-enabled resume requires a valid saved schedule "
+                f"{name}, got {value!r}."
+            )
+    if iteration != (epoch + 1) * steps_per_epoch:
+        raise ValueError(
+            "Queue-enabled resume requires the checkpoint to sit exactly on an "
+            f"epoch boundary: epoch={epoch}, iteration={iteration}, "
+            f"steps_per_epoch={steps_per_epoch}."
+        )
+    prepared_count = preparation.image_count
+    expected_steps = prepared_count // preparation.effective_batch_size
+    if steps_per_epoch != expected_steps:
+        raise ValueError(
+            "Cannot resume an enabled queue run with a different loader: the "
+            f"checkpoint records {steps_per_epoch} step(s) per epoch, but "
+            f"{prepared_count} selected images at batch_size="
+            f"{preparation.effective_batch_size} produce {expected_steps}. Equal "
+            "loader lengths do not make a changed batch size valid."
+        )
+    if "optimizer" not in checkpoint:
+        raise ValueError(
+            "Queue-enabled resume requires the saved optimizer state."
+        )
+    for role in ("student", "teacher"):
+        if not isinstance(checkpoint.get(role), dict):
+            raise ValueError(
+                f"Queue-enabled resume requires the saved {role} encoder state."
+            )
+    if "center" not in checkpoint:
+        raise ValueError(
+            "Queue-enabled resume requires the saved relational center."
+        )
+
+    data = preparation.data
+    assert data is not None  # active preparation always prepares data
+    from otuformer.utils.checkpoint import resolve_checkpoint_state_dict
+
+    state_dict, _ = resolve_checkpoint_state_dict(checkpoint)
+    out_dim = resolve_projector_out_dim(state_dict)
+    if out_dim is None:
+        raise ValueError(
+            "Queue-enabled resume requires a projector width in the saved "
+            "weights; none was found."
+        )
+    queue = RelationalQueue.from_state_dict(
+        state,
+        capacity=int(capacity),
+        out_dim=int(out_dim),
+        completed_steps=int(iteration),
+        allowed_keys=frozenset(data.image_keys),
+        data_fingerprint=data.data_fingerprint,
+        data_image_count=len(data.image_keys),
+        data_size_bytes=data.data_size_bytes,
+        device=torch.device("cpu"),
+    )
+    observed = queue.observed_steps
+    if iteration > 0:
+        required = _required_queue_records(preparation)
+        if len(observed) < required:
+            raise ValueError(
+                "Queue-enabled resume found truncated history: the latest "
+                f"successful batch must leave {required} record(s), got "
+                f"{len(observed)}."
+            )
+        tail = observed[-required:]
+        if any(step != iteration - 1 for step in tail):
+            raise ValueError(
+                "Queue-enabled resume found history that does not end with the "
+                f"latest successful batch at step {iteration - 1}."
+            )
+        earlier = observed[: len(observed) - required]
+        if any(step == iteration - 1 for step in earlier):
+            raise ValueError(
+                "Queue-enabled resume found duplicated latest-commit timestamps "
+                f"at step {iteration - 1}; the newest records must be exactly one "
+                "successful batch."
+            )
+    per_epoch = (prepared_count // preparation.effective_batch_size) * (
+        preparation.effective_batch_size
+    )
+    occupancy_bound = min(int(capacity), per_epoch)
+    if len(queue) < occupancy_bound:
+        raise ValueError(
+            "Queue-enabled resume found truncated history: after a complete epoch "
+            f"of {per_epoch} distinct image(s), at least {occupancy_bound} "
+            f"record(s) must remain, got {len(queue)}."
+        )
+
+
+def _validate_fifo_rng_state(
+    state: object, *, target_device: torch.device | None
+) -> dict[str, object]:
+    """Validate the saved RNG streams for the actual recovery target.
+
+    Missing, ``None`` or malformed streams are a hard error: an enabled queue
+    resume never falls back to a best-effort random sequence, and never seeds a
+    substitute CUDA stream. A CUDA-shaped payload recovered on a non-CUDA target
+    is structurally checked, omitted from the restore copy and reported.
+    """
+    from otuformer.utils.checkpoint import preserved_rng
+
+    if not isinstance(state, dict) or not state:
+        raise ValueError(
+            "Queue-enabled resume requires the saved rng_state; a legacy "
+            "checkpoint without one cannot continue an enabled queue run."
+        )
+    for name in ("python", "numpy", "torch"):
+        if name not in state or state[name] is None:
+            raise ValueError(
+                f"Queue-enabled resume requires rng_state.{name}; the saved "
+                "streams must be complete."
+            )
+    restore_copy = dict(state)
+    cuda = state.get("cuda")
+    cuda_states: list[torch.Tensor] | None = None
+    if cuda is not None:
+        if isinstance(cuda, (list, tuple)):
+            entries = list(cuda)
+        else:
+            raise ValueError(
+                "Queue-enabled resume found a malformed rng_state.cuda payload; "
+                "it must be a sequence of CPU uint8 tensors."
+            )
+        if not entries:
+            raise ValueError(
+                "Queue-enabled resume found an empty rng_state.cuda sequence; "
+                "an absent CUDA stream is recorded by omitting the key."
+            )
+        for entry in entries:
+            if (
+                not isinstance(entry, torch.Tensor)
+                or entry.dtype != torch.uint8
+                or entry.dim() != 1
+                or entry.numel() == 0
+                or entry.device.type != "cpu"
+            ):
+                raise ValueError(
+                    "Queue-enabled resume found a malformed rng_state.cuda "
+                    "stream; each entry must be a nonempty 1-D CPU uint8 tensor."
+                )
+        cuda_states = entries
+
+    is_cuda_target = target_device is not None and target_device.type == "cuda"
+    if is_cuda_target:
+        if cuda_states is None:
+            raise ValueError(
+                "Queue-enabled resume targets CUDA but the checkpoint records no "
+                "CUDA RNG stream; a CPU-generated checkpoint cannot continue an "
+                "enabled run on CUDA."
+            )
+        expected = torch.cuda.device_count()
+        if len(cuda_states) != expected:
+            raise ValueError(
+                "Queue-enabled resume found "
+                f"{len(cuda_states)} saved CUDA RNG stream(s) but this host "
+                f"exposes {expected}; the streams cannot be restored exactly."
+            )
+        with preserved_rng():
+            _restore_rng_state(restore_copy)
+        return restore_copy
+
+    if cuda_states is not None:
+        restore_copy.pop("cuda", None)
+        print(
+            "[Info] Queue-enabled resume: the checkpoint records CUDA RNG "
+            "streams, but this target is not CUDA. Their structure was "
+            "validated and they are not applied; this is a non-CUDA recovery, "
+            "not a CUDA continuation."
+        )
+    with preserved_rng():
+        _restore_rng_state(restore_copy)
+    return restore_copy
+
+
+def _validate_adamw_moment(
+    entry: dict[str, Any], name: str, parameter: torch.Tensor, *, label: str
+) -> None:
+    value = entry.get(name)
+    if not isinstance(value, torch.Tensor):
+        raise ValueError(
+            f"Cannot resume: optimizer state for {label} has no {name} tensor."
+        )
+    if tuple(value.shape) != tuple(parameter.shape):
+        raise ValueError(
+            f"Cannot resume: optimizer state {name} for {label} has shape "
+            f"{tuple(value.shape)} but the parameter is "
+            f"{tuple(parameter.shape)}."
+        )
+    if not value.is_floating_point() or not bool(torch.isfinite(value).all()):
+        raise ValueError(
+            f"Cannot resume: optimizer state {name} for {label} is not finite."
+        )
+    if name in ("exp_avg_sq", "max_exp_avg_sq") and bool((value < 0).any()):
+        raise ValueError(
+            f"Cannot resume: optimizer state {name} for {label} has negative "
+            "values; a second moment is never negative."
+        )
+
+
+def _validate_fifo_adamw_state(
+    optimizer: torch.optim.Optimizer,
+    saved_optimizer: object,
+    *,
+    completed_steps: int,
+    label: str,
+) -> None:
+    """Prove the usable per-parameter AdamW state, not only the group layout.
+
+    Every participating (trainable) parameter must already carry moments from
+    the saved recipe, with an integer step in ``[1, completed_steps]``, correctly
+    shaped finite moments and nonnegative second moments.
+    """
+    if not isinstance(saved_optimizer, dict):
+        raise ValueError(f"Cannot resume: the {label} optimizer state is missing.")
+    state = saved_optimizer.get("state")
+    if not isinstance(state, dict):
+        raise ValueError(
+            f"Cannot resume: the {label} optimizer state records no tensor state."
+        )
+    groups = saved_optimizer.get("param_groups")
+    groups = groups if isinstance(groups, list) else []
+    amsgrad = any(bool(group.get("amsgrad", False)) for group in groups)
+    parameters = [
+        parameter
+        for group in optimizer.param_groups
+        for parameter in group["params"]
+    ]
+    for index, parameter in enumerate(parameters):
+        entry = state.get(index)
+        if entry is None:
+            if parameter.requires_grad:
+                raise ValueError(
+                    f"Cannot resume: the saved {label} optimizer state has no "
+                    f"moments for participating parameter {index}; missing state "
+                    "is not proof of legitimate inactivity."
+                )
+            continue
+        if not isinstance(entry, dict):
+            raise ValueError(
+                f"Cannot resume: optimizer state for parameter {index} is "
+                "malformed."
+            )
+        step = entry.get("step")
+        if isinstance(step, torch.Tensor):
+            if step.numel() != 1:
+                raise ValueError(
+                    f"Cannot resume: optimizer step for parameter {index} is not "
+                    "a scalar."
+                )
+            step_value = step.reshape(()).item()
+        else:
+            step_value = step
+        if isinstance(step_value, bool) or not isinstance(
+            step_value, (int, float)
+        ):
+            raise ValueError(
+                f"Cannot resume: optimizer step for parameter {index} is not an "
+                f"integer ({step!r})."
+            )
+        if float(step_value) != int(step_value):
+            raise ValueError(
+                f"Cannot resume: optimizer step for parameter {index} is not an "
+                f"integer ({step!r})."
+            )
+        if not 1 <= int(step_value) <= int(max(completed_steps, 1)):
+            raise ValueError(
+                f"Cannot resume: optimizer step for parameter {index} is "
+                f"{step_value}, outside [1, {completed_steps}]."
+            )
+        _validate_adamw_moment(entry, "exp_avg", parameter, label=f"parameter {index}")
+        _validate_adamw_moment(
+            entry, "exp_avg_sq", parameter, label=f"parameter {index}"
+        )
+        if amsgrad:
+            _validate_adamw_moment(
+                entry, "max_exp_avg_sq", parameter, label=f"parameter {index}"
+            )
+
+
+def _alias_groups(model: nn.Module) -> list[list[str]]:
+    """State-dict keys that name one live tensor (registered training aliases)."""
+    by_identity: dict[int, list[str]] = {}
+    for key, value in model.state_dict(keep_vars=True).items():
+        by_identity.setdefault(id(value), []).append(key)
+    return [
+        sorted(keys) for keys in by_identity.values() if len(keys) > 1
+    ]
+
+
+def _validate_fifo_encoder_state(
+    role: str,
+    saved_state: object,
+    expected: OTUFormerEncoder,
+) -> None:
+    """Require an independently complete, shaped, finite encoder state.
+
+    Backbone-only or projector-layout checks are not a complete restore check:
+    the saved keys must match this rebuilt encoder exactly, including the
+    ``_pretrain_final_norm`` aliases the training path registers.
+    """
+    if not isinstance(saved_state, dict) or not saved_state:
+        raise ValueError(
+            f"Queue-enabled resume requires the saved {role} encoder state."
+        )
+    reference = expected.state_dict()
+    missing = sorted(set(reference) - set(saved_state))
+    extra = sorted(set(saved_state) - set(reference))
+    if missing or extra:
+        detail = []
+        if missing:
+            detail.append("missing " + ", ".join(missing[:4]))
+        if extra:
+            detail.append("unexpected " + ", ".join(extra[:4]))
+        raise ValueError(
+            f"Cannot resume: the saved {role} state does not match the rebuilt "
+            f"encoder ({'; '.join(detail)})."
+        )
+    for key, tensor in saved_state.items():
+        if not isinstance(tensor, torch.Tensor):
+            raise ValueError(
+                f"Cannot resume: saved {role}.{key} is not a tensor."
+            )
+        if tuple(tensor.shape) != tuple(reference[key].shape):
+            raise ValueError(
+                f"Cannot resume: saved {role}.{key} has shape "
+                f"{tuple(tensor.shape)}; the rebuilt encoder needs "
+                f"{tuple(reference[key].shape)}."
+            )
+        if tensor.is_floating_point() and not bool(torch.isfinite(tensor).all()):
+            raise ValueError(
+                f"Cannot resume: saved {role}.{key} contains non-finite values."
+            )
+    for group in _alias_groups(expected):
+        first = saved_state[group[0]]
+        for alias in group[1:]:
+            if not torch.equal(first, saved_state[alias]):
+                raise ValueError(
+                    f"Cannot resume: the saved {role} state records conflicting "
+                    f"values for one live tensor ({group[0]} vs {alias})."
+                )
+    try:
+        expected.load_state_dict(saved_state, strict=True)
+    except RuntimeError as exc:  # pragma: no cover - guarded above
+        raise ValueError(
+            f"Cannot resume: the saved {role} state cannot be loaded strictly: "
+            f"{exc}"
+        ) from exc
+
+
+def _validate_fifo_center(center: object, out_dim: int) -> None:
+    if not isinstance(center, torch.Tensor):
+        raise ValueError(
+            "Queue-enabled resume requires the saved relational center tensor, "
+            f"got {type(center).__name__}."
+        )
+    if tuple(center.shape) != (1, int(out_dim)):
+        raise ValueError(
+            "Cannot resume: the relational center must have exact shape "
+            f"[1, {out_dim}], got {tuple(center.shape)}. A broadcastable shape is "
+            "not accepted."
+        )
+    if not center.is_floating_point() or not bool(torch.isfinite(center).all()):
+        raise ValueError(
+            "Cannot resume: the relational center contains non-finite values."
+        )
+
+
+def _validate_fifo_patch_state(
+    probe_patch: PatchObjective, saved_patch_state: object, patch_mode: str
+) -> None:
+    """Strictly load the independent patch state and require finite tensors."""
+    if patch_mode in ("masked-feature", "ibot"):
+        if not isinstance(saved_patch_state, dict) or not saved_patch_state:
+            raise ValueError(
+                "Cannot resume: this checkpoint has no patch_objective state for "
+                f"patch_loss={patch_mode!r}. Start a new run to use real masking."
+            )
+    if not isinstance(saved_patch_state, dict) or not saved_patch_state:
+        return
+    try:
+        probe_patch.load_state_dict(saved_patch_state, strict=True)
+    except RuntimeError as exc:
+        raise ValueError(
+            "Cannot resume: patch_objective state is malformed or incompatible "
+            f"with patch_loss={patch_mode!r}: {exc}"
+        ) from exc
+    for key, value in probe_patch.state_dict().items():
+        if isinstance(value, torch.Tensor) and value.is_floating_point():
+            if not bool(torch.isfinite(value).all()):
+                raise ValueError(
+                    f"Cannot resume: patch_objective.{key} contains non-finite "
+                    "values."
+                )
+
+
 class _ResolvedPretrainRecipe(NamedTuple):
     settings: PretrainSettings
     relational_target_config: dict[str, Any]
     teacher_temp_warmup_ratio: float
     augmentation_config: dict[str, object]
     warnings: tuple[str, ...]
+    relational_queue_preparation: "_RelationalQueuePreparation | None" = None
 
     @property
     def weak_teacher_augmentation_config(self) -> dict[str, object] | None:
@@ -2728,9 +3747,34 @@ def _resolve_pretrain_recipe(
     checkpoint: dict[str, Any] | None,
     *,
     settings: PretrainSettings,
+    relational_queue_preparation: "_RelationalQueuePreparation | None" = None,
 ) -> _ResolvedPretrainRecipe:
-    """Resolve and validate the whole pretraining recipe without building a model."""
-    bundle, ratio, warnings = _resolve_relational_target_config(args, checkpoint)
+    """Resolve and validate the whole pretraining recipe without building a model.
+
+    ``relational_queue_preparation`` is the invocation's model-free queue
+    resolution. An enabled request or enabled checkpoint without it is an error:
+    an off recipe is never enabled by default and the finalizer never re-hashes.
+    """
+    preparation = relational_queue_preparation
+    if preparation is None:
+        if _queue_enabled_request(args) or _checkpoint_queue_bundles(checkpoint)[1]:
+            raise ValueError(
+                "The relational queue is enabled for this invocation but no "
+                "prepared selection was supplied. Resolve "
+                "prepare_pretrain_relational_queue() first and pass it to the "
+                "recipe."
+            )
+    elif preparation.active and preparation.data is None:
+        raise ValueError(
+            "An enabled relational queue preparation must carry its prepared "
+            "selection; none was supplied."
+        )
+    candidate_count = (
+        preparation.candidate_bound if preparation is not None else None
+    )
+    bundle, ratio, warnings = _resolve_relational_target_config(
+        args, checkpoint, candidate_count=candidate_count
+    )
     profile = _select_augmentation_profile(
         getattr(args, "augmentation", None), checkpoint, stage="pretrain"
     )
@@ -2771,4 +3815,5 @@ def _resolve_pretrain_recipe(
         teacher_temp_warmup_ratio=ratio,
         augmentation_config=augmentation_config,
         warnings=tuple(warnings),
+        relational_queue_preparation=preparation,
     )

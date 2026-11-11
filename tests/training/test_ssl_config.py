@@ -511,7 +511,7 @@ def test_absent_slot_resolves_before_mkdir(tmp_path, monkeypatch):
     out_dir = tmp_path / "absent"
     seen = {}
 
-    def record(args, resume_ckpt):
+    def record(args, resume_ckpt, **kwargs):
         seen["out_dir_exists"] = out_dir.exists()
         raise RuntimeError("stop before training")
 
