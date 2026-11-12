@@ -773,10 +773,16 @@ def test_finetune_optimizer_arguments_are_forwarded(monkeypatch, tmp_path):
 def test_extract_help_explains_cls_and_task_embedding_use_cases():
     result = runner.invoke(app, ["extract", "--help"])
     assert result.exit_code == 0
-    output = result.output.lower()
-    assert "raw cls" in output
-    assert "arcface embedding" in output
-    assert "unseen classes" in output
+    # Rich wraps long help text inside the panel, so compare on collapsed,
+    # ANSI-free text: a wrapped phrase is still the documented meaning.
+    import re
+
+    # A panel border can also land between two words of one phrase, so keep only
+    # letters and digits before matching.
+    output = re.sub(r"[^a-z0-9]+", "", result.output.lower())
+    assert "rawcls" in output
+    assert "arcfaceembedding" in output
+    assert "unseenclasses" in output
 
 
 def test_finetune_runs_one_epoch(tmp_path):

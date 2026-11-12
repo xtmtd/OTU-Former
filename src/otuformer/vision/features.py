@@ -552,10 +552,10 @@ class SpatialFeatureForward:
             if tensor is None:  # pragma: no cover - guarded by construction
                 raise RuntimeError(f"feature layer {order} was never executed")
             values = self._prepare(tensor)
-            batch, channels = int(values.shape[0]), int(values.shape[-1])
-            outputs.append(
-                values.reshape(batch, grid_h, grid_w, channels)
-            )
+            # ``-1`` keeps the batch axis symbolic: a traced constant batch would
+            # bake a fixed reshape into an exported graph and break batch 2.
+            channels = int(values.shape[-1])
+            outputs.append(values.reshape(-1, grid_h, grid_w, channels))
         return tuple(outputs)
 
     def _prepare(self, tokens: torch.Tensor) -> torch.Tensor:

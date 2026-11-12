@@ -214,3 +214,51 @@ def validate_extract_mode_options(
             "explicit exact match is verified, a conflict fails"
         )
     return notes
+
+
+EXPORT_SPATIAL_OPTIONS = (
+    "feature_layers",
+    "feature_norm",
+    "feature_l2_normalize",
+    "use_student",
+)
+
+
+def validate_export_mode_options(
+    values: Mapping[str, object], *, explicit_options: frozenset[str]
+) -> list[str]:
+    """Apply design §3's export matrix before any output is prepared.
+
+    ``output_kind="embedding"`` keeps its historical graph, so a spatial-only
+    option is rejected as soon as it was supplied — including a value that equals
+    the spatial default, which would otherwise look like it took effect.
+    """
+    output_kind = values.get("output_kind") or "embedding"
+    if output_kind not in OUTPUT_KIND_CHOICES:
+        raise ValueError(
+            f"unknown --output-kind {output_kind!r}; expected one of "
+            f"{OUTPUT_KIND_CHOICES}"
+        )
+    notes: list[str] = []
+    if output_kind == "spatial":
+        norm = values.get("feature_norm")
+        if norm is not None and norm not in FEATURE_NORM_CHOICES:
+            raise ValueError(
+                f"unknown --feature-norm {norm!r}; expected one of "
+                f"{FEATURE_NORM_CHOICES}"
+            )
+        notes.append(
+            "a spatial graph fixes the model, layers, normalization and size; the "
+            "export validates every declared output against CPU PyTorch"
+        )
+        return notes
+    supplied = [
+        name for name in EXPORT_SPATIAL_OPTIONS if name in explicit_options
+    ]
+    if supplied:
+        raise ValueError(
+            "--output-kind embedding cannot accept these spatial-only options: "
+            + ", ".join(_option(name) for name in supplied)
+            + "; add --output-kind spatial or drop them"
+        )
+    return notes

@@ -852,6 +852,13 @@ def validate_constraints(
             )
         )
 
+    if command == "export":
+        from otuformer.spatial.request import validate_export_mode_options
+
+        unresolved.extend(
+            validate_export_mode_options(values, explicit_options=explicit_options)
+        )
+
     if command == "extract":
         validate_extract_data_options(
             label_csv=values.get("label_csv"),
