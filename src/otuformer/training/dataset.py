@@ -595,6 +595,16 @@ def _random_apply(transform: Any, probability: float) -> Any:
     return transforms.RandomApply([transform], p=probability)
 
 
+def _samples_flip(probability: float) -> bool:
+    """One torchvision ``RandomHorizontalFlip``/``RandomVerticalFlip`` decision.
+
+    ``torchvision`` draws ``torch.rand(1)`` against ``p``; drawing the same value
+    from the same global RNG at the same point in the sequence keeps a tracked
+    and an untracked call on identical random states.
+    """
+    return bool(torch.rand(1) < float(probability))
+
+
 class _PretrainViewTransform:
     """Fill-aware transform for one pretraining view (global 1, global 2, or local).
 
@@ -731,33 +741,97 @@ class _PretrainViewTransform:
     def __call__(
         self, image: Image.Image, fill: tuple[int, int, int]
     ) -> torch.Tensor:
-        image = self._crop(image)
+        tensor, _ = self._run(image, fill, track=False)
+        return tensor
+
+    def transform_with_geometry(
+        self, image: Image.Image, fill: tuple[int, int, int]
+    ) -> tuple[torch.Tensor, "_geometry.GeometryTrace"]:
+        """Same tensor as ``__call__`` plus the realized geometry of this view.
+
+        One sampled-operation path serves both calls: the torchvision parameter
+        samplers, their order and every appearance transform are unchanged, so
+        tracking adds a trace without moving a single RNG draw.
+        """
+        tensor, trace = self._run(image, fill, track=True)
+        assert trace is not None
+        return tensor, trace
+
+    def _sample_operations(
+        self, image: Image.Image, fill: tuple[int, int, int]
+    ) -> list["_geometry.GeometryOp"]:
+        """Draw this view's parameters once and describe them as operations."""
+        width, height = image.size
+        # The crop's own samplers are the ones ``RandomResizedCrop`` would use.
+        top, left, crop_h, crop_w = self._crop.get_params(
+            image, self._crop.scale, self._crop.ratio
+        )
+        operations = [
+            _geometry.GeometryOp(
+                "crop",
+                {
+                    "from_wh": [width, height],
+                    "left": int(left),
+                    "top": int(top),
+                    "width": int(crop_w),
+                    "height": int(crop_h),
+                },
+            ),
+            _geometry.GeometryOp(
+                "resize",
+                {
+                    "from_wh": [int(crop_w), int(crop_h)],
+                    "to_wh": [self._crop_size, self._crop_size],
+                    "interpolation": "bicubic",
+                    "antialias": bool(self._crop.antialias),
+                },
+            ),
+        ]
         angle = transforms.RandomRotation.get_params(self._rotation_degrees)
-        image = TF.rotate(
-            image,
-            angle,
-            interpolation=InterpolationMode.BICUBIC,
-            expand=self._rotation_expand,
-            fill=tuple(fill) if self._uses_edge_fill else self._fixed_fill,
+        operations.append(
+            _geometry.GeometryOp(
+                "rotate",
+                {
+                    # The pivot is the canvas entering the rotation — the crop is
+                    # already resized to ``crop_size`` here — and an expanding
+                    # rotation's output canvas is recorded from the executed image.
+                    "angle": float(angle),
+                    "expand": self._rotation_expand,
+                    "interpolation": "bicubic",
+                    "fill": list(tuple(fill) if self._uses_edge_fill else self._fixed_fill),
+                },
+            )
         )
         if self._post_rotation_resize:
-            image = TF.resize(
-                image,
-                [self._crop_size, self._crop_size],
-                interpolation=InterpolationMode.BICUBIC,
-                antialias=True,
+            operations.append(
+                _geometry.GeometryOp(
+                    "resize",
+                    {
+                        "to_wh": [self._crop_size, self._crop_size],
+                        "interpolation": "bicubic",
+                        "antialias": True,
+                    },
+                )
             )
-        if self._horizontal_flip is not None:
-            image = self._horizontal_flip(image)
-        if self._vertical_flip is not None:
-            image = self._vertical_flip(image)
-        if self._color is not None:
-            image = self._color(image)
-        if self._grayscale is not None:
-            image = self._grayscale(image)
-        if self._blur is not None:
-            image = self._blur(image)
-        return self._normalize(self._to_tensor(image))
+        if self._horizontal_flip is not None and _samples_flip(
+            self._horizontal_flip_probability
+        ):
+            operations.append(_geometry.GeometryOp("hflip", {}))
+        if self._vertical_flip is not None and _samples_flip(
+            self._vertical_flip_probability
+        ):
+            operations.append(_geometry.GeometryOp("vflip", {}))
+        return operations
+
+    def _run(
+        self, image: Image.Image, fill: tuple[int, int, int], *, track: bool
+    ) -> tuple[torch.Tensor, "_geometry.GeometryTrace | None"]:
+        operations = self._sample_operations(image, fill)
+        viewed, trace = _geometry.apply_geometry(image, operations, track=track)
+        for step in (self._color, self._grayscale, self._blur):
+            if step is not None:
+                viewed = step(viewed)
+        return self._normalize(self._to_tensor(viewed)), trace
 
 
 def _build_pretrain_view_transform(
@@ -869,34 +943,98 @@ class _ConservativeTransform:
     def __call__(
         self, image: Image.Image, fill: tuple[int, int, int]
     ) -> torch.Tensor:
-        canvas = _pad_to_safe_square(
-            image,
-            fill,
-            max_scale=self._safe_canvas_max_scale,
-            max_translation_fraction=self._safe_canvas_max_translation_fraction,
+        tensor, _ = self._run(image, fill, track=False)
+        return tensor
+
+    def transform_with_geometry(
+        self, image: Image.Image, fill: tuple[int, int, int]
+    ) -> tuple[torch.Tensor, "_geometry.GeometryTrace"]:
+        """Same tensor as ``__call__`` plus the realized geometry of this view.
+
+        The safe-square canvas, the single sampled affine transform, the flip and
+        the final resize are executed once for both calls; tracking only records
+        what ran.
+        """
+        tensor, trace = self._run(image, fill, track=True)
+        assert trace is not None
+        return tensor, trace
+
+    def _sample_operations(
+        self, image: Image.Image, fill: tuple[int, int, int]
+    ) -> list["_geometry.GeometryOp"]:
+        """Draw this view's parameters once and describe them as operations."""
+        width, height = image.size
+        diagonal = math.ceil(math.hypot(width, height))
+        side = math.ceil(
+            diagonal
+            * self._safe_canvas_max_scale
+            / (1 - 2 * self._safe_canvas_max_translation_fraction)
         )
+        operations: list["_geometry.GeometryOp"] = []
+        if (width, height) != (side, side):
+            operations.append(
+                _geometry.GeometryOp(
+                    "pad",
+                    {
+                        "from_wh": [width, height],
+                        "canvas_wh": [side, side],
+                        "offset": [(side - width) // 2, (side - height) // 2],
+                        "fill": list(tuple(fill)),
+                    },
+                )
+            )
         angle, translate, scale, shear = transforms.RandomAffine.get_params(
             degrees=list(self._rotation_degrees),
             translate=list(self._translate),
             scale_ranges=list(self._scale),
             shears=None,
-            img_size=canvas.size,
+            img_size=(side, side),
         )
-        image = TF.affine(
-            canvas,
-            angle=angle,
-            translate=translate,
-            scale=scale,
-            shear=shear,
-            interpolation=InterpolationMode.BICUBIC,
-            fill=list(fill),
+        operations.append(
+            _geometry.GeometryOp(
+                "affine",
+                {
+                    "from_wh": [side, side],
+                    "center": [side / 2.0, side / 2.0],
+                    "angle": float(angle),
+                    "translate": [float(translate[0]), float(translate[1])],
+                    "scale": float(scale),
+                    "shear": [float(shear[0]), float(shear[1])],
+                    "interpolation": "bicubic",
+                    "fill": list(tuple(fill)),
+                    "canvas_wh": [side, side],
+                },
+            )
         )
-        if self._horizontal_flip is not None:
-            image = self._horizontal_flip(image)
-        if self._color is not None:
-            image = self._color(image)
-        image = self._resize(image)
-        return self._normalize(self._to_tensor(image))
+        if self._horizontal_flip is not None and _samples_flip(
+            self._horizontal_flip_probability
+        ):
+            operations.append(_geometry.GeometryOp("hflip", {}))
+        operations.append(
+            _geometry.GeometryOp(
+                "resize",
+                {
+                    "to_wh": [self._image_size, self._image_size],
+                    "interpolation": "bicubic",
+                    "antialias": True,
+                },
+            )
+        )
+        return operations
+
+    def _run(
+        self, image: Image.Image, fill: tuple[int, int, int], *, track: bool
+    ) -> tuple[torch.Tensor, "_geometry.GeometryTrace | None"]:
+        operations = self._sample_operations(image, fill)
+        # The colour jitter runs *before* the final resize, exactly as it always
+        # has: resampling after a photometric change is not the same image.
+        interleave = (
+            {len(operations) - 1: self._color} if self._color is not None else None
+        )
+        viewed, trace = _geometry.apply_geometry(
+            image, operations, track=track, interleave=interleave
+        )
+        return self._normalize(self._to_tensor(viewed)), trace
 
 
 def _validate_view_shape(

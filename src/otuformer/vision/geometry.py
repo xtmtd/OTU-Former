@@ -144,10 +144,13 @@ class GeometryTrace:
         """Canvas size entering operation ``index``."""
         if index == 0:
             return self.source_wh
-        previous = self.operations[index - 1].params
+        previous = self.operations[index - 1]
+        params = previous.params
         for key in ("canvas_wh", "to_wh"):
-            if key in previous:
-                return tuple(int(v) for v in previous[key])  # type: ignore[return-value]
+            if key in params:
+                return tuple(int(v) for v in params[key])  # type: ignore[return-value]
+        if previous.kind == "crop":
+            return (int(params["width"]), int(params["height"]))
         raise ValueError(  # pragma: no cover - every op records its canvas
             f"operation {index - 1} does not record its realized canvas"
         )
@@ -359,26 +362,73 @@ def _trace_canvas(op: GeometryOp, canvas: tuple[int, int]) -> tuple[int, int]:
     )
 
 
+def prepare_operation(op: GeometryOp, before_wh: tuple[int, int]) -> GeometryOp:
+    """Fill the facts known before execution: entering canvas and rotation centre.
+
+    A centred rotation's pivot is the canvas it is applied to, so the operation
+    records that resolution instead of every caller repeating ``width / 2``.
+    """
+    params = dict(op.params)
+    params.setdefault("from_wh", [int(before_wh[0]), int(before_wh[1])])
+    if op.kind in ("rotate", "affine") and "center" not in params:
+        params["center"] = [int(before_wh[0]) / 2.0, int(before_wh[1]) / 2.0]
+    return GeometryOp(op.kind, params)
+
+
+def complete_operation(
+    op: GeometryOp, before_wh: tuple[int, int], after_wh: tuple[int, int]
+) -> GeometryOp:
+    """Fill in the facts of one executed operation.
+
+    ``from_wh`` is always the canvas entering the operation. ``canvas_wh`` is
+    derived from the executed image for the operations whose output size the
+    library decides (an expanding rotation), so a trace records what actually
+    happened instead of a re-derivation of it.
+    """
+    params = dict(op.params)
+    params.setdefault("from_wh", [int(before_wh[0]), int(before_wh[1])])
+    if op.kind in ("rotate", "affine", "pad", "resize", "hflip", "vflip"):
+        params.setdefault("canvas_wh", [int(after_wh[0]), int(after_wh[1])])
+    return GeometryOp(op.kind, params)
+
+
 def apply_geometry(
     image: Image.Image,
     operations: Sequence[GeometryOp],
     *,
     track: bool = False,
+    interleave: Mapping[int, Any] | None = None,
 ) -> tuple[Image.Image, GeometryTrace | None]:
-    """Execute one realized operation sequence, optionally tracing it."""
+    """Execute one realized operation sequence, optionally tracing it.
+
+    ``interleave`` maps an operation index to a callable applied to the image
+    immediately *before* that operation. A pixel step that must stay between two
+    geometry operations (a colour jitter before the final resize) belongs here
+    instead of being reordered: the execution order is the preserved one, and no
+    check that only exists in the caller is needed.
+    """
     current = image
     matrix = np.eye(3, dtype=np.float64)
     canvas = (int(image.size[0]), int(image.size[1]))
-    for op in operations:
+    completed: list[GeometryOp] = []
+    for index, op in enumerate(operations):
+        hook = interleave.get(index) if interleave else None
+        if hook is not None:
+            current = hook(current)
+        before = canvas
+        op = prepare_operation(op, before)
         current = _execute(current, op)
-        canvas = _realized_canvas(op, current)
+        realized = _realized_canvas(op, current)
+        op = complete_operation(op, before, realized)
+        completed.append(op)
+        canvas = realized
         matrix = matrix_for(op) @ matrix
     if not track:
         return current, None
     return current, GeometryTrace(
         source_wh=(int(image.size[0]), int(image.size[1])),
         view_wh=canvas,
-        operations=tuple(operations),
+        operations=tuple(completed),
         source_to_view=matrix,
         view_to_source=support.invert(matrix),
     )
