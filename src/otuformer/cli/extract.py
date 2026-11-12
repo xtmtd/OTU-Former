@@ -58,85 +58,215 @@ def _validate_extract_options(
         raise typer.BadParameter(str(error)) from None
 
 
+SPATIAL_LOG_PARAMETERS = (
+    "output_kind",
+    "spatial_input",
+    "checkpoint",
+    "onnx_path",
+    "input_images_dir",
+    "out_dir",
+    "model_name",
+    "use_student",
+    "feature_layers",
+    "feature_norm",
+    "feature_l2_normalize",
+    "spatial_layout",
+    "spatial_eval",
+    "spatial_eval_sample_size",
+    "dump_model_structure",
+    "extract_size",
+    "eval_transform",
+    "label_csv",
+    "coco_instances",
+    "coco_keypoints",
+    "coco_panoptic",
+    "panoptic_masks_dir",
+    "batch_size",
+    "num_workers",
+    "device",
+    "seed",
+    "overwrite",
+)
+
+
+def _cli_explicit_options(ctx: typer.Context, values: dict) -> frozenset[str]:
+    """Option names the user actually typed, never parser defaults."""
+    from otuformer.cli import source_is_commandline
+
+    return frozenset(
+        name
+        for name in values
+        if source_is_commandline(ctx.get_parameter_source(name))
+    )
+
+
+def _spatial_log_values(values: dict) -> dict:
+    """Requested values as written: raw strings, no resolved substitution."""
+    logged: dict = {}
+    for name in SPATIAL_LOG_PARAMETERS:
+        value = values.get(name)
+        if value is None:
+            logged[name] = ""
+        elif isinstance(value, Path):
+            logged[name] = str(value)
+        else:
+            logged[name] = value
+    return logged
+
+
+def _run_spatial(ctx: typer.Context, values: dict) -> None:
+    """Orchestrate one spatial extraction or artifact read.
+
+    Request resolution happens before the output directory is touched, the
+    requested/resolved records are logged separately, and the completed run
+    envelope is published only after the log is closed and every artifact byte
+    is final.
+    """
+    from otuformer.cli_schema import (
+        check_inputs_survive_cleanup,
+        input_identities,
+        verify_inputs_unchanged,
+    )
+    from otuformer.data.paths import is_within
+    from otuformer.spatial.extractor import (
+        SpatialRequestError,
+        extract_spatial,
+        prepare_spatial_request,
+        publish_spatial_run,
+        reevaluate_spatial,
+    )
+    from otuformer.utils.io import prepare_output_dir
+    from otuformer.utils.logging import TeeLogger
+
+    explicit = _cli_explicit_options(ctx, values)
+    log_values = _spatial_log_values(values)
+    requested_params = dict(log_values)
+    cli_command = format_user_command(ctx, requested_params, "extract")
+    out_dir = Path(values.get("out_dir") or "runs/extract").expanduser()
+
+    # Resolve the request before anything is written: a rejected mode/applicability
+    # combination must not clear an existing output directory.
+    try:
+        request = prepare_spatial_request(
+            {**values, "out_dir": out_dir}, explicit_options=explicit
+        )
+    except (ValueError, OSError) as error:
+        raise typer.BadParameter(str(error)) from None
+
+    protected = [snapshot.path for snapshot in request.protected_files]
+    written_inputs = [*protected]
+    if values.get("input_images_dir") is not None:
+        written_inputs.append(Path(values["input_images_dir"]))
+    if values.get("label_csv") is not None:
+        written_inputs.append(Path(values["label_csv"]))
+    out_target = out_dir.expanduser().resolve()
+    for path in protected:
+        try:
+            candidate = Path(path).expanduser().resolve()
+        except OSError:  # pragma: no cover - defensive
+            continue
+        if is_within(root=out_target, candidate=candidate):
+            request.close()
+            raise typer.BadParameter(
+                f"--out-dir {out_target} contains the input {candidate}; choose a "
+                "directory that cannot clear model, image, annotation or product data"
+            )
+    identities = input_identities(written_inputs)
+    try:
+        if bool(values.get("overwrite")):
+            check_inputs_survive_cleanup(out_dir, written_inputs)
+        prepare_output_dir(
+            out_dir,
+            overwrite=bool(values.get("overwrite")),
+            protected_paths=written_inputs,
+        )
+        verify_inputs_unchanged(identities)
+    except (ValueError, OSError) as error:
+        request.close()
+        raise typer.BadParameter(str(error)) from None
+
+    tee = TeeLogger(out_dir / "logs" / "extract.log")
+    original_stdout, original_stderr = sys.stdout, sys.stderr
+    sys.stdout = tee
+    sys.stderr = tee
+    from datetime import datetime, timezone
+
+    started = datetime.now(timezone.utc).isoformat()
+    result: dict | None = None
+    failure: dict | None = None
+    try:
+        print(f"Command: {cli_command}")
+        print("Parameters:")
+        print(json.dumps(log_values, ensure_ascii=False, indent=2, sort_keys=True))
+        print("-" * 80)
+        runner = extract_spatial if request.mode == "checkpoint" else reevaluate_spatial
+        result = runner(request, defer_publication=True)
+        print("Resolved:")
+        print(
+            json.dumps(
+                result.get("envelope", {}).get("effective", {}),
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+                default=str,
+            )
+        )
+    except KeyboardInterrupt:
+        failure = {"reason": "interrupted by the user", "type": "KeyboardInterrupt"}
+    except Exception as error:  # noqa: BLE001 - recorded, then re-raised
+        failure = {"reason": str(error), "type": type(error).__name__}
+    finally:
+        sys.stdout = original_stdout
+        sys.stderr = original_stderr
+        try:
+            tee.close()
+        finally:
+            pass
+
+    if result is not None and failure is None:
+        envelope = result["envelope"]
+        published = publish_spatial_run(out_dir, envelope, include_log=True)
+        request.close()
+        product_id = result.get("manifest", {}).get("product_id", "")
+        print(f"Spatial product written to {out_dir}")
+        print(f"Product id: {product_id}")
+        return
+
+    from otuformer.data.provenance import build_spatial_run_record
+
+    status = "interrupted" if (failure or {}).get("type") == "KeyboardInterrupt" else "failed"
+    record = build_spatial_run_record(
+        requested={"cli_command": cli_command, **log_values},
+        bundle=None,
+        source_product=request.source_product,
+        effective={"status": status, "mode": request.mode},
+        used_files=request.protected_files,
+        evaluation=None,
+        status=status,
+        started_at=started,
+        ended_at=None,
+        artifacts=[],
+        failure=failure,
+    )
+    publish_spatial_run(out_dir, record, include_log=True)
+    request.close()
+    if status == "interrupted":
+        raise typer.Exit(code=130)
+    message = (failure or {}).get("reason", "spatial extraction failed")
+    raise typer.BadParameter(message)
+
 @app.callback(invoke_without_command=True)
 def extract(
     ctx: typer.Context,
-    checkpoint: Path | None = typer.Option(
+    input_images_dir: Path | None = typer.Option(
         None,
-        "--checkpoint",
-        help="Path to pretrain or finetune checkpoint. Required unless --onnx-path is provided.",
-    ),
-    input_images_dir: Path = typer.Option(
-        ..., "--input-images-dir", help="Image directory or parent directory."
-    ),
-    out_dir: Path = typer.Option(
-        Path("runs/extract"), "--out-dir", help="Output directory."
-    ),
-    model_name: str = typer.Option(
-        "vit_tiny_patch16_224", "--model-name", help="timm backbone."
-    ),
-    extract_size: str = typer.Option(
-        "auto",
-        "--extract-size",
+        "--input-images-dir",
         help=(
-            "Resize/crop size for extraction. 'auto' uses the checkpoint's "
-            "recorded training size. "
-            f"{SIZE_EXAMPLES}"
+            "Image directory or parent directory. Required for embedding and "
+            "spatial image extraction; optional in spatial artifact read mode, "
+            "where it only supplies images for report overlays."
         ),
-    ),
-    eval_transform: str = typer.Option(
-        "center-crop",
-        "--eval-transform",
-        help=(
-            "Evaluation preprocessing protocol: center-crop (Resize + CenterCrop) "
-            "or whole-specimen-pad (aspect-preserving square padding). "
-            "Default: center-crop."
-        ),
-    ),
-    use_projector_output: bool = typer.Option(
-        False,
-        "--use-projector-output",
-        help=(
-            "Use SSL projector output for SSL checkpoints, or the ArcFace embedding "
-            "for fine-tune checkpoints; useful for fine-tuned-class retrieval and "
-            "closed-set clustering."
-        ),
-    ),
-    use_student: bool = typer.Option(
-        False,
-        "--use-student",
-        help=(
-            "Load student weights instead of teacher (EMA model). "
-            "Default loads teacher, which gives better embeddings for downstream "
-            "analysis (DINO/iBOT convention). No effect on finetune checkpoints."
-        ),
-    ),
-    token_mode: str = typer.Option(
-        "cls",
-        "--token-mode",
-        help=(
-            "Embedding token mode. cls=raw CLS token (the comparison baseline for "
-            "unseen classes, cross-dataset transfer, and general morphology); "
-            "patch-topk=top-K patch tokens + PCA; attention-pool=learned query pooling "
-            "over patch tokens."
-        ),
-    ),
-    topk_patches: int = typer.Option(
-        20,
-        "--topk-patches",
-        help="Top-K patch tokens for patch-topk mode (common: 10/20/30).",
-    ),
-    attention_pooling_type: str = typer.Option(
-        "lightweight",
-        "--attention-pooling-type",
-        help="Attention pooling type. Choices: lightweight | multihead | gated.",
-    ),
-    attention_pooling_epochs: int = typer.Option(
-        20,
-        "--attention-pooling-epochs",
-        help=(
-            "Epochs to finetune attention query when no cached pooling checkpoint is found."
-        ),
+        rich_help_panel="Input and output",
     ),
     label_csv: Path | None = typer.Option(
         None,
@@ -148,16 +278,19 @@ def extract(
             "source. In attention-pool mode it must include labels when cached "
             "pooling weights are missing."
         ),
+        rich_help_panel="Input and output",
     ),
     coco_instances: Path | None = typer.Option(
         None,
         "--coco-instances",
         help="COCO instance annotations (boxes, polygons, RLE).",
+        rich_help_panel="Input and output",
     ),
     coco_keypoints: Path | None = typer.Option(
         None,
         "--coco-keypoints",
         help="COCO keypoint annotations.",
+        rich_help_panel="Input and output",
     ),
     coco_panoptic: Path | None = typer.Option(
         None,
@@ -165,6 +298,7 @@ def extract(
         help=(
             "COCO panoptic JSON. Requires --panoptic-masks-dir."
         ),
+        rich_help_panel="Input and output",
     ),
     panoptic_masks_dir: Path | None = typer.Option(
         None,
@@ -173,36 +307,27 @@ def extract(
             "Root for panoptic segment-ID PNGs, resolved from each annotation's "
             "file_name as written. Requires --coco-panoptic."
         ),
+        rich_help_panel="Input and output",
     ),
-    metrics_sample_size: int = typer.Option(
-        10000,
-        "--metrics-sample-size",
-        help="Max samples for metrics and UMAP evaluation (<=0 means no cap).",
+    out_dir: Path = typer.Option(
+        Path("runs/extract"), "--out-dir", help="Output directory.",
+        rich_help_panel="Input and output",
     ),
-    # UMAP options (mirrors pretrain/finetune)
-    umap_n_neighbors: int = typer.Option(
-        15, "--umap-n-neighbors", help="UMAP n_neighbors."
+    output_kind: str = typer.Option(
+        "embedding",
+        "--output-kind",
+        help=(
+            "Product to write: 'embedding' keeps the existing vector output; "
+            "'spatial' writes complete backbone-block feature grids with "
+            "geometry and diagnostics. No option switches it implicitly."
+        ),
+        rich_help_panel="Input and output",
     ),
-    umap_min_dist: float = typer.Option(0.1, "--umap-min-dist", help="UMAP min_dist."),
-    umap_metric: str = typer.Option(
-        "cosine",
-        "--umap-metric",
-        help="Distance metric for UMAP projection. Common choices: cosine, euclidean.",
-    ),
-    visualize_class_number: int = typer.Option(
-        20,
-        "--visualize-class-number",
-        help="Max classes to show in UMAP plot.",
-    ),
-    disable_umap: bool = typer.Option(
-        False,
-        "--disable-umap",
-        help="Skip UMAP generation even when --label-csv is provided.",
-    ),
-    batch_size: int = typer.Option(32, "--batch-size", help="Batch size."),
-    num_workers: int = typer.Option(4, "--num-workers", help="DataLoader workers."),
-    device: str = typer.Option(
-        "auto", "--device", help="Device: auto | cpu | cuda | mps."
+    checkpoint: Path | None = typer.Option(
+        None,
+        "--checkpoint",
+        help="Path to pretrain or finetune checkpoint. Required unless --onnx-path is provided.",
+        rich_help_panel="Model and feature source",
     ),
     onnx_path: Path | None = typer.Option(
         None,
@@ -213,13 +338,261 @@ def extract(
             "Only supports token-mode 'cls' (default). "
             "Overrides --checkpoint, --model-name, --use-student, and --device."
         ),
+        rich_help_panel="Model and feature source",
     ),
-    seed: int = typer.Option(42, "--seed", help="Random seed."),
+    model_name: str = typer.Option(
+        "vit_tiny_patch16_224", "--model-name", help="timm backbone.",
+        rich_help_panel="Model and feature source",
+    ),
+    use_student: bool = typer.Option(
+        False,
+        "--use-student",
+        help=(
+            "Load student weights instead of teacher (EMA model). "
+            "Default loads teacher, which gives better embeddings for downstream "
+            "analysis (DINO/iBOT convention). No effect on finetune checkpoints."
+        ),
+        rich_help_panel="Model and feature source",
+    ),
+    feature_layers: str | None = typer.Option(
+        None,
+        "--feature-layers",
+        help=(
+            "Spatial only. Comma-separated backbone-relative complete block paths "
+            "(for example 'blocks.5,blocks.11'). Omitted: the last complete block. "
+            "Requested order is preserved; no ranges, duplicates or averaging."
+        ),
+        rich_help_panel="Model and feature source",
+    ),
+    feature_norm: str = typer.Option(
+        "backbone",
+        "--feature-norm",
+        help=(
+            "Spatial only. Apply the backbone's final norm to each selected block "
+            "('backbone') or export the raw block output ('none')."
+        ),
+        rich_help_panel="Model and feature source",
+    ),
+    feature_l2_normalize: bool = typer.Option(
+        False,
+        "--feature-l2-normalize",
+        help=(
+            "Spatial only. L2-normalize each token channel vector after the "
+            "backbone norm. Independent of CAM heatmap min-max scaling."
+        ),
+        rich_help_panel="Model and feature source",
+    ),
+    spatial_input: Path | None = typer.Option(
+        None,
+        "--spatial-input",
+        help=(
+            "Existing completed spatial product to read. Requires "
+            "--output-kind spatial; no model or images are needed for numeric "
+            "diagnostics, and the source product is never modified."
+        ),
+        rich_help_panel="Model and feature source",
+    ),
+    dump_model_structure: bool = typer.Option(
+        False,
+        "--dump-model-structure",
+        help=(
+            "Checkpoint spatial only. Write backbone-relative module paths with "
+            "their spatial eligibility to model_layers.txt, then continue."
+        ),
+        rich_help_panel="Model and feature source",
+    ),
+    extract_size: str = typer.Option(
+        "auto",
+        "--extract-size",
+        help=(
+            "Resize/crop size for extraction. 'auto' uses the checkpoint's "
+            "recorded training size. "
+            f"{SIZE_EXAMPLES}"
+        ),
+        rich_help_panel="Preprocessing and geometry",
+    ),
+    eval_transform: str = typer.Option(
+        "center-crop",
+        "--eval-transform",
+        help=(
+            "Evaluation preprocessing protocol: center-crop (Resize + CenterCrop) "
+            "or whole-specimen-pad (aspect-preserving square padding). "
+            "Default: center-crop."
+        ),
+        rich_help_panel="Preprocessing and geometry",
+    ),
+    token_mode: str = typer.Option(
+        "cls",
+        "--token-mode",
+        help=(
+            "Embedding token mode. cls=raw CLS token (the comparison baseline for "
+            "unseen classes, cross-dataset transfer, and general morphology); "
+            "patch-topk=top-K patch tokens + PCA; attention-pool=learned query pooling "
+            "over patch tokens."
+        ),
+        rich_help_panel="Embedding output",
+    ),
+    topk_patches: int = typer.Option(
+        20,
+        "--topk-patches",
+        help="Top-K patch tokens for patch-topk mode (common: 10/20/30).",
+        rich_help_panel="Embedding output",
+    ),
+    use_projector_output: bool = typer.Option(
+        False,
+        "--use-projector-output",
+        help=(
+            "Use SSL projector output for SSL checkpoints, or the ArcFace embedding "
+            "for fine-tune checkpoints; useful for fine-tuned-class retrieval and "
+            "closed-set clustering."
+        ),
+        rich_help_panel="Embedding output",
+    ),
+    attention_pooling_type: str = typer.Option(
+        "lightweight",
+        "--attention-pooling-type",
+        help="Attention pooling type. Choices: lightweight | multihead | gated.",
+        rich_help_panel="Embedding output",
+    ),
+    attention_pooling_epochs: int = typer.Option(
+        20,
+        "--attention-pooling-epochs",
+        help=(
+            "Epochs to finetune attention query when no cached pooling checkpoint is found."
+        ),
+        rich_help_panel="Embedding output",
+    ),
+    spatial_layout: str = typer.Option(
+        "per-image",
+        "--spatial-layout",
+        help=(
+            "Spatial extraction only. 'per-image' writes one uncompressed NPZ per "
+            "sample; 'sharded' writes bounded NPY shards. Both share one reader."
+        ),
+        rich_help_panel="Spatial output and storage",
+    ),
+    metrics_sample_size: int = typer.Option(
+        10000,
+        "--metrics-sample-size",
+        help="Max samples for metrics and UMAP evaluation (<=0 means no cap).",
+        rich_help_panel="Embedding evaluation and visualization",
+    ),
+    umap_n_neighbors: int = typer.Option(
+        15, "--umap-n-neighbors", help="UMAP n_neighbors.",
+        rich_help_panel="Embedding evaluation and visualization",
+    ),
+    umap_min_dist: float = typer.Option(0.1, "--umap-min-dist", help="UMAP min_dist.",
+        rich_help_panel="Embedding evaluation and visualization",
+    ),
+    umap_metric: str = typer.Option(
+        "cosine",
+        "--umap-metric",
+        help="Distance metric for UMAP projection. Common choices: cosine, euclidean.",
+        rich_help_panel="Embedding evaluation and visualization",
+    ),
+    visualize_class_number: int = typer.Option(
+        20,
+        "--visualize-class-number",
+        help="Max classes to show in UMAP plot.",
+        rich_help_panel="Embedding evaluation and visualization",
+    ),
+    disable_umap: bool = typer.Option(
+        False,
+        "--disable-umap",
+        help="Skip UMAP generation even when --label-csv is provided.",
+        rich_help_panel="Embedding evaluation and visualization",
+    ),
+    spatial_eval: bool = typer.Option(
+        False,
+        "--spatial-eval",
+        help=(
+            "Enable frozen same-image cross-view correspondence "
+            "(protocol spatial-geometry-v1). Rejected in this build until the "
+            "evaluation task ships it; never silently skipped."
+        ),
+        rich_help_panel="Spatial evaluation and diagnostics",
+    ),
+    spatial_eval_sample_size: int = typer.Option(
+        100,
+        "--spatial-eval-sample-size",
+        help=(
+            "Spatial evaluation only. Maximum number of deterministically selected "
+            "images for correspondence. Rejected in read mode; use --label-csv there."
+        ),
+        rich_help_panel="Spatial evaluation and diagnostics",
+    ),
+    batch_size: int = typer.Option(32, "--batch-size", help="Batch size.",
+        rich_help_panel="Runtime and reproducibility",
+    ),
+    num_workers: int = typer.Option(4, "--num-workers", help="DataLoader workers.",
+        rich_help_panel="Runtime and reproducibility",
+    ),
+    device: str = typer.Option(
+        "auto", "--device", help="Device: auto | cpu | cuda | mps.",
+        rich_help_panel="Runtime and reproducibility",
+    ),
+    seed: int = typer.Option(42, "--seed", help="Random seed.",
+        rich_help_panel="Runtime and reproducibility",
+    ),
     overwrite: bool = typer.Option(
-        False, "--overwrite", help="Clear an existing non-empty output directory."
+        False, "--overwrite", help="Clear an existing non-empty output directory.",
+        rich_help_panel="Safety",
     ),
 ) -> None:
     if ctx.invoked_subcommand is not None:
+        return
+
+    if spatial_input is not None and output_kind != "spatial":
+        raise typer.BadParameter(
+            "--spatial-input reads an existing spatial product and requires "
+            "--output-kind spatial; add it, or drop --spatial-input for the "
+            "default embedding extraction"
+        )
+
+    if output_kind == "spatial":
+        _run_spatial(
+            ctx,
+            {
+                "output_kind": output_kind,
+                "spatial_input": spatial_input,
+                "checkpoint": checkpoint,
+                "onnx_path": onnx_path,
+                "input_images_dir": input_images_dir,
+                "out_dir": out_dir,
+                "model_name": model_name,
+                "use_student": use_student,
+                "feature_layers": feature_layers,
+                "feature_norm": feature_norm,
+                "feature_l2_normalize": feature_l2_normalize,
+                "spatial_layout": spatial_layout,
+                "spatial_eval": spatial_eval,
+                "spatial_eval_sample_size": spatial_eval_sample_size,
+                "dump_model_structure": dump_model_structure,
+                "extract_size": extract_size,
+                "eval_transform": eval_transform,
+                "token_mode": token_mode,
+                "topk_patches": topk_patches,
+                "use_projector_output": use_projector_output,
+                "attention_pooling_type": attention_pooling_type,
+                "attention_pooling_epochs": attention_pooling_epochs,
+                "metrics_sample_size": metrics_sample_size,
+                "umap_n_neighbors": umap_n_neighbors,
+                "umap_min_dist": umap_min_dist,
+                "umap_metric": umap_metric,
+                "visualize_class_number": visualize_class_number,
+                "disable_umap": disable_umap,
+                "label_csv": label_csv,
+                "coco_instances": coco_instances,
+                "coco_keypoints": coco_keypoints,
+                "coco_panoptic": coco_panoptic,
+                "panoptic_masks_dir": panoptic_masks_dir,
+                "batch_size": batch_size,
+                "num_workers": num_workers,
+                "device": device,
+                "seed": seed,
+                "overwrite": overwrite,
+            },
+        )
         return
 
     _validate_extract_options(

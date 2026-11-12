@@ -11,6 +11,19 @@ code, dependency installation, data conversion, analysis, README/command/Skill
 update, version change, commit, push, or release is authorized by this documentation
 step.
 
+### Dated spatial-only deviation (2026-11-12)
+
+The [spatial design](2026-11-12-spatial-geometry-features-design.md) adds one
+explicit internal selection policy, `csv-or-directory`, to the shared reader.
+It applies to spatial image mode only: CSV rows still select, but COCO sources
+attach annotations without narrowing the set, so an otherwise unselected root is
+scanned recursively. At the spatial product boundary, `sample` survives only when
+`sample_origin == "explicit"`; a `first_directory` inference is suppressed from
+the index and reports. Every existing embedding caller keeps the historical
+`legacy` policy (CSV > COCO union > directory scan) and its `sample` inference
+unchanged. This note records the deviation; the historical embedding selector
+documented above is not rewritten.
+
 ## 1. Intent and Roadmap Position
 
 Start the shared foundation described by Sections 4.1 and 4.8 of the local

@@ -497,3 +497,92 @@ def build_run_record(
         "artifacts": artifacts,
         "failure": failure,
     }
+
+
+def _jsonable(value):
+    """Convert request values (paths, tuples) into canonical-JSON values."""
+    from pathlib import Path as _Path
+
+    if isinstance(value, _Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): _jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_jsonable(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def build_spatial_run_record(
+    *,
+    requested: dict,
+    bundle=None,
+    source_product: dict | None,
+    effective: dict,
+    used_files=(),
+    evaluation: dict | None,
+    status: str,
+    started_at: str,
+    ended_at: str | None,
+    artifacts: list[dict],
+    failure: dict | None = None,
+) -> dict:
+    """Serialize one spatial extraction/read run.
+
+    Reuses the canonical status/reason and hashing helpers. ``build_run_record``
+    and its embedding schema are untouched: a spatial run adds its own sections
+    and keeps the shared envelope keys a reader already understands.
+    """
+    if status not in ("running", "completed", "failed", "interrupted"):
+        raise ValueError(f"unknown run status: {status!r}")
+    unavailable = lambda reason: {"status": "not_provided", "reason": reason}
+    used = [
+        {
+            "path": str(snapshot.path),
+            "sha256": snapshot.sha256,
+            "bytes": int(snapshot.size_bytes),
+        }
+        for snapshot in used_files
+    ]
+    if bundle is None:
+        selection = unavailable("no image selection in this mode")
+    else:
+        selection = {
+            "rule": bundle.selection_rule,
+            "selected_images": len(bundle.records),
+            "selector": (
+                {"path": str(bundle.selector.path), "sha256": bundle.selector.sha256}
+                if bundle.selector is not None
+                else {"status": "not_provided", "reason": "no selector CSV"}
+            ),
+            "selector_columns": list(bundle.selector_columns),
+            "selection_metadata_sha256_v1": selection_metadata_digest(bundle),
+            "data_content_sha256_v1": data_content_digest(bundle),
+        }
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "status": status,
+        "command": "extract",
+        "output_kind": "spatial",
+        "started_at": started_at,
+        "ended_at": ended_at,
+        "package": {
+            "name": "otuformer",
+            "version": _package_version(),
+            "git": _git_provenance(),
+        },
+        "dependencies": _dependency_versions(),
+        "requested": _jsonable(requested),
+        "effective": _jsonable(effective),
+        "selection": selection,
+        "source_product": _jsonable(source_product)
+        if source_product is not None
+        else unavailable("this run did not read a spatial product"),
+        "used_files": used,
+        "evaluation": evaluation
+        if evaluation is not None
+        else unavailable("correspondence evaluation was not requested"),
+        "artifacts": artifacts,
+        "failure": failure,
+    }

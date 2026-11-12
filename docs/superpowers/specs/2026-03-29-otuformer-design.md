@@ -215,11 +215,23 @@ Parameters migrated from `ref/ibot20260115.py` `get_parser()`, mode=extract.
 - `--use-projector-output` : use SSL projector output for SSL checkpoints, or the ArcFace embedding for fine-tune checkpoints; recommended for fine-tuned-class retrieval and closed-set clustering
 - `--token-mode` : `cls` is raw CLS and remains the comparison baseline for unseen classes, cross-dataset transfer, and general morphology representation
 - `--label-csv` : labels enable quality metrics, while image-only input enables unlabeled UMAP. Attention-pool query training still requires `label`.
-- `--eval-transform` : `center-crop` | `whole-specimen-pad` [default: center-crop; deterministic evaluation preprocessing protocol, applied to extraction and CAM]
+- `--eval-transform` : `center-crop` | `whole-specimen-pad` [default: center-crop for embeddings, whole-specimen-pad for spatial output; deterministic evaluation preprocessing protocol, applied to extraction and CAM]
+
+**Spatial output (`--output-kind spatial`, Stage 1 delivered):** complete
+backbone-block feature grids with realized geometry are written as a separate,
+self-contained product (`spatial_manifest.json`, `spatial_index.jsonl`,
+`features/`, diagnostics) instead of `embeddings.csv`; see the
+[spatial design](2026-11-12-spatial-geometry-features-design.md) for the contract.
+Compatibility invariants: the default remains embedding output with its old
+selection, metrics and UMAP semantics; `--token-mode` gains no new meaning; a
+checkpoint or ONNX embedding run behaves exactly as before; an artifact read
+(`--spatial-input`) needs no model and never mutates the source product; and no
+spatial option is silently active in embedding mode.
 
 **Design history:**
 [v0.7.1 metric corrections](2026-09-21-otuformer-v071-cli-metrics-corrections.md),
-[optional register tokens](2026-09-28-otuformer-optional-registers-design.md).
+[optional register tokens](2026-09-28-otuformer-optional-registers-design.md),
+[spatial geometry and feature loop](2026-11-12-spatial-geometry-features-design.md).
 
 **Optional DINO extension (implemented on branch `OTU-Former-dense`, commit `ae6bde5`; formal acceptance/release not recorded):** the
 [CLS design](2026-10-31-otuformer-cls-distillation-design.md) keeps default

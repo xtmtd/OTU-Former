@@ -135,3 +135,20 @@ proposed command:
 
 Ask for a new approval when the operator changes the selector or adds a `--coco-*`
 option, because that can change parsing semantics for the same CSV file.
+
+## Spatial-output notice in the parameter card
+
+A spatial request states its resolved mode above the proposed command:
+
+- `spatial mode: checkpoint extraction` — `--checkpoint` plus `--input-images-dir`;
+  complete block grids are written with geometry, support and diagnostics.
+- `spatial mode: graph extraction` — `--onnx-path` plus images; the graph fixes the
+  layers, normalization and size, so an explicit conflicting value must be dropped.
+- `spatial mode: artifact read` — `--spatial-input` only; this needs no model and no
+  images for numeric diagnostics, writes a separate report directory, and never
+  modifies the source product.
+
+Also state, in one line, that `--output-kind spatial` is a different product from
+`embeddings.csv`, that a directory-derived `sample` is not exported, and that
+`--spatial-eval` is unavailable in this build. Missing prerequisites mean ask for
+them; they never authorize inference.

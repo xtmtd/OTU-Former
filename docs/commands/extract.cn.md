@@ -25,9 +25,63 @@ otuformer extract \
 
 ### `--input-images-dir`
 
-**默认值：** `Required`
+**默认值：** `Required`（空间产物读取模式除外）
 
-图像目录或父目录。
+图像目录或父目录。嵌入与空间图像抽取必填；空间产物读取模式可省略，此时它只用于报告叠加的图像。
+
+### `--output-kind`
+
+**默认值：** `embedding` · **可选值：** embedding / spatial
+
+要写出的产物：`embedding` 保持既有向量输出；`spatial` 写出完整的 backbone 块特征网格，并附带几何与诊断。任何选项都不会隐式切换它。
+
+### `--spatial-input`
+
+**默认值：** `None`
+
+要读取的既有已完成空间产物。需要 `--output-kind spatial`；数值诊断不需要模型或图像，且源产物永不被修改。
+
+### `--feature-layers`
+
+**默认值：** `None`（最后一个完整块）
+
+仅空间模式。逗号分隔的 backbone 相对完整块路径（例如 `blocks.5,blocks.11`）。省略时取最后一个完整块。请求顺序被保留；不支持区间、重复项或取平均。
+
+### `--feature-norm`
+
+**默认值：** `backbone` · **可选值：** backbone / none
+
+仅空间模式。对每个选定块施加 backbone 的最终归一化（`backbone`），或导出原始块输出（`none`）。
+
+### `--feature-l2-normalize`
+
+**默认值：** `No`
+
+仅空间模式。在 backbone 归一化之后对每个 token 的通道向量做 L2 归一化。与 CAM 热图的 min-max 缩放无关。
+
+### `--spatial-layout`
+
+**默认值：** `per-image` · **可选值：** per-image / sharded
+
+仅空间抽取。`per-image` 为每个样本写一个未压缩 NPZ；`sharded` 写有上界的 NPY 分片。两者共用同一个读取器。
+
+### `--spatial-eval`
+
+**默认值：** `No`
+
+启用冻结的同图跨视图对应（协议 spatial-geometry-v1）。在当前构建中，评测任务尚未交付前一律拒绝，绝不静默跳过。
+
+### `--spatial-eval-sample-size`
+
+**默认值：** `100`
+
+仅空间评测。用于对应的按确定性规则抽取的最大图像数。读取模式拒绝该选项；请改用 `--label-csv`。
+
+### `--dump-model-structure`
+
+**默认值：** `No`
+
+仅检查点的空间模式。把 backbone 相对模块路径及其空间可用性写入 `model_layers.txt`，然后继续抽取。
 
 ### `--out-dir`
 
@@ -249,6 +303,40 @@ otuformer extract \
 ```
 
 ## 说明
+
+**空间产物（`--output-kind spatial`）。**
+
+`--output-kind spatial` 完全不改动嵌入行为，而是写出独立产物，替代 `embeddings.csv`。同一个
+`extract` 命令只依据请求本身解析出三种空间模式之一：
+
+| 模式 | 必需输入 | 行为 |
+| --- | --- | --- |
+| 空间检查点 | `--checkpoint` + 图像（可选 CSV/COCO） | 单次前向读取所选完整块，映射几何与标注，写出诊断 |
+| 空间 ONNX | 已导出的空间图 + 图像 | 只读图声明的层与契约；模型、层、归一化与尺寸由图固定 |
+| 空间读取 | `--spatial-input` | 校验并重开已存样本；诊断或兼容的重评测写入独立运行目录 |
+
+- **选择。** 提供 `--label-csv` 时，严格按其行的 CSV 顺序选择图像。未提供时递归扫描根目录下
+  所有受支持图像，因此根目录与嵌套图像都会被包含。COCO 源只挂接标注，绝不扩大或收窄集合。
+  这是空间模式相对 legacy“CSV > COCO > 目录”选择器的专属偏离，嵌入抽取保持不变。
+- **不推断分组。** 只有 CSV 显式提供的 `sample` 才会保留。由目录推断出的 `sample` 会从索引
+  与报告中抑制，因此不会凭空造出标本分组。
+- **存储。** 默认 `--spatial-layout per-image`；`--spatial-layout sharded` 写出于固定未压缩
+  载荷预算内封口的 NPY 分片。布局绝不改变逻辑数组、顺序或任何诊断行。
+- **支撑记录。** 每个存储视图在模型输入画布上携带 `pixel_geometric_coverage` /
+  `pixel_sampling_valid`，在 patch 网格上携带 `geometric_coverage` / `patch_sampling_valid`。
+  覆盖率是几何比例，有效性是保守重采样支撑。两者都不是前景或解剖掩码。
+- **读取是显式的。** 不做自动发现、续跑、修补或推断。读取运行永不修改源产物，数值诊断不需要
+  模型，并在写出前拒绝抽取类覆盖选项（检查点、层、归一化、布局、尺寸、变换、COCO 源、模型名、
+  学生权重）。
+- **读取结果是报告，不是产物。** 读取结果目录只保存所选样本的诊断；它不是可复用的空间产物。
+  如果 `--spatial-input` 判定它不完整，请把 `--spatial-input` 指向原始的已完成抽取目录
+  （含 `spatial_manifest.json` 与 `spatial_index.jsonl` 的那个），该目录由报告的
+  `source_product` 溯源信息指明。
+- **限制。** 完全有效的 patch 排除了直接的填充污染，但 ViT 的全局注意力仍可能把无效 token 的
+  影响传播进来。
+
+`--spatial-eval` 已声明但本构建尚未启用：请求它会写出任何文件之前就失败，因此运行永远不会声称
+执行了并未发生的评测。
 
 可读取 OTU 检查点与旧脚本检查点（`ref/ibot20260115.py`）。嵌入头优先按 `config.embedding_head` 重建，缺失时按权重中的投影器形状推断。
 

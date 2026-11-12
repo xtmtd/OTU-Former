@@ -228,13 +228,23 @@ def help_output(args: list[str]) -> str:
     return CliRunner().invoke(get_command(app), args).output
 
 
+ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+
 def compact(text: str) -> str:
-    """Whitespace-free form.
+    """Whitespace-free, ANSI-free form.
 
     Rich wraps long URLs mid-word at the default width, so a raw substring test
-    fails even when the URL is correct.
+    fails even when the URL is correct. Forced color additionally emits escape
+    sequences between wrapped fragments, so they are stripped before whitespace:
+    otherwise a correct URL looks broken purely because the terminal was colored.
     """
-    return "".join(text.split())
+    return "".join(ANSI_ESCAPE.sub("", text).split())
+
+
+def test_compact_strips_ansi_inside_wrapped_url():
+    assert compact("training-augment\x1b[0m\x1b[2mation.md") == "training-augmentation.md"
+    assert compact("a\n  b\x1b[0m c") == "abc"
 
 
 def readme_pairs() -> list[tuple[str, str, str]]:

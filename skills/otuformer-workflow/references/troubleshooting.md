@@ -134,3 +134,18 @@ A failed shared-path run publishes `data_validation.json` plus a `failed`
 `run_provenance.json`, and no embedding/mapping pair. Report the issue codes and the
 affected image keys instead of retrying; missing annotations must not be reread as
 biological absence, and an `interrupted` or `running` status is never success.
+
+## Spatial product problems
+
+Read `run_provenance.json` first: `status` must be `completed` before a product is
+readable, and a `failed`/`interrupted` envelope means stop and report the recorded
+reason instead of retrying. A "no completed run envelope" or "manifest/index bytes do
+not match" error is a rejected or truncated product, not something to repair in place:
+re-extract into a new directory. `--spatial-input` errors about extraction overrides
+mean the request tried to relabel stored tensors; drop those options and re-extract if
+a different representation is actually wanted. If `--spatial-input` rejects a directory
+that looks like output, check whether it is a read-result report (it has
+`spatial_results.csv` but no `spatial_manifest.json`); use the original completed
+extraction directory named in that report's `source_product`. `--spatial-eval` is not
+enabled in this build and fails before writing: report that limitation rather than
+substituting a different check or a model run.

@@ -140,6 +140,21 @@ also carries a `sample` column inferred from the **first directory level** (or
 taken verbatim from a `sample` column in the input CSV). For a demo laid out as
 `<label>/<image>`, `sample` therefore equals the label directory name.
 
+`--output-kind spatial` writes a separate product instead of `embeddings.csv`:
+complete backbone-block feature grids, the realized geometry, pixel/patch
+coverage and validity support, `spatial_results.csv` and
+`spatial_diagnostics.json`, sealed by `spatial_manifest.json` and
+`spatial_index.jsonl` plus a `run_provenance.json` published last. Three modes
+resolve from the request alone: checkpoint (`--checkpoint` + images), spatial ONNX
+(`--onnx-path` + images, layers/norm/size fixed by the graph), and read
+(`--spatial-input`, no model needed). Spatial image selection is a spatial-only
+deviation: with `--label-csv` its rows select in order, otherwise **every**
+supported image under the root is scanned recursively, COCO only attaches
+annotations, and a directory-derived `sample` is suppressed instead of exported.
+Remind the operator that a read-result directory is a report, not a reusable
+product, and that `--spatial-eval` is not enabled yet, so it fails before writing
+rather than being silently skipped.
+
 ## cluster
 
 Partitions embeddings into candidate OTU sets. Typical artifacts:

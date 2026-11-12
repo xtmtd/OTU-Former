@@ -860,6 +860,13 @@ def validate_constraints(
             coco_panoptic=values.get("coco_panoptic"),
             panoptic_masks_dir=values.get("panoptic_masks_dir"),
         )
+        from otuformer.spatial.request import validate_extract_mode_options
+
+        # One shared applicability matrix: the CLI, the schema and spatial
+        # preparation must agree on what an explicit option means.
+        unresolved.extend(
+            validate_extract_mode_options(values, explicit_options=explicit_options)
+        )
 
     for name, value in values.items():
         rule = rules.get(name)

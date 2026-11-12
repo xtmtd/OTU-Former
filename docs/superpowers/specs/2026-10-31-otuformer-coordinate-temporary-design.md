@@ -71,3 +71,13 @@ Validate geometry and learned representation separately:
 The operator has now prioritized a separate CLS migration: align global cross-view pairing and DINO head-distribution distillation, without requiring an exact reproduction of the entire DINO training recipe. The current CLS objective is batch-relative similarity-distribution distillation, and its default global pairs include same-view pairs. This finding motivates that separate work; it does not select a Coordinate objective.
 
 Resume this document after CLS design is settled. Before Coordinate implementation, resolve the open decisions, review a complete design, obtain approval, and prepare an implementation plan. A later implementation should review the master design links, English/Chinese README and command documentation, shared augmentation documentation, and `skills/otuformer-workflow/` references for affected behavior. None of those integrations is performed by this temporary note.
+
+## Foundation status (2026-11-12)
+
+The [spatial geometry and feature loop](2026-11-12-spatial-geometry-features-design.md)
+now supplies the read-only foundation this note deferred: realized image geometry
+with checked source/view maps and separated coverage/validity support, verified
+complete-block feature grids, both artifact layouts with one reader, and frozen
+same-image correspondence evaluation. The Coordinate **loss** decisions in this
+note stay open: no loss, head, training handoff or resume contract was added, and
+consuming these contracts for training remains a separate design.

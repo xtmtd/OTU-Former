@@ -68,7 +68,20 @@ step at a time. Never run an analysis because this Skill was loaded.
    identity, and needs a queue-capable version for training resume.
 9. **Interpretation stays honest.** Distinguish morphOTUs from verified species,
    label classes from ecological samples, morphological trees from established
-   phylogenies, and raw-feature gradient CAM from validated attribution.
+   phylogenies, raw-feature gradient CAM from validated attribution, and numeric
+   artifact health from learned correspondence.
+10. **Name the spatial mode in the card.** When the operator asks for complete
+   feature grids rather than an embedding vector, propose `--output-kind spatial`
+   and say which spatial mode the request resolves to: checkpoint, ONNX graph, or
+   `--spatial-input` read of a completed product. A spatial extraction needs
+   `--checkpoint` or `--onnx-path` plus images; a read run needs neither a model
+   nor images for numeric diagnostics, and never writes into the source product.
+   Missing inputs are a reason to ask, never permission to run inference or to
+   repair a product. A read-result directory holds reports only: if it is rejected
+   as an incomplete product, point `--spatial-input` at the original completed
+   extraction directory named by the report's `source_product`. Report
+   coverage/validity support as geometry, not foreground, and never present
+   diagnostics as correspondence quality.
 
 Read-only inspection (schema, `--help`, logs, existing results) needs no
 approval. Analysis, installation, and version changes always do.

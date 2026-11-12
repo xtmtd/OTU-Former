@@ -36,6 +36,12 @@ Missing prerequisite: offer an individually approved preceding step, a selected
 existing artifact, or an explanation without execution. Never invent a
 random-weight checkpoint and present it as trained.
 
+The demo path teaches the embedding product. `--output-kind spatial` is a separate
+product with its own cost profile (one reference plus eleven evaluation views per
+sampled image when evaluation is enabled), so teach it only when the operator asks
+for feature grids, and never advertise correspondence results: the frozen protocol
+is not enabled in this build, and numeric diagnostics are not a matching score.
+
 ## Label and correction tables
 
 The CLI resolves image basenames to nested files. Extraction emits `id` values

@@ -25,9 +25,63 @@ Path to pretrain or finetune checkpoint. Required unless --onnx-path is provided
 
 ### `--input-images-dir`
 
-**Default:** `Required`
+**Default:** `Required` (except spatial artifact read mode)
 
-Image directory or parent directory.
+Image directory or parent directory. Required for embedding and spatial image extraction; optional in spatial artifact read mode, where it only supplies images for report overlays.
+
+### `--output-kind`
+
+**Default:** `embedding` · **Allowed:** embedding / spatial
+
+Product to write: 'embedding' keeps the existing vector output; 'spatial' writes complete backbone-block feature grids with geometry and diagnostics. No option switches it implicitly.
+
+### `--spatial-input`
+
+**Default:** `None`
+
+Existing completed spatial product to read. Requires `--output-kind spatial`; no model or images are needed for numeric diagnostics, and the source product is never modified.
+
+### `--feature-layers`
+
+**Default:** `None` (last complete block)
+
+Spatial only. Comma-separated backbone-relative complete block paths (for example 'blocks.5,blocks.11'). Omitted: the last complete block. Requested order is preserved; no ranges, duplicates or averaging.
+
+### `--feature-norm`
+
+**Default:** `backbone` · **Allowed:** backbone / none
+
+Spatial only. Apply the backbone's final norm to each selected block ('backbone') or export the raw block output ('none').
+
+### `--feature-l2-normalize`
+
+**Default:** `No`
+
+Spatial only. L2-normalize each token channel vector after the backbone norm. Independent of CAM heatmap min-max scaling.
+
+### `--spatial-layout`
+
+**Default:** `per-image` · **Allowed:** per-image / sharded
+
+Spatial extraction only. 'per-image' writes one uncompressed NPZ per sample; 'sharded' writes bounded NPY shards. Both share one reader.
+
+### `--spatial-eval`
+
+**Default:** `No`
+
+Enable frozen same-image cross-view correspondence (protocol spatial-geometry-v1). Rejected in this build until the evaluation task ships it; never silently skipped.
+
+### `--spatial-eval-sample-size`
+
+**Default:** `100`
+
+Spatial evaluation only. Maximum number of deterministically selected images for correspondence. Rejected in read mode; use --label-csv there.
+
+### `--dump-model-structure`
+
+**Default:** `No`
+
+Checkpoint spatial only. Write backbone-relative module paths with their spatial eligibility to model_layers.txt, then continue.
 
 ### `--out-dir`
 
@@ -256,6 +310,49 @@ otuformer extract \
 ```
 
 ## Notes
+
+**Spatial output (`--output-kind spatial`).**
+
+`--output-kind spatial` keeps the embedding behaviour untouched and writes a
+separate product instead of `embeddings.csv`. The same `extract` command runs one
+of three spatial modes, resolved from the request only:
+
+| Mode | Required inputs | Behaviour |
+| --- | --- | --- |
+| Spatial checkpoint | `--checkpoint` + images (optional CSV/COCO) | Read the selected complete blocks in one forward, map geometry and annotations, write diagnostics |
+| Spatial ONNX | exported spatial graph + images | Read only the graph-declared layers and contract; the graph fixes model, layers, normalization and size |
+| Spatial read | `--spatial-input` | Validate and reopen stored samples; diagnostics or compatible re-evaluation, written to a separate run directory |
+
+- **Selection.** With `--label-csv`, exactly its rows in CSV order select images.
+  Without it, every supported image under the root is scanned recursively, so
+  root-level and nested images are both included. COCO sources attach annotations
+  and never expand or narrow the set. This is a spatial-only deviation from the
+  legacy CSV > COCO > directory selector, which embedding extraction keeps.
+- **No inferred groups.** A `sample` value is kept only when the CSV supplies it
+  explicitly. Directory-derived `sample` values are suppressed from the index and
+  reports, so no specimen grouping is invented.
+- **Storage.** `--spatial-layout per-image` is the default; `--spatial-layout sharded`
+  writes NPY shards sealed below a fixed uncompressed payload budget. Layouts never
+  change a logical array, its order or any diagnostic row.
+- **Support records.** Every stored view carries `pixel_geometric_coverage` /
+  `pixel_sampling_valid` at the model-input canvas and `geometric_coverage` /
+  `patch_sampling_valid` on the patch grid. Coverage is a geometric fraction;
+  validity is conservative resampling support. Neither is a foreground or
+  anatomical mask.
+- **Read mode is explicit.** Nothing is discovered, resumed, repaired or inferred.
+  A read run never mutates the source product, needs no model for numeric
+  diagnostics, and rejects extraction overrides (checkpoint, layers, norm, layout,
+  size, transform, COCO sources, model name, student weights) before writing.
+- **Read results are reports, not products.** A read-result directory holds
+  diagnostics for the selected samples; it is not a reusable spatial product. If
+  `--spatial-input` rejects it as incomplete, point `--spatial-input` at the original
+  completed extraction directory (the one holding `spatial_manifest.json` and
+  `spatial_index.jsonl`), as identified by the report's `source_product` provenance.
+- **Limitation.** Fully valid patches exclude direct fill contamination, but ViT
+  global attention can still propagate influence from invalid tokens.
+
+`--spatial-eval` is declared but not enabled in this build: requesting it fails
+before any output is written, so a run never claims an evaluation it did not perform.
 
 Accepts OTU checkpoints and ref-script checkpoints (`ref/ibot20260115.py`). The embedding head is rebuilt from `config.embedding_head`, falling back to the projector shapes in the weights.
 
