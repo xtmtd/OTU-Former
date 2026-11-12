@@ -8,6 +8,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from PIL import Image
 
 from otuformer.data.provenance import sha256_bytes
 from otuformer.spatial.records import (
@@ -680,3 +681,131 @@ def test_v1_index_entry_fields_are_pinned(tmp_path):
     assert manifest["evaluation_plan"] == {"status": "absent"}
     assert manifest["key_rule"] == "artifact-key-resolution-v1"
     assert manifest["samples"] == 1 and manifest["views"] == 1
+
+
+def test_a_stored_plan_is_carried_and_preflighted(tmp_path):
+    """The optional paired plan persists, and a planned pair needs its payload."""
+    from otuformer.spatial.protocol import (
+        PROTOCOL_VIEW_IDS,
+        build_evaluation_plan,
+        protocol_operations,
+    )
+    from otuformer.vision.geometry import apply_geometry, evaluation_view_ops
+
+    root = tmp_path / "product"
+    feature_contract = contract_for()
+    samples = [make_sample("a.png", width=64, height=64)]
+    writer = SpatialWriter(
+        root, contract=feature_contract, layout="per-image", samples=samples
+    )
+    image = Image.new("RGB", (64, 64), (30, 60, 90))
+    base_ops = evaluation_view_ops(image, name="whole-specimen-pad", size=32)
+    stored = []
+    for view_id in PROTOCOL_VIEW_IDS:
+        if view_id == "reference":
+            ops = base_ops
+            stored_id, role = "base", "base"
+        else:
+            ops = [*base_ops, *protocol_operations(32, view_id)]
+            stored_id, role = view_id, "eval-transform"
+        _, trace = apply_geometry(image, ops, track=True)
+        view = make_view(samples[0], feature_contract, view_id=stored_id, role=role)
+        view = SpatialView(
+            image_key=view.image_key,
+            view_id=stored_id,
+            role=role,
+            trace=trace,
+            features=view.features,
+            pixel_geometric_coverage=view.pixel_geometric_coverage,
+            pixel_sampling_valid=view.pixel_sampling_valid,
+            geometric_coverage=view.geometric_coverage,
+            patch_sampling_valid=view.patch_sampling_valid,
+        )
+        writer.write(view)
+        stored.append(view)
+    plan = build_evaluation_plan({"a.png": stored}, seed=42)
+    writer.set_evaluation_plan(plan)
+    manifest = writer.finish()
+    write_envelope(root)
+
+    assert manifest["evaluation_plan"]["status"] == "present"
+    reader = open_spatial_product(root)
+    try:
+        assert reader.evaluation_plan is not None
+        assert reader.evaluation_plan["protocol"] == "spatial-geometry-v1"
+        assert reader.evaluation_plan["selected_keys"] == ["a.png"]
+        assert len(reader.evaluation_plan["pairs"]) == len(PROTOCOL_VIEW_IDS) - 1
+        assert len(reader.view_ids("a.png")) == len(PROTOCOL_VIEW_IDS)
+        # The base view is the reference alias: no second saved copy.
+        assert reader.view_ids("a.png")[0] == "base"
+    finally:
+        reader.close()
+
+    # A planned view that was never stored is corruption, not a normal subset: the
+    # index and its count are consistent, but the plan references a missing payload.
+    second = tmp_path / "truncated"
+    truncated_writer = SpatialWriter(
+        second, contract=feature_contract, layout="per-image", samples=samples
+    )
+    for view in stored:
+        if view.view_id == "rot90":
+            continue
+        truncated_writer.write(view)
+    truncated_writer.set_evaluation_plan(plan)
+    truncated_writer.finish()
+    write_envelope(second)
+    with pytest.raises(SpatialRecordError, match="missing stored view"):
+        open_spatial_product(second)
+
+
+def test_a_plan_with_a_foreign_protocol_is_rejected(tmp_path):
+    from otuformer.spatial.protocol import PROTOCOL_VIEW_IDS, build_evaluation_plan, protocol_operations
+    from otuformer.vision.geometry import apply_geometry, evaluation_view_ops
+
+    root = tmp_path / "product"
+    feature_contract = contract_for()
+    samples = [make_sample("a.png", width=64, height=64)]
+    writer = SpatialWriter(
+        root, contract=feature_contract, layout="per-image", samples=samples
+    )
+    image = Image.new("RGB", (64, 64), (30, 60, 90))
+    base_ops = evaluation_view_ops(image, name="whole-specimen-pad", size=32)
+    stored = []
+    for view_id in PROTOCOL_VIEW_IDS:
+        if view_id == "reference":
+            ops, stored_id, role = base_ops, "base", "base"
+        else:
+            ops = [*base_ops, *protocol_operations(32, view_id)]
+            stored_id, role = view_id, "eval-transform"
+        _, trace = apply_geometry(image, ops, track=True)
+        template = make_view(samples[0], feature_contract, view_id=stored_id, role=role)
+        view = SpatialView(
+            image_key=template.image_key,
+            view_id=stored_id,
+            role=role,
+            trace=trace,
+            features=template.features,
+            pixel_geometric_coverage=template.pixel_geometric_coverage,
+            pixel_sampling_valid=template.pixel_sampling_valid,
+            geometric_coverage=template.geometric_coverage,
+            patch_sampling_valid=template.patch_sampling_valid,
+        )
+        writer.write(view)
+        stored.append(view)
+    writer.set_evaluation_plan(build_evaluation_plan({"a.png": stored}, seed=42))
+    writer.finish()
+
+    from otuformer.data.provenance import canonical_json_bytes
+
+    plan_path = root / "spatial_evaluation_plan.json"
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    plan["protocol"] = "some-other-protocol"
+    payload = canonical_json_bytes(plan)
+    plan_path.write_bytes(payload)
+    manifest_path = root / FILENAME_MANIFEST
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["evaluation_plan"]["sha256"] = sha256_bytes(payload)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    write_envelope(root)
+    with pytest.raises(SpatialRecordError, match="is not 'spatial-geometry-v1'"):
+        open_spatial_product(root)

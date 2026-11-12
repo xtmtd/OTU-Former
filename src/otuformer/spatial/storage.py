@@ -656,6 +656,8 @@ class SpatialReader:
         }
 
     def _load_evaluation_plan(self) -> dict[str, Any] | None:
+        from ..constants import SPATIAL_PROTOCOL
+
         status = self.manifest["evaluation_plan"]["status"]
         if status == "absent":
             return None
@@ -663,7 +665,30 @@ class SpatialReader:
         payload = path.read_bytes()
         if sha256_bytes(payload) != self.manifest["evaluation_plan"]["sha256"]:
             raise SpatialRecordError("evaluation plan bytes do not match")
-        return json.loads(payload.decode("utf-8"))
+        plan = json.loads(payload.decode("utf-8"))
+        if plan.get("protocol") != SPATIAL_PROTOCOL:
+            raise SpatialRecordError(
+                f"saved plan protocol {plan.get('protocol')!r} is not {SPATIAL_PROTOCOL!r}"
+            )
+        require_schema_version(plan.get("schema_version"))
+        require_support_version(plan.get("support_version"))
+        stored = {(entry["sample"]["image_key"], entry["view_id"]) for entry in self._index}
+        keys = {entry["sample"]["image_key"] for entry in self._index}
+        missing_keys = [key for key in plan.get("selected_keys", []) if key not in keys]
+        if missing_keys:
+            raise SpatialRecordError(
+                "the saved plan selects keys this product does not contain: "
+                + ", ".join(missing_keys[:3])
+            )
+        for pair in plan.get("pairs", []):
+            image_key = pair.get("image_key")
+            target = pair.get("target_view")
+            if (image_key, target) not in stored:
+                raise SpatialRecordError(
+                    f"a planned pair references a missing stored view: "
+                    f"{image_key!r}/{target!r}"
+                )
+        return plan
 
     # -- access ----------------------------------------------------------
     @property

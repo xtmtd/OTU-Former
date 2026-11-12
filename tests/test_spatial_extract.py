@@ -403,3 +403,110 @@ def test_sheared_input_is_not_silently_accepted(tmp_path):
             ],
             track=True,
         )
+
+
+def test_stored_plan_keeps_base_views_and_adds_protocol_views(tmp_path):
+    """Paired storage: evaluated keys gain 11 views, every key keeps its base."""
+    import numpy as np
+
+    from otuformer.spatial.extractor import store_evaluation_views
+    from otuformer.spatial.protocol import PROTOCOL_VIEW_IDS
+    from otuformer.spatial.records import SpatialView
+    from otuformer.spatial.storage import SpatialWriter
+    from otuformer.vision.geometry import build_eval_view, patch_support, pixel_support
+
+    images = write_images(tmp_path / "images", keys=("a.png", "b.png"))
+    checkpoint = write_checkpoint(tmp_path / "model.pt")
+    values = base_values(
+        tmp_path, checkpoint=str(checkpoint), input_images_dir=str(images)
+    )
+    request = prepare_spatial_request(
+        values, explicit_options=frozenset({"checkpoint", "input_images_dir"})
+    )
+    out = Path(values["out_dir"])
+    out.mkdir(parents=True, exist_ok=True)
+    writer = SpatialWriter(
+        out,
+        contract=request.contract,
+        layout="per-image",
+        samples=list(request.samples),
+        annotations=request.annotations,
+    )
+    try:
+        base_views: dict[str, SpatialView] = {}
+        import torch
+
+        for record in request.bundle.records:
+            image = Image.open(record.access_path).convert("RGB")
+            tensor, trace = build_eval_view(
+                image, name=request.eval_transform, size=request.image_size
+            )
+            with torch.no_grad():
+                (grid,) = request.forward(tensor.unsqueeze(0))
+            coverage, pixel_valid = pixel_support(trace)
+            grid_h, grid_w = (
+                request.image_size // request.contract.patch_hw[0],
+                request.image_size // request.contract.patch_hw[1],
+            )
+            patch_cov, patch_ok = patch_support(
+                trace,
+                pixel_sampling_valid=pixel_valid,
+                grid_hw=(grid_h, grid_w),
+                patch_hw=request.contract.patch_hw,
+            )
+            base = SpatialView(
+                image_key=record.image_key,
+                view_id="base",
+                role="base",
+                trace=trace,
+                features={
+                    path: grid[0].numpy().astype(np.float32) for path in request.contract.layer_paths
+                },
+                pixel_geometric_coverage=coverage,
+                pixel_sampling_valid=pixel_valid,
+                geometric_coverage=patch_cov,
+                patch_sampling_valid=patch_ok,
+            )
+            # One layer here, so the single grid is reused for it.
+            writer.write(base)
+            base_views[record.image_key] = base
+
+        plan = store_evaluation_views(
+            request, writer, base_views=base_views, image_limit=1
+        )
+        assert plan["selected_keys"] in (["a.png"], ["b.png"])
+        writer.finish()
+    finally:
+        request.close()
+
+    from otuformer.spatial.storage import open_spatial_product
+
+    # A completed envelope is required: write the attempt's own completion record.
+    import json as _json
+
+    from otuformer.data.provenance import sha256_bytes as _sha
+
+    manifest_bytes = (out / "spatial_manifest.json").read_bytes()
+    (out / "run_provenance.json").write_text(
+        _json.dumps(
+            {
+                "status": "completed",
+                "artifacts": [
+                    {"path": "spatial_manifest.json", "sha256": _sha(manifest_bytes)}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    reader = open_spatial_product(out)
+    try:
+        evaluated = plan["selected_keys"][0]
+        other = next(key for key in reader.image_keys if key != evaluated)
+        # The stored base view is the protocol reference; the eleven transforms
+        # follow it in table order.
+        assert reader.view_ids(evaluated) == ("base", *PROTOCOL_VIEW_IDS[1:])
+        assert reader.view_ids(other) == ("base",)
+        assert reader.evaluation_plan["seed"] == 42
+        assert len(reader.evaluation_plan["pairs"]) == len(PROTOCOL_VIEW_IDS) - 1
+    finally:
+        reader.close()

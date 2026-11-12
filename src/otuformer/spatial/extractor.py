@@ -30,6 +30,7 @@ from ..constants import (
     IMAGENET_STD,
     SPATIAL_EVAL_SAMPLE_SIZE,
     SPATIAL_PROTOCOL,
+    SPATIAL_QUERY_LIMIT,
 )
 from ..data.provenance import build_spatial_run_record, canonical_json_bytes, sha256_bytes
 from ..data.reader import read_dataset
@@ -49,6 +50,7 @@ from ..spatial.records import (
     SpatialView,
     samples_from_records,
 )
+from ..spatial.protocol import select_evaluation_keys
 from ..spatial.request import (
     MODE_CHECKPOINT,
     MODE_EMBEDDING,
@@ -672,17 +674,10 @@ def _run_forward(
     prepared: PreparedSpatialRequest, tensors, device: Any
 ) -> tuple[np.ndarray, ...]:
     """One batch through whichever backend this request resolved to."""
-    if prepared.mode == MODE_ONNX:
-        import numpy as _np
-
-        stacked = _np.stack([tensor.numpy() for _, tensor, _, _ in tensors])
-        return tuple(prepared.forward(stacked))
     import torch
 
-    stacked = torch.stack([item[1] for item in tensors]).to(device)
-    produced = prepared.forward(stacked)
-    return tuple(
-        value.detach().to("cpu").numpy().astype(np.float32) for value in produced
+    return _forward_numpy(
+        prepared, torch.stack([item[1] for item in tensors]), device
     )
 
 
@@ -872,6 +867,116 @@ def reevaluate_spatial(
         "out_dir": str(out_dir),
         "deferred": False,
     }
+
+
+def _forward_numpy(
+    prepared: PreparedSpatialRequest, tensor_batch, device: Any
+) -> tuple[np.ndarray, ...]:
+    """One stacked batch through whichever backend this request resolved to."""
+    if prepared.mode == MODE_ONNX:
+        return tuple(
+            prepared.forward(np.stack([tensor.numpy() for tensor in tensor_batch]))
+        )
+    produced = prepared.forward(tensor_batch.to(device))
+    return tuple(
+        value.detach().to("cpu").numpy().astype(np.float32) for value in produced
+    )
+
+
+def _assemble_view(
+    prepared: PreparedSpatialRequest,
+    image_key: str,
+    view_id: str,
+    role: str,
+    trace: Any,
+    outputs: Sequence[np.ndarray],
+    position: int,
+) -> SpatialView:
+    """One stored view: shared support plus this backend's feature grids."""
+    contract = prepared.contract
+    assert contract is not None
+    grid_h, grid_w = (
+        int(contract.input_hw[0]) // int(contract.patch_hw[0]),
+        int(contract.input_hw[1]) // int(contract.patch_hw[1]),
+    )
+    coverage, pixel_valid = pixel_support(trace)
+    patch_coverage, patch_valid = patch_support(
+        trace,
+        pixel_sampling_valid=pixel_valid,
+        grid_hw=(grid_h, grid_w),
+        patch_hw=contract.patch_hw,
+    )
+    features = {
+        path: np.asarray(outputs[index][position], dtype=np.float32)
+        for index, path in enumerate(contract.layer_paths)
+    }
+    return SpatialView(
+        image_key=image_key,
+        view_id=view_id,
+        role=role,
+        trace=trace,
+        features=features,
+        pixel_geometric_coverage=coverage,
+        pixel_sampling_valid=pixel_valid,
+        geometric_coverage=patch_coverage,
+        patch_sampling_valid=patch_valid,
+    )
+
+
+def store_evaluation_views(
+    prepared: PreparedSpatialRequest,
+    writer: SpatialWriter,
+    *,
+    base_views: Mapping[str, SpatialView],
+    image_limit: int = SPATIAL_EVAL_SAMPLE_SIZE,
+    query_limit: int = SPATIAL_QUERY_LIMIT,
+) -> dict[str, Any]:
+    """Store the frozen protocol views for the sampled keys and seal the plan.
+
+    Only evaluated keys get extra views: their stored base view is the protocol
+    reference (no second copy), plus the eleven transforms. The plan is built from
+    stored support only, so no feature value, label or true location influences
+    which images or queries are used.
+    """
+    import torch
+
+    from ..spatial.protocol import build_evaluation_plan, build_evaluation_views
+
+    assert prepared.contract is not None
+    seed = int(prepared.values.get("seed") or 42)
+    records = {record.image_key: record for record in prepared.bundle.records}
+    selected = select_evaluation_keys(list(base_views), seed=seed, limit=image_limit)
+    views_by_key: dict[str, list[SpatialView]] = {}
+    with _backend_context(prepared) as device:
+        for key in selected:
+            image = _decode(records[key].image_file)
+            built = build_evaluation_views(
+                image,
+                image_key=key,
+                eval_transform=str(prepared.eval_transform),
+                size=int(prepared.image_size),
+            )
+            transformed = [
+                (view_id, tensor, trace)
+                for view_id, tensor, trace in built
+                if view_id != "reference"
+            ]
+            tensor_batch = torch.stack([tensor for _, tensor, _ in transformed])
+            outputs = _forward_numpy(prepared, tensor_batch, device)
+            views = [
+                _assemble_view(
+                    prepared, key, view_id, "eval-transform", trace, outputs, position
+                )
+                for position, (view_id, _tensor, trace) in enumerate(transformed)
+            ]
+            for view in views:
+                writer.write(view)
+            views_by_key[key] = [base_views[key], *views]
+    plan = build_evaluation_plan(
+        views_by_key, seed=seed, image_limit=image_limit, query_limit=query_limit
+    )
+    writer.set_evaluation_plan(plan)
+    return plan
 
 
 def _attach_reader_sample_ids(rows: list[dict[str, Any]], reader: SpatialReader) -> None:
