@@ -52,6 +52,51 @@ RELATIONAL_PAIRING_CHOICES: tuple[str, ...] = ("cross", "full")
 LEGACY_RELATIONAL_PAIRING = "same"
 
 EVAL_TRANSFORM_CHOICES = ("center-crop", "whole-specimen-pad")
+
+# ---------------------------------------------------------------------------
+# Spatial geometry and feature reading (design 2026-11-12). Version-1 products
+# keep these identifiers fixed: they name a stored representation contract, not
+# a tunable.
+# ---------------------------------------------------------------------------
+
+# Input normalization applied once after every geometric operation.
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
+
+OUTPUT_KIND_CHOICES = ("embedding", "spatial")
+FEATURE_NORM_CHOICES = ("backbone", "none")
+SPATIAL_LAYOUT_CHOICES = ("per-image", "sharded")
+SPATIAL_VIEW_ROLES = ("base", "eval-reference", "eval-transform")
+
+SPATIAL_SCHEMA_VERSION = 1
+SPATIAL_PROTOCOL = "spatial-geometry-v1"
+SPATIAL_SUPPORT_VERSION = "conservative-resampling-v1"
+SPATIAL_COORDINATE_ADAPTER = "coco-pixel-index-to-edge-v1"
+SPATIAL_KEY_RULE = "artifact-key-resolution-v1"
+SPATIAL_ONNX_METADATA_KEY = "otuformer.spatial.v1"
+
+SPATIAL_L2_EPSILON = 1e-12
+SPATIAL_EVAL_SAMPLE_SIZE = 100
+SPATIAL_QUERY_LIMIT = 64
+SPATIAL_PCK_THRESHOLDS = (0.01, 0.02, 0.05)
+SPATIAL_EVAL_VIEW_IDS = (
+    "reference",
+    "crop075",
+    "tx10",
+    "ty10",
+    "scale090",
+    "scale110",
+    "rot-15",
+    "rot15",
+    "rot90",
+    "hflip",
+    "vflip",
+    "combo",
+)
+SPATIAL_ATTENTION_LIMITATION = (
+    "Fully valid patches exclude direct fill contamination, but ViT global "
+    "attention can still propagate influence from invalid tokens."
+)
 TOKEN_MODES = ("cls", "patch-topk", "attention-pool")
 ATTENTION_POOLING_TYPES = ("lightweight", "multihead", "gated")
 
