@@ -102,6 +102,7 @@ class SpatialWriter:
         samples: Sequence[SpatialSample],
         annotations: Mapping[str, Any] | None = None,
         evaluation_plan: Mapping[str, Any] | None = None,
+        shard_bytes: int | None = None,
     ) -> None:
         if not layout_is_valid(layout):
             raise SpatialRecordError(f"unsupported spatial layout {layout!r}")
@@ -124,6 +125,14 @@ class SpatialWriter:
         self._sample_payloads: dict[int, Path] = {}
         self._pending_sample: int | None = None
         self._pending_arrays: dict[str, np.ndarray] = {}
+        # Bounded shard budget. ``shard_bytes`` is a private test seam, never a
+        # CLI option: version 1 has one budget.
+        self._shard_bytes = int(shard_bytes or SHARD_BYTES)
+        self._staging: dict[tuple[Any, ...], list[np.ndarray]] = {}
+        self._staging_bytes: dict[tuple[Any, ...], int] = {}
+        self._shard_numbers: dict[tuple[Any, ...], int] = {}
+        self._shard_paths: dict[tuple[Any, ...], str] = {}
+        self._shards: list[dict[str, Any]] = []
         self._closed = False
         self._manifest: dict[str, Any] | None = None
         (self.out_dir / DIRECTORY_FEATURES).mkdir(parents=True, exist_ok=True)
@@ -172,9 +181,12 @@ class SpatialWriter:
         logical: dict[str, dict[str, Any]] = {}
         refs: dict[str, dict[str, Any]] = {}
         for logical_name, role, array in view_arrays(view):
+            logical[logical_name] = array_descriptor(role, array)
+            if self.layout == "sharded":
+                refs[logical_name] = self._stage_row(logical_name, role, array)
+                continue
             key = f"v{slot:04d}.{logical_name}"
             arrays[key] = np.asarray(array)
-            logical[logical_name] = array_descriptor(role, array)
             refs[logical_name] = {
                 "kind": "npz",
                 "path": f"{DIRECTORY_FEATURES}/{sample_id:06d}.npz",
@@ -196,6 +208,8 @@ class SpatialWriter:
         }
         self._entries.append(entry)
         self._written_views.add(identity)
+        if self.layout == "sharded":
+            return
         # One NPZ per sample. Views arrive grouped by sample, so the archive is
         # written once when the sample's views are complete (or at finish()), and
         # a reader never observes a half-updated sample.
@@ -211,6 +225,108 @@ class SpatialWriter:
         self._pending_sample = None
         self._pending_arrays = {}
 
+    # -- bounded shards --------------------------------------------------
+    def _bucket_key(
+        self, logical_name: str, role: str, array: np.ndarray
+    ) -> tuple[Any, ...]:
+        """One bucket per compatible (kind, layer/support role, grid, dtype)."""
+        canonical = _canonical_array(array)
+        if logical_name.startswith(FEATURE_ARRAY_PREFIX):
+            return ("feature", logical_name, tuple(canonical.shape), canonical.dtype.str)
+        return ("support", role, tuple(canonical.shape), canonical.dtype.str)
+
+    def _shard_path(self, bucket: tuple[Any, ...]) -> str:
+        number = self._shard_numbers.get(bucket, 0)
+        if bucket[0] == "feature":
+            label = bucket[1].replace(FEATURE_ARRAY_PREFIX, "feature-")
+        else:
+            label = f"support-{bucket[1]}"
+        label = "".join(
+            character if character.isalnum() or character in "-_" else "_"
+            for character in label
+        )
+        return f"{DIRECTORY_FEATURES}/{label}-{number:06d}.npy"
+
+    def _stage_row(
+        self, logical_name: str, role: str, array: np.ndarray
+    ) -> dict[str, Any]:
+        canonical = _canonical_array(array)
+        bucket = self._bucket_key(logical_name, role, array)
+        if bucket not in self._staging:
+            self._staging[bucket] = []
+            self._staging_bytes[bucket] = 0
+            self._shard_numbers[bucket] = 0
+            self._shard_paths[bucket] = self._shard_path(bucket)
+        if (
+            self._staging[bucket]
+            and self._staging_bytes[bucket] + canonical.nbytes > self._shard_bytes
+        ):
+            self._seal_bucket(bucket)
+        row = len(self._staging[bucket])
+        self._staging[bucket].append(canonical)
+        self._staging_bytes[bucket] += int(canonical.nbytes)
+        return {
+            "kind": "npy",
+            "path": self._shard_paths[bucket],
+            "row": row,
+            "bucket": "|".join(str(part) for part in bucket[:-1]),
+        }
+
+    def _seal_bucket(self, bucket: tuple[Any, ...]) -> None:
+        rows = self._staging.get(bucket) or []
+        if not rows:
+            return
+        stacked = np.stack(rows, axis=0)
+        relative = self._shard_paths[bucket]
+        path = self.out_dir / relative
+        payload = io.BytesIO()
+        np.save(payload, stacked, allow_pickle=False)
+        body = payload.getvalue()
+        path.write_bytes(body)
+        self._created.append(path)
+        oversized = len(rows) == 1 and stacked.nbytes > self._shard_bytes
+        self._shards.append(
+            {
+                "path": relative,
+                "bucket": "|".join(str(part) for part in bucket[:-1]),
+                "rows": len(rows),
+                "uncompressed_bytes": int(stacked.nbytes),
+                "physical_bytes": len(body),
+                "oversized_record": bool(oversized),
+                "dtype": stacked.dtype.str,
+                "record_shape": [int(v) for v in stacked.shape[1:]],
+            }
+        )
+        self._files.append(
+            {
+                "role": "payload",
+                "path": relative,
+                "sha256": sha256_bytes(body),
+                "bytes": len(body),
+                "uncompressed_bytes": int(stacked.nbytes),
+                "records": len(rows),
+                "rows": len(rows),
+                "bucket": "|".join(str(part) for part in bucket[:-1]),
+                "oversized_record": bool(oversized),
+            }
+        )
+        self._staging[bucket] = []
+        self._staging_bytes[bucket] = 0
+        self._shard_numbers[bucket] = self._shard_numbers.get(bucket, 0) + 1
+        next_path = self._shard_path(bucket)
+        while (self.out_dir / next_path).exists():
+            self._shard_numbers[bucket] = self._shard_numbers.get(bucket, 0) + 1
+            next_path = self._shard_path(bucket)
+        self._shard_paths[bucket] = next_path
+
+    def _seal_all_buckets(self) -> None:
+        for bucket in list(self._staging):
+            self._seal_bucket(bucket)
+
+    def shard_report(self) -> list[dict[str, Any]]:
+        """Sealed shard sizes for the run log (physical and payload bytes)."""
+        return [dict(entry) for entry in self._shards]
+
     # -- plan and sealing ------------------------------------------------
     def set_evaluation_plan(self, plan: Mapping[str, Any]) -> None:
         if self._closed:
@@ -223,6 +339,7 @@ class SpatialWriter:
         if self._closed:
             raise SpatialRecordError("this writer is already sealed")
         self._flush_pending()
+        self._seal_all_buckets()
         missing = [
             sample.image_key
             for sample in self.samples
@@ -405,6 +522,7 @@ class SpatialReader:
         )
         self._verified_payloads: list[str] = []
         self._open_npz: dict[str, Any] = {}
+        self._open_shards: dict[str, Any] = {}
         self.annotations = self._load_annotations()
         self.evaluation_plan = self._load_evaluation_plan()
 
@@ -619,19 +737,41 @@ class SpatialReader:
         loaded: dict[str, np.ndarray] = {}
         for name, descriptor in entry["arrays"].items():
             ref = entry["refs"][name]
-            if ref["kind"] != "npz":
+            if ref["kind"] == "npz":
+                archive = self._open_archive(ref["path"])
+                if ref["key"] not in archive.files:
+                    raise SpatialRecordError(
+                        f"payload {ref['path']} has no array {ref['key']!r}"
+                    )
+                array = archive[ref["key"]]
+                label = ref["key"]
+            elif ref["kind"] == "npy":
+                shard = self._open_shard(ref["path"])
+                row = int(ref["row"])
+                if row < 0 or row >= int(shard.shape[0]):
+                    raise SpatialRecordError(
+                        f"shard {ref['path']} has no row {row}"
+                    )
+                # One bounded copy: the memmap stays read-only and no caller can
+                # write through a materialized view.
+                array = np.array(shard[row], copy=True)
+                label = f"{ref['path']}[{row}]"
+            else:
                 raise SpatialRecordError(
                     f"unsupported payload kind {ref['kind']!r} for this reader"
                 )
-            archive = self._open_archive(ref["path"])
-            if ref["key"] not in archive.files:
-                raise SpatialRecordError(
-                    f"payload {ref['path']} has no array {ref['key']!r}"
-                )
-            array = archive[ref["key"]]
-            self._check_descriptor(array, descriptor, ref["key"])
+            self._check_descriptor(array, descriptor, label)
             loaded[name] = array
         return loaded
+
+    def _open_shard(self, relative: str):
+        cached = self._open_shards.get(relative)
+        if cached is not None:
+            return cached
+        self._verify_payload(relative)
+        shard = np.load(self.path / relative, mmap_mode="r", allow_pickle=False)
+        self._open_shards[relative] = shard
+        return shard
 
     def _check_descriptor(
         self, array: np.ndarray, descriptor: Mapping[str, Any], name: str
@@ -690,6 +830,12 @@ class SpatialReader:
             except Exception:  # pragma: no cover - archive already closed
                 pass
         self._open_npz.clear()
+        for shard in self._open_shards.values():
+            try:
+                del shard
+            except Exception:  # pragma: no cover - memmap already released
+                pass
+        self._open_shards.clear()
 
     def __enter__(self) -> "SpatialReader":
         return self
