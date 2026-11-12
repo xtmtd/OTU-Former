@@ -58,6 +58,14 @@ SELECTION_CSV = "csv_rows"
 SELECTION_COCO = "coco_union"
 SELECTION_DIRECTORY = "directory_scan"
 
+#: Historical selector: CSV rows, otherwise the COCO image union, otherwise a
+#: recursive directory scan.
+LEGACY_SELECTION = "legacy"
+#: Spatial image mode: CSV rows, otherwise every supported image under the root.
+#: COCO sources attach annotations only and never expand or narrow the selection.
+CSV_OR_DIRECTORY_SELECTION = "csv-or-directory"
+SELECTION_POLICIES = (LEGACY_SELECTION, CSV_OR_DIRECTORY_SELECTION)
+
 
 def read_dataset(
     images_dir: Path,
@@ -67,7 +75,20 @@ def read_dataset(
     coco_keypoints: Path | None = None,
     coco_panoptic: Path | None = None,
     panoptic_masks_dir: Path | None = None,
+    selection_policy: str = LEGACY_SELECTION,
 ) -> DataBundle:
+    """Read one validated ``DataBundle`` under an explicit selection policy.
+
+    ``selection_policy="legacy"`` is the historical selector and stays the
+    default for every existing caller. ``selection_policy="csv-or-directory"``
+    is the spatial-only deviation: CSV rows still win, but COCO sources attach
+    annotations only, so an otherwise unselected root is scanned recursively.
+    """
+    if selection_policy not in SELECTION_POLICIES:
+        raise ValueError(
+            f"unknown selection policy {selection_policy!r}; "
+            f"expected one of {SELECTION_POLICIES}"
+        )
     # Keep the spelling the caller used: an absolute reference may name the root
     # through the same symlink, and that spelling carries the alias identity.
     root_written = Path(images_dir).expanduser()
@@ -115,7 +136,7 @@ def read_dataset(
             root, Path(manifest), report, key_refs, declared, root_written
         )
         rule = SELECTION_CSV
-    elif sources:
+    elif sources and selection_policy == LEGACY_SELECTION:
         records, snapshot, columns = _read_coco_selection(
             root, report, key_refs, declared
         )
