@@ -203,26 +203,15 @@ def load_model_from_checkpoint(
 
 
 def get_module_by_name(model: torch.nn.Module, name: str) -> torch.nn.Module:
-    module = model
-    for attr in name.split("."):
-        if attr.isdigit():
-            idx = int(attr)
-            try:
-                module = module[idx]
-            except Exception as exc:
-                raise AttributeError(
-                    f"Module '{module.__class__.__name__}' has no index '{attr}'"
-                ) from exc
-            continue
-        if isinstance(module, torch.nn.ModuleDict) and attr in module:
-            module = module[attr]
-            continue
-        if not hasattr(module, attr):
-            raise AttributeError(
-                f"Module '{module.__class__.__name__}' has no attribute '{attr}'"
-            )
-        module = getattr(module, attr)
-    return module
+    """Resolve a dotted module path.
+
+    Delegates to :func:`otuformer.vision.features.get_module_by_name`: spatial
+    extraction and CAM look a module up the same way, and CAM keeps accepting
+    arbitrary attribution targets (not only complete blocks).
+    """
+    from otuformer.vision.features import get_module_by_name as _lookup
+
+    return _lookup(model, name)
 
 
 def find_last_conv_module(model: torch.nn.Module) -> torch.nn.Module:
@@ -257,58 +246,112 @@ def infer_architecture(base_model_name: str, model: torch.nn.Module) -> str:
 
 
 def vit_reshape_transform(
-    tensor: torch.Tensor, prefix_tokens: int = 1
+    tensor: torch.Tensor,
+    prefix_tokens: int = 1,
+    *,
+    grid_hw: tuple[int, int] | None = None,
 ) -> torch.Tensor:
-    """Reshape ViT tokens into a square grid, dropping every prefix token.
+    """Reshape ViT tokens into a grid, dropping every prefix token.
 
     ``prefix_tokens`` is the loaded backbone's ``num_prefix_tokens`` so CLS and
     register tokens never become image pixels; the default keeps the historical
     one-prefix behaviour for direct callers.
+
+    ``grid_hw`` is the real patch grid of the loaded input. Production callbacks
+    always pass it, because a square root of the token count is only correct for a
+    square input; without it that historical fallback is used and still validated.
     """
     if tensor.ndim != 3:
         raise ValueError(f"Expected (B, N, C), got {tensor.shape}")
-    tensor = tensor[:, int(prefix_tokens):, :]
+    prefix = int(prefix_tokens)
+    if prefix < 0 or prefix >= int(tensor.shape[1]):
+        raise ValueError(
+            f"prefix_tokens must leave at least one patch token, got {prefix} for "
+            f"{int(tensor.shape[1])} tokens"
+        )
+    tensor = tensor[:, prefix:, :]
     batch, tokens, channels = tensor.shape
+    if grid_hw is not None:
+        grid_h, grid_w = int(grid_hw[0]), int(grid_hw[1])
+        if grid_h <= 0 or grid_w <= 0:
+            raise ValueError(f"grid_hw must be positive, got {grid_hw}")
+        if grid_h * grid_w != tokens:
+            raise ValueError(
+                f"{tokens} patch tokens do not match the {grid_h}x{grid_w} grid"
+            )
+        return tensor.permute(0, 2, 1).reshape(batch, channels, grid_h, grid_w)
     spatial_dim = int(tokens**0.5)
     if spatial_dim * spatial_dim != tokens:
-        raise ValueError("Token count cannot form a square grid.")
+        raise ValueError(
+            "Token count cannot form a square grid; pass grid_hw from the loaded "
+            "input and patch layout."
+        )
     return tensor.permute(0, 2, 1).reshape(batch, channels, spatial_dim, spatial_dim)
 
 
-def _bind_reshape_transform(model: torch.nn.Module):
-    """Bind the loaded backbone's prefix-token count into the ViT reshape."""
+def vit_input_grid(model: torch.nn.Module, image_size: int | None) -> tuple[int, int] | None:
+    """The real patch grid for a loaded backbone at ``image_size``."""
+    if image_size is None:
+        return None
+    from otuformer.utils.size import resolve_backbone_patch_size
+
+    patch = resolve_backbone_patch_size(model)
+    if patch is None:
+        return None
+    size = int(image_size)
+    if size % patch:
+        raise ValueError(
+            f"input size {size} is not divisible by patch size {patch}; the CAM "
+            "grid cannot be derived from a square-root guess"
+        )
+    return (size // patch, size // patch)
+
+
+def _bind_reshape_transform(
+    model: torch.nn.Module, *, grid_hw: tuple[int, int] | None = None
+):
+    """Bind the loaded backbone's prefix-token count and real grid."""
     backbone = getattr(model, "backbone", model)
     prefix_tokens = int(getattr(backbone, "num_prefix_tokens", 1))
 
     def reshape(tensor: torch.Tensor) -> torch.Tensor:
-        return vit_reshape_transform(tensor, prefix_tokens=prefix_tokens)
+        return vit_reshape_transform(
+            tensor, prefix_tokens=prefix_tokens, grid_hw=grid_hw
+        )
 
     return reshape
+
+
+class _DisplayView:
+    """The geometric part of one eval protocol, executed by the shared owner."""
+
+    def __init__(self, name: str, size: int) -> None:
+        if name not in EVAL_TRANSFORMS:
+            raise ValueError(
+                f"Unknown eval transform '{name}'; choose from: "
+                f"{', '.join(EVAL_TRANSFORMS)}"
+            )
+        self.name = name
+        self.size = int(size)
+
+    def __call__(self, image: Image.Image) -> Image.Image:
+        from otuformer.vision.geometry import apply_geometry, evaluation_view_ops
+
+        viewed, _ = apply_geometry(
+            image, evaluation_view_ops(image, name=self.name, size=self.size)
+        )
+        return viewed
 
 
 def build_display_transform(name: str, size: int) -> transforms.Compose:
     """Return the display transform matching the named eval protocol.
 
     The display transform mirrors the geometric (resize/pad/crop) part of the
-    preprocessing without the tensor/normalization steps.
+    preprocessing without the tensor/normalization steps. It executes the same
+    operation list the extractor and :func:`map_cam_to_original` use, so the
+    overlay, the field of view and the model input cannot disagree.
     """
-    if name == "center-crop":
-        return transforms.Compose(
-            [
-                transforms.Resize(size, interpolation=Image.BICUBIC),
-                transforms.CenterCrop(size),
-            ]
-        )
-    if name == "whole-specimen-pad":
-        return transforms.Compose(
-            [
-                transforms.Lambda(pad_to_square),
-                transforms.Resize((size, size), interpolation=Image.BICUBIC),
-            ]
-        )
-    raise ValueError(
-        f"Unknown eval transform '{name}'; choose from: {', '.join(EVAL_TRANSFORMS)}"
-    )
+    return transforms.Compose([_DisplayView(name, size)])
 
 
 def _dim_desaturate(rgb: np.ndarray, factor: float = 0.5) -> np.ndarray:
@@ -337,30 +380,35 @@ def map_cam_to_original(
     """
     import cv2
 
+    from otuformer.vision.geometry import evaluation_view_operations
+
     width, height = original_size
+    # The crop bounds and padding offsets come from the same owner that builds the
+    # extracted view, so CAM and extraction cannot disagree about the field of view.
+    operations = evaluation_view_operations(
+        (width, height), name=eval_transform, size=model_size
+    )
     if eval_transform == "whole-specimen-pad":
-        side = max(width, height)
+        pad = next((op for op in operations if op.kind == "pad"), None)
+        side = int(pad.params["canvas_wh"][0]) if pad is not None else max(width, height)
+        offset_x, offset_y = (
+            (int(pad.params["offset"][0]), int(pad.params["offset"][1]))
+            if pad is not None
+            else (0, 0)
+        )
         padded = cv2.resize(cam_norm, (side, side), interpolation=cv2.INTER_LINEAR)
-        if width >= height:
-            y0 = (side - height) // 2
-            region = padded[y0 : y0 + height, :]
-        else:
-            x0 = (side - width) // 2
-            region = padded[:, x0 : x0 + width]
+        region = padded[offset_y : offset_y + height, offset_x : offset_x + width]
         cam_on_full = cv2.resize(
             region, (width, height), interpolation=cv2.INTER_LINEAR
         )
         return cam_on_full, np.ones((height, width), dtype=bool)
 
-    # center-crop: replicate torchvision Resize(shorter side) then CenterCrop.
-    # torchvision truncates the long side with int(); CenterCrop offsets use
-    # int(round((long - size) / 2)).
-    if width >= height:
-        resized_w, resized_h = int(model_size * width / height), model_size
-    else:
-        resized_w, resized_h = model_size, int(model_size * height / width)
-    x0 = int(round((resized_w - model_size) / 2.0))
-    y0 = int(round((resized_h - model_size) / 2.0))
+    # center-crop: the recorded resize target and the recorded integer crop bounds.
+    resize = next(op for op in operations if op.kind == "resize")
+    crop = next(op for op in operations if op.kind == "crop")
+    resized_w, resized_h = (int(v) for v in resize.params["to_wh"])
+    x0 = int(crop.params["left"])
+    y0 = int(crop.params["top"])
     canvas = np.zeros((resized_h, resized_w), dtype=np.float32)
     fov = np.zeros((resized_h, resized_w), dtype=bool)
     canvas[y0 : y0 + model_size, x0 : x0 + model_size] = cam_norm
@@ -378,6 +426,8 @@ def prepare_cam(
     target_layer_name: Optional[str],
     cam_name: str,
     cam_batch_size: int,
+    *,
+    image_size: int | None = None,
 ):
     if not _HAS_CAM:
         raise ImportError("pytorch-grad-cam is required for CAM generation")
@@ -391,7 +441,11 @@ def prepare_cam(
             else [default_vit_target(model)]
         )
 
-    reshape_transform = _bind_reshape_transform(model) if arch == "vit" else None
+    reshape_transform = (
+        _bind_reshape_transform(model, grid_hw=vit_input_grid(model, image_size))
+        if arch == "vit"
+        else None
+    )
     cam_kwargs = {
         "model": model,
         "target_layers": target_layers,

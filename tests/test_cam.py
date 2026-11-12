@@ -356,13 +356,16 @@ def test_every_cam_method_uses_a_patch_only_grid(
     seen = []
     real_reshape = cam_module.vit_reshape_transform
 
-    def spy(tensor, prefix_tokens=1):
-        result = real_reshape(tensor, prefix_tokens=prefix_tokens)
-        seen.append((tuple(tensor.shape), int(prefix_tokens), tuple(result.shape)))
+    def spy(tensor, prefix_tokens=1, *, grid_hw=None):
+        result = real_reshape(tensor, prefix_tokens=prefix_tokens, grid_hw=grid_hw)
+        seen.append(
+            (tuple(tensor.shape), int(prefix_tokens), grid_hw, tuple(result.shape))
+        )
         return result
 
     monkeypatch.setattr(cam_module, "vit_reshape_transform", spy)
-    cam, _layers, _reshape = prepare_cam(encoder, "vit", None, name, 1)
+    # Production always passes the loaded input size; 48 px / 16 px patch = 3x3.
+    cam, _layers, _reshape = prepare_cam(encoder, "vit", None, name, 1, image_size=48)
 
     with torch.enable_grad():
         raw = cam(
@@ -372,9 +375,11 @@ def test_every_cam_method_uses_a_patch_only_grid(
 
     assert np.isfinite(raw).all()
     assert seen, "reshape_transform was never called"
-    for input_shape, seen_prefix, output_shape in seen:
+    for input_shape, seen_prefix, seen_grid, output_shape in seen:
         assert seen_prefix == prefix
         assert input_shape[1] == prefix + 9
+        # The production callback passes the real patch grid, never sqrt(N).
+        assert seen_grid == (3, 3)
         assert output_shape[-2:] == (3, 3)
 
 
@@ -657,18 +662,40 @@ def test_cam_arch_is_inferred_from_checkpoint_model_name(monkeypatch, tmp_path):
 
 
 def test_build_display_transform_matches_protocol_and_rejects_unknown():
-    import torchvision.transforms as transforms
+    import numpy as np
+    from torchvision.transforms import functional as TF
 
-    from otuformer.training.dataset import EVAL_TRANSFORMS, build_eval_transform
+    from otuformer.training.dataset import (
+        EVAL_TRANSFORMS,
+        build_eval_transform,
+        pad_to_square,
+    )
+
+    image = Image.new("RGB", (91, 37))
+    for x in range(91):
+        for y in range(37):
+            image.putpixel((x, y), (x * 5 % 256, y * 7 % 256, (x + y) % 256))
+
+    # Independent reference of the historical geometric composition per protocol.
+    def reference(name: str) -> Image.Image:
+        if name == "center-crop":
+            # 91x37: the shorter side (height) becomes 224, width grows to 551.
+            resized = TF.resize(
+                image, [224, int(224 * 91 / 37)], interpolation=Image.BICUBIC
+            )
+            return TF.center_crop(resized, [224, 224])
+        return TF.resize(pad_to_square(image), [224, 224], interpolation=Image.BICUBIC)
 
     for name in EVAL_TRANSFORMS:
         preprocess = build_eval_transform(name, 224)
         display = build_display_transform(name, 224)
-        # the display transform is exactly the geometric part of the preprocess
-        assert [type(t) for t in display.transforms] == [
-            type(t) for t in preprocess.transforms[: len(display.transforms)]
-        ]
-        assert len(preprocess.transforms) == len(display.transforms) + 2  # + ToTensor, Normalize
+        produced = display(image)
+        assert produced.size == (224, 224)
+        np.testing.assert_array_equal(np.asarray(produced), np.asarray(reference(name)))
+        # The preprocessing tensor still equals ToTensor+Normalize of that view.
+        torch.testing.assert_close(
+            preprocess(image), preprocess.transforms[0](produced)
+        )
     with pytest.raises(ValueError, match="Unknown eval transform 'bogus'"):
         build_display_transform("bogus", 224)
     assert "center-crop" in EVAL_TRANSFORMS

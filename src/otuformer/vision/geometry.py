@@ -461,8 +461,7 @@ def resize_output_size(size: int, width: int, height: int) -> tuple[int, int]:
     return int(new_w), int(new_h)
 
 
-def _center_crop_ops(image: Image.Image, size: int) -> list[GeometryOp]:
-    width, height = image.size
+def _center_crop_ops_for_size(width: int, height: int, size: int) -> list[GeometryOp]:
     new_w, new_h = resize_output_size(size, width, height)
     ops = [
         GeometryOp(
@@ -494,9 +493,9 @@ def _center_crop_ops(image: Image.Image, size: int) -> list[GeometryOp]:
     return ops
 
 
-def _whole_specimen_ops(image: Image.Image, size: int) -> list[GeometryOp]:
-    width, height = image.size
-    fill = estimate_background_color(image)
+def _whole_specimen_ops_for_size(
+    width: int, height: int, size: int, fill: tuple[int, int, int]
+) -> list[GeometryOp]:
     side = max(width, height)
     offset = (
         (0, (side - height) // 2) if width > height else ((side - width) // 2, 0)
@@ -529,16 +528,38 @@ def _whole_specimen_ops(image: Image.Image, size: int) -> list[GeometryOp]:
     return ops
 
 
-def evaluation_view_ops(image: Image.Image, *, name: str, size: int) -> list[GeometryOp]:
-    """The recorded operation list of one named deterministic eval protocol."""
+def evaluation_view_operations(
+    source_wh: tuple[int, int],
+    *,
+    name: str,
+    size: int,
+    fill: tuple[int, int, int] | None = None,
+) -> list[GeometryOp]:
+    """Operations of one named deterministic eval protocol for a source size.
+
+    Size-based so a consumer that only knows the stored dimensions (CAM's
+    original-coordinate mapping) derives the crop bounds and padding offsets from
+    the same owner as extraction, instead of recomputing them.
+    """
+    width, height = int(source_wh[0]), int(source_wh[1])
     if name == "center-crop":
-        return _center_crop_ops(image, size)
+        return _center_crop_ops_for_size(width, height, size)
     if name == "whole-specimen-pad":
-        return _whole_specimen_ops(image, size)
+        return _whole_specimen_ops_for_size(
+            width, height, size, fill if fill is not None else BACKGROUND_FILL_FALLBACK
+        )
     raise ValueError(
         f"unknown eval transform {name!r}; expected one of "
         "'center-crop', 'whole-specimen-pad'"
     )
+
+
+def evaluation_view_ops(image: Image.Image, *, name: str, size: int) -> list[GeometryOp]:
+    """The recorded operation list of one named deterministic eval protocol."""
+    fill = (
+        estimate_background_color(image) if name == "whole-specimen-pad" else None
+    )
+    return evaluation_view_operations(image.size, name=name, size=size, fill=fill)
 
 
 def normalize_tensor(image: Image.Image):
