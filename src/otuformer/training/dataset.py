@@ -20,9 +20,12 @@ from torchvision.transforms import InterpolationMode, functional as TF
 from otuformer.constants import (
     EVAL_TRANSFORM_CHOICES,
     FINETUNE_AUGMENTATIONS,
+    IMAGENET_MEAN as _SHARED_IMAGENET_MEAN,
+    IMAGENET_STD as _SHARED_IMAGENET_STD,
     ORIENTATION_POLICIES,
     PRETRAIN_AUGMENTATIONS,
 )
+from otuformer.vision import geometry as _geometry
 
 IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.webp', '.tif', '.tiff'}
 
@@ -30,8 +33,10 @@ IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.webp', '.tif', '.tiff'}
 # estimation fails (e.g. degenerate or empty images).
 _BACKGROUND_FILL_FALLBACK = (124, 116, 104)
 
-_IMAGENET_MEAN = [0.485, 0.456, 0.406]
-_IMAGENET_STD = [0.229, 0.224, 0.225]
+# Canonical values owned by ``otuformer.constants`` so the spatial feature
+# contract and the training preprocessing cannot drift apart.
+_IMAGENET_MEAN = list(_SHARED_IMAGENET_MEAN)
+_IMAGENET_STD = list(_SHARED_IMAGENET_STD)
 
 
 _PRETRAIN_GLOBAL_SCALE = [0.4, 1.0]
@@ -907,6 +912,33 @@ def _validate_view_shape(
         )
 
 
+class _SharedEvalView:
+    """Delegating eval view: one realized operation list, one geometry owner.
+
+    ``vision.geometry`` executes and traces the same resize/crop/pad operations
+    this module used to compose inline, so the tensor path is unchanged while a
+    spatial caller can obtain the matching geometry trace.
+    """
+
+    def __init__(self, name: str, image_size: int) -> None:
+        self.name = name
+        self.image_size = int(image_size)
+        # Read-only record of the normalization this step applies, so execution
+        # provenance is introspected from the executed transform rather than
+        # assumed.
+        self.mean = tuple(_IMAGENET_MEAN)
+        self.std = tuple(_IMAGENET_STD)
+
+    def __call__(self, image: Image.Image) -> torch.Tensor:
+        tensor, _ = _geometry.build_eval_view(
+            image, name=self.name, size=self.image_size
+        )
+        return tensor
+
+    def __repr__(self) -> str:  # pragma: no cover - diagnostics only
+        return f"{type(self).__name__}({self.name!r}, {self.image_size})"
+
+
 def center_crop_eval_transform(image_size: int) -> transforms.Compose:
     """Deterministic center-crop evaluation protocol.
 
@@ -915,14 +947,7 @@ def center_crop_eval_transform(image_size: int) -> transforms.Compose:
     This is the shared deterministic preprocessing used by extraction, periodic
     evaluation, fine-tuning ``none``, and CAM.
     """
-    return transforms.Compose(
-        [
-            transforms.Resize(image_size, interpolation=Image.BICUBIC),
-            transforms.CenterCrop(image_size),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=_IMAGENET_MEAN, std=_IMAGENET_STD),
-        ]
-    )
+    return transforms.Compose([_SharedEvalView("center-crop", image_size)])
 
 
 # Backward-compatible alias during the transition to the named protocol.
@@ -933,23 +958,10 @@ def _estimate_background_color(image: Image.Image) -> tuple[int, int, int]:
     """Per-channel median of all four outer edges of the image.
 
     Returns the documented fallback ``(124, 116, 104)`` on any conversion or
-    shape failure.
+    shape failure. The shared geometry module owns this rule so a traced pad
+    records the same fill it applied.
     """
-    try:
-        arr = np.asarray(image.convert("RGB"))
-        if (
-            arr.ndim != 3
-            or arr.shape[2] != 3
-            or arr.shape[0] < 2
-            or arr.shape[1] < 2
-        ):
-            return _BACKGROUND_FILL_FALLBACK
-        edges = np.concatenate(
-            [arr[0, :, :], arr[-1, :, :], arr[:, 0, :], arr[:, -1, :]], axis=0
-        )
-        return tuple(int(v) for v in np.median(edges, axis=0))
-    except Exception:
-        return _BACKGROUND_FILL_FALLBACK
+    return _geometry.estimate_background_color(image)
 
 
 def pad_to_square(image: Image.Image) -> Image.Image:
@@ -980,16 +992,7 @@ def whole_specimen_pad_transform(image_size: int) -> transforms.Compose:
     then tensorizes and normalizes. Reserved for later promotion once it wins
     on downstream metrics.
     """
-    return transforms.Compose(
-        [
-            transforms.Lambda(pad_to_square),
-            transforms.Resize(
-                (image_size, image_size), interpolation=Image.BICUBIC
-            ),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=_IMAGENET_MEAN, std=_IMAGENET_STD),
-        ]
-    )
+    return transforms.Compose([_SharedEvalView("whole-specimen-pad", image_size)])
 
 
 EVAL_TRANSFORMS = {

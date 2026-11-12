@@ -146,15 +146,27 @@ def test_multicrop_dataset_uses_all_images_when_csv_missing(tmp_path: Path):
 
 
 def test_center_crop_eval_transform_equals_old_composition():
+    """The retained builder is numerically the historical composition.
+
+    The structure assertion was a proxy; the shared geometry owner now executes
+    the same operations, so parity is pinned by an independent local copy of the
+    historical Compose on an asymmetric, non-square input.
+    """
     tf = center_crop_eval_transform(64)
-    assert [type(t) for t in tf.transforms] == [
-        transforms.Resize,
-        transforms.CenterCrop,
-        transforms.ToTensor,
-        transforms.Normalize,
-    ]
-    assert tf.transforms[0].size == 64
-    assert tf.transforms[1].size == (64, 64)
+    assert isinstance(tf, transforms.Compose)
+    reference = transforms.Compose(
+        [
+            transforms.Resize(64, interpolation=Image.BICUBIC),
+            transforms.CenterCrop(64),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ]
+    )
+    image = Image.new("RGB", (37, 91))
+    for x in range(37):
+        for y in range(91):
+            image.putpixel((x, y), (x * 5 % 256, y * 3 % 256, (x + y) % 256))
+    torch.testing.assert_close(tf(image), reference(image))
 
 
 def test_whole_specimen_pad_transform_preserves_aspect_ratio():
@@ -506,12 +518,10 @@ def test_finetune_none_profile_keeps_deterministic_compose(tmp_path):
         augmentation_profile="none",
     )
     assert isinstance(ds.transform, transforms.Compose)
-    assert [type(t) for t in ds.transform.transforms] == [
-        transforms.Resize,
-        transforms.CenterCrop,
-        transforms.ToTensor,
-        transforms.Normalize,
-    ]
+    assert len(ds.transform.transforms) == 1
+    # Parity with the historical composition is pinned numerically above; the
+    # profile still selects the deterministic center-crop protocol.
+    assert ds.transform.transforms[0].name == "center-crop"
 
 
 def test_conservative_config_has_no_removed_transforms():
