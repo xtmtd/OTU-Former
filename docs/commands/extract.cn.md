@@ -103,9 +103,9 @@ timm 骨干网络。 timm 骨干网络名称
 
 ### `--eval-transform`
 
-**默认值：** `center-crop` · **允许值：** center-crop / whole-specimen-pad
+**默认值：** 嵌入输出为 `center-crop`，空间输出为 `whole-specimen-pad` · **允许值：** center-crop / whole-specimen-pad
 
-评估预处理协议：center-crop（Resize + CenterCrop）或 whole-specimen-pad（保持宽高比的方形填充）。默认：center-crop。
+评估预处理协议：center-crop（Resize + CenterCrop）或 whole-specimen-pad（保持宽高比的方形填充）。默认：嵌入输出用 center-crop，空间输出用 whole-specimen-pad；两种模式下显式指定都以请求为准。
 
 ### `--use-projector-output`
 
@@ -336,6 +336,11 @@ otuformer extract \
   如果 `--spatial-input` 判定它不完整，请把 `--spatial-input` 指向原始的已完成抽取目录
   （含 `spatial_manifest.json` 与 `spatial_index.jsonl` 的那个），该目录由报告的
   `source_product` 溯源信息指明。
+- **成本（算术估算，非实测）。** 评测会为每张抽样图像存下一个参考视图加十一个变换视图：14x14 网格、
+  C=192 时，100 张图像每层约 172 MiB；224x224 视图下，存储的像素支撑在跨层共享后约 287 MiB。
+  分片只改变物理打包方式：每个分片未压缩载荷上限 256 MiB，绝不改变逻辑数组、顺序或任何诊断行。
+- **L2 是表示选择。** `--feature-l2-normalize` 记录网格里装的是什么；余弦匹配在特征采样之后总会归一化，
+  因此 v1 没有任何评分必须依赖单位范数导出，原始导出与单位化导出是两个不同的契约，不可互换。
 - **限制。** 完全有效的 patch 排除了直接的填充污染，但 ViT 的全局注意力仍可能把无效 token 的
   影响传播进来。
 

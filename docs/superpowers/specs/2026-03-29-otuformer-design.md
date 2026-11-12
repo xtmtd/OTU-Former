@@ -320,8 +320,16 @@ Implementation mirrors `entomokit classify cam` (`/Users/zf/data/coding/entomoki
 - Heatmaps are overlaid on the full original image via the correct inverse of the selected preprocessing: with `center-crop` the heatmap is confined to the model's field of view using a binary FOV mask (out-of-view pixels are dimmed directly, never routed through the heatmap colormap); with `whole-specimen-pad` the heatmap covers the whole specimen. The figure is a gradient-attribution heatmap of the raw CLS feature (its argmax treated as a pseudo-class), not a verified class-discriminative CAM; that semantic is tracked separately.
 - `--eval-transform` : `center-crop` | `whole-specimen-pad` [default: center-crop; deterministic evaluation preprocessing protocol shared with extraction]
 
+**Spatial export (`--output-kind spatial`):** one named output per selected
+complete block (`spatial_000`, ...) with a canonical feature contract in the graph
+metadata (`otuformer.spatial.v1`), validated for every declared output at batches 1
+and 2 against CPU FP32 PyTorch. The embedding graph keeps its single `embedding`
+output, `out_dim` report field and tolerance behaviour unchanged; a spatial-only
+option is rejected in embedding mode even at its default value.
+
 **Design history:**
-[optional register tokens](2026-09-28-otuformer-optional-registers-design.md).
+[optional register tokens](2026-09-28-otuformer-optional-registers-design.md),
+[spatial geometry and feature loop](2026-11-12-spatial-geometry-features-design.md).
 
 ### 3.8 `export`
 Export encoder + projector to ONNX for deployment.
@@ -331,8 +339,16 @@ Export encoder + projector to ONNX for deployment.
 **Key constraints:**
 - Always exports encoder + projector only. The projector is rebuilt from the checkpoint's `config.embedding_head`, falling back to the projector shapes, so fine-tune checkpoints with an `ArcFaceEmbeddingHead` export correctly; the ref-script `projector.<i>` naming is normalized on read. Output embedding dimension is read from the checkpoint metadata (set by `--out-dim` or `--metric-embed-dim` at training time) — not hardcoded. A backbone that does not fit the resolved model name raises an error naming whether the conflict is in the checkpoint metadata or in `--model-name`.
 
+**Spatial export (`--output-kind spatial`):** one named output per selected
+complete block (`spatial_000`, ...) with a canonical feature contract in the graph
+metadata (`otuformer.spatial.v1`), validated for every declared output at batches 1
+and 2 against CPU FP32 PyTorch. The embedding graph keeps its single `embedding`
+output, `out_dim` report field and tolerance behaviour unchanged; a spatial-only
+option is rejected in embedding mode even at its default value.
+
 **Design history:**
-[optional register tokens](2026-09-28-otuformer-optional-registers-design.md).
+[optional register tokens](2026-09-28-otuformer-optional-registers-design.md),
+[spatial geometry and feature loop](2026-11-12-spatial-geometry-features-design.md).
 
 ### 3.9 `doctor`
 Check environment health.

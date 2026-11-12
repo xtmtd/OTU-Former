@@ -421,8 +421,12 @@ def extract(
         help=(
             "Evaluation preprocessing protocol: center-crop (Resize + CenterCrop) "
             "or whole-specimen-pad (aspect-preserving square padding). "
-            "Default: center-crop."
+            "Default: center-crop for embedding output, whole-specimen-pad for "
+            "spatial output; an explicit value wins in both modes."
         ),
+        # The conditional default is stated above; the bare parser default would
+        # read as if it applied to spatial output too.
+        show_default=False,
         rich_help_panel="Preprocessing and geometry",
     ),
     token_mode: str = typer.Option(

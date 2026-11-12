@@ -103,9 +103,9 @@ Resize/crop size for extraction. 'auto' uses the checkpoint's recorded training 
 
 ### `--eval-transform`
 
-**Default:** `center-crop` · **Allowed:** center-crop / whole-specimen-pad
+**Default:** `center-crop` for embedding output, `whole-specimen-pad` for spatial output · **Allowed:** center-crop / whole-specimen-pad
 
-Evaluation preprocessing protocol: center-crop (Resize + CenterCrop) or whole-specimen-pad (aspect-preserving square padding). Default: center-crop.
+Evaluation preprocessing protocol: center-crop (Resize + CenterCrop) or whole-specimen-pad (aspect-preserving square padding). Default: center-crop for embedding output, whole-specimen-pad for spatial output; an explicit value wins in both modes.
 
 ### `--use-projector-output`
 
@@ -355,6 +355,16 @@ of three spatial modes, resolved from the request only:
   `--spatial-input` rejects it as incomplete, point `--spatial-input` at the original
   completed extraction directory (the one holding `spatial_manifest.json` and
   `spatial_index.jsonl`), as identified by the report's `source_product` provenance.
+- **Cost (arithmetic estimate, not a measurement).** Evaluation stores one reference
+  plus eleven views per sampled image, so a 14x14 grid with C=192 costs about
+  172 MiB per layer for 100 images, and the stored pixel support adds about
+  287 MiB at 224x224 views across layers. Sharding changes only the physical
+  packaging: it caps each shard below 256 MiB of uncompressed payload and never
+  changes a logical array, its order or a diagnostic row.
+- **L2 is a representation choice.** `--feature-l2-normalize` records what the grid
+  contains; the cosine matcher normalizes after feature sampling anyway, so no v1
+  score requires a unit-norm export, and raw versus unit exports are distinct
+  contracts rather than interchangeable ones.
 - **Limitation.** Fully valid patches exclude direct fill contamination, but ViT
   global attention can still propagate influence from invalid tokens.
 

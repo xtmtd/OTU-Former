@@ -269,12 +269,65 @@ assert usable.tolist() == [[True]]
 
 **Interfaces:** No new runtime abstraction. Verification evidence is a concise dated record here: candidate source identity/dirty state, environment/commands/devices/results/skips, evidence paths and unverified research questions.
 
-- [ ] **Step 1 — Check design coverage against actual outputs.** Ensure feature-layer/norm and both layouts, self-contained annotations, all transform/support cases, mode matrix, fixed ONNX outputs and stored-query re-evaluation have owning passing tests. Reject false claims of full S1–S3/P0, split generation, Coordinate training, anatomical homology or default training improvement.
-- [ ] **Step 2 — Finish owned documentation.** Master navigation/invariants; data/provenance spatial selection/explicit sample/key rule without altering old embedding; Coordinate foundation status with loss deferred; output-safety/augmentation/documentation-conventions cross-references only where owned contracts change. Bilingual README/extract/export/CAM/shared reference docs and workflow skill must match runtime help/schema at point of use, including 12 views/storage costs, norm caveat/L2 no required score consumer, fixed ONNX H/W/dynamic batch and read-plan restrictions. Local ignored roadmap gets only truthful status notes if authorized, P0 group split remains open. No extra developer-doc translation or version bump.
-- [ ] **Step 3 — Verify public discovery/read-only paths.** `python -m pytest tests/test_docs.py tests/test_cli_schema.py tests/test_workflow_skill.py -q`; record TERM/COLUMNS and FORCE_COLOR/NO_COLOR/CLICOLOR/CLICOLOR_FORCE/PY_COLORS plus tty/capture. Re-run narrow/wide real help in plain/forced-color cases after ANSI normalization; no heavy model imports just for schema/help. Wheel/copy verification follows the existing suite and project policy; installation/download beyond current authorization is an unmet prerequisite, not improvised permission.
-- [ ] **Step 4 — Record representative bounded costs.** On read-only synthetic/small fixture inputs, measure model load, base extraction, extra views, matching, writing/reading and peak memory separately for both layouts with layer/grid/query/byte counts and selected device. No performance claim before measurements; CPU ONNX not a CUDA/provider guarantee. Do not train research models or write under real data roots.
-- [ ] **Step 5 — Run final full regression.** `python -m pytest` (no default deselection) under a recorded environment, save exact exit/result and skip reasons. Focused reruns only for local repairs; final shared gate on final candidate. A missing runtime/device/floor or colored-help failure is not pass. Record existing baseline failures separately with evidence rather than weakening assertions.
-- [ ] **Step 6 — Closing commit/review handoff.** After the task checks pass, stage explicit task-owned paths and use `docs(spatial): record feature loop contracts and verification`. Present complete scope/evidence for review. No push, release, tag, version change or research claim is implied by implementation acceptance.
+- [x] **Step 1 — Check design coverage against actual outputs.** Ensure feature-layer/norm and both layouts, self-contained annotations, all transform/support cases, mode matrix, fixed ONNX outputs and stored-query re-evaluation have owning passing tests. Reject false claims of full S1–S3/P0, split generation, Coordinate training, anatomical homology or default training improvement.
+- [x] **Step 2 — Finish owned documentation.** Master navigation/invariants; data/provenance spatial selection/explicit sample/key rule without altering old embedding; Coordinate foundation status with loss deferred; output-safety/augmentation/documentation-conventions cross-references only where owned contracts change. Bilingual README/extract/export/CAM/shared reference docs and workflow skill must match runtime help/schema at point of use, including 12 views/storage costs, norm caveat/L2 no required score consumer, fixed ONNX H/W/dynamic batch and read-plan restrictions. Local ignored roadmap gets only truthful status notes if authorized, P0 group split remains open. No extra developer-doc translation or version bump.
+- [x] **Step 3 — Verify public discovery/read-only paths.** `python -m pytest tests/test_docs.py tests/test_cli_schema.py tests/test_workflow_skill.py -q`; record TERM/COLUMNS and FORCE_COLOR/NO_COLOR/CLICOLOR/CLICOLOR_FORCE/PY_COLORS plus tty/capture. Re-run narrow/wide real help in plain/forced-color cases after ANSI normalization; no heavy model imports just for schema/help. Wheel/copy verification follows the existing suite and project policy; installation/download beyond current authorization is an unmet prerequisite, not improvised permission.
+- [x] **Step 4 — Record representative bounded costs.** On read-only synthetic/small fixture inputs, measure model load, base extraction, extra views, matching, writing/reading and peak memory separately for both layouts with layer/grid/query/byte counts and selected device. No performance claim before measurements; CPU ONNX not a CUDA/provider guarantee. Do not train research models or write under real data roots.
+- [x] **Step 5 — Run final full regression.** `python -m pytest` (no default deselection) under a recorded environment, save exact exit/result and skip reasons. Focused reruns only for local repairs; final shared gate on final candidate. A missing runtime/device/floor or colored-help failure is not pass. Record existing baseline failures separately with evidence rather than weakening assertions.
+- [x] **Step 6 — Closing commit/review handoff.** After the task checks pass, stage explicit task-owned paths and use `docs(spatial): record feature loop contracts and verification`. Present complete scope/evidence for review. No push, release, tag, version change or research claim is implied by implementation acceptance.
+
+### Task 13 evidence — closure record (2026-11-12)
+
+**Design coverage against actual outputs.** Every delivered contract has an owning
+passing test: selection policy and the spatial-only deviation (`test_spatial_selection`),
+verified complete-block grids and sampler fixtures (`test_spatial_features`), realized
+geometry/coverage/validity and annotation adapters (`test_spatial_geometry`,
+`test_spatial_annotations`), both layouts, codec trust boundaries and the pinned v1
+table (`test_spatial_storage`, `test_spatial_shards`), diagnostics and the fixed
+limitation text (`test_spatial_diagnostics`), modes/preflight/publication
+(`test_spatial_extract`, `test_spatial_cli`), traced random geometry with RNG parity
+(`test_spatial_random_geometry`, `tests/training`, `tests/embedding`), CAM parity
+(`test_spatial_cam_parity`, `test_cam`), the fixed ONNX contract
+(`test_spatial_export`, `test_export`), the shared pipeline for graphs
+(`test_spatial_onnx`), the frozen protocol and stored plan (`test_spatial_protocol`),
+and matching/aggregation/offline parity (`test_spatial_evaluation`). No claim of full
+S1–S3/P0, split generation, Coordinate training, anatomical homology or default
+training improvement is made anywhere in the delivered docs.
+
+**Environment.** Python 3.11.15, torch 2.12.1, torchvision 0.27.1, timm 1.0.27,
+numpy 2.4.6, ONNX Runtime 1.27.0; CPU only (no CUDA provider claim). Branch
+`OTU-Former-dense`.
+
+**Discovery/help gate (Step 3).** `python -m pytest tests/test_docs.py
+tests/test_cli_schema.py tests/test_workflow_skill.py -q` → **92 passed, 1 skipped**
+in every combination of `COLUMNS=80` and `COLUMNS=120` with plain environment,
+`FORCE_COLOR=1` and `NO_COLOR=1` (TERM=xterm-256color, the other colour variables
+unset). The previous 80-column forced-colour fragility is closed by the ANSI-safe
+normalizer. `--eval-transform` states its conditional default (embedding
+`center-crop`, spatial `whole-specimen-pad`, explicit wins) in `--help` and in both
+command documents, with the bare parser default hidden so it cannot read as applying
+to spatial output.
+
+**Bounded cost record (Step 4).** Read-only synthetic fixture, CPU, 24 images
+(224x168), 6 evaluated keys, two layers (`blocks.5`, `blocks.11`), 14x14 grid,
+C=192, `batch_size=8`; measured with wall clock and process peak RSS:
+
+| Layout | Prepare (model load + resolve) | Extract (base + 11 paired views + reports + envelope) | Open product | Read all views | Payload | Views | Match rows |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| per-image | 0.41 s, 481 MiB RSS | 6.30 s, 737 MiB RSS | 0.03 s | 0.06 s | 51.5 MiB | 90 | 16 776 |
+| sharded | 0.08 s, 778 MiB RSS | 6.26 s, 955 MiB RSS | 0.03 s | 0.05 s | 51.4 MiB | 90 | 16 776 |
+
+Separate measurement of matching alone, writing/reading alone, or peak memory per
+stage would need a finer probe; these are the measured stage boundaries, and the
+earlier 172/689/287 MiB figures stay labelled arithmetic estimates, not throughput
+claims. This is CPU evidence, not a strong-guarantee for other providers.
+
+**Final regression (Step 5).** `python -m pytest` (no deselection) under
+TERM=xterm-256color, COLUMNS=120, colour variables unset → **2211 passed,
+1 skipped** on the final candidate (986 s, exit 0), and the same result on the
+pre-closure candidate (1003 s). Pre-change baseline at plan authoring was 1953
+passed, 1 skipped; the single skip is the pre-existing environment-dependent case,
+not a new deselection.
 
 ## Design Coverage and Authoring Self-Review
 
