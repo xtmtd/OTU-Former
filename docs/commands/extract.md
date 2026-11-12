@@ -358,8 +358,21 @@ of three spatial modes, resolved from the request only:
 - **Limitation.** Fully valid patches exclude direct fill contamination, but ViT
   global attention can still propagate influence from invalid tokens.
 
-`--spatial-eval` is declared but not enabled in this build: requesting it fails
-before any output is written, so a run never claims an evaluation it did not perform.
+- **Evaluation (`--spatial-eval`).** With evaluation enabled, the selected images
+  (default at most 100, chosen by seeded SHA-256 ranking over the existing `--seed`)
+  also store one reference plus eleven geometric views, and the run writes
+  `spatial_evaluation_plan.json`, `spatial_matches.csv` and `spatial_evaluation.json`.
+  Queries are conservatively valid source patch centres whose mapped point and target
+  interpolation support are valid; at most 64 per pair and direction are used, chosen
+  by the same seeded ranking, and candidates are **all** valid target centres — no
+  label, mask or true-location filter. Scores are cosine matching with PCK at 0.01,
+  0.02 and 0.05 of the original-image diagonal, aggregated per image first and then
+  macro-averaged per transform, layer and direction with explicit denominators.
+  Failed matches (invalid feature, no usable candidate) stay in the PCK denominator
+  and are reported with no finite error. In read mode the stored plan is reused: a
+  CSV may only restrict it, `--spatial-eval-sample-size` is rejected, and an explicit
+  `--seed` must equal the stored plan seed. A product without paired views fails with
+  `missing_paired_views` instead of silently skipping the request.
 
 Accepts OTU checkpoints and ref-script checkpoints (`ref/ibot20260115.py`). The embedding head is rebuilt from `config.embedding_head`, falling back to the projector shapes in the weights.
 

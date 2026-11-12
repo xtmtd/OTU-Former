@@ -286,17 +286,62 @@ def test_read_mode_rejects_an_output_inside_the_source_product(tmp_path):
     assert not (product / "nested").exists()
 
 
-def test_spatial_eval_is_rejected_without_claiming_completion(tmp_path):
+def test_spatial_eval_writes_paired_results_and_plan(tmp_path):
     images = write_images(tmp_path / "images")
-    checkpoint = write_checkpoint(tmp_path / "model.pt")
+    # A 64 px checkpoint so the 4x4 grid has enough centres to sample queries.
+    checkpoint = write_checkpoint(tmp_path / "model.pt", image_size=64)
     out = tmp_path / "product"
     result = runner.invoke(
         app,
-        spatial_argv(tmp_path, images, checkpoint, "--spatial-eval"),
+        spatial_argv(
+            tmp_path, images, checkpoint, "--spatial-eval",
+            "--spatial-eval-sample-size", "2",
+            # A 4x4 patch grid with full-coverage preprocessing keeps queries
+            # geometrically eligible, so the report has rows to compare.
+            "--extract-size", "64", "--eval-transform", "center-crop",
+        ),
     )
-    assert result.exit_code != 0
-    assert "spatialevalisnotenabled" in flat(result.output)
-    assert not (out / "run_provenance.json").exists()
+    assert result.exit_code == 0, result.output
+    plan = json.loads(
+        (out / "spatial_evaluation_plan.json").read_text(encoding="utf-8")
+    )
+    assert plan["protocol"] == "spatial-geometry-v1"
+    assert plan["seed"] == 42
+    assert plan["selected_keys"]
+    evaluation = json.loads((out / "spatial_evaluation.json").read_text(encoding="utf-8"))
+    assert evaluation["protocol"] == "spatial-geometry-v1"
+    assert evaluation["metrics"]["pck_thresholds"] == [0.01, 0.02, 0.05]
+    assert (out / "spatial_matches.csv").is_file()
+    envelope = json.loads((out / "run_provenance.json").read_text(encoding="utf-8"))
+    assert envelope["evaluation"]["status"] == "completed"
+    assert envelope["evaluation"]["seed"] == 42
+
+    # Reading the product back reproduces the stored plan without a model.
+    checkpoint.unlink()
+    import shutil
+
+    shutil.rmtree(images)
+    read_out = tmp_path / "read-out"
+    read = runner.invoke(
+        app,
+        [
+            "extract", "--output-kind", "spatial", "--spatial-input", str(out),
+            "--out-dir", str(read_out), "--spatial-eval",
+        ],
+    )
+    assert read.exit_code == 0, read.output
+    import csv
+
+    def first_match(path):
+        with path.open(encoding="utf-8") as handle:
+            return next(csv.DictReader(handle))
+
+    replayed = first_match(read_out / "spatial_matches.csv")
+    stored = first_match(out / "spatial_matches.csv")
+    assert replayed["image_key"] == stored["image_key"]
+    assert replayed["match_status"] == stored["match_status"]
+    assert replayed["normalized_error"] == stored["normalized_error"]
+    assert replayed["raw_error"] == stored["raw_error"]
 
 
 def test_dump_model_structure_continues_extraction(tmp_path):

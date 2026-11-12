@@ -152,8 +152,11 @@ deviation: with `--label-csv` its rows select in order, otherwise **every**
 supported image under the root is scanned recursively, COCO only attaches
 annotations, and a directory-derived `sample` is suppressed instead of exported.
 Remind the operator that a read-result directory is a report, not a reusable
-product, and that `--spatial-eval` is not enabled yet, so it fails before writing
-rather than being silently skipped.
+product. With `--spatial-eval` the run also stores one reference plus eleven
+geometric views for at most 100 seeded-sampled images and writes
+`spatial_evaluation_plan.json`, `spatial_matches.csv` and `spatial_evaluation.json`;
+report PCK at 0.01/0.02/0.05 of the original diagonal with the denominators, never as
+an overall quality score, and say that a read run only reproduces the stored plan.
 
 ## cluster
 

@@ -51,9 +51,17 @@ RESULT_FIELDS = (
 
 
 def diagnose_views(
-    views: Iterable[SpatialView], contract: FeatureContract
+    views: Iterable[SpatialView],
+    contract: FeatureContract,
+    *,
+    plan: Mapping[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Return deterministic per sample/view/layer rows and a summary."""
+    """Return deterministic per sample/view/layer rows and a summary.
+
+    ``plan`` is the product's stored evaluation plan when it has one; the summary
+    then states how many keys and query pairs it covers, so a report never implies
+    correspondence data a product does not carry.
+    """
     rows: list[dict[str, Any]] = []
     samples: dict[str, int] = {}
     view_count = 0
@@ -114,6 +122,21 @@ def diagnose_views(
         )
     summary = {
         "schema_version": 1,
+        "evaluation_plan": (
+            {
+                "status": "present",
+                "protocol": plan.get("protocol"),
+                "seed": plan.get("seed"),
+                "selected_keys": len(plan.get("selected_keys", [])),
+                "pairs": len(plan.get("pairs", [])),
+                "query_limit": plan.get("query_limit"),
+            }
+            if plan is not None
+            else {
+                "status": "absent",
+                "reason": "this product stores no paired views or evaluation plan",
+            }
+        ),
         "samples": len(samples),
         "views": view_count,
         "layers": list(contract.layer_paths),

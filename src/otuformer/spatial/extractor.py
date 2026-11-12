@@ -42,6 +42,7 @@ from ..spatial.records import (
     FILENAME_INDEX,
     FILENAME_LOG,
     FILENAME_MANIFEST,
+    FILENAME_MATCHES,
     FILENAME_MODEL_LAYERS,
     FILENAME_PROVENANCE,
     FILENAME_RESULTS,
@@ -217,13 +218,6 @@ def prepare_spatial_request(
             "--output-kind spatial"
         )
     out_dir = Path(str(resolved.get("out_dir") or "runs/extract")).expanduser()
-    if resolved.get("spatial_eval"):
-        raise SpatialRequestError(
-            "--spatial-eval is not enabled in this build: the frozen "
-            "correspondence protocol ships with the evaluation task, and a run "
-            "must not claim evaluation it did not perform"
-        )
-
     if mode == MODE_READ:
         return _prepare_read(resolved, explicit_options, out_dir, notes)
     if mode == MODE_ONNX:
@@ -279,6 +273,20 @@ def _prepare_read(
             size_bytes=manifest_path.stat().st_size,
         )
     )
+    plan = reader.evaluation_plan
+    if plan is not None and "seed" in explicit_options:
+        if int(values.get("seed") or 0) != int(plan.get("seed", 0)):
+            reader.close()
+            raise SpatialRequestError(
+                f"--seed {values.get('seed')} does not match the saved evaluation "
+                f"plan seed {plan.get('seed')}; a stored plan fixes its seed"
+            )
+    if values.get("spatial_eval") and plan is None:
+        reader.close()
+        raise SpatialRequestError(
+            "missing_paired_views: this product has no stored paired views or "
+            "evaluation plan, so --spatial-eval cannot be satisfied from it"
+        )
     images = _as_path(values.get("input_images_dir"))
     if images is not None:
         notes.append(
@@ -606,8 +614,8 @@ def _write_model_layers(out_dir: Path, encoder: Any) -> Path:
 
 def _run_checkpoint_extraction(
     prepared: PreparedSpatialRequest,
-) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
-    """Write payload/index/manifest, then return (manifest, rows, summary)."""
+) -> tuple[SpatialWriter, dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
+    """Write payload/index/manifest, then return the sealed writer and reports."""
     import torch
 
     assert prepared.bundle is not None
@@ -622,6 +630,7 @@ def _run_checkpoint_extraction(
         annotations=prepared.annotations,
     )
     records = list(prepared.bundle.records)
+    base_views: dict[str, SpatialView] = {}
     try:
         with _backend_context(prepared) as device:
             batch: list[tuple[Any, Any, Any, str]] = []
@@ -632,10 +641,22 @@ def _run_checkpoint_extraction(
                 )
                 batch.append((record, tensor, trace, "base"))
                 if len(batch) >= prepared.batch_size:
-                    _flush_batch(writer, prepared, batch, device)
+                    base_views.update(
+                        _flush_batch(writer, prepared, batch, device)
+                    )
                     batch = []
             if batch:
-                _flush_batch(writer, prepared, batch, device)
+                base_views.update(_flush_batch(writer, prepared, batch, device))
+        if prepared.values.get("spatial_eval"):
+            store_evaluation_views(
+                prepared,
+                writer,
+                base_views=base_views,
+                image_limit=int(
+                    prepared.values.get("spatial_eval_sample_size")
+                    or SPATIAL_EVAL_SAMPLE_SIZE
+                ),
+            )
     except Exception:
         writer.abort({"reason": "extraction failed"})
         raise
@@ -645,7 +666,7 @@ def _run_checkpoint_extraction(
     reader = writer.reader()
     try:
         rows, summary = diagnose_views(
-            reader.iter_views(), prepared.contract
+            reader.iter_views(), prepared.contract, plan=reader.evaluation_plan
         )
     finally:
         reader.close()
@@ -654,7 +675,7 @@ def _run_checkpoint_extraction(
     (out_dir / FILENAME_DIAGNOSTICS).write_text(
         json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8"
     )
-    return manifest, rows, summary
+    return writer, manifest, rows, summary
 
 
 def _attach_sample_ids(rows: list[dict[str, Any]], out_dir: Path) -> None:
@@ -686,9 +707,10 @@ def _flush_batch(
     prepared: PreparedSpatialRequest,
     batch: Sequence[tuple[Any, Any, Any, str]],
     device: Any,
-) -> None:
+) -> dict[str, SpatialView]:
     contract = prepared.contract
     outputs = _run_forward(prepared, list(batch), device)
+    written: dict[str, SpatialView] = {}
     for position, (record, tensor, trace, view_id) in enumerate(batch):
         grid_h, grid_w = (
             int(contract.input_hw[0]) // int(contract.patch_hw[0]),
@@ -705,19 +727,56 @@ def _flush_batch(
             path: np.asarray(outputs[index][position], dtype=np.float32)
             for index, path in enumerate(contract.layer_paths)
         }
-        writer.write(
-            SpatialView(
-                image_key=record.image_key,
-                view_id=view_id,
-                role="base",
-                trace=trace,
-                features=features,
-                pixel_geometric_coverage=coverage,
-                pixel_sampling_valid=pixel_valid,
-                geometric_coverage=patch_coverage,
-                patch_sampling_valid=patch_valid,
+        view = SpatialView(
+            image_key=record.image_key,
+            view_id=view_id,
+            role="base",
+            trace=trace,
+            features=features,
+            pixel_geometric_coverage=coverage,
+            pixel_sampling_valid=pixel_valid,
+            geometric_coverage=patch_coverage,
+            patch_sampling_valid=patch_valid,
+        )
+        writer.write(view)
+        written[record.image_key] = view
+    return written
+
+
+def _evaluate_sealed_product(
+    prepared: PreparedSpatialRequest, writer: SpatialWriter, manifest: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Evaluate the plan from the sealed bytes, via the writer's staging reader.
+
+    The same matcher serves online and offline evaluation, so an online score and
+    a later re-evaluation of the same product are the same computation.
+    """
+    from .evaluation import evaluate_spatial, write_spatial_evaluation
+
+    reader = writer.reader()
+    try:
+        keys = list(
+            dict.fromkeys(
+                entry["sample"]["image_key"] for entry in reader._index  # noqa: SLF001
             )
         )
+        eval_rows, eval_summary = evaluate_spatial(reader, selected_keys=keys)
+        write_spatial_evaluation(
+            prepared.out_dir,
+            eval_rows,
+            eval_summary,
+            reader=reader,
+            images_dir=_as_path(prepared.values.get("input_images_dir")),
+        )
+        return {
+            "status": "completed",
+            "protocol": eval_summary["protocol"],
+            "seed": eval_summary["seed"],
+            "counts": eval_summary["counts"],
+            "matches": str(Path(prepared.out_dir) / FILENAME_MATCHES),
+        }
+    finally:
+        reader.close()
 
 
 def _artifact_rows(out_dir: Path, *, include_log: bool) -> list[dict[str, Any]]:
@@ -768,7 +827,10 @@ def extract_spatial(
     started = _utc_now()
     out_dir = prepared.out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
-    manifest, rows, summary = _run_checkpoint_extraction(prepared)
+    writer, manifest, rows, summary = _run_checkpoint_extraction(prepared)
+    evaluation_summary = None
+    if prepared.values.get("spatial_eval"):
+        evaluation_summary = _evaluate_sealed_product(prepared, writer, manifest)
     effective = (
         _effective_onnx(prepared)
         if prepared.mode == MODE_ONNX
@@ -780,7 +842,7 @@ def extract_spatial(
         source_product=None,
         effective=effective,
         used_files=prepared.protected_files,
-        evaluation=None,
+        evaluation=evaluation_summary,
         status="completed",
         started_at=started,
         ended_at=_utc_now(),
@@ -792,6 +854,7 @@ def extract_spatial(
             "manifest": manifest,
             "rows": rows,
             "summary": summary,
+            "evaluation": evaluation_summary,
             "envelope": record,
             "out_dir": str(out_dir),
             "deferred": True,
@@ -802,6 +865,7 @@ def extract_spatial(
         "manifest": manifest,
         "rows": rows,
         "summary": summary,
+        "evaluation": evaluation_summary,
         "envelope": published,
         "out_dir": str(out_dir),
         "deferred": False,
@@ -818,12 +882,35 @@ def reevaluate_spatial(
     out_dir = prepared.out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
     started = _utc_now()
-    rows, summary = diagnose_views(reader.iter_views(), reader.contract)
+    rows, summary = diagnose_views(
+        reader.iter_views(), reader.contract, plan=reader.evaluation_plan
+    )
     _attach_reader_sample_ids(rows, reader)
     write_csv_rows(out_dir / FILENAME_RESULTS, rows, RESULT_FIELDS)
     (out_dir / FILENAME_DIAGNOSTICS).write_text(
         json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8"
     )
+    evaluation_summary = None
+    if prepared.values.get("spatial_eval"):
+        from .evaluation import evaluate_spatial, write_spatial_evaluation
+
+        eval_rows, eval_summary = evaluate_spatial(
+            reader, selected_keys=list(reader.image_keys)
+        )
+        write_spatial_evaluation(
+            out_dir,
+            eval_rows,
+            eval_summary,
+            reader=reader,
+            images_dir=_as_path(prepared.values.get("input_images_dir")),
+        )
+        evaluation_summary = {
+            "status": "completed",
+            "protocol": eval_summary["protocol"],
+            "seed": eval_summary["seed"],
+            "counts": eval_summary["counts"],
+            "matches": str(out_dir / FILENAME_MATCHES),
+        }
     effective = {
         "mode": MODE_READ,
         "source_product": str(prepared.values.get("spatial_input")),
@@ -843,7 +930,7 @@ def reevaluate_spatial(
         source_product=prepared.source_product,
         effective=effective,
         used_files=prepared.protected_files,
-        evaluation=None,
+        evaluation=evaluation_summary,
         status="completed",
         started_at=started,
         ended_at=_utc_now(),
@@ -854,6 +941,7 @@ def reevaluate_spatial(
             "status": "completed",
             "rows": rows,
             "summary": summary,
+            "evaluation": evaluation_summary,
             "envelope": record,
             "out_dir": str(out_dir),
             "deferred": True,
@@ -863,6 +951,7 @@ def reevaluate_spatial(
         "status": "completed",
         "rows": rows,
         "summary": summary,
+        "evaluation": evaluation_summary,
         "envelope": published,
         "out_dir": str(out_dir),
         "deferred": False,

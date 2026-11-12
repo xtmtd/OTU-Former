@@ -146,6 +146,13 @@ class SpatialWriter:
         path.write_bytes(payload)
         self._created.append(path)
         self._sample_payloads[sample_id] = path
+        # A sample's archive can be extended after its first flush (protocol views
+        # are written later), so the manifest keeps exactly one record per payload
+        # file and always the hash of its final bytes.
+        relative = path.relative_to(self.out_dir).as_posix()
+        self._files = [
+            record for record in self._files if record.get("path") != relative
+        ]
         self._files.append(
             {
                 "role": "payload",
@@ -219,9 +226,21 @@ class SpatialWriter:
         self._pending_arrays.update(arrays)
 
     def _flush_pending(self) -> None:
+        """Write this sample's archive, merged with anything already sealed for it.
+
+        A sample's views can arrive in more than one group (base views first, the
+        protocol views later), so the archive is extended rather than replaced: its
+        earlier arrays must not disappear from the file an index entry points at.
+        """
         if self._pending_sample is None or not self._pending_arrays:
             return
-        self._write_npz(self._pending_sample, self._pending_arrays)
+        existing: dict[str, np.ndarray] = {}
+        path = self._sample_payloads.get(self._pending_sample)
+        if path is not None and path.is_file():
+            with np.load(path, allow_pickle=False) as archive:
+                existing = {name: archive[name] for name in archive.files}
+        existing.update(self._pending_arrays)
+        self._write_npz(self._pending_sample, existing)
         self._pending_sample = None
         self._pending_arrays = {}
 

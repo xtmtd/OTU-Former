@@ -146,6 +146,8 @@ mean the request tried to relabel stored tensors; drop those options and re-extr
 a different representation is actually wanted. If `--spatial-input` rejects a directory
 that looks like output, check whether it is a read-result report (it has
 `spatial_results.csv` but no `spatial_manifest.json`); use the original completed
-extraction directory named in that report's `source_product`. `--spatial-eval` is not
-enabled in this build and fails before writing: report that limitation rather than
-substituting a different check or a model run.
+extraction directory named in that report's `source_product`. `--spatial-eval` on a product without paired views fails with
+`missing_paired_views`: report that the product stores no evaluation plan instead of
+substituting a different check or running a model. A read-mode seed that differs from
+the saved plan, or a `--spatial-eval-sample-size` in read mode, is a rejected request
+rather than a preference.

@@ -169,15 +169,8 @@ def test_spatial_extraction_requires_a_source_and_images():
         validate_extract_mode_options(values, explicit_options=frozenset())
 
 
-def test_later_stage_requests_fail_before_any_output(tmp_path):
-    values = base_values(
-        tmp_path, checkpoint="c.pt", input_images_dir="i", spatial_eval=True
-    )
-    out = Path(values["out_dir"])
-    with pytest.raises(SpatialRequestError, match="--spatial-eval is not enabled"):
-        prepare_spatial_request(values, explicit_options=frozenset({"spatial_eval"}))
-    assert not out.exists()
-
+def test_unrunnable_requests_fail_before_any_output(tmp_path):
+    out = tmp_path / "out"
     values = base_values(
         tmp_path, onnx_path=str(tmp_path / "missing.onnx"), input_images_dir=str(tmp_path)
     )

@@ -144,3 +144,24 @@ def test_limitation_text_is_fixed():
         "ViT global attention can still propagate influence from invalid tokens."
         in SPATIAL_ATTENTION_LIMITATION
     )
+
+
+def test_summary_states_the_stored_plan_status():
+    views = [view()]
+    _, absent = diagnose_views(views, contract())
+    assert absent["evaluation_plan"]["status"] == "absent"
+
+    plan = {
+        "protocol": "spatial-geometry-v1",
+        "seed": 42,
+        "selected_keys": ["a.png"],
+        "pairs": [{"pair_id": "tx10"}],
+        "query_limit": 64,
+    }
+    _, present = diagnose_views(views, contract(), plan=plan)
+    entry = present["evaluation_plan"]
+    assert entry["status"] == "present"
+    assert entry["protocol"] == "spatial-geometry-v1"
+    assert entry["seed"] == 42
+    assert entry["selected_keys"] == 1
+    assert entry["pairs"] == 1
