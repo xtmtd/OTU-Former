@@ -201,11 +201,25 @@ def validate_extract_mode_options(
         raise ValueError(
             "--spatial-eval-sample-size only applies with --spatial-eval"
         )
-    if mode == MODE_ONNX and _explicit(explicit_options, "dump_model_structure"):
-        raise ValueError(
-            "--dump-model-structure lists checkpoint modules; a spatial graph "
-            "already declares its exported layers"
-        )
+    if mode == MODE_ONNX:
+        for name, why in (
+            (
+                "dump_model_structure",
+                "lists checkpoint modules; a spatial graph already declares its "
+                "exported layers",
+            ),
+            (
+                "model_name",
+                "cannot relabel a graph; the exported contract fixes the model",
+            ),
+            (
+                "use_student",
+                "cannot choose weights in a graph; the exported contract fixes the "
+                "weight source",
+            ),
+        ):
+            if _explicit(explicit_options, name):
+                raise ValueError(f"{_option(name)} {why}")
     if mode == MODE_CHECKPOINT and _explicit(explicit_options, "use_student"):
         notes.append("--use-student selects the student weights of the checkpoint")
     if mode == MODE_ONNX:

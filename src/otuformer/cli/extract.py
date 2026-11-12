@@ -199,7 +199,11 @@ def _run_spatial(ctx: typer.Context, values: dict) -> None:
         print("Parameters:")
         print(json.dumps(log_values, ensure_ascii=False, indent=2, sort_keys=True))
         print("-" * 80)
-        runner = extract_spatial if request.mode == "checkpoint" else reevaluate_spatial
+        runner = (
+            reevaluate_spatial
+            if request.mode == "read"
+            else extract_spatial
+        )
         result = runner(request, defer_publication=True)
         print("Resolved:")
         print(

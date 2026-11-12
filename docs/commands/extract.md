@@ -339,6 +339,13 @@ of three spatial modes, resolved from the request only:
   `patch_sampling_valid` on the patch grid. Coverage is a geometric fraction;
   validity is conservative resampling support. Neither is a foreground or
   anatomical mask.
+- **Spatial ONNX.** `--onnx-path` with a spatial graph reads only the outputs and
+  contract the graph declares: layers, feature norm, L2 and input size are fixed at
+  export, so an explicit conflicting value fails instead of being re-derived, and
+  `--model-name`, `--use-student` and `--dump-model-structure` are rejected because a
+  graph cannot be relabelled, re-weighted or listed. Geometry, coverage and
+  diagnostics are produced by the same shared preprocessor, so a graph and a
+  checkpoint yield the same logical product for the same images.
 - **Read mode is explicit.** Nothing is discovered, resumed, repaired or inferred.
   A read run never mutates the source product, needs no model for numeric
   diagnostics, and rejects extraction overrides (checkpoint, layers, norm, layout,

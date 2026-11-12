@@ -178,8 +178,10 @@ def test_later_stage_requests_fail_before_any_output(tmp_path):
         prepare_spatial_request(values, explicit_options=frozenset({"spatial_eval"}))
     assert not out.exists()
 
-    values = base_values(tmp_path, onnx_path="g.onnx", input_images_dir="i")
-    with pytest.raises(SpatialRequestError, match="spatial ONNX extraction is not enabled"):
+    values = base_values(
+        tmp_path, onnx_path=str(tmp_path / "missing.onnx"), input_images_dir=str(tmp_path)
+    )
+    with pytest.raises(SpatialRequestError, match="spatial graph does not exist"):
         prepare_spatial_request(values, explicit_options=frozenset({"onnx_path"}))
     assert not out.exists()
 

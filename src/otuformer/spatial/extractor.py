@@ -225,10 +225,7 @@ def prepare_spatial_request(
     if mode == MODE_READ:
         return _prepare_read(resolved, explicit_options, out_dir, notes)
     if mode == MODE_ONNX:
-        raise SpatialRequestError(
-            "spatial ONNX extraction is not enabled in this build: export the "
-            "fixed-contract graph first, then read it through the same pipeline"
-        )
+        return _prepare_onnx(resolved, explicit_options, out_dir, notes)
     return _prepare_checkpoint(resolved, explicit_options, out_dir, notes)
 
 
@@ -414,6 +411,145 @@ def _effective_checkpoint(prepared: PreparedSpatialRequest) -> dict[str, Any]:
     }
 
 
+def _prepare_onnx(
+    values: dict[str, Any],
+    explicit_options: frozenset[str],
+    out_dir: Path,
+    notes: list[str],
+) -> PreparedSpatialRequest:
+    """Resolve a spatial graph: the exported contract fixes the representation."""
+    from ..constants import IMAGENET_MEAN, IMAGENET_STD
+    from ..data.provenance import snapshot_bytes
+    from ..vision.export import OnnxSpatialForward
+
+    graph_path = _as_path(values.get("onnx_path"))
+    if graph_path is None or not graph_path.is_file():
+        raise SpatialRequestError(f"spatial graph does not exist: {graph_path}")
+    images_dir = _as_path(values.get("input_images_dir"))
+    if images_dir is None:
+        raise SpatialRequestError(
+            "--input-images-dir is required for spatial image extraction"
+        )
+    forward = OnnxSpatialForward(graph_path)
+    contract = forward.contract
+
+    # The graph owns layers, normalization and size: an explicit request must
+    # match it exactly rather than silently inherit a different meaning.
+    if "feature_layers" in explicit_options:
+        requested = [
+            entry.strip()
+            for entry in str(values.get("feature_layers") or "").split(",")
+            if entry.strip()
+        ]
+        if requested != list(contract.layer_paths):
+            raise SpatialRequestError(
+                f"--feature-layers {requested} does not match the graph's exported "
+                f"layers {list(contract.layer_paths)}"
+            )
+    if "feature_norm" in explicit_options and str(
+        values.get("feature_norm")
+    ) != contract.norm:
+        raise SpatialRequestError(
+            f"--feature-norm {values.get('feature_norm')!r} does not match the graph's "
+            f"exported normalization {contract.norm!r}"
+        )
+    if "feature_l2_normalize" in explicit_options and bool(
+        values.get("feature_l2_normalize")
+    ) != bool(contract.l2):
+        raise SpatialRequestError(
+            f"--feature-l2-normalize {bool(values.get('feature_l2_normalize'))} does "
+            f"not match the graph's exported L2 setting {contract.l2}"
+        )
+    if "extract_size" in explicit_options:
+        requested_size = values.get("extract_size")
+        if str(requested_size) not in ("auto", "", "None"):
+            if int(requested_size) != int(contract.input_hw[0]):
+                raise SpatialRequestError(
+                    f"--extract-size {requested_size} does not match the graph's fixed "
+                    f"input size {contract.input_hw[0]}"
+                )
+    declared = dict(contract.normalization or {})
+    if declared.get("mean") and [
+        float(v) for v in declared["mean"]
+    ] != [float(v) for v in IMAGENET_MEAN]:
+        raise SpatialRequestError(
+            "the graph declares an input normalization this build does not apply; "
+            f"graph={declared.get('mean')}, supported={list(IMAGENET_MEAN)}"
+        )
+
+    bundle = read_dataset(
+        images_dir,
+        manifest=_as_path(values.get("label_csv")),
+        coco_instances=_as_path(values.get("coco_instances")),
+        coco_keypoints=_as_path(values.get("coco_keypoints")),
+        coco_panoptic=_as_path(values.get("coco_panoptic")),
+        panoptic_masks_dir=_as_path(values.get("panoptic_masks_dir")),
+        selection_policy="csv-or-directory",
+    )
+    if not bundle.validation.valid:
+        raise DataValidationError(bundle.validation)
+    eval_transform = (
+        str(values.get("eval_transform"))
+        if "eval_transform" in explicit_options
+        else "whole-specimen-pad"
+    )
+    if eval_transform not in EVAL_TRANSFORM_CHOICES:
+        raise SpatialRequestError(
+            f"unknown --eval-transform {eval_transform!r}; expected one of "
+            f"{EVAL_TRANSFORM_CHOICES}"
+        )
+    protected: list[FileSnapshot] = [record.image_file for record in bundle.records]
+    if bundle.selector is not None:
+        protected.append(bundle.selector)
+    for index in bundle.sources.values():
+        protected.append(index.file)
+    protected.append(snapshot_bytes(graph_path)[1])
+    for sidecar in (
+        graph_path.with_name(graph_path.name + ".data"),
+        graph_path.with_suffix(".onnx.data"),
+    ):
+        if sidecar.is_file():
+            protected.append(snapshot_bytes(sidecar)[1])
+    notes.append(
+        "the graph's declared contract fixes layers, normalization, L2 and input "
+        "size; numeric agreement was validated at export time"
+    )
+    return PreparedSpatialRequest(
+        mode=MODE_ONNX,
+        values=values,
+        explicit_options=explicit_options,
+        out_dir=out_dir,
+        bundle=bundle,
+        contract=contract,
+        forward=forward,
+        samples=tuple(samples_from_records(bundle.records)),
+        annotations=_annotation_snapshot(bundle),
+        protected_files=tuple(protected),
+        notes=tuple(notes),
+        image_size=int(contract.input_hw[0]),
+        eval_transform=eval_transform,
+        device="cpu (onnxruntime)",
+        batch_size=int(values.get("batch_size") or 16),
+        layout=str(values.get("spatial_layout") or "per-image"),
+    )
+
+
+def _effective_onnx(prepared: PreparedSpatialRequest) -> dict[str, Any]:
+    return {
+        "mode": MODE_ONNX,
+        "input_size": prepared.image_size,
+        "eval_transform": prepared.eval_transform,
+        "layout": prepared.layout,
+        "feature_contract": prepared.contract.to_json(),
+        "input_normalization": dict(prepared.contract.normalization),
+        "device": prepared.device,
+        "batch_size": prepared.batch_size,
+        "onnx_path": str(prepared.values.get("onnx_path")),
+        "backend": "onnxruntime-cpu",
+        "notes": list(prepared.notes),
+    }
+
+
 def _decode(snapshot: FileSnapshot) -> Image.Image:
     from ..data.provenance import read_verified_bytes
 
@@ -421,6 +557,16 @@ def _decode(snapshot: FileSnapshot) -> Image.Image:
     with Image.open(io.BytesIO(payload)) as image:
         image.load()
         return image.convert("RGB")
+
+
+@contextmanager
+def _backend_context(prepared: PreparedSpatialRequest) -> Iterator[Any]:
+    """Torch inference context for a checkpoint; a pass-through for ONNX."""
+    if prepared.mode == MODE_ONNX:
+        yield prepared.device
+        return
+    with _torch_inference(prepared) as device:
+        yield device
 
 
 @contextmanager
@@ -475,7 +621,7 @@ def _run_checkpoint_extraction(
     )
     records = list(prepared.bundle.records)
     try:
-        with _torch_inference(prepared) as device:
+        with _backend_context(prepared) as device:
             batch: list[tuple[Any, Any, Any, str]] = []
             for record in records:
                 image = _decode(record.image_file)
@@ -522,17 +668,32 @@ def _attach_sample_ids(rows: list[dict[str, Any]], out_dir: Path) -> None:
         row["sample_id"] = order.get(row["image_key"])
 
 
+def _run_forward(
+    prepared: PreparedSpatialRequest, tensors, device: Any
+) -> tuple[np.ndarray, ...]:
+    """One batch through whichever backend this request resolved to."""
+    if prepared.mode == MODE_ONNX:
+        import numpy as _np
+
+        stacked = _np.stack([tensor.numpy() for _, tensor, _, _ in tensors])
+        return tuple(prepared.forward(stacked))
+    import torch
+
+    stacked = torch.stack([item[1] for item in tensors]).to(device)
+    produced = prepared.forward(stacked)
+    return tuple(
+        value.detach().to("cpu").numpy().astype(np.float32) for value in produced
+    )
+
+
 def _flush_batch(
     writer: SpatialWriter,
     prepared: PreparedSpatialRequest,
     batch: Sequence[tuple[Any, Any, Any, str]],
     device: Any,
 ) -> None:
-    import torch
-
     contract = prepared.contract
-    tensors = torch.stack([item[1] for item in batch]).to(device)
-    outputs = prepared.forward(tensors)
+    outputs = _run_forward(prepared, list(batch), device)
     for position, (record, tensor, trace, view_id) in enumerate(batch):
         grid_h, grid_w = (
             int(contract.input_hw[0]) // int(contract.patch_hw[0]),
@@ -546,7 +707,7 @@ def _flush_batch(
             patch_hw=contract.patch_hw,
         )
         features = {
-            path: outputs[index][position].detach().to("cpu").numpy().astype(np.float32)
+            path: np.asarray(outputs[index][position], dtype=np.float32)
             for index, path in enumerate(contract.layer_paths)
         }
         writer.write(
@@ -600,9 +761,10 @@ def extract_spatial(
     prepared: PreparedSpatialRequest, *, defer_publication: bool = False
 ) -> dict[str, Any]:
     """Run one spatial extraction and publish its completed run."""
-    if prepared.mode != MODE_CHECKPOINT:
+    if prepared.mode not in (MODE_CHECKPOINT, MODE_ONNX):
         raise SpatialRequestError(
-            f"extract_spatial needs a checkpoint request, not {prepared.mode!r}"
+            "extract_spatial needs a checkpoint or graph request, not "
+            f"{prepared.mode!r}"
         )
     if not prepared.samples:
         raise SpatialRequestError(
@@ -612,7 +774,11 @@ def extract_spatial(
     out_dir = prepared.out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
     manifest, rows, summary = _run_checkpoint_extraction(prepared)
-    effective = _effective_checkpoint(prepared)
+    effective = (
+        _effective_onnx(prepared)
+        if prepared.mode == MODE_ONNX
+        else _effective_checkpoint(prepared)
+    )
     record = build_spatial_run_record(
         requested=dict(prepared.values),
         bundle=prepared.bundle,

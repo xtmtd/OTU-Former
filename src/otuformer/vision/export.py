@@ -620,6 +620,89 @@ def _export_spatial(
     return report
 
 
+class OnnxSpatialForward:
+    """CPU ONNX Runtime adapter for a validated spatial graph.
+
+    It owns one session and the graph's own feature contract, accepts normalized
+    BCHW FP32 images and returns the ordered BHWC grids. Named outputs are
+    requested explicitly, never ``session.run(None, ...)[0]``: a graph that drops
+    or reorders a layer must fail here instead of silently returning a subset.
+    """
+
+    def __init__(self, path: Path) -> None:
+        import onnxruntime as ort
+
+        self.path = Path(path)
+        self.contract = read_spatial_onnx_contract(self.path)
+        self.session = ort.InferenceSession(
+            str(self.path), providers=["CPUExecutionProvider"]
+        )
+        self.output_names = [
+            spatial_output_name(index) for index in range(len(self.contract.layers))
+        ]
+        declared = [output.name for output in self.session.get_outputs()]
+        if declared != self.output_names:
+            raise ValueError(
+                f"graph outputs {declared} do not match the feature contract "
+                f"{self.output_names}"
+            )
+        graph_input = self.session.get_inputs()[0]
+        if graph_input.name != "input":
+            raise ValueError(
+                f"graph input must be named 'input', got {graph_input.name!r}"
+            )
+        if not isinstance(graph_input.shape[0], str):
+            raise ValueError(
+                "spatial v1 requires a dynamic batch dimension; this graph has a "
+                f"fixed batch ({graph_input.shape[0]})"
+            )
+        expected_hw = (int(self.contract.input_hw[1]), int(self.contract.input_hw[0]))
+        declared_hw = graph_input.shape[-2:]
+        if tuple(declared_hw) != expected_hw:
+            raise ValueError(
+                f"graph input spatial size {tuple(declared_hw)} does not match the "
+                f"declared contract {self.contract.input_hw}"
+            )
+        self.normalization = dict(self.contract.normalization)
+
+    def __call__(self, images: np.ndarray) -> tuple[np.ndarray, ...]:
+        batch = np.asarray(images)
+        if batch.dtype != np.float32:
+            raise ValueError(
+                f"spatial ONNX input must be float32, got {batch.dtype}"
+            )
+        expected = (None, 3, int(self.contract.input_hw[1]), int(self.contract.input_hw[0]))
+        if batch.ndim != 4 or tuple(batch.shape[1:]) != expected[1:]:
+            raise ValueError(
+                f"spatial ONNX input must be BCHW {expected}, got {batch.shape}"
+            )
+        produced = self.session.run(self.output_names, {"input": batch})
+        outputs: list[np.ndarray] = []
+        for name, layer, array in zip(self.output_names, self.contract.layers, produced):
+            expected_shape = (
+                batch.shape[0],
+                int(layer.grid_hw[0]),
+                int(layer.grid_hw[1]),
+                int(layer.channels),
+            )
+            if tuple(array.shape) != expected_shape:
+                raise ValueError(
+                    f"graph output {name} has shape {tuple(array.shape)}, expected "
+                    f"{expected_shape}"
+                )
+            if array.dtype != np.float32:
+                raise ValueError(
+                    f"graph output {name} is {array.dtype}, expected float32"
+                )
+            if not np.all(np.isfinite(array)):
+                raise ValueError(f"graph output {name} contains non-finite values")
+            outputs.append(np.asarray(array, dtype=np.float32))
+        return tuple(outputs)
+
+    def close(self) -> None:  # pragma: no cover - ORT sessions own no handle here
+        self.session = None
+
+
 def load_exported_onnx(onnx_path: Path):
     import onnxruntime as ort
 
