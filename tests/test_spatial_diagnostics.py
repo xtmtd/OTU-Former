@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -165,3 +168,50 @@ def test_summary_states_the_stored_plan_status():
     assert entry["seed"] == 42
     assert entry["selected_keys"] == 1
     assert entry["pairs"] == 1
+
+
+def test_diagnostics_eligibility_is_per_branch_and_selected_only(tmp_path):
+    """Diagnostics must match the evaluation's per-branch report and subset."""
+    from test_spatial_evaluation import base_values, run_extraction
+
+    from otuformer.spatial.diagnostics import diagnose_views
+    from otuformer.spatial.extractor import prepare_spatial_request, reevaluate_spatial
+    from otuformer.spatial.storage import open_spatial_product
+
+    result = run_extraction(tmp_path, spatial_eval_sample_size=2)
+    subset = tmp_path / "subset.csv"
+    subset.write_text("image\na.png\n", encoding="utf-8")
+    values = base_values(
+        tmp_path,
+        spatial_input=str(result["out_dir"]),
+        label_csv=str(subset),
+        spatial_eval=True,
+        out_dir=str(tmp_path / "read"),
+    )
+    request = prepare_spatial_request(
+        values, explicit_options=frozenset({"spatial_input", "label_csv"})
+    )
+    try:
+        replayed = reevaluate_spatial(request)
+    finally:
+        request.close()
+    evaluation = json.loads(
+        (Path(replayed["out_dir"]) / "spatial_evaluation.json").read_text(encoding="utf-8")
+    )
+    diagnostics = json.loads(
+        (Path(replayed["out_dir"]) / "spatial_diagnostics.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    reported = diagnostics["evaluation_plan"]["eligibility"]
+    # Only the selected key is counted, not the whole plan.
+    assert set(reported["pairs"]) == {"a.png"}
+    assert reported["totals"] == evaluation["geometric_eligibility"]["totals"]
+    branch = next(
+        b
+        for pair in reported["pairs"]["a.png"].values()
+        for b in pair.values()
+        if b.get("available")
+    )
+    assert branch["eligibility_fraction"] is not None
+    assert branch["sample_fraction"] is not None

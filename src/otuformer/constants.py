@@ -72,6 +72,7 @@ SPATIAL_SCHEMA_VERSION = 1
 SPATIAL_PROTOCOL = "spatial-geometry-v1"
 SPATIAL_SUPPORT_VERSION = "conservative-resampling-v1"
 SPATIAL_COORDINATE_ADAPTER = "coco-pixel-index-to-edge-v1"
+SPATIAL_MASK_SAMPLING = "categorical-nearest-neighbour-v1"
 SPATIAL_KEY_RULE = "artifact-key-resolution-v1"
 SPATIAL_ONNX_METADATA_KEY = "otuformer.spatial.v1"
 

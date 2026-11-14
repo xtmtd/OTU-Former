@@ -122,7 +122,7 @@ def test_explicit_embedding_only_options_reject_spatial_even_at_default(name):
 
 @pytest.mark.parametrize(
     "name",
-    ["feature_layers", "feature_norm", "spatial_layout", "spatial_eval"],
+    ["feature_layers", "feature_norm", "spatial_layout", "spatial_eval", "dump_model_structure"],
 )
 def test_explicit_spatial_only_options_reject_embedding(name):
     values = base_values(Path("/tmp"), output_kind="embedding")
@@ -503,3 +503,152 @@ def test_stored_plan_keeps_base_views_and_adds_protocol_views(tmp_path):
         assert len(reader.evaluation_plan["pairs"]) == len(PROTOCOL_VIEW_IDS) - 1
     finally:
         reader.close()
+
+
+def test_seed_zero_is_used_as_requested(tmp_path):
+    """``--seed 0`` is a valid seed; ``or 42`` silently replaced it."""
+    images = write_images(tmp_path / "images")
+    checkpoint = write_checkpoint(tmp_path / "model.pt")
+    out = tmp_path / "seeded"
+    values = base_values(
+        tmp_path,
+        checkpoint=str(checkpoint),
+        input_images_dir=str(images),
+        spatial_eval=True,
+        seed=0,
+        out_dir=str(out),
+    )
+    request = prepare_spatial_request(
+        values, explicit_options=frozenset({"checkpoint", "input_images_dir", "seed"})
+    )
+    try:
+        result = extract_spatial(request)
+    finally:
+        request.close()
+    plan = json.loads((out / "spatial_evaluation_plan.json").read_text(encoding="utf-8"))
+    assert plan["seed"] == 0
+    assert result["evaluation"]["seed"] == 0
+
+
+def test_evaluation_limit_is_validated_before_any_output(tmp_path):
+    images = write_images(tmp_path / "images")
+    checkpoint = write_checkpoint(tmp_path / "model.pt")
+    out = tmp_path / "out"
+    out.mkdir()
+    keep = out / "keep.txt"
+    keep.write_text("previous attempt", encoding="utf-8")
+    for limit in (0, -3, 101):
+        values = base_values(
+            tmp_path,
+            checkpoint=str(checkpoint),
+            input_images_dir=str(images),
+            spatial_eval=True,
+            spatial_eval_sample_size=limit,
+            out_dir=str(out),
+        )
+        with pytest.raises(ValueError, match="spatial-eval-sample-size must be an integer in"):
+            prepare_spatial_request(
+                values,
+                explicit_options=frozenset(
+                    {"checkpoint", "input_images_dir", "spatial_eval_sample_size"}
+                ),
+            )
+    assert keep.read_text(encoding="utf-8") == "previous attempt"
+
+
+def test_base_views_are_retained_only_for_evaluated_images(tmp_path):
+    """Retention must follow the evaluation budget, not the dataset size."""
+    from otuformer.spatial.extractor import _evaluation_keys
+
+    images = write_images(tmp_path / "images", keys=("a.png", "b.png", "c.png"))
+    checkpoint = write_checkpoint(tmp_path / "model.pt")
+    values = base_values(
+        tmp_path,
+        checkpoint=str(checkpoint),
+        input_images_dir=str(images),
+        spatial_eval=True,
+        spatial_eval_sample_size=1,
+    )
+    request = prepare_spatial_request(
+        values, explicit_options=frozenset({"checkpoint", "input_images_dir"})
+    )
+    try:
+        keys = [record.image_key for record in request.bundle.records]
+        sampled = _evaluation_keys(request, keys)
+        assert len(sampled) == 1 and set(sampled) <= set(keys)
+        # Retention mirrors exactly that resolved subset.
+        assert set(sampled) != set(keys) or len(keys) == 1
+    finally:
+        request.close()
+
+
+def test_prepare_protects_selected_panoptic_masks(tmp_path):
+    """Panoptic masks are inputs: an out-dir aimed at them must be refused."""
+    from otuformer.cli_schema import check_output_safety
+
+    images = tmp_path / "images"
+    (images / "a").mkdir(parents=True)
+    Image.new("RGB", (2, 2), (10, 20, 30)).save(images / "a" / "001.png")
+    selector = tmp_path / "sel.csv"
+    selector.write_text("image\na/001.png\n", encoding="utf-8")
+    masks = tmp_path / "masks"
+    masks.mkdir()
+    ids = np.array([[1, 1], [0, 0]], dtype=np.uint32)
+    rgb = np.stack(
+        [(ids % 256), ((ids // 256) % 256), ((ids // (256 * 256)) % 256)], axis=-1
+    ).astype(np.uint8)
+    Image.fromarray(rgb, mode="RGB").save(masks / "image_001.png")
+    panoptic = tmp_path / "panoptic.json"
+    panoptic.write_text(
+        json.dumps(
+            {
+                "images": [
+                    {"id": 17, "file_name": "a/001.png", "width": 2, "height": 2}
+                ],
+                "categories": [
+                    {"id": 4, "name": "Head", "supercategory": "body", "isthing": 1}
+                ],
+                "annotations": [
+                    {
+                        "image_id": 17,
+                        "file_name": "image_001.png",
+                        "segments_info": [
+                            {
+                                "id": 1,
+                                "category_id": 4,
+                                "area": 2,
+                                "bbox": [0, 0, 2, 1],
+                                "iscrowd": 0,
+                            }
+                        ],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    checkpoint = write_checkpoint(tmp_path / "model.pt")
+    values = base_values(
+        tmp_path,
+        checkpoint=str(checkpoint),
+        input_images_dir=str(images),
+        label_csv=str(selector),
+        coco_panoptic=str(panoptic),
+        panoptic_masks_dir=str(masks),
+        out_dir=str(tmp_path / "out"),
+    )
+    request = prepare_spatial_request(
+        values,
+        explicit_options=frozenset(
+            {"checkpoint", "input_images_dir", "label_csv", "coco_panoptic", "panoptic_masks_dir"}
+        ),
+    )
+    try:
+        protected = {snapshot.path.resolve() for snapshot in request.protected_files}
+        assert (masks / "image_001.png").resolve() in protected
+        with pytest.raises(ValueError, match="contains protected input dependency"):
+            check_output_safety(
+                masks, protected_paths=sorted(protected), overwrite=True
+            )
+    finally:
+        request.close()

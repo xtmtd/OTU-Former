@@ -223,6 +223,50 @@ def test_query_plan_counts_and_directions():
     assert plan["geometry"]["target"]["view_wh"] == [32, 32]
 
 
+def test_query_points_use_the_composed_view_to_view_map():
+    """``p_target = M_target inverse(M_source) p_source``, checked on real views.
+
+    An independent assertion on the composed map: a translated target must place
+    the mapped point at source + translation, not at source - translation. The
+    reversed composition passed the support checks and silently corrupted the
+    ground truth of every query.
+    """
+    picture = image()
+    built = {
+        view_id: trace
+        for view_id, _tensor, trace in build_evaluation_views(
+            picture, image_key="a.png", eval_transform="whole-specimen-pad", size=64
+        )
+    }
+    reference = view_from_trace("a.png", "reference", "base", built["reference"])
+    target = view_from_trace("a.png", "tx10", "eval-transform", built["tx10"])
+    shift = target.trace.source_to_view[0, 2]
+    assert shift > 0.0  # a positive x translation moves content right
+    plan = build_query_plan("a.png", reference, target, pair_id="tx10", seed=42)
+    queries = plan["directions"]["reference_to_target"]["queries"]
+    assert queries
+    for query in queries:
+        source_point = np.asarray(query["xy_source"], dtype=np.float64)
+        assert query["xy_target"] == pytest.approx(
+            [float(source_point[0] + shift), float(source_point[1])], abs=1e-9
+        )
+    # Both directions map the same pair the other way round. The query lattice is
+    # the source view's own grid, so the two directions are compared through the
+    # mapped points rather than through (row, column).
+    reverse = plan["directions"]["target_to_reference"]["queries"]
+    forward_points = {
+        (round(query["xy_source"][0], 6), round(query["xy_source"][1], 6)): query
+        for query in queries
+    }
+    for query in reverse:
+        forward = forward_points.get(
+            (round(query["xy_target"][0], 6), round(query["xy_target"][1], 6))
+        )
+        if forward is None:
+            continue
+        assert forward["xy_target"] == pytest.approx(query["xy_source"], abs=1e-6)
+
+
 def test_queries_require_full_source_and_target_support():
     picture = image()
     built = {
@@ -382,3 +426,41 @@ def test_plan_rejects_missing_views_and_mismatched_pairs():
         build_query_plan("a.png", view_from_trace("a.png", "tx10", "eval-transform", trace), reference, pair_id="base", seed=42)
     with pytest.raises(Exception, match="missing protocol view"):
         build_evaluation_plan({"a.png": [reference]}, seed=42)
+
+
+def test_eligibility_needs_complete_target_feature_support_not_only_pixels():
+    """A mapped point valid on the pixel grid but not on the feature grid fails.
+
+    The stored-plan target-support check used to look at `pixel_sampling_valid`
+    only, so a query whose bilinear feature interpolation reached an invalid
+    neighbour was accepted as eligible.
+    """
+    picture = image()
+    built = {
+        view_id: trace
+        for view_id, _tensor, trace in build_evaluation_views(
+            picture, image_key="a.png", eval_transform="whole-specimen-pad", size=32
+        )
+    }
+    source_valid = np.ones((2, 2), dtype=bool)
+    reference = view_from_trace(
+        "a.png", "reference", "eval-reference", built["reference"],
+        patch_valid=source_valid,
+    )
+    # Everything is pixel-valid, but the whole target feature grid is invalid.
+    target = view_from_trace(
+        "a.png", "rot90", "eval-transform", built["rot90"],
+        patch_valid=np.zeros((2, 2), dtype=bool),
+    )
+    plan = build_query_plan("a.png", reference, target, pair_id="rot90", seed=42)
+    forward = plan["directions"]["reference_to_target"]
+    assert forward["source_valid_count"] == 4
+    assert forward["eligible_count"] == 0
+    assert forward["queries"] == []
+    assert forward["unavailable"] is True
+    assert forward["unavailable_reason"] == "no_overlap"
+    # The reverse direction has no valid source centre at all, so it is a
+    # different unavailable cause rather than the same overlap failure.
+    reverse = plan["directions"]["target_to_reference"]
+    assert reverse["source_valid_count"] == 0
+    assert reverse["unavailable_reason"] == "no_source_valid_center"

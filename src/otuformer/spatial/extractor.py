@@ -165,16 +165,61 @@ def _load_checkpoint_encoder(values: Mapping[str, Any]):
     return encoder, payload, architecture, resolved, image_size, checkpoint_path
 
 
+def _protected_inputs(bundle) -> list[FileSnapshot]:
+    """Every input a cleanup of the output directory could destroy.
+
+    Source JSON alone is not enough: a panoptic product reads the selected mask
+    PNGs through ``SourceIndex.mask_files``, and an output directory pointed at
+    the mask root would clear them while the guard only saw the COCO file. The
+    snapshots carry the real paths, whose symlink hops the shared
+    ``input_dependency_positions`` policy already resolves.
+    """
+    protected: list[FileSnapshot] = [record.image_file for record in bundle.records]
+    if bundle.selector is not None:
+        protected.append(bundle.selector)
+    for index in bundle.sources.values():
+        protected.append(index.file)
+        protected.extend(index.mask_files.values())
+    return protected
+
+
+def _onnx_protected_inputs(graph_path: Path) -> list[FileSnapshot]:
+    """The graph and every external tensor file it declares.
+
+    The payload names are read from the graph instead of guessed: a legitimate
+    model may put its weights anywhere, and a guessed sidecar name leaves a real
+    input unprotected against ``--overwrite``.
+    """
+    from ..data.provenance import snapshot_bytes
+    from ..embedding.extractor import _onnx_external_files
+
+    protected = [snapshot_bytes(graph_path)[1]]
+    for external in _onnx_external_files(graph_path):
+        if external.is_file():
+            protected.append(snapshot_bytes(external)[1])
+    return protected
+
+
 def _annotation_snapshot(bundle) -> dict[str, Any] | None:
+    """Snapshot the selected source annotations and their categorical rasters.
+
+    Instances and keypoints are copied as source records. A panoptic source is a
+    per-image categorical raster plus its ``segments_info``: the source pixel grid
+    is read here (from the already verified mask snapshot) and stored with the
+    product, so view rasters can be rebuilt after the original COCO and mask paths
+    are gone. Nothing is decoded into per-view masks at snapshot time.
+    """
     if not bundle.sources:
         return None
-    from ..data.coco import ROLE_INSTANCES, ROLE_KEYPOINTS
-    from ..vision.geometry import transform_annotations
+    from ..data.coco import ROLE_INSTANCES, ROLE_KEYPOINTS, ROLE_PANOPTIC
+    from ..data.masks import decode_panoptic_map
+    from ..data.provenance import read_verified_bytes
 
     records: list[dict[str, Any]] = []
     categories: dict[str, Any] = {}
     sources: dict[str, Any] = {}
-    for role in (ROLE_INSTANCES, ROLE_KEYPOINTS):
+    rasters: dict[str, Any] = {}
+    for role in (ROLE_INSTANCES, ROLE_KEYPOINTS, ROLE_PANOPTIC):
         index = bundle.sources.get(role)
         if index is None:
             continue
@@ -183,24 +228,47 @@ def _annotation_snapshot(bundle) -> dict[str, Any] | None:
             "sha256": index.file.sha256,
             "images": len(index.images_by_id),
         }
+        # Category IDs are source-local: instances and keypoints may both use id
+        # 1 for different things, so the namespace is ``role`` first. Without it
+        # one source's names and keypoint schema silently overwrite the other's.
         for category_id, category in index.categories_by_id.items():
-            categories[str(category_id)] = dict(category)
+            categories[f"{role}:{int(category_id)}"] = dict(category)
         for record in bundle.records:
             for reference in record.coco_images:
                 if reference.source_id != role:
                     continue
-                for annotation in index.annotations_by_image.get(reference.image_id, ()):
-                    entry = {
-                        "annotation_id": annotation.get("id"),
-                        "image_key": record.image_key,
-                        "category_id": annotation.get("category_id"),
-                        "role": role,
-                        "annotation": dict(annotation),
-                    }
-                    records.append(entry)
+                annotations = index.annotations_by_image.get(reference.image_id, ())
+                for annotation in annotations:
+                    role_name = role
+                    payload = dict(annotation)
+                    if role == ROLE_PANOPTIC:
+                        snapshot = index.mask_files.get(reference.image_id)
+                        raster = decode_panoptic_map(
+                            read_verified_bytes(snapshot),
+                            record.width,
+                            record.height,
+                        )
+                        rasters[record.image_key] = raster
+                        # One stored entry per image keeps the segment table with
+                        # its own raster instead of one record per segment.
+                        role_name = ROLE_PANOPTIC
+                    records.append(
+                        {
+                            "annotation_id": annotation.get("id"),
+                            "image_key": record.image_key,
+                            "category_id": annotation.get("category_id"),
+                            "role": role_name,
+                            "annotation": payload,
+                        }
+                    )
     if not records and not sources:
         return None
-    return {"records": records, "categories": categories, "sources": sources}
+    return {
+        "records": records,
+        "categories": categories,
+        "sources": sources,
+        "rasters": rasters,
+    }
 
 
 def prepare_spatial_request(
@@ -219,10 +287,60 @@ def prepare_spatial_request(
         )
     out_dir = Path(str(resolved.get("out_dir") or "runs/extract")).expanduser()
     if mode == MODE_READ:
-        return _prepare_read(resolved, explicit_options, out_dir, notes)
-    if mode == MODE_ONNX:
-        return _prepare_onnx(resolved, explicit_options, out_dir, notes)
-    return _prepare_checkpoint(resolved, explicit_options, out_dir, notes)
+        prepared = _prepare_read(resolved, explicit_options, out_dir, notes)
+    elif mode == MODE_ONNX:
+        prepared = _prepare_onnx(resolved, explicit_options, out_dir, notes)
+    else:
+        prepared = _prepare_checkpoint(resolved, explicit_options, out_dir, notes)
+    try:
+        _require_separate_output(prepared)
+    except Exception:
+        prepared.close()
+        raise
+    return prepared
+
+
+def _overlay_inputs(images_dir: Path, reader: Any) -> list[FileSnapshot]:
+    """The selected original images an overlay would read."""
+    from ..data.provenance import snapshot_bytes
+
+    protected: list[FileSnapshot] = []
+    for key in reader.image_keys:
+        path = images_dir / key
+        if path.is_file():
+            try:
+                protected.append(snapshot_bytes(path)[1])
+            except OSError:  # pragma: no cover - unreadable image is reported later
+                continue
+    return protected
+
+
+def _require_separate_output(prepared: PreparedSpatialRequest) -> None:
+    """Refuse an output directory that would write over a declared input.
+
+    The CLI clears the directory before the run, so a Python caller was the only
+    path that could reach a report write with an input inside it - for example a
+    selector CSV placed where ``spatial_results.csv`` goes, which the report then
+    overwrote while the file sat in ``protected_files``. Collecting the protection
+    list is not enough; the core executes the same non-overlap rule.
+    """
+    from ..utils.paths import input_dependency_positions
+
+    target = prepared.out_dir.expanduser().resolve()
+    for snapshot in prepared.protected_files:
+        entry = Path(snapshot.path)
+        for position in input_dependency_positions(entry):
+            if position == target or target in position.parents:
+                raise SpatialRequestError(
+                    f"--out-dir {target} contains the input {position}, which this "
+                    f"run reads through {entry}; choose a directory that cannot "
+                    "clear or overwrite it"
+                )
+        resolved = entry.resolve()
+        if target == resolved or target in resolved.parents:
+            raise SpatialRequestError(
+                f"--out-dir {target} is inside the protected input {resolved}"
+            )
 
 
 def _prepare_read(
@@ -275,20 +393,37 @@ def _prepare_read(
     )
     plan = reader.evaluation_plan
     if plan is not None and "seed" in explicit_options:
-        if int(values.get("seed") or 0) != int(plan.get("seed", 0)):
+        stored_seed = plan.get("seed")
+        if stored_seed is not None and int(values.get("seed")) != int(stored_seed):
             reader.close()
             raise SpatialRequestError(
                 f"--seed {values.get('seed')} does not match the saved evaluation "
-                f"plan seed {plan.get('seed')}; a stored plan fixes its seed"
+                f"plan seed {stored_seed}; a stored plan fixes its seed"
             )
-    if values.get("spatial_eval") and plan is None:
-        reader.close()
-        raise SpatialRequestError(
-            "missing_paired_views: this product has no stored paired views or "
-            "evaluation plan, so --spatial-eval cannot be satisfied from it"
-        )
+    if values.get("spatial_eval"):
+        if plan is None:
+            reader.close()
+            raise SpatialRequestError(
+                "missing_paired_views: this product has no stored paired views or "
+                "evaluation plan, so --spatial-eval cannot be satisfied from it"
+            )
+        # An explicit evaluation must be decidable before the output changes: the
+        # selection/plan intersection is what the report will cover.
+        planned = set(plan.get("selected_keys", []))
+        if not [key for key in reader.image_keys if key in planned]:
+            reader.close()
+            raise SpatialRequestError(
+                "no stored planned pairs were selected; the saved evaluation plan "
+                f"covers {sorted(planned)[:3]}{'...' if len(planned) > 3 else ''} "
+                "and the selection contains none of them"
+            )
     images = _as_path(values.get("input_images_dir"))
     if images is not None:
+        # The overlay is drawn from these files, and its figures are written under
+        # the output, so the selected originals must be protected exactly like any
+        # other input: an out-dir whose overlay directory holds them would replace
+        # the image being measured.
+        protected.extend(_overlay_inputs(images, reader))
         notes.append(
             f"optional image overlay requested from {images}; stored numeric "
             "results stay readable when images are missing or mismatched"
@@ -371,11 +506,8 @@ def _prepare_checkpoint(
             f"{EVAL_TRANSFORM_CHOICES}"
         )
     samples = tuple(samples_from_records(bundle.records))
-    protected = [record.image_file for record in bundle.records]
-    if bundle.selector is not None:
-        protected.append(bundle.selector)
-    for index in bundle.sources.values():
-        protected.append(index.file)
+    _require_evaluable_selection(values, samples)
+    protected = _protected_inputs(bundle)
     from ..data.provenance import snapshot_bytes
 
     protected.append(snapshot_bytes(checkpoint_path)[1])
@@ -479,13 +611,33 @@ def _prepare_onnx(
                     f"input size {contract.input_hw[0]}"
                 )
     declared = dict(contract.normalization or {})
-    if declared.get("mean") and [
-        float(v) for v in declared["mean"]
-    ] != [float(v) for v in IMAGENET_MEAN]:
-        raise SpatialRequestError(
-            "the graph declares an input normalization this build does not apply; "
-            f"graph={declared.get('mean')}, supported={list(IMAGENET_MEAN)}"
-        )
+    # The whole normalization is compared, not only the mean: a graph that changes
+    # the std or the pixel space receives a different input than this build
+    # produces, so inference would silently differ from the graph's declaration.
+    expected_normalization = {
+        "mean": [float(v) for v in IMAGENET_MEAN],
+        "std": [float(v) for v in IMAGENET_STD],
+        "space": "rgb01",
+    }
+    for field, expected in expected_normalization.items():
+        if field not in declared:
+            raise SpatialRequestError(
+                f"the graph declares no input {field!r}; this build applies "
+                f"{field}={expected}"
+            )
+        declared_value = declared[field]
+        if field == "space":
+            matched = str(declared_value) == expected
+        else:
+            try:
+                matched = [float(v) for v in declared_value] == expected
+            except (TypeError, ValueError):
+                matched = False
+        if not matched:
+            raise SpatialRequestError(
+                f"the graph declares input {field}={declared_value!r}, which this "
+                f"build does not apply; supported {field}={expected}"
+            )
 
     bundle = read_dataset(
         images_dir,
@@ -508,22 +660,14 @@ def _prepare_onnx(
             f"unknown --eval-transform {eval_transform!r}; expected one of "
             f"{EVAL_TRANSFORM_CHOICES}"
         )
-    protected: list[FileSnapshot] = [record.image_file for record in bundle.records]
-    if bundle.selector is not None:
-        protected.append(bundle.selector)
-    for index in bundle.sources.values():
-        protected.append(index.file)
-    protected.append(snapshot_bytes(graph_path)[1])
-    for sidecar in (
-        graph_path.with_name(graph_path.name + ".data"),
-        graph_path.with_suffix(".onnx.data"),
-    ):
-        if sidecar.is_file():
-            protected.append(snapshot_bytes(sidecar)[1])
+    protected: list[FileSnapshot] = _protected_inputs(bundle)
+    protected.extend(_onnx_protected_inputs(graph_path))
     notes.append(
         "the graph's declared contract fixes layers, normalization, L2 and input "
         "size; numeric agreement was validated at export time"
     )
+    onnx_samples = tuple(samples_from_records(bundle.records))
+    _require_evaluable_selection(values, onnx_samples)
     return PreparedSpatialRequest(
         mode=MODE_ONNX,
         values=values,
@@ -532,7 +676,7 @@ def _prepare_onnx(
         bundle=bundle,
         contract=contract,
         forward=forward,
-        samples=tuple(samples_from_records(bundle.records)),
+        samples=onnx_samples,
         annotations=_annotation_snapshot(bundle),
         protected_files=tuple(protected),
         notes=tuple(notes),
@@ -630,6 +774,10 @@ def _run_checkpoint_extraction(
         annotations=prepared.annotations,
     )
     records = list(prepared.bundle.records)
+    # Resolve the evaluation subset before the first payload is written: an empty
+    # intersection or a rejected plan must not reach an output that was already
+    # cleared.
+    keep_keys = set(_evaluation_keys(prepared, [record.image_key for record in records]))
     base_views: dict[str, SpatialView] = {}
     try:
         with _backend_context(prepared) as device:
@@ -642,20 +790,19 @@ def _run_checkpoint_extraction(
                 batch.append((record, tensor, trace, "base"))
                 if len(batch) >= prepared.batch_size:
                     base_views.update(
-                        _flush_batch(writer, prepared, batch, device)
+                        _flush_batch(writer, prepared, batch, device, keep=keep_keys)
                     )
                     batch = []
             if batch:
-                base_views.update(_flush_batch(writer, prepared, batch, device))
-        if prepared.values.get("spatial_eval"):
+                base_views.update(
+                    _flush_batch(writer, prepared, batch, device, keep=keep_keys)
+                )
+        if keep_keys:
             store_evaluation_views(
                 prepared,
                 writer,
                 base_views=base_views,
-                image_limit=int(
-                    prepared.values.get("spatial_eval_sample_size")
-                    or SPATIAL_EVAL_SAMPLE_SIZE
-                ),
+                image_limit=_evaluation_limit(prepared),
             )
     except Exception:
         writer.abort({"reason": "extraction failed"})
@@ -702,44 +849,119 @@ def _run_forward(
     )
 
 
+def _evaluation_keys(
+    prepared: PreparedSpatialRequest, keys: Sequence[str]
+) -> tuple[str, ...]:
+    """The evaluated subset, resolved before any output changes.
+
+    An explicit evaluation may only cover images that will be sampled, so the
+    empty case is a rejected request rather than a failure reached after payloads
+    were already written and an existing output had been cleared.
+    """
+    if not prepared.values.get("spatial_eval"):
+        return ()
+    sampled = select_evaluation_keys(
+        list(keys),
+        seed=_evaluation_seed(prepared),
+        limit=_evaluation_limit(prepared),
+    )
+    if not sampled:
+        raise SpatialRequestError(
+            "the selection resolved no image for spatial evaluation; "
+            "--spatial-eval needs at least one selected image"
+        )
+    return tuple(sampled)
+
+
+def _require_evaluable_selection(
+    values: Mapping[str, Any], samples: Sequence[SpatialSample]
+) -> None:
+    """Fail a request that cannot evaluate anything before its output is cleared."""
+    if not values.get("spatial_eval"):
+        return
+    raw_limit = values.get("spatial_eval_sample_size")
+    limit = SPATIAL_EVAL_SAMPLE_SIZE if raw_limit is None else int(raw_limit)
+    raw_seed = values.get("seed")
+    seed = 42 if raw_seed is None else int(raw_seed)
+    if not select_evaluation_keys(
+        [sample.image_key for sample in samples], seed=seed, limit=limit
+    ):
+        raise SpatialRequestError(
+            "--spatial-eval needs at least one selected image; this request "
+            "selects none"
+        )
+
+
+def _evaluation_seed(prepared: PreparedSpatialRequest) -> int:
+    raw_seed = prepared.values.get("seed")
+    return 42 if raw_seed is None else int(raw_seed)
+
+
+def _evaluation_limit(prepared: PreparedSpatialRequest) -> int:
+    raw_limit = prepared.values.get("spatial_eval_sample_size")
+    return SPATIAL_EVAL_SAMPLE_SIZE if raw_limit is None else int(raw_limit)
+
+
+def _base_view_views(
+    record: Any,
+    trace: Any,
+    contract: FeatureContract,
+    outputs: Sequence[np.ndarray],
+    position: int,
+    view_id: str = "base",
+) -> SpatialView:
+    """One base view from already-computed batch output."""
+    grid_h, grid_w = (
+        int(contract.input_hw[0]) // int(contract.patch_hw[0]),
+        int(contract.input_hw[1]) // int(contract.patch_hw[1]),
+    )
+    coverage, pixel_valid = pixel_support(trace)
+    patch_coverage, patch_valid = patch_support(
+        trace,
+        pixel_sampling_valid=pixel_valid,
+        grid_hw=(grid_h, grid_w),
+        patch_hw=contract.patch_hw,
+    )
+    return SpatialView(
+        image_key=record.image_key,
+        view_id=view_id,
+        role="base",
+        trace=trace,
+        features={
+            path: np.asarray(outputs[index][position], dtype=np.float32)
+            for index, path in enumerate(contract.layer_paths)
+        },
+        pixel_geometric_coverage=coverage,
+        pixel_sampling_valid=pixel_valid,
+        geometric_coverage=patch_coverage,
+        patch_sampling_valid=patch_valid,
+    )
+
+
 def _flush_batch(
     writer: SpatialWriter,
     prepared: PreparedSpatialRequest,
     batch: Sequence[tuple[Any, Any, Any, str]],
     device: Any,
+    *,
+    keep: set[str] | None = None,
 ) -> dict[str, SpatialView]:
+    """Write one batch and return the base views the caller asked to keep.
+
+    ``keep`` bounds retention: only evaluation-sampled base grids survive the
+    call, because every other base view is already sealed in its payload. Holding
+    all of them would grow with the dataset rather than with the evaluation
+    budget.
+    """
     contract = prepared.contract
+    assert contract is not None
     outputs = _run_forward(prepared, list(batch), device)
     written: dict[str, SpatialView] = {}
-    for position, (record, tensor, trace, view_id) in enumerate(batch):
-        grid_h, grid_w = (
-            int(contract.input_hw[0]) // int(contract.patch_hw[0]),
-            int(contract.input_hw[1]) // int(contract.patch_hw[1]),
-        )
-        coverage, pixel_valid = pixel_support(trace)
-        patch_coverage, patch_valid = patch_support(
-            trace,
-            pixel_sampling_valid=pixel_valid,
-            grid_hw=(grid_h, grid_w),
-            patch_hw=contract.patch_hw,
-        )
-        features = {
-            path: np.asarray(outputs[index][position], dtype=np.float32)
-            for index, path in enumerate(contract.layer_paths)
-        }
-        view = SpatialView(
-            image_key=record.image_key,
-            view_id=view_id,
-            role="base",
-            trace=trace,
-            features=features,
-            pixel_geometric_coverage=coverage,
-            pixel_sampling_valid=pixel_valid,
-            geometric_coverage=patch_coverage,
-            patch_sampling_valid=patch_valid,
-        )
+    for position, (record, _tensor, trace, _view_id) in enumerate(batch):
+        view = _base_view_views(record, trace, contract, outputs, position)
         writer.write(view)
-        written[record.image_key] = view
+        if keep is None or record.image_key in keep:
+            written[record.image_key] = view
     return written
 
 
@@ -886,6 +1108,10 @@ def reevaluate_spatial(
         reader.iter_views(), reader.contract, plan=reader.evaluation_plan
     )
     _attach_reader_sample_ids(rows, reader)
+    # A selector CSV is a report overlay, so every read report carries it - not
+    # only the evaluation report. Diagnostics-only re-reads used to accept the CSV
+    # and drop its labels.
+    summary["sample_metadata"] = reader.overlay_report()
     write_csv_rows(out_dir / FILENAME_RESULTS, rows, RESULT_FIELDS)
     (out_dir / FILENAME_DIAGNOSTICS).write_text(
         json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8"
@@ -922,6 +1148,7 @@ def reevaluate_spatial(
             "rule": "artifact-key-resolution-v1 if --label-csv supplied, else index order",
             "selected_keys": list(reader.image_keys),
         },
+        "metadata_overlay": reader.overlay_report(),
         "notes": list(prepared.notes),
     }
     record = build_spatial_run_record(
@@ -1032,7 +1259,7 @@ def store_evaluation_views(
     from ..spatial.protocol import build_evaluation_plan, build_evaluation_views
 
     assert prepared.contract is not None
-    seed = int(prepared.values.get("seed") or 42)
+    seed = _evaluation_seed(prepared)
     records = {record.image_key: record for record in prepared.bundle.records}
     selected = select_evaluation_keys(list(base_views), seed=seed, limit=image_limit)
     views_by_key: dict[str, list[SpatialView]] = {}

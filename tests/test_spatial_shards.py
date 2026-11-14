@@ -238,7 +238,7 @@ def test_oversized_record_gets_a_dedicated_shard(tmp_path):
 
 def test_shard_reads_are_read_only_and_close_their_resources(tmp_path):
     write_product(tmp_path / "p", layout="sharded", keys=("a.png",))
-    reader = SpatialReader(tmp_path / "p", require_completion=False)
+    reader = SpatialReader(tmp_path / "p", _staging=True)
     views = list(reader.iter_views())
     first = views[0]
     assert not first.features["blocks.0"].flags.writeable or True

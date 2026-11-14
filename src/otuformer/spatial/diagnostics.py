@@ -50,6 +50,22 @@ RESULT_FIELDS = (
 )
 
 
+def _eligibility_counts(
+    plan: Mapping[str, Any], selected: Sequence[str] | None = None
+) -> dict[str, Any]:
+    """Stored geometric eligibility, restricted to the selected keys.
+
+    The evaluation summary publishes per image/pair/direction counts, both
+    fractions and the unavailable reason; diagnostics must publish the same shape
+    over the same restriction, or a diagnostic total would include samples the
+    report does not cover.
+    """
+    from .evaluation import eligibility_report
+
+    keys = list(selected) if selected is not None else list(plan.get("selected_keys", []))
+    return eligibility_report(plan, keys)
+
+
 def diagnose_views(
     views: Iterable[SpatialView],
     contract: FeatureContract,
@@ -66,8 +82,15 @@ def diagnose_views(
     samples: dict[str, int] = {}
     view_count = 0
     failures: list[str] = []
+    # One pass: the keys come from the stream, so diagnostics never hold every
+    # decoded feature/support array of the product at once.
+    selected_keys: list[str] = []
+    seen_keys: set[str] = set()
     for view in views:
         view_count += 1
+        if view.image_key not in seen_keys:
+            seen_keys.add(view.image_key)
+            selected_keys.append(view.image_key)
         samples[view.image_key] = samples.get(view.image_key, 0) + 1
         coverage = np.asarray(view.pixel_geometric_coverage, dtype=np.float64)
         pixel_valid = np.asarray(view.pixel_sampling_valid, dtype=bool)
@@ -130,6 +153,11 @@ def diagnose_views(
                 "selected_keys": len(plan.get("selected_keys", [])),
                 "pairs": len(plan.get("pairs", [])),
                 "query_limit": plan.get("query_limit"),
+                "image_limit": plan.get("image_limit"),
+                # The plan separates "no source-valid centre" from "no overlap"
+                # from a matching failure. Publishing the stored counts keeps that
+                # distinction visible without running the matcher.
+                "eligibility": _eligibility_counts(plan, selected_keys),
             }
             if plan is not None
             else {

@@ -284,29 +284,72 @@ def geometry_signature(view: SpatialView) -> dict[str, Any]:
 def _eligible_queries(
     source_view: SpatialView, target_view: SpatialView, patch_hw: tuple[int, int]
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
-    """Geometric eligibility of every source grid center against one target."""
+    """Geometric eligibility of every source grid center against one target.
+
+    Vectorized: a plan check recomputes eligibility for every stored branch, and a
+    per-query Python loop made that check cost seconds per product. Both support
+    tests are the same rules the scalar helpers apply (complete bilinear feature
+    support for the target grid, complete pixel support for the target view).
+    """
+    import torch
+
+    from ..vision.features import sample_grid_features
+    from ..vision.geometry_support import transform_points
+
     source_valid = np.asarray(source_view.patch_sampling_valid, dtype=bool)
     target_patch_valid = np.asarray(target_view.patch_sampling_valid, dtype=bool)
     target_pixel_valid = np.asarray(target_view.pixel_sampling_valid, dtype=bool)
     rows, columns = np.nonzero(source_valid)
-    pairwise = target_view.trace.view_to_source @ source_view.trace.source_to_view
-    queries: list[dict[str, Any]] = []
-    for row, column in zip(rows.tolist(), columns.tolist()):
-        point = np.array([grid_center_point(row, column, patch_hw)], dtype=np.float64)
-        # Column-vector map through the composed ref->target transform.
-        mapped = transform_points(pairwise, point)[0]
-        if not pixel_point_support(target_pixel_valid, mapped):
-            continue
-        if not grid_point_support(target_patch_valid, mapped, patch_hw):
-            continue
-        queries.append(
-            {
-                "row": int(row),
-                "column": int(column),
-                "xy_source": [float(point[0, 0]), float(point[0, 1])],
-                "xy_target": [float(mapped[0]), float(mapped[1])],
-            }
+    # ``p_target = M_target inverse(M_source) p_source``: map the source view's
+    # point back to the shared source frame first, then forward into the target.
+    pairwise = target_view.trace.source_to_view @ source_view.trace.view_to_source
+    centers = (
+        np.stack(
+            [
+                (columns + 0.5) * float(patch_hw[1]),
+                (rows + 0.5) * float(patch_hw[0]),
+            ],
+            axis=1,
         )
+        if rows.size
+        else np.zeros((0, 2), dtype=np.float64)
+    )
+    mapped = (
+        transform_points(pairwise, centers)
+        if rows.size
+        else np.zeros((0, 2), dtype=np.float64)
+    )
+    keep = np.ones(rows.size, dtype=bool)
+    if rows.size:
+        keep &= np.array(
+            [pixel_point_support(target_pixel_valid, point) for point in mapped],
+            dtype=bool,
+        )
+        grid = torch.zeros(
+            (1, int(target_patch_valid.shape[0]), int(target_patch_valid.shape[1]), 1),
+            dtype=torch.float32,
+        )
+        _values, usable = sample_grid_features(
+            grid,
+            torch.as_tensor(mapped, dtype=torch.float32)[None, ...],
+            patch_hw=(int(patch_hw[0]), int(patch_hw[1])),
+            valid=torch.as_tensor(target_patch_valid)[None, ...],
+        )
+        keep &= usable[0].to(torch.bool).numpy()
+    queries = [
+        {
+            "row": int(row),
+            "column": int(column),
+            "xy_source": [float(point[0]), float(point[1])],
+            "xy_target": [float(target_point[0]), float(target_point[1])],
+        }
+        for row, column, point, target_point in zip(
+            rows[keep].tolist(),
+            columns[keep].tolist(),
+            centers[keep].tolist(),
+            mapped[keep].tolist(),
+        )
+    ]
     counts = {
         "source_valid_count": int(rows.size),
         "eligible_count": len(queries),

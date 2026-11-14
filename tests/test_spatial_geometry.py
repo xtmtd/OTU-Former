@@ -433,6 +433,130 @@ def test_support_agrees_with_the_real_resampler_footprint():
         assert valid.any()
 
 
+def test_crop_then_pad_keeps_the_surviving_content_domain():
+    """Coverage and annotations must respect an intermediate crop.
+
+    Cropping half the image away and padding back to the original canvas leaves
+    the discarded half as fill. The final matrix is the identity, so a
+    matrix-only support computation claimed full coverage and kept annotations in
+    the black half.
+    """
+    from otuformer.vision.geometry import transform_annotations
+
+    image = Image.new("RGB", (8, 8), (200, 10, 10))
+    operations = [
+        GeometryOp("crop", {"from_wh": [8, 8], "left": 4, "top": 0, "width": 4, "height": 8}),
+        GeometryOp(
+            "pad",
+            {"from_wh": [4, 8], "canvas_wh": [8, 8], "offset": [4, 0], "fill": [0, 0, 0]},
+        ),
+    ]
+    viewed, trace = apply_geometry(image, operations, track=True)
+    assert trace is not None
+    np.testing.assert_allclose(trace.source_to_view, np.eye(3))
+    # The left half is black fill, the right half still holds content.
+    pixels = np.asarray(viewed)
+    assert (pixels[:, :4].sum(axis=2) == 0).all()
+    assert (pixels[:, 4:].sum(axis=2) > 0).all()
+
+    coverage, valid = pixel_support(trace)
+    np.testing.assert_allclose(coverage[:, :4], 0.0)
+    np.testing.assert_allclose(coverage[:, 4:], 1.0)
+    np.testing.assert_allclose(valid[:, :4], False)
+    np.testing.assert_allclose(valid[:, 4:], True)
+
+    annotation = {
+        "id": 1,
+        "image_id": 1,
+        "category_id": 3,
+        "bbox": [0.0, 0.0, 4.0, 8.0],
+        "keypoints": [1.0, 4.0, 2],
+        "segmentation": [[0.0, 0.0, 4.0, 0.0, 4.0, 8.0, 0.0, 8.0]],
+    }
+    kept = {
+        "id": 2,
+        "image_id": 1,
+        "category_id": 3,
+        "bbox": [5.0, 1.0, 2.0, 4.0],
+        "keypoints": [6.0, 4.0, 2],
+        "segmentation": [[5.0, 1.0, 7.0, 1.0, 7.0, 5.0, 5.0, 5.0]],
+    }
+    discarded, retained = transform_annotations(
+        [annotation, kept], {3: {"name": "x"}}, trace, role="instances"
+    )
+    assert discarded["annotation_in_view"] is False
+    assert discarded["area_retained"] == 0.0
+    assert discarded["polygon_xy"] is None
+    assert discarded["keypoints_in_view"] == [False]
+    assert retained["annotation_in_view"] is True
+    assert retained["area_retained"] == pytest.approx(8.0)
+    assert retained["keypoints_in_view"] == [True]
+
+
+def test_categorical_raster_support_follows_the_surviving_domain():
+    from otuformer.vision.geometry import transform_annotations
+
+    image = Image.new("RGB", (8, 8), (10, 20, 30))
+    operations = [
+        GeometryOp("crop", {"from_wh": [8, 8], "left": 4, "top": 0, "width": 4, "height": 8}),
+        GeometryOp(
+            "pad",
+            {"from_wh": [4, 8], "canvas_wh": [8, 8], "offset": [4, 0], "fill": [0, 0, 0]},
+        ),
+    ]
+    _, trace = apply_geometry(image, operations, track=True)
+    assert trace is not None
+    raster = np.zeros((8, 8), dtype=np.uint8)
+    raster[2:6, 2:6] = 7
+    (record,) = transform_annotations(
+        [{"id": 1, "image_id": 1, "category_id": 3, "raster": raster}],
+        {3: {"name": "x"}},
+        trace,
+        role="panoptic",
+    )
+    # The fill half must not be readable as a real category.
+    assert not record["mask_support"][:, :4].any()
+    assert record["mask_support"][:, 4:].any()
+    assert set(np.unique(record["mask"][:, :4])) == {0}
+
+
+def test_affine_upscale_does_not_shrink_the_kernel_footprint():
+    """Validity must cover every pixel the real resampler lets the fill change."""
+
+    def run(fill):
+        image = Image.new("RGB", (16, 16), (200, 10, 10))
+        operations = [
+            GeometryOp(
+                "pad",
+                {"from_wh": [16, 16], "canvas_wh": [24, 24], "offset": [0, 0], "fill": list(fill)},
+            ),
+            GeometryOp(
+                "affine",
+                {
+                    "from_wh": [24, 24],
+                    "angle": 0.0,
+                    "translate": [0.0, 0.0],
+                    "scale": 2.0,
+                    "shear": [0.0, 0.0],
+                    "interpolation": "bicubic",
+                    "canvas_wh": [24, 24],
+                },
+            ),
+        ]
+        viewed, trace = apply_geometry(image, operations, track=True)
+        assert trace is not None
+        return np.asarray(viewed), pixel_support(trace)[1]
+
+    with_black, valid = run((0, 0, 0))
+    with_white, _ = run((255, 255, 255))
+    changed = np.any(with_black != with_white, axis=2)
+    assert changed.any()
+    # Every pixel the fill colour can reach is unavailable, not just the ones the
+    # shrunken radius happened to cover.
+    assert not valid[changed].any()
+    assert valid.any()
+
+
 def test_trace_round_trips_and_rejects_inconsistent_records():
     image = asymmetric_image(40, 30)
     ops = evaluation_view_ops(image, name="whole-specimen-pad", size=32)
@@ -507,3 +631,321 @@ def test_unknown_operation_and_eval_name_are_rejected():
         GeometryOp("stretch", {})
     with pytest.raises(ValueError, match="unknown eval transform"):
         build_eval_view(image, name="random-crop", size=16)
+
+
+def test_categorical_raster_replays_each_stored_operation():
+    """Two nearest rotations do not compose into one nearest sample."""
+    from torchvision.transforms import InterpolationMode
+    from torchvision.transforms import functional as TF
+
+    from otuformer.vision.geometry import transform_annotations
+
+    size = 16
+    rotation = GeometryOp(
+        "rotate",
+        {
+            "from_wh": [size, size],
+            "angle": -15.0,
+            "center": [size / 2, size / 2],
+            "expand": False,
+            "interpolation": "nearest",
+            "fill": [0],
+            "canvas_wh": [size, size],
+        },
+    )
+    trace = trace_operations((size, size), [rotation, rotation])
+    raster = np.zeros((size, size), dtype=np.uint8)
+    raster[4:11, 5:9] = 1
+    raster[6:8, 7:8] = 2
+    (record,) = transform_annotations(
+        [{"id": 1, "image_id": 1, "category_id": 4, "raster": raster}],
+        {4: {"name": "x"}},
+        trace,
+        role="panoptic",
+    )
+    expected = Image.fromarray(raster)
+    for _ in range(2):
+        expected = TF.rotate(
+            expected,
+            -15.0,
+            interpolation=InterpolationMode.NEAREST,
+            expand=False,
+            center=[size / 2, size / 2],
+            fill=0,
+        )
+    truth = np.asarray(expected)
+    # No category may be invented or replaced by a different real category.
+    assert not ((truth > 0) & (record["mask"] > 0) & (record["mask"] != truth)).any()
+    assert not ((truth == 0) & (record["mask"] > 0)).any()
+    # And a real category is never dropped from its own nearest support.
+    assert np.array_equal(record["mask"], truth)
+    assert record["mask_support"][truth > 0].all()
+
+
+def test_categorical_support_is_the_nearest_taps_not_the_image_kernel():
+    """A mask's support follows its own nearest taps, not the image's bicubic one."""
+    from otuformer.vision.geometry import transform_annotations
+
+    raster = np.zeros((12, 12), dtype=np.uint8)
+    raster[3:9, 3:9] = 5
+    operations = [
+        GeometryOp(
+            "pad",
+            {"from_wh": [12, 12], "canvas_wh": [16, 16], "offset": [2, 2], "fill": [0]},
+        ),
+        GeometryOp(
+            "rotate",
+            {
+                "from_wh": [16, 16],
+                "angle": 15.0,
+                "center": [8.0, 8.0],
+                "expand": False,
+                "interpolation": "nearest",
+                "fill": [0],
+                "canvas_wh": [16, 16],
+            },
+        ),
+    ]
+    trace = trace_operations((12, 12), operations)
+    (record,) = transform_annotations(
+        [{"id": 1, "image_id": 1, "category_id": 4, "raster": raster}],
+        {4: {"name": "x"}},
+        trace,
+        role="panoptic",
+    )
+    assert record["mask_support"].any()
+    # Every written category is inside the support, and the support is not the
+    # image resampler's wider footprint (which cleared real nearest samples).
+    assert record["mask_support"][record["mask"] > 0].all()
+    nearest_hits = int((record["mask"] > 0).sum())
+    assert nearest_hits > 0
+    assert int(record["mask_support"].sum()) >= nearest_hits
+
+
+def test_a_fully_cropped_segmentation_does_not_fall_back_to_its_bbox():
+    """Two parts on either side of a centre crop are out of view, not visible."""
+    from otuformer.vision.geometry import transform_annotations
+
+    trace = trace_operations(
+        (20, 20),
+        [
+            GeometryOp(
+                "crop",
+                {"from_wh": [20, 20], "left": 8, "top": 0, "width": 4, "height": 20},
+            )
+        ],
+    )
+    annotation = {
+        "id": 1,
+        "image_id": 1,
+        "category_id": 4,
+        "bbox": [0.0, 0.0, 20.0, 4.0],
+        "segmentation": [[0, 0, 4, 0, 4, 4, 0, 4], [16, 0, 20, 0, 20, 4, 16, 4]],
+    }
+    (record,) = transform_annotations(
+        [annotation], {4: {"name": "x"}}, trace, role="instances"
+    )
+    assert record["annotation_in_view"] is False
+    assert record["area_retained"] == 0.0
+    assert record["polygon_xy"] is None
+    # A bbox-only annotation keeps its fallback, and so does an empty segmentation.
+    for candidate in (
+        {"id": 2, "image_id": 1, "category_id": 4, "bbox": [8.0, 0.0, 4.0, 4.0]},
+        {
+            "id": 3,
+            "image_id": 1,
+            "category_id": 4,
+            "bbox": [8.0, 0.0, 4.0, 4.0],
+            "segmentation": [],
+        },
+    ):
+        (fallback,) = transform_annotations(
+            [candidate], {4: {"name": "x"}}, trace, role="instances"
+        )
+        assert fallback["annotation_in_view"] is True
+        assert fallback["area_retained"] == pytest.approx(16.0)
+
+
+def test_categorical_replay_matches_the_backend_pixel_for_pixel():
+    """The oracle is the library itself: same ops on an integer image."""
+    from otuformer.vision.geometry import transform_annotations
+
+    rng = np.random.default_rng(0)
+    cases = [
+        (
+            "resize 8x1 -> 12x1",
+            (8, 1),
+            [
+                GeometryOp(
+                    "resize",
+                    {
+                        "from_wh": [8, 1],
+                        "to_wh": [12, 1],
+                        "interpolation": "nearest",
+                        "antialias": False,
+                    },
+                )
+            ],
+            rng.integers(1, 9, size=(1, 8)).astype(np.uint8),
+        ),
+        (
+            "rotate 45 nearest",
+            (13, 9),
+            [
+                GeometryOp(
+                    "rotate",
+                    {
+                        "from_wh": [13, 9],
+                        "angle": 45.0,
+                        "center": [6.5, 4.5],
+                        "expand": False,
+                        "interpolation": "nearest",
+                        "fill": [0],
+                        "canvas_wh": [13, 9],
+                    },
+                )
+            ],
+            rng.integers(1, 9, size=(9, 13)).astype(np.uint16),
+        ),
+        (
+            "rotate 90 expanding, odd height",
+            (10, 7),
+            [
+                GeometryOp(
+                    "rotate",
+                    {
+                        "from_wh": [10, 7],
+                        "angle": 90.0,
+                        "center": [5.0, 3.5],
+                        "expand": True,
+                        "interpolation": "nearest",
+                        "fill": [0],
+                        "canvas_wh": [8, 11],
+                    },
+                )
+            ],
+            rng.integers(1, 9, size=(7, 10)).astype(np.uint16),
+        ),
+        (
+            "rotate 90 in place, odd/even canvas",
+            (7, 9),
+            [
+                GeometryOp(
+                    "rotate",
+                    {
+                        "from_wh": [7, 9],
+                        "angle": 90.0,
+                        "center": [3.5, 4.5],
+                        "expand": False,
+                        "interpolation": "nearest",
+                        "fill": [0],
+                        "canvas_wh": [7, 9],
+                    },
+                )
+            ],
+            rng.integers(1, 9, size=(9, 7)).astype(np.uint8),
+        ),
+        (
+            "affine scale 1.5",
+            (9, 9),
+            [
+                GeometryOp(
+                    "affine",
+                    {
+                        "from_wh": [9, 9],
+                        "angle": 0.0,
+                        "translate": [0.0, 0.0],
+                        "scale": 1.5,
+                        "shear": [0.0, 0.0],
+                        "interpolation": "nearest",
+                        "canvas_wh": [9, 9],
+                    },
+                )
+            ],
+            rng.integers(1, 9, size=(9, 9)).astype(np.uint8),
+        ),
+        (
+            "pad then rotate",
+            (12, 12),
+            [
+                GeometryOp(
+                    "pad",
+                    {
+                        "from_wh": [12, 12],
+                        "canvas_wh": [16, 16],
+                        "offset": [2, 2],
+                        "fill": [0],
+                    },
+                ),
+                GeometryOp(
+                    "rotate",
+                    {
+                        "from_wh": [16, 16],
+                        "angle": 15.0,
+                        "center": [8.0, 8.0],
+                        "expand": False,
+                        "interpolation": "nearest",
+                        "fill": [0],
+                        "canvas_wh": [16, 16],
+                    },
+                ),
+            ],
+            rng.integers(1, 9, size=(12, 12)).astype(np.uint8),
+        ),
+        (
+            "crop then hflip",
+            (12, 12),
+            [
+                GeometryOp(
+                    "crop",
+                    {"from_wh": [12, 12], "left": 2, "top": 3, "width": 6, "height": 5},
+                ),
+                GeometryOp("hflip", {"from_wh": [6, 5], "canvas_wh": [6, 5]}),
+            ],
+            rng.integers(1, 9, size=(12, 12)).astype(np.uint8),
+        ),
+    ]
+    for label, source_wh, operations, raster in cases:
+        _, trace = apply_geometry(Image.new("RGB", source_wh), operations, track=True)
+        assert trace is not None
+        oracle, _ = apply_geometry(
+            Image.fromarray(raster.astype(np.int32), mode="I"), operations, track=True
+        )
+        truth = np.asarray(oracle)
+        (record,) = transform_annotations(
+            [{"id": 1, "image_id": 1, "category_id": 4, "raster": raster}],
+            {4: {"name": "x"}},
+            trace,
+            role="panoptic",
+        )
+        assert np.array_equal(record["mask"], truth), label
+        assert record["mask_support"][truth > 0].all(), label
+
+
+def test_a_categorical_resize_matches_pillow_column_mapping():
+    """Deterministic fixture: 8 ids upscaled to 12 columns."""
+    from otuformer.vision.geometry import transform_annotations
+
+    raster = np.arange(1, 9, dtype=np.uint8).reshape(1, 8)
+    trace = trace_operations(
+        (8, 1),
+        [
+            GeometryOp(
+                "resize",
+                {
+                    "from_wh": [8, 1],
+                    "to_wh": [12, 1],
+                    "interpolation": "nearest",
+                    "antialias": False,
+                },
+            )
+        ],
+    )
+    (record,) = transform_annotations(
+        [{"id": 1, "image_id": 1, "category_id": 4, "raster": raster}],
+        {4: {"name": "x"}},
+        trace,
+        role="panoptic",
+    )
+    # Pillow's own mapping, not floor((i + 0.5) * 8 / 12).
+    assert record["mask"][0].tolist() == [1, 2, 2, 3, 3, 4, 5, 6, 6, 7, 8, 8]

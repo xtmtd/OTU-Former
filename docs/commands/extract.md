@@ -81,7 +81,7 @@ Spatial evaluation only. Maximum number of deterministically selected images for
 
 **Default:** `No`
 
-Checkpoint spatial only. Write backbone-relative module paths with their spatial eligibility to model_layers.txt, then continue.
+Checkpoint spatial only. Write backbone-relative module paths with their spatial eligibility to model_layers.txt, then continue. Explicit use in embedding output is rejected rather than silently ignored.
 
 ### `--out-dir`
 

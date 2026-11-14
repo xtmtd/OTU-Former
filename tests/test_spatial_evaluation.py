@@ -268,6 +268,40 @@ def test_missing_plan_and_empty_intersection_are_errors(tmp_path):
         )
 
 
+def test_empty_evaluation_intersection_fails_before_any_output(tmp_path):
+    """A selected subset outside the saved plan is rejected at preparation."""
+    # Two images stored, but only one of them is in the saved evaluation plan.
+    paired = run_extraction(tmp_path, spatial_eval_sample_size=1)
+    product = Path(paired["out_dir"])
+    reader = open_spatial_product(product)
+    try:
+        planned = set(reader.evaluation_plan["selected_keys"])
+        unplanned = [key for key in reader.image_keys if key not in planned]
+    finally:
+        reader.close()
+    assert unplanned
+    subset = tmp_path / "unplanned.csv"
+    subset.write_text("image\n" + "\n".join(unplanned) + "\n", encoding="utf-8")
+    values = base_values(
+        tmp_path,
+        spatial_input=str(product),
+        label_csv=str(subset),
+        spatial_eval=True,
+        out_dir=str(tmp_path / "read"),
+    )
+    with pytest.raises(SpatialRequestError, match="no stored planned pairs were selected"):
+        prepare_spatial_request(
+            values,
+            explicit_options=frozenset({"spatial_input", "label_csv", "spatial_eval"}),
+        )
+    # Diagnostics-only reads of those same stored keys remain allowed.
+    values["spatial_eval"] = False
+    request = prepare_spatial_request(
+        values, explicit_options=frozenset({"spatial_input", "label_csv"})
+    )
+    request.close()
+
+
 def test_read_evaluation_without_plan_raises_from_the_matcher(tmp_path):
     plain = run_extraction(tmp_path, spatial_eval=False, out_dir=str(tmp_path / "plain"))
     reader = open_spatial_product(Path(plain["out_dir"]))
@@ -379,3 +413,258 @@ def test_write_spatial_evaluation_uses_the_documented_filenames(tmp_path):
     assert envelope["evaluation"]["counts"]["queries"] == len(
         list(csv.DictReader((out / FILENAME_MATCHES).open(encoding="utf-8")))
     )
+
+
+def test_subset_evaluation_follows_the_csv_selection_order(tmp_path):
+    """A CSV subset is the report order: [b.png, a.png] must stay [b, a]."""
+    result = run_extraction(tmp_path, spatial_eval_sample_size=2)
+    product = Path(result["out_dir"])
+    subset = tmp_path / "subset.csv"
+    subset.write_text("image\nb.png\na.png\n", encoding="utf-8")
+    values = base_values(
+        tmp_path,
+        spatial_input=str(product),
+        label_csv=str(subset),
+        out_dir=str(tmp_path / "ordered"),
+    )
+    request = prepare_spatial_request(
+        values, explicit_options=frozenset({"spatial_input", "label_csv"})
+    )
+    try:
+        replayed = reevaluate_spatial(request)
+    finally:
+        request.close()
+    with (Path(replayed["out_dir"]) / FILENAME_MATCHES).open(encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert [key for key in dict.fromkeys(row["image_key"] for row in rows)] == [
+        "b.png",
+        "a.png",
+    ]
+
+
+def test_summary_denominators_count_images_not_rows(tmp_path):
+    result = run_extraction(tmp_path, spatial_eval_sample_size=2)
+    evaluation = json.loads(
+        (Path(result["out_dir"]) / FILENAME_EVALUATION).read_text(encoding="utf-8")
+    )
+    metrics = evaluation["metrics"]
+    # No pooled cross-transform score is published.
+    assert "overall" not in metrics
+    assert "denominators" in metrics
+    for layer, payload in metrics["per_layer"].items():
+        assert "overall" not in payload
+        for pair_id, transform in payload["transforms"].items():
+            for direction in DIRECTIONS:
+                branch = transform["directions"][direction]
+                if not branch.get("available"):
+                    continue
+                # Two images, two directions: a row count of 4 is not 4 images.
+                assert branch["contributing_images"] <= 2
+                assert branch["rows"] >= branch["contributing_images"]
+                assert branch["contributing_images"] == len(
+                    branch["contributing_image_keys"]
+                )
+
+
+def test_diagnostics_only_read_reports_the_selector_overlay(tmp_path):
+    """A selector CSV is a report overlay for every read, not only evaluation."""
+    result = run_extraction(tmp_path, spatial_eval=False, out_dir=str(tmp_path / "plain"))
+    subset = tmp_path / "labels.csv"
+    subset.write_text("image,label\nb.png,beetle\n", encoding="utf-8")
+    values = base_values(
+        tmp_path,
+        spatial_input=str(result["out_dir"]),
+        label_csv=str(subset),
+        spatial_eval=False,
+        out_dir=str(tmp_path / "read"),
+    )
+    request = prepare_spatial_request(
+        values, explicit_options=frozenset({"spatial_input", "label_csv"})
+    )
+    try:
+        replayed = reevaluate_spatial(request)
+    finally:
+        request.close()
+    out = Path(replayed["out_dir"])
+    diagnostics = json.loads((out / "spatial_diagnostics.json").read_text(encoding="utf-8"))
+    overlay = diagnostics["sample_metadata"]
+    assert overlay["status"] == "present"
+    assert overlay["samples"]["b.png"] == {"label": "beetle"}
+    envelope = json.loads((out / "run_provenance.json").read_text(encoding="utf-8"))
+    assert envelope["effective"]["metadata_overlay"]["status"] == "present"
+    assert envelope["effective"]["metadata_overlay"]["fields"] == ["label"]
+
+
+def test_overlay_only_requires_the_selected_images_and_their_real_size(tmp_path):
+    """An unselected image cannot make the selected overlay unavailable."""
+    result = run_extraction(tmp_path, spatial_eval_sample_size=2)
+    images = tmp_path / "images"
+    subset = tmp_path / "subset.csv"
+    subset.write_text("image\na.png\n", encoding="utf-8")
+    # Remove the unselected image from the supplied root.
+    (images / "b.png").unlink()
+    values = base_values(
+        tmp_path,
+        spatial_input=str(result["out_dir"]),
+        label_csv=str(subset),
+        input_images_dir=str(images),
+        spatial_eval=True,
+        out_dir=str(tmp_path / "overlay"),
+    )
+    request = prepare_spatial_request(
+        values,
+        explicit_options=frozenset(
+            {"spatial_input", "label_csv", "input_images_dir"}
+        ),
+    )
+    try:
+        replayed = reevaluate_spatial(request)
+    finally:
+        request.close()
+    payload = json.loads(
+        (Path(replayed["out_dir"]) / FILENAME_EVALUATION).read_text(encoding="utf-8")
+    )
+    assert payload["overlays"]["status"] == "available"
+    assert payload["overlays"]["verified_images"] == ["a.png"]
+    assert payload["overlays"]["missing_images"] == []
+    # The documented matching-line figure is produced, not just a status flag.
+    figures = payload["overlays"]["figures"]
+    assert figures["status"] == "available"
+    assert figures["figures"] and Path(figures["figures"][0]).is_file()
+
+
+def test_overlay_rejects_bytes_that_hide_a_wrong_stored_size(tmp_path):
+    from PIL import Image
+
+    from otuformer.spatial.evaluation import _verify_overlay_images
+
+    root = tmp_path / "product"
+    build = run_extraction(tmp_path, spatial_eval_sample_size=1, out_dir=str(root))
+    images = tmp_path / "wrong"
+    images.mkdir()
+    Image.new("RGB", (8, 8), (5, 6, 7)).save(images / "a.png")
+    reader = open_spatial_product(Path(build["out_dir"]))
+    try:
+        # Match the stored hash so only the dimension check can catch it.
+        import hashlib
+
+        stored = reader._index[0]["sample"]  # noqa: SLF001 - reader owns its index
+        payload = (images / "a.png").read_bytes()
+        stored["image_sha256"] = hashlib.sha256(payload).hexdigest()
+        stored["width"], stored["height"] = 999, 888
+        report = _verify_overlay_images(reader, images)
+    finally:
+        reader.close()
+    assert report["status"] == "unavailable"
+    assert report["wrong_size_images"] == ["a.png"]
+
+
+def test_plan_geometry_is_keyed_by_image_and_reports_eligibility_counts(tmp_path):
+    result = run_extraction(tmp_path, spatial_eval_sample_size=2)
+    payload = json.loads(
+        (Path(result["out_dir"]) / FILENAME_EVALUATION).read_text(encoding="utf-8")
+    )
+    # Both images have a tx10 pair; neither may shadow the other.
+    assert set(payload["plan_geometry"]) == {"a.png", "b.png"}
+    for image_key, pairs in payload["plan_geometry"].items():
+        assert "tx10" in pairs
+        assert pairs["tx10"]["reference_signature"]["view_id"]
+    eligibility = payload["geometric_eligibility"]
+    assert set(eligibility["totals"]) == {
+        "source_valid_count",
+        "eligible_count",
+        "sampled_count",
+    }
+    assert eligibility["totals"]["source_valid_count"] >= eligibility["totals"][
+        "eligible_count"
+    ]
+    branch = next(
+        branch
+        for pairs in eligibility["pairs"].values()
+        for pair in pairs.values()
+        for branch in pair.values()
+        if branch.get("available")
+    )
+    assert branch["eligibility_fraction"] is not None
+    assert branch["sample_fraction"] is not None
+    # A no-overlap branch keeps its reason instead of only `available: false`.
+    unavailable = [
+        branch
+        for pairs in eligibility["pairs"].values()
+        for pair in pairs.values()
+        for branch in pair.values()
+        if not branch.get("available")
+    ]
+    assert unavailable
+    assert all(branch.get("unavailable_reason") for branch in unavailable)
+
+
+def test_overlay_names_do_not_collide_and_keep_every_family(tmp_path):
+    """`a_b.png` and `a/b.png` must not share a figure; families are not dropped."""
+    from otuformer.spatial.evaluation import draw_match_overlays
+
+    keys = ("a_b.png", "a/b.png", "a.jpg", "a.jpg.png/b.jpg")
+
+    class FakeReader:
+        image_keys = keys
+
+    rows = []
+    for index, key in enumerate(keys):
+        for layer in ("blocks.0", "blocks.11"):
+            for family in ("tx10", "rot15"):
+                for query in range(6):
+                    rows.append(
+                        {
+                            "image_key": key,
+                            "layer": layer,
+                            "pair_id": family,
+                            "direction": "reference_to_target",
+                            "query_index": query,
+                            "normalized_error": str(0.1 + index + query * 0.01),
+                            "true_x": 1.0,
+                            "true_y": 1.0,
+                            "predicted_x": 2.0,
+                            "predicted_y": 2.0,
+                        }
+                    )
+    images = tmp_path / "images"
+    for key in keys:
+        (images / key).parent.mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (16, 16), (9, 9, 9)).save(images / key)
+    overlay = {"status": "available", "verified_images": list(keys)}
+    report = draw_match_overlays(
+        tmp_path / "out",
+        rows,
+        reader=FakeReader(),  # type: ignore[arg-type]
+        overlay=overlay,
+        images_dir=images,
+    )
+    assert report["status"] == "available"
+    paths = report["figures"]
+    assert len(paths) == len(keys)
+    assert len(set(paths)) == len(keys)  # no silent overwrite
+    assert all(Path(path).is_file() for path in paths)
+    # `a.jpg` must not occupy the path `a.jpg.png/b.jpg` needs as a directory.
+    assert all(Path(path).parent.name == "spatial_overlays" for path in paths)
+    # Each family/layer keeps its own worst five: the loss cap is per group.
+    assert report["per_image_lines"] == 5
+
+
+def test_core_read_protects_the_optional_overlay_images(tmp_path):
+    """A core read whose out-dir holds the originals must be refused."""
+    result = run_extraction(tmp_path, spatial_eval_sample_size=1)
+    # Put an original image where the overlay figure would be written.
+    overlays = tmp_path / "read" / "spatial_overlays"
+    overlays.mkdir(parents=True)
+    Image.new("RGB", (64, 64), (11, 22, 33)).save(overlays / "a.png")
+    values = base_values(
+        tmp_path,
+        spatial_input=str(result["out_dir"]),
+        input_images_dir=str(overlays),
+        spatial_eval=True,
+        out_dir=str(tmp_path / "read"),
+    )
+    with pytest.raises(SpatialRequestError, match="contains the input"):
+        prepare_spatial_request(
+            values, explicit_options=frozenset({"spatial_input", "input_images_dir"})
+        )

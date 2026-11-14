@@ -10,7 +10,12 @@ from __future__ import annotations
 
 from typing import Mapping
 
-from ..constants import FEATURE_NORM_CHOICES, OUTPUT_KIND_CHOICES, SPATIAL_LAYOUT_CHOICES
+from ..constants import (
+    FEATURE_NORM_CHOICES,
+    OUTPUT_KIND_CHOICES,
+    SPATIAL_EVAL_SAMPLE_SIZE,
+    SPATIAL_LAYOUT_CHOICES,
+)
 
 #: Options that only ever describe an embedding vector or its evaluation.
 EMBEDDING_ONLY_OPTIONS = (
@@ -36,6 +41,9 @@ SPATIAL_ONLY_OPTIONS = (
     "spatial_layout",
     "spatial_eval",
     "spatial_eval_sample_size",
+    # The parser accepts it for every extract run, so it must be rejected where
+    # nothing consumes it: the embedding path never writes model_layers.txt.
+    "dump_model_structure",
 )
 
 #: Rejected in artifact read mode: a stored product fixes these contracts.
@@ -201,6 +209,27 @@ def validate_extract_mode_options(
         raise ValueError(
             "--spatial-eval-sample-size only applies with --spatial-eval"
         )
+    if bool(values.get("spatial_eval")):
+        # The evaluation subset decides which base grids are kept; validating the
+        # limit now keeps a rejected request from clearing an existing output.
+        limit = values.get("spatial_eval_sample_size")
+        if limit is None:
+            limit = SPATIAL_EVAL_SAMPLE_SIZE
+        try:
+            resolved_limit = int(limit)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"--spatial-eval-sample-size must be a positive integer, got {limit!r}"
+            ) from None
+        # The frozen protocol caps the evaluated sample at the stored-plan bound;
+        # accepting a larger value here would only defer the same rejection to the
+        # reader, after payloads were written.
+        if resolved_limit <= 0 or resolved_limit > SPATIAL_EVAL_SAMPLE_SIZE:
+            raise ValueError(
+                "--spatial-eval-sample-size must be an integer in "
+                f"1..{SPATIAL_EVAL_SAMPLE_SIZE} (the frozen evaluation budget), "
+                f"got {resolved_limit}"
+            )
     if mode == MODE_ONNX:
         for name, why in (
             (

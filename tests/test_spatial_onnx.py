@@ -383,3 +383,46 @@ def test_cli_rejects_graph_overrides_before_writing(tmp_path, graph):
         assert result.exit_code != 0, extra
         assert match in result.output.replace("\n", " "), extra
         assert not out.exists()
+
+
+def test_preparation_protects_declared_onnx_external_data(tmp_path, graph):
+    """External weights are inputs: a guessed sidecar name is not protection."""
+    import os
+
+    import onnx
+
+    from otuformer.cli_schema import check_output_safety
+    from otuformer.spatial.extractor import _onnx_protected_inputs
+
+    checkpoint, onnx_path = graph
+    # Re-save the graph with its tensors in an arbitrarily named payload.
+    external_root = tmp_path / "external"
+    (external_root / "weights").mkdir(parents=True)
+    previous = os.getcwd()
+    os.chdir(external_root)
+    try:
+        proto = onnx.load(str(onnx_path), load_external_data=True)
+        onnx.save(
+            proto,
+            str(external_root / "model.onnx"),
+            save_as_external_data=True,
+            all_tensors_to_one_file=True,
+            location="weights/tensors.bin",
+            size_threshold=0,
+        )
+    finally:
+        os.chdir(previous)
+    payload = external_root / "weights" / "tensors.bin"
+    assert payload.is_file()
+
+    protected = _onnx_protected_inputs(external_root / "model.onnx")
+    paths = {snapshot.path.resolve() for snapshot in protected}
+    assert (external_root / "model.onnx").resolve() in paths
+    assert payload.resolve() in paths
+    # And that protection actually blocks clearing the payload's directory.
+    with pytest.raises(ValueError, match="contains protected input dependency"):
+        check_output_safety(
+            external_root / "weights",
+            protected_paths=sorted(paths),
+            overwrite=True,
+        )

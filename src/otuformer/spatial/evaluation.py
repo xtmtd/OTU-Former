@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import numpy as np
+from PIL import Image
 
 from ..constants import (
     SPATIAL_ATTENTION_LIMITATION,
@@ -28,6 +29,7 @@ from .protocol import DIRECTIONS, geometry_signature, grid_center_point
 from .records import (
     FILENAME_EVALUATION,
     FILENAME_MATCHES,
+    FILENAME_OVERLAYS,
     SpatialRecordError,
     SpatialView,
 )
@@ -226,26 +228,29 @@ def evaluate_spatial(
     query_limit = int(plan.get("query_limit", SPATIAL_QUERY_LIMIT))
     rows: list[dict[str, Any]] = []
     evaluated_keys: list[str] = []
+    # Selected keys are the outer order: a CSV subset that asks for [b, a] must
+    # report [b, a], not the order the original plan happened to store.
+    pairs_by_key: dict[str, list[dict[str, Any]]] = {}
     for pair in plan["pairs"]:
-        image_key = pair["image_key"]
-        if image_key not in set(selected):
-            continue
+        pairs_by_key.setdefault(pair["image_key"], []).append(pair)
+    for image_key in selected:
         if image_key not in evaluated_keys:
             evaluated_keys.append(image_key)
-        reference = reader.get_view(image_key, pair["reference_view"])
-        target = reader.get_view(image_key, pair["target_view"])
-        for direction in DIRECTIONS:
-            for layer in reader.contract.layer_paths:
-                rows.extend(
-                    _evaluate_pair_direction(
-                        reference,
-                        target,
-                        pair=pair,
-                        direction=direction,
-                        layer=layer,
-                        query_limit=query_limit,
+        for pair in pairs_by_key.get(image_key, []):
+            reference = reader.get_view(image_key, pair["reference_view"])
+            target = reader.get_view(image_key, pair["target_view"])
+            for direction in DIRECTIONS:
+                for layer in reader.contract.layer_paths:
+                    rows.extend(
+                        _evaluate_pair_direction(
+                            reference,
+                            target,
+                            pair=pair,
+                            direction=direction,
+                            layer=layer,
+                            query_limit=query_limit,
+                        )
                     )
-                )
     summary = _aggregate(
         rows,
         plan=plan,
@@ -255,7 +260,69 @@ def evaluate_spatial(
         not_planned=not_planned,
         planned=planned,
     )
+    summary["geometric_eligibility"] = eligibility_report(plan, selected)
     return rows, summary
+
+
+def eligibility_report(
+    plan: Mapping[str, Any], selected: Sequence[str]
+) -> dict[str, Any]:
+    """Per image/pair/direction eligibility counts, as the plan stored them.
+
+    The plan already separates "no source-valid centre" from "no overlap" from a
+    model match failure; without publishing those counts the two unavailable causes
+    collapse into one boolean, and the geometric sample fraction is lost.
+    """
+    selected_set = set(selected)
+    pairs: dict[str, dict[str, Any]] = {}
+    totals = {
+        "source_valid_count": 0,
+        "eligible_count": 0,
+        "sampled_count": 0,
+    }
+    for pair in plan.get("pairs", []):
+        image_key = pair.get("image_key")
+        if image_key not in selected_set:
+            continue
+        branches: dict[str, Any] = {}
+        for direction in DIRECTIONS:
+            branch = (pair.get("directions") or {}).get(direction)
+            if not isinstance(branch, Mapping):
+                branches[direction] = {"available": False}
+                continue
+            source_valid = int(branch.get("source_valid_count", 0))
+            eligible = int(branch.get("eligible_count", 0))
+            sampled = int(branch.get("sampled_count", 0))
+            totals["source_valid_count"] += source_valid
+            totals["eligible_count"] += eligible
+            totals["sampled_count"] += sampled
+            branches[direction] = {
+                "available": eligible > 0,
+                "source_valid_count": source_valid,
+                "eligible_count": eligible,
+                "sampled_count": sampled,
+                "unavailable_reason": branch.get("unavailable_reason"),
+                "eligibility_fraction": (
+                    float(eligible) / float(source_valid) if source_valid else None
+                ),
+                "sample_fraction": (
+                    float(sampled) / float(eligible) if eligible else None
+                ),
+            }
+        pairs.setdefault(image_key, {})[str(pair["pair_id"])] = branches
+    reasons: dict[str, int] = {}
+    for image_pairs in pairs.values():
+        for branches in image_pairs.values():
+            for branch in branches.values():
+                reason = branch.get("unavailable_reason")
+                if reason:
+                    reasons[str(reason)] = reasons.get(str(reason), 0) + 1
+    return {
+        "unit": "source grid centres per image/pair/direction",
+        "totals": totals,
+        "unavailable_reason_counts": reasons,
+        "pairs": pairs,
+    }
 
 
 def _aggregate(
@@ -268,7 +335,13 @@ def _aggregate(
     not_planned: Sequence[str],
     planned: Sequence[str],
 ) -> dict[str, Any]:
-    """Per-image results first, then a macro average over contributing images."""
+    """Per-image results first, then a macro average over contributing images.
+
+    There is deliberately no score across transform families: the protocol
+    defines per-transform and per-layer results, and an average that pools
+    families, pairs and directions would present a number the protocol does not
+    define. Counts use the real denominator (images), never matching rows.
+    """
     groups: dict[tuple[str, str, str, str], list[Mapping[str, Any]]] = {}
     for row in rows:
         key = (row["image_key"], row["pair_id"], row["direction"], row["layer"])
@@ -310,9 +383,15 @@ def _aggregate(
     def macro(subset: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         contributing = [row for row in subset if row["queries"] > 0]
         finite = [row for row in contributing if row["error_mean"] is not None]
+        # A row is one image/pair/direction/layer, so the contributing
+        # denominator is the number of distinct images, not the row count.
+        images = {str(row["image_key"]) for row in contributing}
+        finite_images = {str(row["image_key"]) for row in finite}
         return {
-            "contributing_images": len(contributing),
-            "images_with_finite_errors": len(finite),
+            "contributing_images": len(images),
+            "images_with_finite_errors": len(finite_images),
+            "contributing_image_keys": sorted(images),
+            "rows": len(contributing),
             "queries": int(sum(row["queries"] for row in contributing)),
             "finite_error_queries": int(
                 sum(row["finite_error_queries"] for row in contributing)
@@ -386,9 +465,11 @@ def _aggregate(
                 if combined is not None
                 else {"available": False, "reason": "one direction is unavailable"},
             }
+        # No layer-level pooled score either: the protocol publishes per
+        # transform/layer/direction results, and pooling transform families would
+        # invent a number across a crop, a rotation and a reflection.
         per_layer[layer] = {
             "transforms": transforms,
-            "overall": macro([row for row in layer_rows]),
         }
 
     return {
@@ -402,6 +483,11 @@ def _aggregate(
             "aggregation": (
                 "per-image mean/median first, then a macro average over contributing "
                 "images; PCK is over all geometrically selected queries"
+            ),
+            "denominators": (
+                "contributing_images counts distinct images per "
+                "transform/direction/layer row; a pooled cross-transform score is "
+                "deliberately not published"
             ),
             "per_layer": per_layer,
         },
@@ -523,10 +609,16 @@ def _verify_overlay_images(
     verified: list[str] = []
     missing: list[str] = []
     mismatched: list[str] = []
+    wrong_size: list[str] = []
+    # Only the *selected* samples matter: an unselected image that happens to be
+    # absent cannot make the overlay of the selected ones unavailable.
+    selected = set(reader.image_keys)
     for entry in reader._index:  # noqa: SLF001 - reader owns its index
         sample = entry["sample"]
         key = sample["image_key"]
-        if key in verified or key in missing or key in mismatched:
+        if key not in selected:
+            continue
+        if key in verified or key in missing or key in mismatched or key in wrong_size:
             continue
         path = root / key
         if not path.is_file():
@@ -535,16 +627,143 @@ def _verify_overlay_images(
         if sha256_bytes(path.read_bytes()) != sample["image_sha256"]:
             mismatched.append(key)
             continue
+        # Bytes alone are not the identity: a stored size that disagrees with the
+        # decoded image means the stored coordinates do not describe this image.
+        try:
+            with Image.open(path) as opened:
+                size = (int(opened.size[0]), int(opened.size[1]))
+        except OSError:
+            mismatched.append(key)
+            continue
+        if size != (int(sample["width"]), int(sample["height"])):
+            wrong_size.append(key)
+            continue
         verified.append(key)
-    available = bool(verified) and not missing and not mismatched
+    available = bool(verified) and not missing and not mismatched and not wrong_size
     return {
         "status": "available" if available else "unavailable",
         "verified_images": verified,
         "missing_images": missing,
         "mismatched_images": mismatched,
+        "wrong_size_images": wrong_size,
         "reason": None
         if available
         else "overlay needs every selected image with matching bytes and dimensions",
+    }
+
+
+def draw_match_overlays(
+    out_dir: Path,
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    reader: SpatialReader,
+    overlay: Mapping[str, Any],
+    images_dir: Path | None,
+    per_kind: int = 5,
+) -> dict[str, Any]:
+    """Draw the documented matching-line overlays for verified images.
+
+    One figure per image holds the deterministic worst finite-error queries of each
+    layer/family, with a line from the true point to the predicted one. The
+    capability is reported as ``unavailable`` when no verified image exists rather
+    than silently producing nothing.
+    """
+    if images_dir is None or overlay.get("status") != "available":
+        return {
+            "status": "unavailable",
+            "reason": overlay.get("reason") or "no verified original images",
+            "figures": [],
+        }
+    verified = set(overlay.get("verified_images", []))
+    # The documented example set is the worst `per_kind` finite errors *per layer
+    # and family*, not a global top-N: with six errors in one family and two in
+    # another, a global top five would drop the quieter family entirely.
+    groups: dict[tuple[str, str, str], list[Mapping[str, Any]]] = {}
+    for row in rows:
+        if row["normalized_error"] == "" or row["image_key"] not in verified:
+            continue
+        groups.setdefault(
+            (str(row["image_key"]), str(row["layer"]), str(row["pair_id"])), []
+        ).append(row)
+    worst: dict[str, list[Mapping[str, Any]]] = {}
+    for (image_key, _layer, _pair), group in groups.items():
+        worst.setdefault(image_key, []).extend(
+            sorted(
+                group,
+                key=lambda row: (
+                    -float(row["normalized_error"]),
+                    row["direction"],
+                    row["layer"],
+                    int(row["query_index"]),
+                ),
+            )[:per_kind]
+        )
+    root = Path(images_dir).expanduser()
+    directory = Path(out_dir) / FILENAME_OVERLAYS
+    figures: list[str] = []
+    directory.mkdir(parents=True, exist_ok=True)
+    for image_key in sorted(worst):
+        selected = sorted(
+            worst[image_key],
+            key=lambda row: (
+                -float(row["normalized_error"]),
+                row["pair_id"],
+                row["direction"],
+                row["layer"],
+                int(row["query_index"]),
+            ),
+        )
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        figure, axis = plt.subplots(figsize=(6, 6))
+        try:
+            with Image.open(root / image_key) as opened:
+                axis.imshow(opened.convert("RGB"))
+            for row in selected:
+                axis.plot(
+                    [float(row["true_x"]), float(row["predicted_x"])],
+                    [float(row["true_y"]), float(row["predicted_y"])],
+                    "-",
+                    linewidth=0.8,
+                )
+                axis.plot(
+                    [float(row["true_x"])],
+                    [float(row["true_y"])],
+                    "o",
+                    markersize=3,
+                )
+                axis.plot(
+                    [float(row["predicted_x"])],
+                    [float(row["predicted_y"])],
+                    "x",
+                    markersize=3,
+                )
+            axis.set_title(image_key)
+            axis.set_axis_off()
+            directory.mkdir(parents=True, exist_ok=True)
+            # Keys are arbitrary relative paths, so the figure name cannot be a
+            # path prefix of another: `a.jpg` would write the file the key
+            # `a.jpg.png/b.jpg` needs as a directory. A flat, injective escape
+            # (`%` and `/` both encoded, so no key can decode onto another) has
+            # no ancestors to collide with.
+            name = (
+                image_key.replace("%", "%25").replace("/", "%2F")
+                + ".png"
+            )
+            path = directory / name
+            figure.savefig(path, dpi=110, bbox_inches="tight")
+            figures.append(str(path))
+        finally:
+            plt.close(figure)
+    return {
+        "status": "available" if figures else "unavailable",
+        "reason": None if figures else "no finite-error query on a verified image",
+        "figures": figures,
+        "per_image_lines": per_kind,
+        "convention": "line from true point (o) to predicted point (x), original pixels",
     }
 
 
@@ -561,21 +780,32 @@ def write_spatial_evaluation(
     out_dir.mkdir(parents=True, exist_ok=True)
     matches_path = out_dir / FILENAME_MATCHES
     write_csv_rows(matches_path, rows, MATCH_FIELDS)
+    overlay = _verify_overlay_images(reader, images_dir)
+    figures = draw_match_overlays(
+        out_dir, rows, reader=reader, overlay=overlay, images_dir=images_dir
+    )
     payload = {
         **summary,
         "failure_examples": failure_examples(rows),
-        "overlays": _verify_overlay_images(reader, images_dir),
+        "overlays": {**overlay, "figures": figures},
+        "sample_metadata": reader.overlay_report(),
         "source_product": {
             "product_id": reader.product_id,
             "layout": reader.manifest["layout"],
             "verification_scope": reader.verification_scope().to_json(),
         },
+        # Keyed by image *and* pair: two images with different source sizes both
+        # hold a `tx10`, so a pair-id key silently kept only the last one.
         "plan_geometry": {
-            pair["pair_id"]: {
-                "reference": pair["geometry"]["reference"]["view_id"],
-                "target": pair["geometry"]["target"]["view_id"],
-                "reference_signature": pair["geometry"]["reference"],
-                "target_signature": pair["geometry"]["target"],
+            pair["image_key"]: {
+                stored["pair_id"]: {
+                    "reference": stored["geometry"]["reference"]["view_id"],
+                    "target": stored["geometry"]["target"]["view_id"],
+                    "reference_signature": stored["geometry"]["reference"],
+                    "target_signature": stored["geometry"]["target"],
+                }
+                for stored in reader.evaluation_plan.get("pairs", [])
+                if stored["image_key"] == pair["image_key"]
             }
             for pair in reader.evaluation_plan.get("pairs", [])
         }

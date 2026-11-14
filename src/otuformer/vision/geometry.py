@@ -583,11 +583,8 @@ def build_eval_view(
 
 def pixel_support(trace: GeometryTrace) -> tuple[np.ndarray, np.ndarray]:
     """Pixel-level geometric coverage (float32) and conservative validity (Boolean)."""
-    polygon = support.rect_polygon(*trace.source_wh)
-    valid = np.ones((trace.source_wh[1], trace.source_wh[0]), dtype=bool)
-    for index, op in enumerate(trace.operations):
-        polygon = _transform_support_polygon(polygon, op, trace, index)
-        valid = _propagate_valid(valid, op)
+    polygon = content_support(trace)
+    valid = content_validity(trace)
     coverage = support.pixel_coverage(polygon, trace.view_wh)
     if valid.shape != (trace.view_wh[1], trace.view_wh[0]):
         raise ValueError(
@@ -596,33 +593,56 @@ def pixel_support(trace: GeometryTrace) -> tuple[np.ndarray, np.ndarray]:
     return coverage.astype(np.float32), valid
 
 
-def _transform_support_polygon(
-    polygon: np.ndarray, op: GeometryOp, trace: GeometryTrace, index: int
-) -> np.ndarray:
-    canvas = trace.canvas_before(index)
-    if op.kind == "crop":
-        rectangle = np.array(
-            [
-                [float(op.params["left"]), float(op.params["top"])],
-                [
-                    float(op.params["left"]) + float(op.params["width"]),
-                    float(op.params["top"]),
-                ],
-                [
-                    float(op.params["left"]) + float(op.params["width"]),
-                    float(op.params["top"]) + float(op.params["height"]),
-                ],
-                [
-                    float(op.params["left"]),
-                    float(op.params["top"]) + float(op.params["height"]),
-                ],
-            ],
-            dtype=np.float64,
-        )
-        polygon = support.clip_polygon_to_rect(polygon, rectangle[1, 0], rectangle[2, 1])
+def content_support(trace: GeometryTrace) -> np.ndarray:
+    """View-space polygon of source content that survived the whole sequence.
+
+    Every operation keeps its own clipping history: the current support is
+    clipped to the crop window it enters, transformed by the realized map, and
+    clipped again to the canvas the operation produced. An invertible matrix
+    alone cannot express content an intermediate crop, rotation or canvas
+    truncation discarded, so this polygon - not the final map - is the support
+    domain of the stored view. Everything outside it holds fill.
+    """
+    polygon = support.rect_polygon(*trace.source_wh)
+    for index, op in enumerate(trace.operations):
+        polygon = _transform_support_polygon(polygon, op)
+        if len(polygon) < 3:
+            return np.zeros((0, 2), dtype=np.float64)
+        canvas = trace.canvas_before(index + 1)
         polygon = support.clip_polygon_to_rect(
             polygon, float(canvas[0]), float(canvas[1])
         )
+    return polygon
+
+
+def content_validity(trace: GeometryTrace) -> np.ndarray:
+    """Boolean "this view pixel still holds source content" mask.
+
+    The image-level counterpart of :func:`content_support`: exact for crop, pad
+    and flips, conservative (kernel footprint) for the resamplers that mix
+    neighbouring samples. Used for categorical rasters, whose support is not a
+    polygon.
+    """
+    valid = np.ones((trace.source_wh[1], trace.source_wh[0]), dtype=bool)
+    for op in trace.operations:
+        valid = _propagate_valid(valid, op)
+    return valid
+
+
+def _transform_support_polygon(polygon: np.ndarray, op: GeometryOp) -> np.ndarray:
+    """Clip to the operation's own window, then map into the produced canvas."""
+    if op.kind == "crop":
+        # The crop window is an offset rectangle in the entering canvas; clipping
+        # to [0,left+width] x [0,top+height] would keep discarded content.
+        polygon = support.clip_polygon_to_window(
+            polygon,
+            float(op.params["left"]),
+            float(op.params["top"]),
+            float(op.params["width"]),
+            float(op.params["height"]),
+        )
+        if len(polygon) < 3:
+            return np.zeros((0, 2), dtype=np.float64)
     transformed = support.transform_polygon(matrix_for(op), polygon)
     return transformed
 
@@ -665,9 +685,11 @@ def _propagate_valid(valid: np.ndarray, op: GeometryOp) -> np.ndarray:
         )
     if kind in ("rotate", "affine"):
         canvas = [int(v) for v in params["canvas_wh"]]
+        # The kernel radius is the resampler's source-pixel support. Upscaling
+        # does not shrink it: torchvision keeps kernel width 2.0 source pixels
+        # for bicubic and widens it only when downscaling, so dividing by the
+        # affine scale would mark fill-dependent pixels as valid.
         radius = support.interpolation_radius(params["interpolation"])
-        if kind == "affine":
-            radius = max(radius / max(abs(float(params["scale"])), 1e-6), 0.5)
         return support.footprint_valid(
             valid,
             support.invert(matrix_for(op)),
@@ -705,7 +727,7 @@ def map_points(
 
 def transform_annotations(
     annotations: Sequence[Mapping[str, Any]],
-    categories: Mapping[int, Mapping[str, Any]],
+    categories: Mapping[Any, Mapping[str, Any]],
     trace: GeometryTrace,
     *,
     role: str,
@@ -717,14 +739,21 @@ def transform_annotations(
     own retained area, a separately exposed axis-aligned enclosure, mapped
     keypoints in source (pixel-index) convention, and a nearest-neighbour
     categorical raster with its own support.
+
+    Everything derived is clipped to the same surviving-content domain as the
+    stored image view (:func:`content_support`), so an annotation whose content an
+    intermediate crop or canvas truncation discarded is out of view even when the
+    final invertible map would place it inside the canvas.
     """
     if role not in ("instances", "keypoints", "panoptic"):
         raise ValueError(f"unknown annotation role {role!r}")
     view_width, view_height = trace.view_wh
     matrix = trace.source_to_view
+    support_polygon = content_support(trace)
+    support_mask = content_validity(trace)
     results: list[dict[str, Any]] = []
     for annotation in annotations:
-        category = dict(categories.get(annotation.get("category_id"), {}) or {})
+        category = _category_for(categories, annotation.get("category_id"), role)
         record: dict[str, Any] = {
             "annotation_id": annotation.get("id"),
             "image_id": annotation.get("image_id"),
@@ -751,6 +780,9 @@ def transform_annotations(
 
         segmentation = annotation.get("segmentation")
         polygons = support_polygon_parts(segmentation)
+        # A source raster already describes the object; a polygon then does not
+        # need the bbox fallback either.
+        polygons_absent = not polygons and annotation.get("raster") is None
         if polygons:
             transformed: list[list[list[float]]] = []
             retained = 0.0
@@ -759,8 +791,8 @@ def transform_annotations(
                 points = np.asarray(part, dtype=np.float64).reshape(-1, 2)
                 source_area += support.polygon_area(points)
                 moved = support.transform_polygon(matrix, points)
-                clipped = support.clip_polygon_to_rect(
-                    moved, float(view_width), float(view_height)
+                clipped = _clip_to_view(
+                    moved, support_polygon, view_width, view_height
                 )
                 retained += support.polygon_area(clipped)
                 if len(clipped) >= 3:
@@ -791,7 +823,15 @@ def transform_annotations(
             record["annotation_in_view"] = retained > 0.0
 
         bbox = annotation.get("bbox")
-        if record["bbox_xy"] is None and isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+        # The bbox is a fallback for an annotation that *carries no usable
+        # polygon*, not a second chance for one whose segmentation was clipped
+        # away: two parts on either side of a centre crop are genuinely out of
+        # view, and their enclosure would otherwise reappear as a visible object.
+        if (
+            polygons_absent
+            and isinstance(bbox, (list, tuple))
+            and len(bbox) == 4
+        ):
             x, y, box_w, box_h = (float(v) for v in bbox)
             corners = np.array(
                 [[x, y], [x + box_w, y], [x + box_w, y + box_h], [x, y + box_h]],
@@ -799,9 +839,7 @@ def transform_annotations(
             )
             record["area_source"] = float(box_w * box_h)
             moved = support.transform_polygon(matrix, corners)
-            clipped = support.clip_polygon_to_rect(
-                moved, float(view_width), float(view_height)
-            )
+            clipped = _clip_to_view(moved, support_polygon, view_width, view_height)
             retained = support.polygon_area(clipped)
             record["area_retained"] = float(retained)
             record["annotation_in_view"] = bool(retained > 0.0)
@@ -819,21 +857,161 @@ def transform_annotations(
 
         if role == "keypoints" or "keypoints" in annotation:
             record["keypoints"], record["keypoints_in_view"] = _map_keypoints(
-                annotation.get("keypoints") or [], trace
+                annotation.get("keypoints") or [], trace, support_polygon
             )
 
         raster = annotation.get("raster")
         if raster is not None and role in ("panoptic", "instances"):
-            warped, warped_support = support.nearest_warp(
-                np.asarray(raster), matrix, trace.view_wh, fill=0
-            )
-            record["mask"] = warped
+            warped, warped_support = warp_categorical(np.asarray(raster), trace)
+            record["mask"] = np.where(warped_support, warped, 0).astype(warped.dtype)
             record["mask_support"] = warped_support
         elif role in ("panoptic", "instances") and isinstance(segmentation, dict):
             record["mask_unavailable"] = "rle_mask_requires_explicit_decode"
 
         results.append(record)
     return results
+
+
+def _category_for(
+    categories: Mapping[Any, Mapping[str, Any]], category_id: Any, role: str
+) -> dict[str, Any]:
+    """One annotation's category within its source's namespace.
+
+    A product stores categories per source role (``instances:1``,
+    ``keypoints:1``), because a COCO category id is source-local. A flat table, or
+    a product written before that change, still resolves by bare id - in either key
+    form, because a JSON round trip turns the integer key into a string and an
+    integer lookup would silently lose the whole category schema.
+    """
+    if category_id is None:
+        return {}
+    try:
+        numeric = int(category_id)
+    except (TypeError, ValueError):
+        return {}
+    for key in (f"{role}:{numeric}", numeric, str(numeric), str(category_id)):
+        if key in categories:
+            return dict(categories[key] or {})
+    return {}
+
+
+def _execute_categorical(image: Image.Image, op: GeometryOp) -> Image.Image:
+    """Execute one recorded operation on a categorical raster.
+
+    The mask must move exactly as the image did, so the same library call is used
+    with nearest-neighbour interpolation instead of a re-derived sampling rule:
+    every resampler has its own rounding and centre convention (Pillow's ``COORD``
+    truncation, resize's ``xmin/xmax`` rounding, rotation's pivot arithmetic), and
+    reimplementing them produced categories one pixel off. Categories are integers,
+    so the working image is mode ``I`` and every fill is the identity value 0.
+    """
+    params = op.params
+    kind = op.kind
+    if kind == "crop":
+        return TF.crop(
+            image,
+            int(params["top"]),
+            int(params["left"]),
+            int(params["height"]),
+            int(params["width"]),
+        )
+    if kind == "resize":
+        to_w, to_h = (int(v) for v in params["to_wh"])
+        return TF.resize(
+            image, [to_h, to_w], interpolation=InterpolationMode.NEAREST
+        )
+    if kind == "pad":
+        canvas = [int(v) for v in params["canvas_wh"]]
+        offset = [int(v) for v in params["offset"]]
+        output = Image.new(image.mode, (canvas[0], canvas[1]), color=0)
+        output.paste(image, (offset[0], offset[1]))
+        return output
+    if kind == "rotate":
+        return TF.rotate(
+            image,
+            float(params["angle"]),
+            interpolation=InterpolationMode.NEAREST,
+            expand=bool(params["expand"]),
+            center=[float(v) for v in params["center"]],
+            fill=0,
+        )
+    if kind == "affine":
+        return TF.affine(
+            image,
+            float(params["angle"]),
+            [float(v) for v in params["translate"]],
+            float(params["scale"]),
+            [float(v) for v in params["shear"]],
+            interpolation=InterpolationMode.NEAREST,
+            fill=0,
+        )
+    if kind == "hflip":
+        return TF.hflip(image)
+    if kind == "vflip":
+        return TF.vflip(image)
+    raise ValueError(f"unhandled geometry operation {kind!r}")  # pragma: no cover
+
+
+def warp_categorical(raster: np.ndarray, trace: GeometryTrace) -> tuple[np.ndarray, np.ndarray]:
+    """Replay a categorical raster through the stored operations, one at a time.
+
+    Composing two nearest-neighbour resamples into the final matrix is not
+    equivalent to resampling twice: nearest sampling is not linear, so sampling
+    once over the composed map moves categories the real sequence never moved.
+    Each operation is therefore applied to the raster with the *same* library call
+    the image used, which keeps the backend's own rounding and centre rules.
+
+    A known-value mask travels through the identical sequence: where an operation
+    wrote its fill the mask is 0, so the result is the mask's own
+    ``categorical-nearest-neighbour-v1`` support rather than the image resampler's
+    wider bicubic footprint. A real category is therefore never cleared because an
+    unrelated image kernel reached a neighbouring cell, and a real category 0 (void)
+    is never confused with fill.
+    """
+    values = np.asarray(raster)
+    if values.ndim != 2:
+        raise ValueError(
+            f"a categorical raster must be 2-D, got shape {values.shape}"
+        )
+    if values.dtype.kind not in ("u", "i"):
+        raise ValueError(
+            f"a categorical raster must hold integer ids, got dtype {values.dtype}"
+        )
+    # The backend works in int32, so a 64-bit id would be silently truncated
+    # (`4294967297` becomes `1`). Rather than shrink the accepted range, relabel
+    # the ids to a dense index, replay, then map the index back: every id the
+    # caller supplied is recovered exactly, whatever its width.
+    ids, inverse = np.unique(values, return_inverse=True)
+    index = (inverse.reshape(values.shape) + 1).astype(np.int32)  # 0 stays fill
+    warped = Image.fromarray(index, mode="I")
+    known = Image.fromarray(np.ones(values.shape, dtype=np.int32), mode="I")
+    for op in trace.operations:
+        warped = _execute_categorical(warped, op)
+        known = _execute_categorical(known, op)
+    positions = np.asarray(warped, dtype=np.int64)
+    surviving = np.asarray(known) > 0
+    restored = np.zeros(positions.shape, dtype=values.dtype)
+    restored[surviving] = ids[positions[surviving] - 1]
+    return restored, surviving
+
+
+def _clip_to_view(
+    polygon: np.ndarray,
+    support_polygon: np.ndarray,
+    view_width: int,
+    view_height: int,
+) -> np.ndarray:
+    """Clip a mapped annotation to the canvas *and* the surviving content."""
+    clipped = support.clip_polygon_to_rect(
+        polygon, float(view_width), float(view_height)
+    )
+    if len(clipped) < 3:
+        return np.zeros((0, 2), dtype=np.float64)
+    clipped = support.clip_polygon_to_convex(clipped, support_polygon)
+    if len(clipped) < 3 or support.polygon_area(clipped) <= 1e-12:
+        # Touching the support boundary is not retained content.
+        return np.zeros((0, 2), dtype=np.float64)
+    return clipped
 
 
 def support_polygon_parts(segmentation: Any) -> list[list[float]]:
@@ -843,7 +1021,7 @@ def support_polygon_parts(segmentation: Any) -> list[list[float]]:
 
 
 def _map_keypoints(
-    values: Sequence[float], trace: GeometryTrace
+    values: Sequence[float], trace: GeometryTrace, support_polygon: np.ndarray
 ) -> tuple[list[list[float]], list[bool]]:
     """Map keypoints through the chosen ``coco-pixel-index-to-edge-v1`` adapter.
 
@@ -851,6 +1029,10 @@ def _map_keypoints(
     coordinates, mapped, then shifted back for source-format output. The
     unlabeled ``v=0, x=y=0`` sentinel is passed through unchanged: it is not a
     location, so shifting it would invent one.
+
+    ``keypoints_in_view`` additionally requires the mapped point to lie in the
+    surviving-content domain, so a point whose content an intermediate crop
+    discarded is out of view even though the final map keeps it on the canvas.
     """
     width, height = trace.view_wh
     mapped: list[list[float]] = []
@@ -874,7 +1056,15 @@ def _map_keypoints(
         if visibility in (1, 2):
             point = transformed[table[index]]
             mapped.append([float(point[0] - 0.5), float(point[1] - 0.5), float(visibility)])
-            inside.append(bool(0.0 <= point[0] <= width and 0.0 <= point[1] <= height))
+            on_canvas = bool(
+                0.0 <= point[0] <= width and 0.0 <= point[1] <= height
+            )
+            inside.append(
+                bool(
+                    on_canvas
+                    and support.point_in_polygon(support_polygon, point)
+                )
+            )
         else:
             mapped.append([float(x), float(y), float(visibility)])
             inside.append(False)

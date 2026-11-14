@@ -218,7 +218,7 @@ def test_missing_completion_is_not_a_readable_product(tmp_path):
     with pytest.raises(SpatialRecordError, match="no completed run envelope"):
         open_spatial_product(root)
     # The writer-owned staging reader still opens its own sealed files.
-    reader = SpatialReader(root, require_completion=False)
+    reader = SpatialReader(root, _staging=True)
     reader.close()
 
     write_envelope(root, status="failed")
@@ -393,7 +393,7 @@ def test_unsupported_schema_and_support_versions_are_rejected(tmp_path):
 @pytest.mark.parametrize(
     "mutate, message",
     [
-        ("feature_shape", "has shape"),
+        ("feature_shape", "shape"),
         ("feature_dtype", "dtype"),
         ("feature_digest", "does not match its digest"),
         ("pixel_dtype", "dtype"),
@@ -476,15 +476,14 @@ def test_missing_payload_or_manifest_entry_is_corruption(tmp_path):
 
 
 def test_invalid_trace_is_rejected_before_reading(tmp_path):
+    """A singular map is structural: the whole index is checked at open."""
     root = tmp_path / "product"
     build_product(root)
     entries = _index_lines(root)
     entries[0]["geometry"]["source_to_view"] = np.zeros((3, 3)).tolist()
     _rewrite_index(root, entries)
-    reader = open_spatial_product(root)
-    with pytest.raises(ValueError, match="singular"):
-        list(reader.iter_views())
-    reader.close()
+    with pytest.raises(SpatialRecordError, match="singular"):
+        open_spatial_product(root)
 
 
 def test_writer_validates_views_before_publishing(tmp_path):
@@ -543,24 +542,42 @@ def test_abort_removes_only_attempt_files(tmp_path):
         writer.write(make_view(samples[0], contract))
 
 
-def test_previous_completed_product_survives_a_failed_attempt(tmp_path):
+def test_previous_completed_product_survives_a_refused_attempt(tmp_path):
     root = tmp_path / "product"
     build_product(root)
     before = (root / FILENAME_MANIFEST).read_bytes()
-    # A second attempt into the same directory fails before sealing.
+    # A second attempt into the same directory is refused before any byte moves:
+    # the core writer owns an attempt directory, it never adopts a sealed product.
     contract = contract_for()
-    writer = SpatialWriter(
-        root, contract=contract, layout="per-image", samples=[make_sample("a/one.png")]
-    )
-    with pytest.raises(SpatialRecordError):
-        writer.finish()
-    writer.abort({"reason": "no views"})
+    with pytest.raises(SpatialRecordError, match="already holds a spatial product"):
+        SpatialWriter(
+            root,
+            contract=contract,
+            layout="per-image",
+            samples=[make_sample("a/one.png")],
+        )
     assert (root / FILENAME_MANIFEST).read_bytes() == before
     reader = open_spatial_product(root)
     try:
         assert len(list(reader.iter_views())) == 2
     finally:
         reader.close()
+
+
+def test_writer_refuses_a_directory_with_foreign_payload_files(tmp_path):
+    """A public ``write``/``finish``/``abort`` cycle cannot delete old payloads."""
+    root = tmp_path / "product"
+    (root / "features").mkdir(parents=True)
+    stale = root / "features" / "000001.npz"
+    stale.write_bytes(b"previous attempt")
+    with pytest.raises(SpatialRecordError, match="already holds payload files"):
+        SpatialWriter(
+            root,
+            contract=contract_for(),
+            layout="per-image",
+            samples=[make_sample("a.png")],
+        )
+    assert stale.read_bytes() == b"previous attempt"
 
 
 def test_unsupported_layout_and_empty_samples_are_rejected(tmp_path):
@@ -805,7 +822,1213 @@ def test_a_plan_with_a_foreign_protocol_is_rejected(tmp_path):
     manifest_path = root / FILENAME_MANIFEST
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest["evaluation_plan"]["sha256"] = sha256_bytes(payload)
+    # The manifest inventories the plan file too, so a consistent rewrite has to
+    # update both digests; only then is the protocol the next check to fail.
+    for item in manifest["files"]:
+        if item["path"] == "spatial_evaluation_plan.json":
+            item["sha256"] = sha256_bytes(payload)
+            item["bytes"] = len(payload)
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     write_envelope(root)
     with pytest.raises(SpatialRecordError, match="is not 'spatial-geometry-v1'"):
         open_spatial_product(root)
+
+
+def _rewrite_manifest(root: Path) -> dict:
+    path = root / FILENAME_MANIFEST
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    return manifest
+
+
+def _store_manifest(root: Path, manifest: dict) -> None:
+    (root / FILENAME_MANIFEST).write_text(json.dumps(manifest), encoding="utf-8")
+    write_envelope(root)
+
+
+def test_annotation_snapshot_outside_the_product_root_is_refused(tmp_path):
+    """An ``annotations.path`` outside the inventory/root is a trust-boundary break."""
+    root = tmp_path / "product"
+    build_product(
+        root,
+        annotations={
+            "records": [{"annotation_id": 1, "image_key": "a/one.png", "category_id": 4}],
+            "categories": {"4": {"name": "Head"}},
+            "sources": {},
+        },
+    )
+    outside = tmp_path / "outside.jsonl"
+    outside.write_text('{"annotation_id": 9}\n', encoding="utf-8")
+    manifest = _rewrite_manifest(root)
+    # A digest consistent with the outside file is not enough: the path escapes.
+    manifest["annotations"]["path"] = "../outside.jsonl"
+    manifest["annotations"]["sha256"] = sha256_bytes(outside.read_bytes())
+    _store_manifest(root, manifest)
+    with pytest.raises(SpatialRecordError, match="escapes the product root"):
+        open_spatial_product(root)
+
+
+def test_annotation_snapshot_must_be_in_the_manifest_inventory(tmp_path):
+    root = tmp_path / "product"
+    build_product(
+        root,
+        annotations={
+            "records": [{"annotation_id": 1, "image_key": "a/one.png", "category_id": 4}],
+            "categories": {},
+            "sources": {},
+        },
+    )
+    # A second, untouched copy inside the root but absent from files[].
+    spare = root / "spare_annotations.jsonl"
+    spare.write_bytes((root / "annotations.jsonl").read_bytes())
+    manifest = _rewrite_manifest(root)
+    manifest["annotations"]["path"] = "spare_annotations.jsonl"
+    _store_manifest(root, manifest)
+    with pytest.raises(SpatialRecordError, match="not sealed by the manifest inventory"):
+        open_spatial_product(root)
+
+
+def test_a_plan_with_out_of_bounds_or_unknown_queries_is_refused(tmp_path):
+    """Structural plan validation happens at open, before any evaluation."""
+    from otuformer.spatial.protocol import (
+        PROTOCOL_VIEW_IDS,
+        build_evaluation_plan,
+        protocol_operations,
+    )
+    from otuformer.vision.geometry import apply_geometry, evaluation_view_ops
+
+    root = tmp_path / "product"
+    contract = contract_for()
+    sample = make_sample("a.png")
+    # A complete protocol view set, so the reader can resolve each pair.
+    base_ops = evaluation_view_ops(Image.new("RGB", (640, 480)), name="center-crop", size=32)
+    from otuformer.vision.geometry import apply_geometry
+
+    image = Image.new("RGB", (640, 480), (10, 20, 30))
+    writer = SpatialWriter(root, contract=contract, layout="per-image", samples=[sample])
+    stored = []
+    for view_id in PROTOCOL_VIEW_IDS:
+        if view_id == "reference":
+            ops, role = base_ops, "base"
+            stored_id = "base"
+        else:
+            ops = [*base_ops, *protocol_operations(32, view_id)]
+            stored_id, role = view_id, "eval-transform"
+        _, trace = apply_geometry(image, ops, track=True)
+        template = make_view(sample, contract, view_id=stored_id, role=role)
+        view = SpatialView(
+            image_key=template.image_key,
+            view_id=stored_id,
+            role=role,
+            trace=trace,
+            features=template.features,
+            pixel_geometric_coverage=template.pixel_geometric_coverage,
+            pixel_sampling_valid=template.pixel_sampling_valid,
+            geometric_coverage=template.geometric_coverage,
+            patch_sampling_valid=template.patch_sampling_valid,
+        )
+        writer.write(view)
+        stored.append(view)
+    writer.set_evaluation_plan(build_evaluation_plan({"a.png": stored}, seed=42))
+    writer.finish()
+    write_envelope(root)
+
+    plan_path = root / "spatial_evaluation_plan.json"
+    original = json.loads(plan_path.read_text(encoding="utf-8"))
+    from otuformer.data.provenance import canonical_json_bytes
+
+    grid = contract.layers[0].grid_hw
+    cases = (
+        ("query_bounds", grid[0] + 8, 0, None),
+        ("query_direction", 0, 0, "sideways"),
+    )
+    for _name, row, column, direction in cases:
+        plan = json.loads(json.dumps(original))
+        pair = plan["pairs"][0]
+        branch = pair["directions"]["reference_to_target"]
+        branch["queries"] = [
+            {
+                "row": row,
+                "column": column,
+                "xy_source": [1.0, 1.0],
+                "xy_target": [2.0, 2.0],
+            }
+        ]
+        # Keep the counts consistent with the stored support so the bounds check is
+        # the next failure, not a count mismatch.
+        valid = int(
+            original["pairs"][0]["directions"]["reference_to_target"][
+                "source_valid_count"
+            ]
+        )
+        branch["sampled_count"] = 1
+        branch["eligible_count"] = 1
+        branch["source_valid_count"] = valid
+        branch["unavailable"] = False
+        branch["unavailable_reason"] = None
+        if direction is not None:
+            branch = pair["directions"].pop("reference_to_target")
+            pair["directions"][direction] = branch
+        payload = canonical_json_bytes(plan)
+        plan_path.write_bytes(payload)
+        manifest = _rewrite_manifest(root)
+        manifest["evaluation_plan"]["sha256"] = sha256_bytes(payload)
+        manifest["evaluation_plan"]["bytes"] = len(payload)
+        for item in manifest["files"]:
+            if item["path"] == "spatial_evaluation_plan.json":
+                item["sha256"] = sha256_bytes(payload)
+                item["bytes"] = len(payload)
+        _store_manifest(root, manifest)
+        expected = (
+            "outside the stored"
+            if direction is None
+            else "must hold exactly the directions"
+        )
+        with pytest.raises(SpatialRecordError, match=expected):
+            open_spatial_product(root)
+
+
+def test_open_payload_handles_are_bounded(tmp_path):
+    """A full read must not keep one descriptor per payload file open."""
+    root = tmp_path / "product"
+    build_product(root, keys=("a.png", "b.png", "c.png", "d.png", "e.png", "f.png"))
+    reader = SpatialReader(root, _staging=True, open_payload_limit=2)
+    try:
+        for view in reader.iter_views():
+            assert view.features
+            assert len(reader._open_npz) <= 2
+    finally:
+        reader.close()
+    assert not reader._open_npz
+
+
+def test_a_verified_payload_is_not_rehashed_when_its_handle_is_reopened(tmp_path):
+    """Verification is per file identity, not per open: the cache is bounded.
+
+    With one payload per sample and a smaller handle budget, a full read evicts
+    and reopens the same archives. Re-reading each file for its SHA-256 made the
+    hash work scale with reads instead of with files.
+    """
+    from otuformer.spatial import storage as storage_module
+
+    root = tmp_path / "product"
+    keys = ("a.png", "b.png", "c.png", "d.png", "e.png", "f.png")
+    build_product(root, keys=keys)
+    reader = SpatialReader(root, _staging=True, open_payload_limit=2)
+    try:
+        payload_bytes = {
+            (root / item["path"]).stat().st_size
+            for item in reader.manifest["files"]
+            if item["path"].startswith("features/")
+        }
+        hashed: list[int] = []
+        original = storage_module.sha256_bytes
+
+        def counting(data: bytes) -> str:
+            hashed.append(len(data))
+            return original(data)
+
+        storage_module.sha256_bytes = counting
+        try:
+            views = list(reader.iter_views())
+        finally:
+            storage_module.sha256_bytes = original
+    finally:
+        reader.close()
+    assert len(views) == len(keys)
+    # One hash per payload file, not one per (evicted and reopened) handle.
+    assert len([size for size in hashed if size in payload_bytes]) == len(keys)
+
+
+def test_selector_overlay_reports_labels_without_rewriting_the_product(tmp_path):
+    root = tmp_path / "product"
+    build_product(root)
+    stored_before = (root / "spatial_index.jsonl").read_bytes()
+    selector = tmp_path / "labels.csv"
+    selector.write_text(
+        "image,label,site\nb/one.png,beetle,lab\na/one.png,,\n", encoding="utf-8"
+    )
+    reader = open_spatial_product(root, selector_csv=selector)
+    try:
+        assert reader.image_keys == ("b/one.png", "a/one.png")
+        assert reader.sample_metadata("b/one.png") == {"label": "beetle", "site": "lab"}
+        # Empty CSV values keep the existing missing-value semantics.
+        assert reader.sample_metadata("a/one.png") == {}
+        report = reader.overlay_report()
+        assert report["status"] == "present"
+        assert report["fields"] == ["label", "site"]
+        assert report["sha256"] == sha256_bytes(selector.read_bytes())
+        assert report["samples"]["b/one.png"]["label"] == "beetle"
+    finally:
+        reader.close()
+    assert (root / "spatial_index.jsonl").read_bytes() == stored_before
+
+
+def test_selector_csv_rejects_a_repeated_column(tmp_path):
+    root = tmp_path / "product"
+    build_product(root)
+    selector = tmp_path / "labels.csv"
+    selector.write_text("image,label,label\nb/one.png,x,y\n", encoding="utf-8")
+    with pytest.raises(SpatialRecordError, match="repeats a column name"):
+        open_spatial_product(root, selector_csv=selector)
+
+
+def test_product_id_covers_the_evaluation_plan(tmp_path):
+    from otuformer.spatial.protocol import (
+        PROTOCOL_VIEW_IDS,
+        build_evaluation_plan,
+        protocol_operations,
+    )
+    from otuformer.vision.geometry import apply_geometry, evaluation_view_ops
+
+    def build(root: Path, seed: int) -> str:
+        contract = contract_for()
+        sample = make_sample("a.png")
+        image = Image.new("RGB", (640, 480), (10, 20, 30))
+        from otuformer.vision.geometry import apply_geometry
+
+        base_ops = evaluation_view_ops(image, name="center-crop", size=32)
+        writer = SpatialWriter(root, contract=contract, layout="per-image", samples=[sample])
+        stored = []
+        for view_id in PROTOCOL_VIEW_IDS:
+            if view_id == "reference":
+                ops, role, stored_id = base_ops, "base", "base"
+            else:
+                ops = [*base_ops, *protocol_operations(32, view_id)]
+                role, stored_id = "eval-transform", view_id
+            _, trace = apply_geometry(image, ops, track=True)
+            template = make_view(sample, contract, view_id=stored_id, role=role)
+            view = SpatialView(
+                image_key=sample.image_key,
+                view_id=stored_id,
+                role=role,
+                trace=trace,
+                features=template.features,
+                pixel_geometric_coverage=template.pixel_geometric_coverage,
+                pixel_sampling_valid=template.pixel_sampling_valid,
+                geometric_coverage=template.geometric_coverage,
+                patch_sampling_valid=template.patch_sampling_valid,
+            )
+            writer.write(view)
+            stored.append(view)
+        writer.set_evaluation_plan(
+            build_evaluation_plan({"a.png": stored}, seed=seed)
+        )
+        return writer.finish()["product_id"]
+
+    first = build(tmp_path / "one", 42)
+    same = build(tmp_path / "two", 42)
+    other = build(tmp_path / "three", 7)
+    assert first == same
+    # The same views under a different evaluation contract are not one product.
+    assert other != first
+
+
+def test_writer_refuses_symlinked_owned_directories(tmp_path):
+    """A symlinked ``features`` would send payloads outside the product root."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    root = tmp_path / "product"
+    root.mkdir()
+    (root / "features").symlink_to(outside)
+    contract = contract_for()
+    with pytest.raises(SpatialRecordError, match="symbolic link"):
+        SpatialWriter(
+            root, contract=contract, layout="per-image", samples=[make_sample("a.png")]
+        )
+    assert not list(outside.iterdir())
+
+    # A dangling target is refused the same way, not silently created elsewhere.
+    dangling = tmp_path / "dangling"
+    dangling.mkdir()
+    (dangling / "features").symlink_to(tmp_path / "missing-directory")
+    with pytest.raises(SpatialRecordError, match="symbolic link"):
+        SpatialWriter(
+            dangling, contract=contract, layout="per-image", samples=[make_sample("a.png")]
+        )
+
+
+def test_writer_refuses_a_symlinked_output_directory(tmp_path):
+    link = tmp_path / "dangling-output"
+    link.symlink_to(tmp_path / "nowhere")
+    with pytest.raises(SpatialRecordError, match="dangling symlink"):
+        SpatialWriter(
+            link, contract=contract_for(), layout="per-image", samples=[make_sample("a.png")]
+        )
+
+
+def test_product_id_covers_annotation_content(tmp_path):
+    def build(annotations) -> str:
+        contract = contract_for()
+        sample = make_sample("a.png", width=2, height=2)
+        writer = SpatialWriter(
+            contract=contract,
+            out_dir=tmp_path / f"p{len(list(tmp_path.iterdir()))}",
+            layout="per-image",
+            samples=[sample],
+            annotations=annotations,
+        )
+        writer.write(make_view(sample, contract))
+        return writer.finish()["product_id"]
+
+    base = {
+        "records": [
+            {
+                "annotation_id": 1,
+                "image_key": "a.png",
+                "category_id": 4,
+                "role": "instances",
+                "annotation": {"id": 1, "category_id": 4, "bbox": [0, 0, 2, 2]},
+            }
+        ],
+        "categories": {"instances:4": {"name": "Head"}},
+        "sources": {"instances": {"sha256": "abc", "images": 1}},
+    }
+    first = build(base)
+    assert build(base) == first
+    assert build({**base, "categories": {"instances:4": {"name": "Body"}}}) != first
+    assert (
+        build(
+            {
+                **base,
+                "records": [
+                    {**base["records"][0], "annotation_id": 2}
+                ],
+            }
+        )
+        != first
+    )
+    raster = np.zeros((2, 2), dtype=np.uint8)
+    with_raster = build({**base, "rasters": {"a.png": raster}})
+    assert with_raster != first
+    assert build({**base, "rasters": {"a.png": raster + 1}}) != with_raster
+
+
+def test_plan_validation_rejects_incomplete_or_unbounded_plans(tmp_path):
+    from otuformer.data.provenance import canonical_json_bytes
+    from otuformer.spatial.protocol import (
+        PROTOCOL_VIEW_IDS,
+        build_evaluation_plan,
+        protocol_operations,
+    )
+    from otuformer.vision.geometry import apply_geometry, evaluation_view_ops
+
+    root = tmp_path / "product"
+    contract = contract_for()
+    sample = make_sample("a.png")
+    image = Image.new("RGB", (640, 480), (10, 20, 30))
+    base_ops = evaluation_view_ops(image, name="center-crop", size=32)
+    writer = SpatialWriter(root, contract=contract, layout="per-image", samples=[sample])
+    stored = []
+    for view_id in PROTOCOL_VIEW_IDS:
+        if view_id == "reference":
+            ops, role, stored_id = base_ops, "base", "base"
+        else:
+            ops = [*base_ops, *protocol_operations(32, view_id)]
+            role, stored_id = "eval-transform", view_id
+        _, trace = apply_geometry(image, ops, track=True)
+        template = make_view(sample, contract, view_id=stored_id, role=role)
+        view = SpatialView(
+            image_key=sample.image_key,
+            view_id=stored_id,
+            role=role,
+            trace=trace,
+            features=template.features,
+            pixel_geometric_coverage=template.pixel_geometric_coverage,
+            pixel_sampling_valid=template.pixel_sampling_valid,
+            geometric_coverage=template.geometric_coverage,
+            patch_sampling_valid=template.patch_sampling_valid,
+        )
+        writer.write(view)
+        stored.append(view)
+    writer.set_evaluation_plan(build_evaluation_plan({"a.png": stored}, seed=42))
+    writer.finish()
+    write_envelope(root)
+    original = json.loads((root / "spatial_evaluation_plan.json").read_text(encoding="utf-8"))
+
+    def store(plan: dict) -> None:
+        payload = canonical_json_bytes(plan)
+        (root / "spatial_evaluation_plan.json").write_bytes(payload)
+        manifest = _rewrite_manifest(root)
+        manifest["evaluation_plan"]["sha256"] = sha256_bytes(payload)
+        manifest["evaluation_plan"]["bytes"] = len(payload)
+        for item in manifest["files"]:
+            if item["path"] == "spatial_evaluation_plan.json":
+                item["sha256"] = sha256_bytes(payload)
+                item["bytes"] = len(payload)
+        _store_manifest(root, manifest)
+
+    def edit(mutate) -> dict:
+        plan = json.loads(json.dumps(original))
+        mutate(plan)
+        return plan
+
+    cases = (
+        ("missing direction", lambda p: p["pairs"][0]["directions"].pop("target_to_reference"), "exactly the directions"),
+        ("no pairs", lambda p: p.update({"pairs": []}), "holds no pairs"),
+        ("query limit above the protocol", lambda p: p.update({"query_limit": 999}), "outside the frozen protocol bound"),
+        ("image limit above the protocol", lambda p: p.update({"image_limit": 1000}), "outside the frozen protocol bound"),
+        ("missing seed", lambda p: p.pop("seed"), "missing required field"),
+        ("missing patch_hw", lambda p: p["pairs"][0].pop("patch_hw"), "missing required field"),
+        ("missing query list", lambda p: p["pairs"][0]["directions"]["reference_to_target"].pop("queries"), "no query list"),
+        ("pair for an unselected key", lambda p: p["pairs"][0].update({"image_key": "ghost.png"}), "does not select"),
+    )
+    for _name, mutate, message in cases:
+        store(edit(mutate))
+        with pytest.raises(SpatialRecordError, match=message):
+            open_spatial_product(root)
+    store(original)
+    reader = open_spatial_product(root)
+    reader.close()
+
+
+def test_dangling_symlink_cannot_redirect_a_sealed_file(tmp_path):
+    """Every sealed write goes through ``_claim_path``, dangling links included."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    base = {
+        "records": [{"annotation_id": 1, "image_key": "a.png", "category_id": 4}],
+        "categories": {"instances:4": {"name": "Head"}},
+        "sources": {},
+    }
+    plan = {"protocol": "spatial-geometry-v1"}
+    for name in (
+        "spatial_index.jsonl",
+        "spatial_manifest.json",
+        "annotations.jsonl",
+        "spatial_evaluation_plan.json",
+    ):
+        root = tmp_path / f"p-{name}"
+        root.mkdir()
+        (root / name).symlink_to(outside / f"{name}.target")
+        contract = contract_for()
+        sample = make_sample("a.png")
+        if name in ("spatial_index.jsonl", "spatial_manifest.json"):
+            # A sealed name is refused at construction; the dangling link counts.
+            with pytest.raises(SpatialRecordError, match="already holds"):
+                SpatialWriter(
+                    root,
+                    contract=contract,
+                    layout="per-image",
+                    samples=[sample],
+                    annotations=base,
+                    evaluation_plan=plan,
+                )
+            continue
+        writer = SpatialWriter(
+            root,
+            contract=contract,
+            layout="per-image",
+            samples=[sample],
+            annotations=base,
+            evaluation_plan=plan,
+        )
+        writer.write(make_view(sample, contract))
+        with pytest.raises(SpatialRecordError, match="symbolic link"):
+            writer.finish()
+    # Nothing was created outside a product root.
+    assert not list(outside.iterdir())
+
+
+def test_categorical_raster_must_match_the_sample_and_hold_integer_ids(tmp_path):
+    contract = contract_for()
+
+    def attempt(raster, *, width=2, height=2, key="a.png"):
+        sample = make_sample(key, width=width, height=height)
+        writer = SpatialWriter(
+            tmp_path / f"p-{len(list(tmp_path.iterdir()))}",
+            contract=contract,
+            layout="per-image",
+            samples=[sample],
+            annotations={
+                "records": [
+                    {"annotation_id": 1, "image_key": key, "category_id": 4, "role": "panoptic"}
+                ],
+                "categories": {"panoptic:4": {"name": "Head"}},
+                "sources": {},
+                "rasters": {key: raster},
+            },
+        )
+        writer.write(make_view(sample, contract))
+        return writer.finish()
+
+    # A 16x16 sample cannot carry a 1x1 raster.
+    with pytest.raises(SpatialRecordError, match="but the sample is"):
+        attempt(np.zeros((1, 1), dtype=np.uint8), width=16, height=16)
+    # A float raster is not a categorical raster, whatever its shape.
+    with pytest.raises(SpatialRecordError, match="must hold integer ids"):
+        attempt(np.zeros((2, 2), dtype=np.float32))
+    # NaN in a float raster is refused before it can be called a valid label.
+    with pytest.raises(SpatialRecordError, match="must hold integer ids"):
+        attempt(np.full((2, 2), np.nan, dtype=np.float32))
+    # Negative ids are not categories either.
+    with pytest.raises(SpatialRecordError, match="negative id"):
+        attempt(np.full((2, 2), -1, dtype=np.int32))
+    # A one-dimensional array is not a raster.
+    with pytest.raises(SpatialRecordError, match="must be 2-D"):
+        attempt(np.zeros((2,), dtype=np.uint8))
+    # A well-formed raster still seals.
+    manifest = attempt(np.zeros((2, 2), dtype=np.uint8))
+    assert manifest["product_id"]
+
+
+def test_reader_rejects_a_hand_built_raster_that_disagrees_with_the_manifest(tmp_path):
+    from otuformer.data.provenance import canonical_json_bytes
+
+    root = tmp_path / "product"
+    contract = contract_for()
+    sample = make_sample("a.png", width=2, height=2)
+    writer = SpatialWriter(
+        root,
+        contract=contract,
+        layout="per-image",
+        samples=[sample],
+        annotations={
+            "records": [
+                {"annotation_id": 1, "image_key": "a.png", "category_id": 4, "role": "panoptic"}
+            ],
+            "categories": {"panoptic:4": {"name": "Head"}},
+            "sources": {},
+            "rasters": {"a.png": np.zeros((2, 2), dtype=np.uint8)},
+        },
+    )
+    writer.write(make_view(sample, contract))
+    writer.finish()
+
+    # Replace the sealed raster with a float one and re-seal every digest, so only
+    # the semantic check can catch it.
+    import io as _io
+
+    import numpy as _np
+
+    relative = "annotations/000001.npz"
+    buffer = _io.BytesIO()
+    _np.savez(buffer, raster=_np.full((2, 2), _np.nan, dtype=_np.float32))
+    payload = buffer.getvalue()
+    (root / relative).write_bytes(payload)
+    manifest = _rewrite_manifest(root)
+    manifest["annotations"]["rasters"]["a.png"]["sha256"] = sha256_bytes(payload)
+    manifest["annotations"]["rasters"]["a.png"]["dtype"] = "<f4"
+    for item in manifest["files"]:
+        if item["path"] == relative:
+            item["sha256"] = sha256_bytes(payload)
+            item["bytes"] = len(payload)
+    _store_manifest(root, manifest)
+    reader = open_spatial_product(root)
+    try:
+        with pytest.raises(SpatialRecordError, match="must hold integer ids"):
+            reader.annotations_for_view("a.png", "base")
+    finally:
+        reader.close()
+
+
+def test_reader_rejects_a_raster_whose_declared_shape_disagrees(tmp_path):
+    root = tmp_path / "product"
+    contract = contract_for()
+    sample = make_sample("a.png", width=2, height=2)
+    writer = SpatialWriter(
+        root,
+        contract=contract,
+        layout="per-image",
+        samples=[sample],
+        annotations={
+            "records": [
+                {"annotation_id": 1, "image_key": "a.png", "category_id": 4, "role": "panoptic"}
+            ],
+            "categories": {"panoptic:4": {"name": "Head"}},
+            "sources": {},
+            "rasters": {"a.png": np.zeros((2, 2), dtype=np.uint8)},
+        },
+    )
+    writer.write(make_view(sample, contract))
+    writer.finish()
+    manifest = _rewrite_manifest(root)
+    manifest["annotations"]["rasters"]["a.png"]["shape"] = [4, 4]
+    _store_manifest(root, manifest)
+    reader = open_spatial_product(root)
+    try:
+        with pytest.raises(SpatialRecordError, match="manifest (declares|seals)"):
+            reader.annotations_for_view("a.png", "base")
+    finally:
+        reader.close()
+
+
+def test_full_plan_contract_is_checked_not_only_field_presence(tmp_path):
+    """Duplicate pairs, dropped transforms, bad ids and stale geometry all fail."""
+    from otuformer.data.provenance import canonical_json_bytes
+    from otuformer.spatial.protocol import (
+        PROTOCOL_VIEW_IDS,
+        build_evaluation_plan,
+        protocol_operations,
+    )
+    from otuformer.vision.geometry import apply_geometry, evaluation_view_ops
+
+    root = tmp_path / "product"
+    contract = contract_for()
+    sample = make_sample("a.png")
+    image = Image.new("RGB", (640, 480), (10, 20, 30))
+    base_ops = evaluation_view_ops(image, name="center-crop", size=32)
+    writer = SpatialWriter(root, contract=contract, layout="per-image", samples=[sample])
+    stored = []
+    for view_id in PROTOCOL_VIEW_IDS:
+        if view_id == "reference":
+            ops, role, stored_id = base_ops, "base", "base"
+        else:
+            ops = [*base_ops, *protocol_operations(32, view_id)]
+            role, stored_id = "eval-transform", view_id
+        _, trace = apply_geometry(image, ops, track=True)
+        template = make_view(sample, contract, view_id=stored_id, role=role)
+        view = SpatialView(
+            image_key=sample.image_key,
+            view_id=stored_id,
+            role=role,
+            trace=trace,
+            features=template.features,
+            pixel_geometric_coverage=template.pixel_geometric_coverage,
+            pixel_sampling_valid=template.pixel_sampling_valid,
+            geometric_coverage=template.geometric_coverage,
+            patch_sampling_valid=template.patch_sampling_valid,
+        )
+        writer.write(view)
+        stored.append(view)
+    writer.set_evaluation_plan(build_evaluation_plan({"a.png": stored}, seed=42))
+    writer.finish()
+    write_envelope(root)
+    original = json.loads((root / "spatial_evaluation_plan.json").read_text(encoding="utf-8"))
+
+    def store(plan: dict) -> None:
+        payload = canonical_json_bytes(plan)
+        (root / "spatial_evaluation_plan.json").write_bytes(payload)
+        manifest = _rewrite_manifest(root)
+        manifest["evaluation_plan"]["sha256"] = sha256_bytes(payload)
+        manifest["evaluation_plan"]["bytes"] = len(payload)
+        for item in manifest["files"]:
+            if item["path"] == "spatial_evaluation_plan.json":
+                item["sha256"] = sha256_bytes(payload)
+                item["bytes"] = len(payload)
+        _store_manifest(root, manifest)
+
+    def edit(mutate) -> dict:
+        plan = json.loads(json.dumps(original))
+        mutate(plan)
+        return plan
+
+    def duplicate_pair(plan):
+        plan["pairs"].append(json.loads(json.dumps(plan["pairs"][0])))
+
+    def drop_transforms(plan):
+        plan["pairs"] = plan["pairs"][:1]
+
+    def zero_patch(plan):
+        plan["pairs"][0]["patch_hw"] = [0, 0]
+
+    def drop_geometry(plan):
+        plan["pairs"][0].pop("geometry")
+
+    def string_seed(plan):
+        plan["seed"] = "forty-two"
+
+    def bad_branch_view(plan):
+        plan["pairs"][0]["directions"]["reference_to_target"]["source_view"] = "ghost"
+
+    def pair_id_mismatch(plan):
+        plan["pairs"][0]["pair_id"] = "not-the-target"
+
+    def stale_geometry(plan):
+        plan["pairs"][0]["geometry"]["target"]["view_wh"] = [99, 99]
+
+    def wrong_patch_size(plan):
+        plan["pairs"][0]["patch_hw"] = [1, 1]
+        plan["pairs"][0]["geometry"]["reference"]["patch_hw"] = [1, 1]
+        plan["pairs"][0]["geometry"]["target"]["patch_hw"] = [1, 1]
+
+    def arbitrary_truth(plan):
+        for pair in plan["pairs"]:
+            queries = pair["directions"]["reference_to_target"]["queries"]
+            if queries:
+                queries[0]["xy_target"] = [999.0, 999.0]
+                return
+
+    def stale_matrix(plan):
+        plan["pairs"][0]["geometry"]["target"]["source_to_view"][0][2] = 3.0
+
+    def shrunk_protocol(plan):
+        plan["view_ids"] = ["reference", "tx10"]
+        plan["pairs"] = [
+            pair for pair in plan["pairs"] if pair["target_view"] == "tx10"
+        ]
+
+    cases = (
+        (duplicate_pair, "twice"),
+        (drop_transforms, "missing transform"),
+        (zero_patch, "positive integer patch_hw"),
+        (drop_geometry, "missing required field"),
+        (string_seed, "must be an integer"),
+        (bad_branch_view, "names source_view"),
+        (pair_id_mismatch, "does not match its target"),
+        (stale_geometry, "does not match the stored view"),
+        (wrong_patch_size, "stored feature contract is"),
+        (arbitrary_truth, "stored geometry maps its source point"),
+        (stale_matrix, "does not match the stored view"),
+        (shrunk_protocol, "do not hold the frozen protocol views"),
+    )
+    for mutate, message in cases:
+        store(edit(mutate))
+        with pytest.raises(SpatialRecordError, match=message):
+            open_spatial_product(root)
+    store(original)
+    reader = open_spatial_product(root)
+    reader.close()
+
+
+def test_wide_integer_category_ids_round_trip_exactly(tmp_path):
+    """The backend works in int32; ids wider than that must not be truncated."""
+    from otuformer.data.provenance import canonical_json_bytes
+
+    values = (
+        (np.uint64, 4294967297),
+        (np.int64, 2147483648),
+        (np.uint32, 16777215),
+        (np.uint8, 255),
+    )
+    for dtype, value in values:
+        root = tmp_path / f"p-{dtype.__name__}-{value}"
+        contract = contract_for()
+        sample = make_sample("a.png", width=2, height=2)
+        raster = np.full((2, 2), value, dtype=dtype)
+        writer = SpatialWriter(
+            root,
+            contract=contract,
+            layout="per-image",
+            samples=[sample],
+            annotations={
+                "records": [
+                    {
+                        "annotation_id": 1,
+                        "image_key": "a.png",
+                        "category_id": 4,
+                        "role": "panoptic",
+                    }
+                ],
+                "categories": {"panoptic:4": {"name": "Head"}},
+                "sources": {},
+                "rasters": {"a.png": raster},
+            },
+        )
+        writer.write(make_view(sample, contract))
+        writer.finish()
+        write_envelope(root)
+        reader = open_spatial_product(root)
+        try:
+            (record,) = reader.annotations_for_view("a.png", "base")
+            assert set(np.unique(record["mask"]).tolist()) == {value}, dtype
+            assert record["mask_support"].all(), dtype
+        finally:
+            reader.close()
+
+
+def test_a_lying_npy_header_is_rejected_before_allocation(tmp_path):
+    """A sealed 2.6 KB product must not become a terabyte allocation request."""
+    import io as _io
+    import struct
+    import zipfile
+
+    root = tmp_path / "product"
+    build_product(root, keys=("a/one.png",))
+    payload_path = root / "features" / "000001.npz"
+    with np.load(payload_path) as archive:
+        arrays = {name: archive[name] for name in archive.files}
+    key = "v0000.feature:blocks.0"
+    declared_shape = [int(v) for v in arrays[key].shape]
+
+    buffer = _io.BytesIO()
+    np.savez(buffer, **arrays)
+    out = _io.BytesIO()
+    with zipfile.ZipFile(_io.BytesIO(buffer.getvalue())) as source, zipfile.ZipFile(
+        out, "w"
+    ) as target:
+        for item in source.infolist():
+            data = source.read(item.filename)
+            if item.filename == f"{key}.npy":
+                header_length = struct.unpack("<H", data[8:10])[0]
+                body = data[10 + header_length :]
+                header = (
+                    "{'descr': '<f4', 'fortran_order': False, "
+                    "'shape': (1000000, 1000000, 4), }"
+                )
+                padding = 64 - ((10 + len(header) + 1) % 64)
+                header = header + " " * padding + "\n"
+                data = (
+                    data[:8]
+                    + struct.pack("<H", len(header))
+                    + header.encode("latin1")
+                    + body
+                )
+            target.writestr(item, data)
+    payload = out.getvalue()
+    payload_path.write_bytes(payload)
+    manifest = _rewrite_manifest(root)
+    for item in manifest["files"]:
+        if item["path"] == "features/000001.npz":
+            item["sha256"] = sha256_bytes(payload)
+            item["bytes"] = len(payload)
+    _store_manifest(root, manifest)
+
+    reader = open_spatial_product(root)
+    try:
+        with pytest.raises(SpatialRecordError, match="declares|seals"):
+            reader.get_view("a/one.png", "base")
+        # The index still describes the honest array.
+        assert declared_shape
+    finally:
+        reader.close()
+
+
+def test_annotation_raster_header_is_checked_before_allocation(tmp_path):
+    """A tiny archive must not become a huge allocation through its header."""
+    import io as _io
+    import struct
+    import zipfile
+
+    root = tmp_path / "product"
+    contract = contract_for()
+    sample = make_sample("a.png", width=2, height=2)
+    writer = SpatialWriter(
+        root,
+        contract=contract,
+        layout="per-image",
+        samples=[sample],
+        annotations={
+            "records": [
+                {
+                    "annotation_id": 1,
+                    "image_key": "a.png",
+                    "category_id": 4,
+                    "role": "panoptic",
+                }
+            ],
+            "categories": {"panoptic:4": {"name": "Head"}},
+            "sources": {},
+            "rasters": {"a.png": np.zeros((2, 2), dtype=np.uint8)},
+        },
+    )
+    writer.write(make_view(sample, contract))
+    writer.finish()
+    relative = "annotations/000001.npz"
+    header = "{'descr': '|u1', 'fortran_order': False, 'shape': (1000000, 4000000), }"
+    padding = 64 - ((10 + len(header) + 1) % 64)
+    header = header + " " * padding + "\n"
+    npy = (
+        b"\x93NUMPY"
+        + bytes([1, 0])
+        + struct.pack("<H", len(header))
+        + header.encode("latin1")
+        + b"\x00\x00\x00\x00"
+    )
+    buffer = _io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("raster.npy", npy)
+    payload = buffer.getvalue()
+    (root / relative).write_bytes(payload)
+    manifest = _rewrite_manifest(root)
+    manifest["annotations"]["rasters"]["a.png"]["sha256"] = sha256_bytes(payload)
+    for item in manifest["files"]:
+        if item["path"] == relative:
+            item["sha256"] = sha256_bytes(payload)
+            item["bytes"] = len(payload)
+    _store_manifest(root, manifest)
+
+    reader = open_spatial_product(root)
+    try:
+        with pytest.raises(SpatialRecordError, match="manifest|declares"):
+            reader.annotations_for_view("a.png", "base")
+    finally:
+        reader.close()
+
+
+def test_whole_index_checks_descriptor_and_ref_schema(tmp_path):
+    root = tmp_path / "product"
+    build_product(root)
+    entries = _index_lines(root)
+
+    def edit(mutate) -> None:
+        copy = json.loads(json.dumps(entries))
+        for entry in copy:
+            if entry["sample"]["image_key"] == "b/one.png":
+                mutate(entry)
+        _rewrite_index(root, copy)
+        write_envelope(root)
+
+    cases = (
+        (lambda e: e["refs"]["pixel_geometric_coverage"].update({"kind": "parquet"}), "unsupported kind"),
+        (lambda e: e["refs"]["pixel_geometric_coverage"].pop("key"), "no NPZ key"),
+        (lambda e: e["arrays"]["feature:blocks.0"].update({"shape": [2, 2, 9]}), "channels"),
+        (lambda e: e["arrays"]["feature:blocks.0"].update({"dtype": "<f8"}), "dtype"),
+        (lambda e: e["arrays"]["geometric_coverage"].update({"shape": [3, 3]}), "grid"),
+        (lambda e: e["arrays"]["feature:blocks.1"].pop("digest"), "no 'digest'"),
+    )
+    for mutate, message in cases:
+        edit(mutate)
+        with pytest.raises(SpatialRecordError, match=message):
+            open_spatial_product(root)
+        _rewrite_index(root, entries)
+        write_envelope(root)
+    reader = open_spatial_product(root)
+    reader.close()
+
+
+def test_plan_counts_must_describe_the_stored_support(tmp_path):
+    """Erasing queries or shrinking source-valid counts is not a valid plan."""
+    from otuformer.data.provenance import canonical_json_bytes
+    from otuformer.spatial.protocol import (
+        PROTOCOL_VIEW_IDS,
+        build_evaluation_plan,
+        protocol_operations,
+    )
+    from otuformer.vision.geometry import apply_geometry, evaluation_view_ops
+
+    root = tmp_path / "product"
+    contract = contract_for()
+    sample = make_sample("a.png")
+    image = Image.new("RGB", (640, 480), (10, 20, 30))
+    base_ops = evaluation_view_ops(image, name="center-crop", size=32)
+    writer = SpatialWriter(root, contract=contract, layout="per-image", samples=[sample])
+    stored = []
+    for view_id in PROTOCOL_VIEW_IDS:
+        if view_id == "reference":
+            ops, role, stored_id = base_ops, "base", "base"
+        else:
+            ops = [*base_ops, *protocol_operations(32, view_id)]
+            role, stored_id = "eval-transform", view_id
+        _, trace = apply_geometry(image, ops, track=True)
+        template = make_view(sample, contract, view_id=stored_id, role=role)
+        view = SpatialView(
+            image_key=sample.image_key,
+            view_id=stored_id,
+            role=role,
+            trace=trace,
+            features=template.features,
+            pixel_geometric_coverage=template.pixel_geometric_coverage,
+            pixel_sampling_valid=template.pixel_sampling_valid,
+            geometric_coverage=template.geometric_coverage,
+            patch_sampling_valid=template.patch_sampling_valid,
+        )
+        writer.write(view)
+        stored.append(view)
+    writer.set_evaluation_plan(build_evaluation_plan({"a.png": stored}, seed=42))
+    writer.finish()
+    write_envelope(root)
+    original = json.loads((root / "spatial_evaluation_plan.json").read_text(encoding="utf-8"))
+
+    def store(plan: dict) -> None:
+        payload = canonical_json_bytes(plan)
+        (root / "spatial_evaluation_plan.json").write_bytes(payload)
+        manifest = _rewrite_manifest(root)
+        manifest["evaluation_plan"]["sha256"] = sha256_bytes(payload)
+        manifest["evaluation_plan"]["bytes"] = len(payload)
+        for item in manifest["files"]:
+            if item["path"] == "spatial_evaluation_plan.json":
+                item["sha256"] = sha256_bytes(payload)
+                item["bytes"] = len(payload)
+        _store_manifest(root, manifest)
+
+    def first_branch(plan):
+        for pair in plan["pairs"]:
+            for branch in pair["directions"].values():
+                if branch["queries"]:
+                    return branch
+        raise AssertionError("fixture needs a branch with queries")
+
+    def erase_queries(plan):
+        branch = first_branch(plan)
+        branch["queries"] = []
+        branch["sampled_count"] = 0
+
+    def fake_source_valid(plan):
+        branch = first_branch(plan)
+        branch["source_valid_count"] = 1
+
+    def consistent_zero(plan):
+        # Every branch agrees with every other and with the real source support:
+        # only recomputing eligibility from the stored geometry catches it.
+        for pair in plan["pairs"]:
+            for branch in pair["directions"].values():
+                branch["queries"] = []
+                branch["sampled_count"] = 0
+                branch["eligible_count"] = 0
+                branch["unavailable"] = True
+                branch["unavailable_reason"] = "no_overlap"
+
+    def drop_signature_matrix(plan):
+        plan["pairs"][0]["geometry"]["target"].pop("source_to_view")
+
+    cases = (
+        (erase_queries, "frozen protocol samples|stored support"),
+        (fake_source_valid, "stored support|valid patch cells"),
+        (consistent_zero, "stored support|frozen protocol samples"),
+        (drop_signature_matrix, "source_to_view"),
+    )
+    for mutate, message in cases:
+        plan = json.loads(json.dumps(original))
+        mutate(plan)
+        store(plan)
+        with pytest.raises(SpatialRecordError, match=message):
+            open_spatial_product(root)
+    store(original)
+    reader = open_spatial_product(root)
+    reader.close()
+
+
+def _protocol_product(tmp_path, *, keys=("a.png",), views_per_key=None):
+    """One product carrying the frozen protocol views and a real saved plan."""
+    from otuformer.spatial.protocol import (
+        PROTOCOL_VIEW_IDS,
+        build_evaluation_plan,
+        protocol_operations,
+    )
+    from otuformer.vision.geometry import apply_geometry, evaluation_view_ops
+
+    root = tmp_path / "product"
+    contract = contract_for()
+
+    def build(selected):
+        samples = [make_sample(key) for key in selected]
+        image = Image.new("RGB", (640, 480), (10, 20, 30))
+        base_ops = evaluation_view_ops(image, name="center-crop", size=32)
+        writer = SpatialWriter(
+            root, contract=contract, layout="per-image", samples=samples
+        )
+        stored: dict[str, list[SpatialView]] = {key: [] for key in selected}
+        for sample in samples:
+            for view_id in PROTOCOL_VIEW_IDS:
+                if view_id == "reference":
+                    ops, role, stored_id = base_ops, "base", "base"
+                else:
+                    ops = [*base_ops, *protocol_operations(32, view_id)]
+                    role, stored_id = "eval-transform", view_id
+                _, trace = apply_geometry(image, ops, track=True)
+                template = make_view(sample, contract, view_id=stored_id, role=role)
+                view = SpatialView(
+                    image_key=sample.image_key,
+                    view_id=stored_id,
+                    role=role,
+                    trace=trace,
+                    features=template.features,
+                    pixel_geometric_coverage=template.pixel_geometric_coverage,
+                    pixel_sampling_valid=template.pixel_sampling_valid,
+                    geometric_coverage=template.geometric_coverage,
+                    patch_sampling_valid=template.patch_sampling_valid,
+                )
+                writer.write(view)
+                stored[sample.image_key].append(view)
+        writer.set_evaluation_plan(build_evaluation_plan(stored, seed=42))
+        writer.finish()
+        write_envelope(root)
+
+    build(tuple(keys))
+    return root
+
+
+def test_a_selected_read_does_not_load_unselected_payloads(tmp_path):
+    """Plan validation reads support bytes only for the selected samples."""
+    root = _protocol_product(tmp_path, keys=("a.png", "b.png"))
+    selector = tmp_path / "selector.csv"
+    selector.write_text("image\na.png\n", encoding="utf-8")
+    # Deleting an unselected payload makes the difference observable: a whole-plan
+    # support check would fail on it even though the report never covers it.
+    b_payloads = sorted((root / "features").glob("*.npz"))
+    removed = 0
+    index = [
+        json.loads(line)
+        for line in (root / "spatial_index.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    b_paths = {
+        entry["refs"][name]["path"]
+        for entry in index
+        if entry["sample"]["image_key"] == "b.png"
+        for name in entry["refs"]
+    }
+    for name in b_paths:
+        (root / name).unlink()
+        removed += 1
+    assert removed
+    reader = open_spatial_product(root, selector_csv=selector)
+    try:
+        assert reader.image_keys == ("a.png",)
+        assert {view.image_key for view in reader.iter_views()} == {"a.png"}
+    finally:
+        reader.close()
+    assert b_payloads  # the fixture really had unselected payloads
+
+
+def test_a_tampered_plan_is_recomputed_not_trusted_from_its_counts(tmp_path):
+    """Consistently forged counts, a dropped query and a bad grid support fail.
+
+    The stored counts are what a report publishes. Checking only their arithmetic
+    let a plan make every branch `eligible_count=0`/`no_overlap` and erase the
+    whole evaluation, and the target-support check tested the pixel grid only, so
+    a point whose feature interpolation support was incomplete still opened.
+    """
+    from otuformer.data.provenance import canonical_json_bytes
+
+    root = _protocol_product(tmp_path, keys=("a.png",))
+    plan_path = root / "spatial_evaluation_plan.json"
+    original = json.loads(plan_path.read_text(encoding="utf-8"))
+
+    def store(plan: dict) -> None:
+        payload = canonical_json_bytes(plan)
+        plan_path.write_bytes(payload)
+        manifest = _rewrite_manifest(root)
+        manifest["evaluation_plan"]["sha256"] = sha256_bytes(payload)
+        manifest["evaluation_plan"]["bytes"] = len(payload)
+        for item in manifest["files"]:
+            if item["path"] == "spatial_evaluation_plan.json":
+                item["sha256"] = sha256_bytes(payload)
+                item["bytes"] = len(payload)
+        _store_manifest(root, manifest)
+
+    def first_branch(plan):
+        for pair in plan["pairs"]:
+            for branch in pair["directions"].values():
+                if branch["queries"]:
+                    return branch
+        raise AssertionError("fixture needs a branch with queries")
+
+    def erase_every_branch(plan):
+        for pair in plan["pairs"]:
+            for branch in pair["directions"].values():
+                branch["queries"] = []
+                branch["sampled_count"] = 0
+                branch["eligible_count"] = 0
+                branch["unavailable"] = True
+                branch["unavailable_reason"] = "no_overlap"
+
+    def drop_one_query(plan):
+        branch = first_branch(plan)
+        branch["queries"] = branch["queries"][1:]
+        branch["sampled_count"] = len(branch["queries"])
+
+    def swap_one_query(plan):
+        branch = first_branch(plan)
+        kept = branch["queries"][0]
+        dropped = branch["queries"][1] if len(branch["queries"]) > 1 else None
+        if dropped is None:
+            raise AssertionError("fixture needs two queries")
+        branch["queries"] = [dropped, kept]
+        branch["queries"][0]["row"], branch["queries"][0]["column"] = 0, 0
+        branch["sampled_count"] = len(branch["queries"])
+
+    cases = (
+        (erase_every_branch, "stored support"),
+        (drop_one_query, "frozen protocol samples"),
+        (swap_one_query, "frozen protocol samples"),
+    )
+    for mutate, message in cases:
+        plan = json.loads(json.dumps(original))
+        mutate(plan)
+        store(plan)
+        with pytest.raises(SpatialRecordError, match=message):
+            open_spatial_product(root)
+    store(original)
+    reader = open_spatial_product(root)
+    reader.close()

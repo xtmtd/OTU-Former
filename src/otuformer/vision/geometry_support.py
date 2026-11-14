@@ -99,6 +99,106 @@ def clip_polygon_to_rect(polygon: np.ndarray, width: float, height: float) -> np
     return np.array(points, dtype=np.float64)
 
 
+def clip_polygon_to_window(
+    polygon: np.ndarray, left: float, top: float, width: float, height: float
+) -> np.ndarray:
+    """Clip a convex polygon to ``[left,left+w] x [top,top+h]`` of its own frame.
+
+    A crop window is an offset rectangle: clipping to ``[0,w] x [0,h]`` would keep
+    the content the crop discarded, which is exactly the historical coordinate
+    bug. The window is shifted to the origin, clipped and shifted back.
+    """
+    points = np.asarray(polygon, dtype=np.float64)
+    if len(points) < 3:
+        return np.zeros((0, 2), dtype=np.float64)
+    shifted = points - np.array([float(left), float(top)], dtype=np.float64)
+    clipped = clip_polygon_to_rect(shifted, float(width), float(height))
+    if len(clipped) < 3:
+        return np.zeros((0, 2), dtype=np.float64)
+    return clipped + np.array([float(left), float(top)], dtype=np.float64)
+
+
+def _edge_intersection(
+    start: np.ndarray, end: np.ndarray, anchor: np.ndarray, direction: np.ndarray
+) -> tuple[float, float]:
+    segment = end - start
+    denominator = segment[0] * (-direction[1]) + segment[1] * direction[0]
+    if abs(denominator) <= 1e-15:  # pragma: no cover - parallel edges
+        return (float(end[0]), float(end[1]))
+    ratio = (
+        (anchor[0] - start[0]) * (-direction[1])
+        + (anchor[1] - start[1]) * direction[0]
+    ) / denominator
+    return (float(start[0] + ratio * segment[0]), float(start[1] + ratio * segment[1]))
+
+
+def clip_polygon_to_convex(polygon: np.ndarray, window: np.ndarray) -> np.ndarray:
+    """Sutherland-Hodgman clip of ``polygon`` to a convex ``window``.
+
+    Used for the surviving-content domain of a realized geometry: a crop or an
+    intermediate canvas truncation is not a rectangle in the final view, so a
+    rectangle clip cannot express it.
+    """
+    subject = np.asarray(polygon, dtype=np.float64).reshape(-1, 2)
+    border = np.asarray(window, dtype=np.float64).reshape(-1, 2)
+    if len(subject) < 3 or len(border) < 3:
+        return np.zeros((0, 2), dtype=np.float64)
+    orientation = 1.0 if _signed_area(border) >= 0.0 else -1.0
+    for index in range(len(border)):
+        anchor = border[index]
+        following = border[(index + 1) % len(border)]
+        direction = following - anchor
+        if not np.any(np.abs(direction) > 1e-15):  # pragma: no cover - degenerate
+            continue
+
+        def inside(point: np.ndarray) -> bool:
+            cross = direction[0] * (point[1] - anchor[1]) - direction[1] * (
+                point[0] - anchor[0]
+            )
+            return bool(orientation * cross >= -1e-12)
+
+        output: list[tuple[float, float]] = []
+        for position, current in enumerate(subject):
+            previous = subject[position - 1]
+            current_inside, previous_inside = inside(current), inside(previous)
+            if current_inside:
+                if not previous_inside:
+                    output.append(
+                        _edge_intersection(previous, current, anchor, direction)
+                    )
+                output.append((float(current[0]), float(current[1])))
+            elif previous_inside:
+                output.append(_edge_intersection(previous, current, anchor, direction))
+        if not output:
+            return np.zeros((0, 2), dtype=np.float64)
+        subject = np.array(output, dtype=np.float64)
+    return subject
+
+
+def point_in_polygon(polygon: np.ndarray, point: Sequence[float]) -> bool:
+    """Even-odd containment test, so a mapped point knows its support domain."""
+    points = np.asarray(polygon, dtype=np.float64).reshape(-1, 2)
+    if len(points) < 3:
+        return False
+    x, y = float(point[0]), float(point[1])
+    if (
+        x < float(points[:, 0].min())
+        or x > float(points[:, 0].max())
+        or y < float(points[:, 1].min())
+        or y > float(points[:, 1].max())
+    ):
+        return False
+    inside = False
+    for index in range(len(points)):
+        x_a, y_a = points[index]
+        x_b, y_b = points[(index + 1) % len(points)]
+        if (y_a > y) != (y_b > y):
+            crossing = x_a + (y - y_a) * (x_b - x_a) / (y_b - y_a)
+            if x < crossing:
+                inside = not inside
+    return bool(inside)
+
+
 def _extent_at(polygon: np.ndarray, y: float) -> tuple[float, float] | None:
     """Left/right x of a convex polygon at one scanline, or ``None``."""
     xs: list[float] = []
@@ -323,39 +423,6 @@ def series_bbox(polygon: np.ndarray) -> np.ndarray:
         [points[:, 0].min(), points[:, 1].min(), points[:, 0].max(), points[:, 1].max()],
         dtype=np.float64,
     )
-
-
-def nearest_warp(
-    raster: np.ndarray,
-    forward_matrix: np.ndarray,
-    out_wh: tuple[int, int],
-    *,
-    fill: int = 0,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Category-safe nearest-neighbour warp of a categorical raster.
-
-    Returns the warped raster and the Boolean support of output cells whose
-    nearest source sample lay inside the source raster. Fill is written where it
-    did not, and the support tells a consumer not to read that fill as a real
-    category.
-    """
-    out_w, out_h = int(out_wh[0]), int(out_wh[1])
-    inverse = invert(forward_matrix)
-    rows, cols = np.indices((out_h, out_w), dtype=np.float64)
-    points = np.stack([cols + 0.5, rows + 0.5], axis=-1)
-    coordinates = transform_points(inverse, points.reshape(-1, 2))
-    source_cols = np.floor(coordinates[:, 0]).astype(np.int64).reshape(out_h, out_w)
-    source_rows = np.floor(coordinates[:, 1]).astype(np.int64).reshape(out_h, out_w)
-    source_h, source_w = raster.shape
-    support = (
-        (source_cols >= 0)
-        & (source_cols < source_w)
-        & (source_rows >= 0)
-        & (source_rows < source_h)
-    )
-    warped = np.full((out_h, out_w), fill, dtype=raster.dtype)
-    warped[support] = raster[source_rows[support], source_cols[support]]
-    return warped, support
 
 
 def coverage_summary(pixel_coverage_array: np.ndarray) -> dict[str, float]:

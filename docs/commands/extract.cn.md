@@ -81,7 +81,7 @@ otuformer extract \
 
 **默认值：** `No`
 
-仅检查点的空间模式。把 backbone 相对模块路径及其空间可用性写入 `model_layers.txt`，然后继续抽取。
+仅检查点的空间模式。把 backbone 相对模块路径及其空间可用性写入 `model_layers.txt`，然后继续抽取。在 embedding 输出下显式使用会被拒绝，而不是被静默忽略。
 
 ### `--out-dir`
 
