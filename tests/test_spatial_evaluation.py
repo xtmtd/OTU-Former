@@ -560,9 +560,10 @@ def test_write_spatial_evaluation_uses_the_documented_filenames(tmp_path):
     envelope = json.loads((out / "run_provenance.json").read_text(encoding="utf-8"))
     paths = {item["path"] for item in envelope["artifacts"]}
     assert {FILENAME_MATCHES, FILENAME_EVALUATION, "spatial_evaluation_plan.json"} <= paths
-    assert envelope["evaluation"]["counts"]["queries"] == len(
-        list(csv.DictReader((out / FILENAME_MATCHES).open(encoding="utf-8")))
-    )
+    with (out / FILENAME_MATCHES).open(encoding="utf-8") as matches:
+        assert envelope["evaluation"]["counts"]["queries"] == len(
+            list(csv.DictReader(matches))
+        )
 
 
 def test_subset_evaluation_follows_the_csv_selection_order(tmp_path):
@@ -749,6 +750,7 @@ def test_plan_geometry_is_keyed_by_image_and_reports_eligibility_counts(tmp_path
     assert all(branch.get("unavailable_reason") for branch in unavailable)
 
 
+@pytest.mark.filterwarnings("error")
 def test_overlay_names_do_not_collide_and_keep_every_family(tmp_path):
     """`a_b.png` and `a/b.png` must not share a figure; families are not dropped."""
     from otuformer.spatial.evaluation import draw_match_overlays

@@ -602,7 +602,8 @@ def test_fifo_metrics_resume_current_43_column_log(tmp_path):
     pretrain_loop_module.InstantMetricsLogger(path, mode="pretrain").log(
         iteration=2, relational_queue_capacity=128
     )
-    rows = list(csv.DictReader(path.open(newline="")))
+    with path.open(newline="") as metrics:
+        rows = list(csv.DictReader(metrics))
     assert all(rows[0][name] == "1" for name in old_header)
     assert rows[0]["relational_queue_capacity"] == ""
     assert rows[1]["relational_queue_capacity"] == "128"

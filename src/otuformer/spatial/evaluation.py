@@ -748,7 +748,16 @@ def draw_match_overlays(
                     "x",
                     markersize=3,
                 )
-            axis.set_title(image_key)
+            from matplotlib import font_manager
+
+            title = axis.set_title("", parse_math=False)
+            font = font_manager.get_font(font_manager.findfont(title.get_fontproperties()))
+            # Keep labels readable without requiring system CJK fonts or losing keys.
+            title.set_text("".join(
+                char if font.get_char_index(ord(char)) else
+                char.encode("unicode_escape").decode("ascii")
+                for char in image_key
+            ))
             axis.set_axis_off()
             directory.mkdir(parents=True, exist_ok=True)
             # A digest bounds Unicode/deep-path names and avoids file/dir conflicts.

@@ -766,6 +766,7 @@ def test_a_fully_cropped_segmentation_does_not_fall_back_to_its_bbox():
         assert fallback["area_retained"] == pytest.approx(16.0)
 
 
+@pytest.mark.filterwarnings("error")
 def test_categorical_replay_matches_the_backend_pixel_for_pixel():
     """The oracle is the library itself: same ops on an integer image."""
     from otuformer.vision.geometry import transform_annotations

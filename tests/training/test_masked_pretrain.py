@@ -2806,7 +2806,8 @@ def test_fifo_empty_history_and_cross_epoch_retention(tmp_path, monkeypatch):
         batch_size=2,
     )
     path = obs["out_dir"] / "logs" / "instant_metrics.pretrain.csv"
-    rows = list(csv.DictReader(path.open(newline="")))
+    with path.open(newline="") as metrics:
+        rows = list(csv.DictReader(metrics))
     assert len(rows) == 4
     # Four images in two batches: the current batch is always excluded, so the
     # first step has no history and later steps read the retained records,
@@ -3409,13 +3410,10 @@ def test_fifo_without_local_views_leaves_the_local_teacher_cells_blank(
         save_every_epochs=5,
         local_crops=0,
     )
-    rows = list(
-        csv.DictReader(
-            (obs["out_dir"] / "logs" / "instant_metrics.pretrain.csv").open(
-                newline=""
-            )
-        )
-    )
+    with (obs["out_dir"] / "logs" / "instant_metrics.pretrain.csv").open(
+        newline=""
+    ) as metrics:
+        rows = list(csv.DictReader(metrics))
     assert rows
     for row in rows:
         for name in reporting_module._RELATIONAL_TEACHER_STAT_NAMES:
@@ -3481,13 +3479,10 @@ def test_fifo_resolved_log_separates_requested_and_effective(
     assert inherited[0]["capacity_source"] == "inherited"
     assert inherited[0]["requested_batch_size"] == 4
     assert inherited[0]["batch_size_source"] == "inherited"
-    rows = list(
-        csv.DictReader(
-            (resumed["out_dir"] / "logs" / "instant_metrics.pretrain.csv").open(
-                newline=""
-            )
-        )
-    )
+    with (resumed["out_dir"] / "logs" / "instant_metrics.pretrain.csv").open(
+        newline=""
+    ) as metrics:
+        rows = list(csv.DictReader(metrics))
     assert rows and all(row["relational_queue_capacity"] == "2" for row in rows)
 
     disabled = _run_tiny_pretrain(
@@ -3503,13 +3498,10 @@ def test_fifo_resolved_log_separates_requested_and_effective(
     assert disabled_records[0]["applicability"] == "disabled"
     assert disabled_records[0]["requested_capacity"] == 0
     assert disabled_records[0]["effective_capacity"] == 0
-    disabled_rows = list(
-        csv.DictReader(
-            (disabled["out_dir"] / "logs" / "instant_metrics.pretrain.csv").open(
-                newline=""
-            )
-        )
-    )
+    with (disabled["out_dir"] / "logs" / "instant_metrics.pretrain.csv").open(
+        newline=""
+    ) as metrics:
+        disabled_rows = list(csv.DictReader(metrics))
     assert disabled_rows
     for name in reporting_module._PRETRAIN_RELATIONAL_QUEUE_FIELDS:
         assert all(row[name] == "" for row in disabled_rows), name

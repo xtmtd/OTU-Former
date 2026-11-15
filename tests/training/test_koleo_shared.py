@@ -331,13 +331,10 @@ def _train_relational(tmp_path, *, koleo_weight: float, **overrides) -> dict:
 def test_positive_relational_koleo_persists_and_records_the_shared_config(tmp_path):
     """One real run covers the enabled checkpoint and reporting contracts."""
     saved = _train_relational(tmp_path, koleo_weight=0.1)
-    rows = list(
-        csv.DictReader(
-            (tmp_path / "out" / "logs" / "instant_metrics.pretrain.csv").open(
-                encoding="utf-8"
-            )
-        )
-    )
+    with (tmp_path / "out" / "logs" / "instant_metrics.pretrain.csv").open(
+        encoding="utf-8"
+    ) as metrics:
+        rows = list(csv.DictReader(metrics))
     last = rows[-1]
 
     assert last["ssl_method"] == "relational"

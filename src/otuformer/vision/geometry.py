@@ -284,7 +284,7 @@ def _execute(image: Image.Image, op: GeometryOp) -> Image.Image:
             image,
             [to_h, to_w],
             interpolation=_interpolation(params["interpolation"]),
-            antialias=bool(params.get("antialias", True)),
+            # Pillow determines antialiasing; passing False only emits a warning.
         )
     if kind == "pad":
         canvas = [int(v) for v in params["canvas_wh"]]
