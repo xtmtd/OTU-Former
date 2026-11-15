@@ -20,6 +20,7 @@ TIMESTAMP = re.compile(r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] ")
 
 def flat(text: str) -> str:
     """Letters/digits only: Rich wraps long messages and inserts box borders."""
+    text = re.sub(r"\x1b\[[0-9;]*m", "", text)
     return re.sub(r"[^a-z0-9]+", "", text.lower())
 
 
@@ -427,10 +428,55 @@ def test_preflight_rejection_preserves_protected_outputs(tmp_path):
     assert inside.is_file()
 
 
+@pytest.mark.parametrize("records", [False, True])
+def test_embedding_checkpoint_layer_and_dump_are_consumed(tmp_path, records):
+    images = write_images(tmp_path / "images")
+    checkpoint = write_checkpoint(tmp_path / "model.pt")
+    out = tmp_path / "embedding"
+    argv = [
+        "extract", "--checkpoint", str(checkpoint), "--input-images-dir", str(images),
+        "--out-dir", str(out), "--feature-layers", "blocks.5",
+        "--dump-model-structure", "--device", "cpu", "--num-workers", "0",
+        "--disable-umap",
+    ]
+    if records:
+        selector = tmp_path / "selected.csv"
+        selector.write_text("image\na.png\nnested/b.png\n", encoding="utf-8")
+        argv += ["--label-csv", str(selector)]
+    result = runner.invoke(app, argv)
+    assert result.exit_code == 0, result.output + str(result.exception)
+    assert (out / "embeddings.csv").is_file()
+    report = (out / "model_layers.txt").read_text()
+    assert "blocks.5" in report and "embedding-cls-eligible" in report
+    if records:
+        provenance = json.loads((out / "run_provenance.json").read_text())
+        assert provenance["effective"]["feature_layer"] == "blocks.5"
+        assert any(row["path"] == "model_layers.txt" for row in provenance["artifacts"])
+
+
+@pytest.mark.parametrize("flags", [
+    ["--spatial-eval"], ["--feature-norm", "backbone"],
+    ["--feature-layers", "blocks.1,blocks.2"],
+    ["--feature-layers", "blocks.1", "--token-mode", "patch-topk"],
+    ["--onnx-path", "missing.onnx", "--dump-model-structure"],
+])
+def test_embedding_inapplicable_flags_fail_before_cleanup(tmp_path, flags):
+    out = tmp_path / "preserved"
+    out.mkdir()
+    sentinel = out / "keep.txt"
+    sentinel.write_text("keep")
+    result = runner.invoke(app, ["extract", "--out-dir", str(out), "--overwrite", *flags])
+    assert result.exit_code != 0
+    assert sentinel.read_text() == "keep"
+    assert "requires" in result.output or "spatial-only" in result.output
+
+
 def test_spatial_help_panels_cover_every_new_option():
     result = runner.invoke(app, ["extract", "--help"])
     assert result.exit_code == 0
-    output = result.output
+    import re
+
+    output = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
     for panel in (
         "Input and output",
         "Model and feature source",
@@ -471,3 +517,63 @@ def test_spatial_help_panels_cover_every_new_option():
         )
     ]
     assert positions == sorted(positions)
+
+
+@pytest.mark.parametrize("fault", ["hash", "close", "interrupt", "open"])
+def test_cli_records_a_failed_publication_instead_of_leaving_it_open(tmp_path, monkeypatch, fault):
+    """The CLI's own final hash/publish is part of the attempt's lifecycle."""
+    images = write_images(tmp_path / "images", keys=("a.png",))
+    checkpoint = write_checkpoint(tmp_path / "model.pt")
+    product = tmp_path / "product"
+    assert runner.invoke(app, spatial_argv(tmp_path, images, checkpoint)).exit_code == 0
+
+    read_out = tmp_path / "read-out"
+    from otuformer.spatial import extractor as module
+
+    from otuformer.utils.logging import TeeLogger
+
+    closed = []
+    original_close = module.PreparedSpatialRequest.close
+
+    def close_request(request):
+        closed.append(request.mode)
+        original_close(request)
+
+    def boom(*args, **kwargs):
+        if fault == "interrupt":
+            raise KeyboardInterrupt()
+        raise OSError("simulated publication failure")
+
+    monkeypatch.setattr(module.PreparedSpatialRequest, "close", close_request)
+    if fault == "close":
+        original_log_close = TeeLogger.close
+
+        def close_log(logger):
+            original_log_close(logger)
+            boom()
+
+        monkeypatch.setattr(TeeLogger, "close", close_log)
+    elif fault == "open":
+        monkeypatch.setattr(TeeLogger, "__init__", boom)
+    else:
+        monkeypatch.setattr(module, "_artifact_rows", boom)
+    result = runner.invoke(
+        app,
+        [
+            "extract",
+            "--output-kind",
+            "spatial",
+            "--spatial-input",
+            str(product),
+            "--out-dir",
+            str(read_out),
+        ],
+    )
+    assert result.exit_code != 0
+    envelope = json.loads((read_out / "run_provenance.json").read_text())
+    assert closed == ["read"]
+    assert envelope["status"] == ("interrupted" if fault == "interrupt" else "failed")
+    if fault == "interrupt":
+        assert result.exit_code == 130
+    else:
+        assert "simulated publication failure" in json.dumps(envelope)

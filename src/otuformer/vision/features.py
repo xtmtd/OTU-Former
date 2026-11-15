@@ -16,11 +16,18 @@ internal normalizations, before any next block or the final ``backbone.norm``.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import torch
 import torch.nn.functional as F
+
+from ..constants import FEATURE_NORM_CHOICES
+
+#: Fields that identify the resolved backbone final norm module.
+NORM_MODULE_FIELDS = frozenset({"path", "qualname"})
 
 __all__ = [
     "FeatureContract",
@@ -54,14 +61,26 @@ class LayerSpec:
     @classmethod
     def from_json(cls, payload: Mapping[str, Any]) -> "LayerSpec":
         _require_keys(payload, {"path", "block_index", "grid_hw", "channels"}, "layer")
-        grid = tuple(int(v) for v in payload["grid_hw"])
-        if len(grid) != 2:
-            raise ValueError("layer grid_hw must have two entries")
+        grid = _positive_pair(payload["grid_hw"], "layer grid_hw")
+        path = payload["path"]
+        if not isinstance(path, str) or not path:
+            raise ValueError(f"layer path must be a non-empty string, got {path!r}")
+        block_index = _exact_int(payload["block_index"], "layer block_index")
+        # The stored pair is what a reader uses to locate the grid; a mismatch
+        # between the path and its index would name a layer the product does not
+        # hold, so it is checked instead of trusted.
+        if path != f"blocks.{block_index}":
+            raise ValueError(
+                f"layer path {path!r} does not match block_index {block_index}"
+            )
+        channels = _exact_int(payload["channels"], "layer channels")
+        if channels <= 0:
+            raise ValueError(f"layer channels must be positive, got {channels}")
         return cls(
-            path=str(payload["path"]),
-            block_index=int(payload["block_index"]),
-            grid_hw=(grid[0], grid[1]),
-            channels=int(payload["channels"]),
+            path=path,
+            block_index=block_index,
+            grid_hw=grid,
+            channels=channels,
         )
 
 
@@ -122,23 +141,116 @@ class FeatureContract:
             },
             "feature contract",
         )
-        input_hw = tuple(int(v) for v in payload["input_hw"])
-        patch_hw = tuple(int(v) for v in payload["patch_hw"])
-        if len(input_hw) != 2 or len(patch_hw) != 2:
-            raise ValueError("feature contract sizes must have two entries")
-        norm_module = payload["norm_module"]
-        return cls(
-            layers=tuple(LayerSpec.from_json(item) for item in payload["layers"]),
-            input_hw=(input_hw[0], input_hw[1]),
-            patch_hw=(patch_hw[0], patch_hw[1]),
-            prefix_tokens=int(payload["prefix_tokens"]),
-            norm=str(payload["norm"]),
-            norm_module=None if norm_module is None else dict(norm_module),
-            l2=bool(payload["l2"]),
-            epsilon=float(payload["epsilon"]),
-            normalization=dict(payload["normalization"]),
-            model_identity=dict(payload["model_identity"]),
+        input_hw = _positive_pair(payload["input_hw"], "feature contract input_hw")
+        patch_hw = _positive_pair(payload["patch_hw"], "feature contract patch_hw")
+        if input_hw[0] % patch_hw[0] or input_hw[1] % patch_hw[1]:
+            raise ValueError(
+                f"patch {patch_hw} does not tile the input canvas {input_hw}"
+            )
+        grid_hw = (input_hw[0] // patch_hw[0], input_hw[1] // patch_hw[1])
+        prefix_tokens = _exact_int(
+            payload["prefix_tokens"], "feature contract prefix_tokens"
         )
+        if prefix_tokens < 0:
+            raise ValueError(
+                f"feature contract prefix_tokens must be non-negative, got "
+                f"{prefix_tokens}"
+            )
+        norm = payload["norm"]
+        if norm not in FEATURE_NORM_CHOICES:
+            raise ValueError(
+                f"feature contract norm must be one of {FEATURE_NORM_CHOICES}, "
+                f"got {norm!r}"
+            )
+        if not isinstance(payload["l2"], bool):
+            # ``bool("false")`` is True, so a string must not decide L2.
+            raise ValueError(
+                f"feature contract l2 must be a Boolean, got {payload['l2']!r}"
+            )
+        epsilon = payload["epsilon"]
+        if isinstance(epsilon, bool) or not isinstance(epsilon, (int, float)):
+            raise ValueError(
+                f"feature contract epsilon must be a number, got {epsilon!r}"
+            )
+        if not math.isfinite(float(epsilon)) or float(epsilon) <= 0.0:
+            raise ValueError(
+                f"feature contract epsilon must be finite and positive, got {epsilon!r}"
+            )
+        norm_module = payload["norm_module"]
+        if norm_module is not None:
+            if not isinstance(norm_module, Mapping):
+                raise ValueError("feature contract norm_module must be a mapping")
+            if set(norm_module) != NORM_MODULE_FIELDS:
+                raise ValueError(
+                    "feature contract norm_module must hold exactly "
+                    f"{sorted(NORM_MODULE_FIELDS)}, got {sorted(norm_module)}"
+                )
+            for field, value in norm_module.items():
+                if not isinstance(value, str) or not value.strip():
+                    raise ValueError(
+                        f"feature contract norm_module {field!r} must be a "
+                        f"non-empty string, got {value!r}"
+                    )
+            norm_module = dict(norm_module)
+            if norm == "none":
+                # ``none`` means no module is applied, so recording one contradicts
+                # the representation it describes.
+                raise ValueError(
+                    "feature contract norm 'none' must not record a norm_module"
+                )
+        elif norm == "backbone":
+            # ``norm="backbone"`` means "apply this resolved module"; without its
+            # identity the stored representation cannot be reproduced.
+            raise ValueError(
+                "feature contract norm 'backbone' needs the resolved norm_module"
+            )
+        normalization = payload["normalization"]
+        model_identity = payload["model_identity"]
+        for name, value in (
+            ("normalization", normalization),
+            ("model_identity", model_identity),
+        ):
+            if not isinstance(value, Mapping):
+                raise ValueError(f"feature contract {name} must be a mapping")
+        layers = tuple(LayerSpec.from_json(item) for item in payload["layers"])
+        if not layers:
+            raise ValueError("feature contract must declare at least one layer")
+        if len({layer.path for layer in layers}) != len(layers):
+            raise ValueError("feature contract repeats a layer path")
+        for layer in layers:
+            if layer.grid_hw != grid_hw:
+                raise ValueError(
+                    f"layer {layer.path!r} grid {layer.grid_hw} does not match the "
+                    f"input/patch lattice {grid_hw}"
+                )
+        return cls(
+            layers=layers,
+            input_hw=input_hw,
+            patch_hw=patch_hw,
+            prefix_tokens=prefix_tokens,
+            norm=str(norm),
+            norm_module=norm_module,
+            l2=bool(payload["l2"]),
+            epsilon=float(epsilon),
+            normalization=dict(normalization),
+            model_identity=dict(model_identity),
+        )
+
+
+def _exact_int(value: Any, what: str) -> int:
+    """Accept only a real integer, never a float or a string that coerces."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{what} must be an integer, got {value!r}")
+    return int(value)
+
+
+def _positive_pair(value: Any, what: str) -> tuple[int, int]:
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        raise ValueError(f"{what} must have two entries, got {value!r}")
+    first, second = (_exact_int(item, what) for item in value)
+    if first <= 0 or second <= 0:
+        raise ValueError(f"{what} must be positive, got {value!r}")
+    return (first, second)
 
 
 def _require_keys(payload: Mapping[str, Any], required: set[str], what: str) -> None:
@@ -225,10 +337,46 @@ def describe_feature_layers(backbone: torch.nn.Module) -> list[dict[str, Any]]:
                     parameter.numel() for parameter in module.parameters()
                 ),
                 "spatial_eligible": bool(eligible),
+                "embedding_eligible": bool(eligible and getattr(backbone, "cls_token", None) is not None),
                 "block_index": index if eligible else None,
             }
         )
     return rows
+
+
+def write_model_layers(path: Path, backbone: torch.nn.Module) -> Path:
+    """Write checkpoint discovery for embedding and spatial extraction."""
+    lines = [
+        "# Named modules for --feature-layers",
+        "# Format: <name>\\t<class>\\t<spatial-eligible>\\t<embedding-cls-eligible>",
+    ]
+    for row in describe_feature_layers(backbone):
+        lines.append(
+            f"{row['path']}\\t{row['module_class'].rsplit('.', 1)[-1]}"
+            f"\\t{'yes' if row['spatial_eligible'] else ''}"
+            f"\\t{'yes' if row['embedding_eligible'] else ''}"
+        )
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+def embedding_block_tokens(
+    backbone: torch.nn.Module, images: torch.Tensor, path: str
+) -> torch.Tensor:
+    """Read one full block through the native forward, retaining its CLS token."""
+    captured: list[torch.Tensor] = []
+    block = get_module_by_name(backbone, path)
+    handle = block.register_forward_hook(
+        lambda _module, _inputs, output: captured.append(output)
+    )
+    try:
+        backbone.forward_features(images)
+    finally:
+        handle.remove()
+    if len(captured) != 1:
+        raise ValueError(f"feature layer {path!r} must run exactly once")
+    norm, _ = _norm_module(backbone, "backbone")
+    return norm(captured[0]) if norm is not None else captured[0]
 
 
 def resolve_feature_layers(
@@ -587,6 +735,8 @@ def sample_grid_features(
     Every contributor with nonzero interpolation weight must be inside the grid
     and valid: out-of-bounds or invalid support is unavailable, never zero-filled
     evidence. Zero-weight neighbours outside the grid do not invalidate a sample.
+    A non-finite coordinate has no support at all, so it is reported unusable
+    instead of inheriting the neighbouring cells' validity.
     """
     if grid.ndim != 4:
         raise ValueError(f"grid must be BHWC, got {tuple(grid.shape)}")
@@ -607,7 +757,13 @@ def sample_grid_features(
     if patch_w <= 0 or patch_h <= 0:
         raise ValueError(f"patch_hw must be positive, got {patch_hw}")
 
-    points = xy.to(dtype=grid.dtype)
+    finite = torch.isfinite(xy).all(dim=-1)
+    points = torch.where(finite.unsqueeze(-1), xy, torch.zeros_like(xy)).to(
+        dtype=grid.dtype
+    )
+    # A finite coordinate can still overflow the grid dtype (1e100 in a float32
+    # grid), so representability is part of validity, not only the input value.
+    finite = finite & torch.isfinite(points).all(dim=-1)
     u = points[..., 0] / patch_w - 0.5
     v = points[..., 1] / patch_h - 0.5
 
@@ -626,7 +782,7 @@ def sample_grid_features(
     values = sampled[:, :, 0, :].permute(0, 2, 1)
 
     usable = _complete_support(u, v, valid, grid_h=grid_h, grid_w=grid_w)
-    return values, usable
+    return values, usable & finite
 
 
 def _complete_support(

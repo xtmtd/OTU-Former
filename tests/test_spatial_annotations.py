@@ -312,7 +312,7 @@ def test_panoptic_snapshot_and_view_rebuild_are_self_contained(tmp_path):
         patch_hw=(16, 16),
         prefix_tokens=1,
         norm="backbone",
-        norm_module=None,
+        norm_module={"path": "norm", "qualname": "timm.layers.norm.LayerNorm"},
         l2=False,
         epsilon=1e-12,
         normalization={"mean": [0.5, 0.5, 0.5], "std": [0.5, 0.5, 0.5]},
@@ -481,3 +481,74 @@ def test_a_legacy_flat_category_table_survives_json_string_keys():
         role="instances",
     )
     assert namespaced["category"]["name"] == "namespaced"
+
+
+def test_a_decodable_instance_rle_is_mapped_not_rewritten_as_a_bbox():
+    """A crowd RLE is real support: crop it away and the object is out of view."""
+    rle = {"size": [4, 4], "counts": "01>0"}  # two corner pixels only
+    annotation = {
+        "id": 31,
+        "image_id": 7,
+        "category_id": 4,
+        "iscrowd": 1,
+        "segmentation": rle,
+        "bbox": [0.0, 0.0, 4.0, 4.0],
+    }
+    cropped = trace_operations(
+        (4, 4),
+        [
+            GeometryOp(
+                "crop",
+                {
+                    "from_wh": [4, 4],
+                    "left": 1.0,
+                    "top": 1.0,
+                    "width": 2,
+                    "height": 2,
+                    "canvas_wh": [2, 2],
+                },
+            )
+        ],
+    )
+    (record,) = transform_annotations(
+        [annotation], CATEGORIES, cropped, role="instances"
+    )
+    assert record["mask"] is not None
+    assert record["mask_unavailable"] is None
+    assert record["annotation_in_view"] is False
+    # The enclosure must not resurrect the fully-cropped object.
+    assert record["bbox_xyxy"] is None
+
+    (whole,) = transform_annotations(
+        [annotation], CATEGORIES, identity_trace(4, 4), role="instances"
+    )
+    assert whole["annotation_in_view"] is True
+    assert int(whole["mask"].sum()) == 2
+
+
+def test_a_visible_raster_object_keeps_its_derived_enclosure_and_area():
+    """A decoded instance mask is support: it must not lose the derived geometry."""
+    import numpy as np
+    from pycocotools import mask as mask_utils
+
+    pixels = np.zeros((4, 4), dtype=np.uint8)
+    pixels[1:3, 1:3] = 1
+    encoded = mask_utils.encode(np.asfortranarray(pixels))
+    rle = {"size": list(encoded["size"]), "counts": encoded["counts"].decode("ascii")}
+    annotation = {
+        "id": 41,
+        "image_id": 7,
+        "category_id": 4,
+        "segmentation": rle,
+        "bbox": [1.0, 1.0, 2.0, 2.0],
+    }
+    (record,) = transform_annotations(
+        [annotation], CATEGORIES, identity_trace(4, 4), role="instances"
+    )
+    assert record["annotation_in_view"] is True
+    assert int(record["mask"].sum()) == 4
+    assert record["bbox_xyxy"] == [1.0, 1.0, 3.0, 3.0]
+    assert record["bbox_xy"] == [1.0, 1.0, 2.0, 2.0]
+    # Raster areas are pixel counts, stated as such by the raster's own support.
+    assert record["area_source"] == 4.0
+    assert record["area_retained"] == 4.0

@@ -124,7 +124,11 @@ evaluated and visualization is not disabled. `id` follows the input path: a
 directory scan emits the file's basename, a `--label-csv` selection keeps that row's
 original `image` text, and a COCO-only selection emits the root-relative key.
 Requires `--checkpoint` or `--onnx-path`; ONNX takes precedence, ignores the
-checkpoint/device, and supports only `--token-mode cls`.
+checkpoint/device, and supports only `--token-mode cls` for embedding graphs.
+Checkpoint embedding and spatial extraction share `--dump-model-structure`, which
+writes `model_layers.txt` and continues. Explicit embedding `--feature-layers`
+selects one complete block, final backbone norm then CLS; it rejects projector,
+patch pooling, multiple layers and ONNX. Omission preserves existing behavior.
 
 Supplying `--label-csv` or any `--coco-*` option selects the shared v2 data path: the
 CSV is parsed once with strict string semantics (literal `NA`, `N/A`, `unknown`, `0`
@@ -157,6 +161,11 @@ geometric views for at most 100 seeded-sampled images and writes
 `spatial_evaluation_plan.json`, `spatial_matches.csv` and `spatial_evaluation.json`;
 report PCK at 0.01/0.02/0.05 of the original diagonal with the denominators, never as
 an overall quality score, and say that a read run only reproduces the stored plan.
+Read metric meanings in `docs/commands/extract.md` / `extract.cn.md`: embedding
+rates are distinct from spatial diagnostics and correspondence. Match CSV PCK
+columns are per-query bits, JSON rates are image macro averages with equal
+directions, and quantization can bound strict thresholds. Matched status and
+unit norms are not accuracy or anatomical evidence.
 
 ## cluster
 
@@ -200,7 +209,7 @@ attribution guidance, not a validated class-discriminative explanation.
 
 ONNX export from a checkpoint, producing `encoder.onnx` (plus any observed report
 files) in `--out-dir`. Confirm the actual opset and image size from the run, and
-explain that downstream ONNX extraction supports only `--token-mode cls`.
+explain that embedding ONNX extraction supports only `--token-mode cls`; spatial ONNX uses its fixed multi-layer feature contract.
 
 ## update
 

@@ -11,6 +11,7 @@ same arrays have the same logical identity.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -54,6 +55,25 @@ class SpatialRecordError(ValueError):
     """A record, product or layout violates the version-1 contract."""
 
 
+def require_relative_key(key: Any, *, what: str = "image key") -> str:
+    """Accept only a canonical root-relative key.
+
+    The key becomes a filesystem path whenever an overlay or a stored payload is
+    read, so ``..``, an absolute path, a backslash or a drive letter would let a
+    product name a file outside the directory it is supposed to live in.
+    """
+    if not isinstance(key, str) or not key:
+        raise SpatialRecordError(f"a spatial sample needs a non-empty {what}")
+    if key.startswith(("/", "\\")) or os.path.isabs(key) or "\\" in key:
+        raise SpatialRecordError(f"{what}s are root-relative, never absolute: {key!r}")
+    parts = key.split("/")
+    if any(part in ("", ".", "..") for part in parts) or ":" in parts[0]:
+        raise SpatialRecordError(
+            f"{what} {key!r} is not a canonical relative path"
+        )
+    return key
+
+
 @dataclass(frozen=True)
 class SpatialSample:
     """One selected source image, as the product stores it.
@@ -71,8 +91,7 @@ class SpatialSample:
     def __post_init__(self) -> None:
         if not self.image_key:
             raise SpatialRecordError("a spatial sample needs a non-empty image key")
-        if "/" in self.image_key and self.image_key.startswith("/"):
-            raise SpatialRecordError("image keys are root-relative, never absolute")
+        require_relative_key(self.image_key)
         if int(self.width) <= 0 or int(self.height) <= 0:
             raise SpatialRecordError("a spatial sample needs positive dimensions")
         self._validate_metadata()
@@ -130,17 +149,19 @@ def samples_from_records(records: Iterable[Any]) -> list[SpatialSample]:
     samples: list[SpatialSample] = []
     seen: set[str] = set()
     for record in records:
-        if record.image_key in seen:
+        # Reader keys are filesystem paths; a product key is not.
+        key = require_relative_key(record.image_key)
+        if key in seen:
             raise SpatialRecordError(
-                f"duplicate image key in the selection: {record.image_key!r}"
+                f"duplicate image key in the selection: {key!r}"
             )
-        seen.add(record.image_key)
+        seen.add(key)
         metadata = dict(record.metadata) if record.metadata else {}
         if getattr(record, "sample_origin", "none") != "explicit":
             metadata.pop("sample", None)
         samples.append(
             SpatialSample(
-                image_key=record.image_key,
+                image_key=key,
                 image_sha256=record.image_file.sha256,
                 width=int(record.width),
                 height=int(record.height),

@@ -126,15 +126,31 @@ class GeometryTrace:
         view_wh = tuple(int(v) for v in payload["view_wh"])
         if len(source_wh) != 2 or len(view_wh) != 2:
             raise ValueError("geometry sizes must have two entries")
-        return cls(
+        operations = tuple(
+            GeometryOp.from_json(item) for item in payload["operations"]
+        )
+        trace = cls(
             source_wh=(source_wh[0], source_wh[1]),
             view_wh=(view_wh[0], view_wh[1]),
-            operations=tuple(
-                GeometryOp.from_json(item) for item in payload["operations"]
-            ),
+            operations=operations,
             source_to_view=np.asarray(payload["source_to_view"], dtype=np.float64),
             view_to_source=np.asarray(payload["view_to_source"], dtype=np.float64),
         )
+        # The stored operations are what an annotation replay executes, so they must
+        # reproduce the stored canvas and map. Otherwise one view would describe two
+        # different geometries: the matrix used for reading and the operation chain
+        # used for rebuilding labels.
+        replayed = trace_operations(trace.source_wh, operations)
+        if tuple(replayed.view_wh) != tuple(trace.view_wh):
+            raise ValueError(
+                f"stored operations produce canvas {tuple(replayed.view_wh)} but the "
+                f"trace declares {tuple(trace.view_wh)}"
+            )
+        if not np.allclose(replayed.source_to_view, trace.source_to_view, atol=1e-9):
+            raise ValueError(
+                "stored operations do not compose to the trace's source-to-view map"
+            )
+        return trace
 
     @property
     def support_version(self) -> str:
@@ -342,6 +358,10 @@ def _trace_canvas(op: GeometryOp, canvas: tuple[int, int]) -> tuple[int, int]:
         recorded = [int(op.params["width"]), int(op.params["height"])]
     if recorded is not None:
         target = (int(recorded[0]), int(recorded[1]))
+        # The declared canvas is not independent evidence: an operation's own
+        # parameters already decide its output size, and a crop that declared a
+        # different canvas would replay to one size while the view stored another.
+        _check_op_output_size(op, target, canvas)
         declared_from = op.params.get("from_wh")
         if declared_from is not None and (int(declared_from[0]), int(declared_from[1])) != canvas:
             raise ValueError(
@@ -360,6 +380,85 @@ def _trace_canvas(op: GeometryOp, canvas: tuple[int, int]) -> tuple[int, int]:
     raise ValueError(  # pragma: no cover - every op records its canvas
         f"{op.kind} op does not record its realized canvas"
     )
+
+
+class _RotationCanvas(Image.Image):
+    """Run Pillow's canvas calculation without creating source or output pixels."""
+
+    def __init__(self, size: tuple[int, int]) -> None:
+        super().__init__()
+        self._size = size
+
+    def transform(self, size, *args, **kwargs):
+        return _RotationCanvas(tuple(size))
+
+
+def _check_op_output_size(
+    op: GeometryOp, declared: tuple[int, int], before: tuple[int, int]
+) -> None:
+    """The declared canvas must be the size this operation actually produces.
+
+    Every supported kind is covered, not only the ones that record an explicit
+    target size: a flip or a fixed-canvas rotation that declared a smaller canvas
+    would pass a replay check while the view stored the larger one.
+    """
+    kind = op.kind
+    params = op.params
+    if kind == "crop":
+        expected = (int(params["width"]), int(params["height"]))
+        if declared != expected:
+            raise ValueError(
+                f"crop op declares canvas {declared}, but its window is "
+                f"{expected} (width, height)"
+            )
+        return
+    if kind == "resize":
+        to_wh = params["to_wh"]
+        expected = (int(to_wh[0]), int(to_wh[1]))
+        if declared != expected:
+            raise ValueError(
+                f"{kind} op declares canvas {declared}, but its target size is "
+                f"{expected}"
+            )
+        return
+    if kind in ("hflip", "vflip", "affine"):
+        if declared != before:
+            raise ValueError(
+                f"{kind} op declares canvas {declared}, but it preserves the "
+                f"entering canvas {before}"
+            )
+        return
+    if kind == "rotate":
+        if not bool(params.get("expand", False)):
+            if declared != before:
+                raise ValueError(
+                    "rotate op declares canvas "
+                    f"{declared}, but a fixed-canvas rotation keeps {before}"
+                )
+            return
+        # Keep Pillow's exact rounding while intercepting its final pixel transform.
+        produced = _RotationCanvas(before).rotate(
+            float(params["angle"]), expand=True,
+            center=[float(v) for v in params["center"]],
+        )
+        if declared != produced.size:
+            raise ValueError(
+                f"rotate op declares canvas {declared}, but the library produces "
+                f"{produced.size}"
+            )
+        return
+    if kind == "pad":
+        offset = params.get("offset")
+        if offset is not None:
+            left, top = int(offset[0]), int(offset[1])
+            if left < 0 or top < 0:
+                raise ValueError(f"pad op has a negative offset {tuple(offset)}")
+            if left + int(before[0]) > declared[0] or top + int(before[1]) > declared[1]:
+                raise ValueError(
+                    f"pad op declares canvas {declared}, which cannot hold the "
+                    f"{before} canvas at offset {tuple(offset)}"
+                )
+        return
 
 
 def prepare_operation(op: GeometryOp, before_wh: tuple[int, int]) -> GeometryOp:
@@ -810,9 +909,13 @@ def transform_annotations(
                 )
                 record["polygon_xy"] = primary
                 record["polygons_xy"] = transformed
-                rectangle = support.series_bbox(
-                    np.asarray(primary, dtype=np.float64)
+                # The object's enclosure covers every retained part, not only the
+                # largest one: a multi-part annotation whose parts sit apart would
+                # otherwise report an enclosure that omits real geometry.
+                points = np.concatenate(
+                    [np.asarray(part, dtype=np.float64) for part in transformed]
                 )
+                rectangle = support.series_bbox(points)
                 record["bbox_xyxy"] = [float(v) for v in rectangle]
                 record["bbox_xy"] = [
                     float(rectangle[0]),
@@ -824,11 +927,23 @@ def transform_annotations(
 
         bbox = annotation.get("bbox")
         # The bbox is a fallback for an annotation that *carries no usable
-        # polygon*, not a second chance for one whose segmentation was clipped
-        # away: two parts on either side of a centre crop are genuinely out of
-        # view, and their enclosure would otherwise reappear as a visible object.
+        # polygon or raster*, not a second chance for one whose segmentation was
+        # clipped away: two parts on either side of a centre crop are genuinely out
+        # of view, and their enclosure would otherwise reappear as a visible object.
+        # A decodable RLE is usable support even when its own pixels fall outside
+        # the view, so it suppresses the fallback too.
+        raster = annotation.get("raster")
+        if raster is None and role == "instances":
+            # A legitimate instance RLE is decodable now (the repository already
+            # decodes it for the mask pipeline), so it must become a categorical
+            # raster instead of falling through to the bbox fallback.
+            raster = decode_instance_rle(
+                segmentation,
+                width=int(trace.source_wh[0]),
+                height=int(trace.source_wh[1]),
+            )
         if (
-            polygons_absent
+            not (polygons or raster is not None)
             and isinstance(bbox, (list, tuple))
             and len(bbox) == 4
         ):
@@ -860,16 +975,81 @@ def transform_annotations(
                 annotation.get("keypoints") or [], trace, support_polygon
             )
 
-        raster = annotation.get("raster")
         if raster is not None and role in ("panoptic", "instances"):
-            warped, warped_support = warp_categorical(np.asarray(raster), trace)
+            source_mask = np.asarray(raster)
+            warped, warped_support = warp_categorical(source_mask, trace)
             record["mask"] = np.where(warped_support, warped, 0).astype(warped.dtype)
             record["mask_support"] = warped_support
+            # The raster is the object's real support: when its own pixels do not
+            # survive the view, the object is out of view - and an empty region
+            # inside a surviving support is not.
+            record["annotation_in_view"] = bool((record["mask"] != 0).any())
+            if role == "instances":
+                _fill_raster_enclosure(record, source_mask, warped)
         elif role in ("panoptic", "instances") and isinstance(segmentation, dict):
             record["mask_unavailable"] = "rle_mask_requires_explicit_decode"
 
         results.append(record)
     return results
+
+
+def _fill_raster_enclosure(
+    record: dict[str, Any], source_mask: np.ndarray, warped: np.ndarray
+) -> None:
+    """Derived enclosure and area for an object whose support is a raster.
+
+    An instance raster is a per-pixel occupancy map, so its areas are pixel counts
+    (in the source grid and in the view grid) rather than continuous polygon areas;
+    the enclosure is the axis-aligned box of the surviving object pixels. Without
+    this a visible raster object would keep a mask but lose the derived geometry
+    the same annotation gets from its bbox.
+    """
+    source_pixels = int(np.count_nonzero(source_mask))
+    occupied = np.argwhere(warped != 0)
+    record["area_source"] = float(source_pixels)
+    record["area_retained"] = float(occupied.shape[0])
+    if not occupied.size:
+        return
+    rows, columns = occupied[:, 0], occupied[:, 1]
+    rectangle = [
+        float(columns.min()),
+        float(rows.min()),
+        float(columns.max() + 1),
+        float(rows.max() + 1),
+    ]
+    record["bbox_xyxy"] = rectangle
+    record["bbox_xy"] = [
+        rectangle[0],
+        rectangle[1],
+        rectangle[2] - rectangle[0],
+        rectangle[3] - rectangle[1],
+    ]
+
+
+def decode_instance_rle(
+    segmentation: Any, *, width: int, height: int
+) -> np.ndarray | None:
+    """Decode one instance RLE segmentation into a categorical raster.
+
+    Only a dict (COCO RLE) segmentation is decoded here; polygons keep their own
+    clipped-geometry path. A mask that cannot be decoded returns ``None`` so the
+    caller can report it unavailable instead of inventing support, and a segment
+    with no foreground pixels yields an all-zero raster whose empty warp is the
+    real "out of view" answer.
+    """
+    if not isinstance(segmentation, Mapping):
+        return None
+    from ..data.masks import MaskDecodeError, decode_instance_mask
+
+    try:
+        mask = decode_instance_mask(
+            {"segmentation": segmentation}, int(width), int(height)
+        )
+    except (MaskDecodeError, ImportError, ValueError):
+        return None
+    # The stored category id comes from the annotation itself; here the raster only
+    # needs to say *which* pixels this instance occupies.
+    return np.asarray(mask != 0, dtype=np.uint8)
 
 
 def _category_for(

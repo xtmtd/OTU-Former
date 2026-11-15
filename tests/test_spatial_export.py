@@ -352,3 +352,62 @@ def test_export_cli_writes_a_spatial_graph(tmp_path):
     log = (out / "logs" / "export.log").read_text(encoding="utf-8")
     assert "--output-kind" in log
     assert "spatial" in log
+
+
+def test_a_rejected_spatial_request_does_not_clear_the_existing_output(tmp_path):
+    """Preflight the request before `--overwrite` deletes an earlier graph."""
+    checkpoint = tiny_checkpoint(tmp_path)
+    out = tmp_path / "export"
+    out.mkdir()
+    previous = out / "encoder.onnx"
+    previous.write_bytes(b"previous graph bytes")
+    result = runner.invoke(
+        app,
+        [
+            "export",
+            "--checkpoint",
+            str(checkpoint),
+            "--out-dir",
+            str(out),
+            "--output-kind",
+            "spatial",
+            "--feature-layers",
+            "blocks.999",
+            "--overwrite",
+        ],
+    )
+    assert result.exit_code != 0
+    assert previous.is_file()
+    assert previous.read_bytes() == b"previous graph bytes"
+
+
+def test_graph_metadata_must_agree_with_the_graph_io(tmp_path):
+    """Output names and the per-image layout are asserted, not just recorded."""
+    import onnx
+
+    checkpoint = tiny_checkpoint(tmp_path)
+    out = tmp_path / "export" / "encoder.onnx"
+    export_to_onnx(checkpoint, out, imgsz=32, output_kind="spatial")
+
+    def rewrite(mutate):
+        proto = onnx.load(str(out))
+        for entry in proto.metadata_props:
+            if entry.key != "otuformer.spatial.v1":
+                continue
+            payload = json.loads(entry.value)
+            mutate(payload)
+            entry.value = json.dumps(payload)
+        target = tmp_path / "tampered.onnx"
+        onnx.save(proto, str(target))
+        return target
+
+    def rename_output(payload):
+        payload["outputs"] = ["spatial_999"]
+
+    def change_layout(payload):
+        payload["per_image_layout"] = "CHW"
+
+    with pytest.raises(ValueError, match="declares outputs"):
+        read_spatial_onnx_contract(rewrite(rename_output))
+    with pytest.raises(ValueError, match="per-image layout"):
+        read_spatial_onnx_contract(rewrite(change_layout))

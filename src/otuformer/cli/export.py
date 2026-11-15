@@ -132,6 +132,25 @@ def export(
         )
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from None
+    # Resolve the checkpoint's spatial capability and layer contract *before* the
+    # output is prepared: a rejected layer list must not have already deleted an
+    # existing graph.
+    prepared_spatial = None
+    if output_kind == "spatial":
+        from otuformer.vision.export import _prepare_spatial_export
+
+        try:
+            prepared_spatial = _prepare_spatial_export(
+                checkpoint,
+                imgsz=_parse_size(imgsz, stage="--imgsz"),
+                model_name=model_name,
+                feature_layers=feature_layers or None,
+                feature_norm=feature_norm,
+                feature_l2_normalize=feature_l2_normalize,
+                use_student=use_student,
+            )
+        except (ValueError, OSError, FileNotFoundError) as exc:
+            raise typer.BadParameter(str(exc)) from None
     try:
         prepare_output_dir(
             out_dir, overwrite=overwrite, protected_paths=[checkpoint],
@@ -177,6 +196,7 @@ def export(
                 feature_l2_normalize if output_kind == "spatial" else None
             ),
             use_student=use_student,
+            prepared_spatial=prepared_spatial,
         )
         typer.echo(f"Export complete: {onnx_path}")
         typer.echo(f"  Model:     {report['model_name']}")

@@ -35,15 +35,11 @@ EMBEDDING_ONLY_OPTIONS = (
 #: Options that only ever describe a spatial product.
 SPATIAL_ONLY_OPTIONS = (
     "spatial_input",
-    "feature_layers",
     "feature_norm",
     "feature_l2_normalize",
     "spatial_layout",
     "spatial_eval",
     "spatial_eval_sample_size",
-    # The parser accepts it for every extract run, so it must be rejected where
-    # nothing consumes it: the embedding path never writes model_layers.txt.
-    "dump_model_structure",
 )
 
 #: Rejected in artifact read mode: a stored product fixes these contracts.
@@ -135,6 +131,14 @@ def validate_extract_mode_options(
                 "--output-kind embedding: "
                 + ", ".join(_option(name) for name in rejected)
             )
+        layer = values.get("feature_layers")
+        if _explicit(explicit_options, "feature_layers") or layer is not None:
+            if not isinstance(layer, str) or not layer.strip() or "," in layer:
+                raise ValueError("embedding --feature-layers requires exactly one complete block")
+            if values.get("onnx_path") or values.get("token_mode", "cls") != "cls" or values.get("use_projector_output"):
+                raise ValueError("embedding --feature-layers requires checkpoint CLS output without --use-projector-output")
+        if values.get("onnx_path") and _explicit(explicit_options, "dump_model_structure"):
+            raise ValueError("--dump-model-structure requires a checkpoint, not ONNX")
         return notes
 
     # Spatial modes: embedding-vector machinery has no meaning here.

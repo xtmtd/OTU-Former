@@ -107,6 +107,12 @@ def _evaluate_pair_direction(
     )
     candidate_count = int(rows.size)
     invalid_candidates = int(candidate_count - int(candidate_usable.sum()))
+    # Candidate geometry is fixed for this direction, independently of the query.
+    centers = np.asarray(
+        [grid_center_point(int(r), int(c), patch_hw) for r, c in zip(rows, columns)],
+        dtype=np.float64,
+    ).reshape(-1, 2)
+    centers_original = transform_points(destination.trace.view_to_source, centers)
 
     diagonal = _diagonal(reference.trace.source_wh)
     quantized: list[dict[str, Any]] = []
@@ -144,17 +150,6 @@ def _evaluate_pair_direction(
         record["true_x"] = float(truth_original[0])
         record["true_y"] = float(truth_original[1])
         if candidate_count:
-            centers = np.stack(
-                [
-                    np.asarray(
-                        [grid_center_point(int(r), int(c), patch_hw)], dtype=np.float64
-                    )[0]
-                    for r, c in zip(rows.tolist(), columns.tolist())
-                ]
-            )
-            centers_original = transform_points(
-                destination.trace.view_to_source, centers
-            )
             distance = np.linalg.norm(
                 centers_original - truth_original[None, :], axis=-1
             )
@@ -173,13 +168,7 @@ def _evaluate_pair_direction(
         best_index = int(np.argmax(similarities))
         predicted_row = int(rows[best_index])
         predicted_column = int(columns[best_index])
-        predicted_view = np.asarray(
-            [grid_center_point(predicted_row, predicted_column, patch_hw)],
-            dtype=np.float64,
-        )
-        predicted_original = transform_points(
-            destination.trace.view_to_source, predicted_view
-        )[0]
+        predicted_original = centers_original[best_index]
         raw_error = float(
             np.linalg.norm(predicted_original - truth_original)
         )
@@ -621,6 +610,11 @@ def _verify_overlay_images(
         if key in verified or key in missing or key in mismatched or key in wrong_size:
             continue
         path = root / key
+        if not _inside(root, path):
+            # A stored key is data, not a trusted path: refuse one that resolves
+            # outside the supplied image root (including through a symlink).
+            wrong_size.append(key)
+            continue
         if not path.is_file():
             missing.append(key)
             continue
@@ -650,6 +644,16 @@ def _verify_overlay_images(
         if available
         else "overlay needs every selected image with matching bytes and dimensions",
     }
+
+
+def _inside(root: Path, path: Path) -> bool:
+    """True when ``path`` stays under ``root`` after resolving symlinks."""
+    try:
+        resolved_root = root.resolve()
+        resolved = path.resolve()
+    except OSError:  # pragma: no cover - defensive
+        return False
+    return resolved == resolved_root or resolved_root in resolved.parents
 
 
 def draw_match_overlays(
@@ -720,7 +724,10 @@ def draw_match_overlays(
 
         figure, axis = plt.subplots(figsize=(6, 6))
         try:
-            with Image.open(root / image_key) as opened:
+            figure_path = root / image_key
+            if not _inside(root, figure_path):
+                continue
+            with Image.open(figure_path) as opened:
                 axis.imshow(opened.convert("RGB"))
             for row in selected:
                 axis.plot(
@@ -744,15 +751,8 @@ def draw_match_overlays(
             axis.set_title(image_key)
             axis.set_axis_off()
             directory.mkdir(parents=True, exist_ok=True)
-            # Keys are arbitrary relative paths, so the figure name cannot be a
-            # path prefix of another: `a.jpg` would write the file the key
-            # `a.jpg.png/b.jpg` needs as a directory. A flat, injective escape
-            # (`%` and `/` both encoded, so no key can decode onto another) has
-            # no ancestors to collide with.
-            name = (
-                image_key.replace("%", "%25").replace("/", "%2F")
-                + ".png"
-            )
+            # A digest bounds Unicode/deep-path names and avoids file/dir conflicts.
+            name = sha256_bytes(image_key.encode("utf-8")) + ".png"
             path = directory / name
             figure.savefig(path, dpi=110, bbox_inches="tight")
             figures.append(str(path))

@@ -4,7 +4,7 @@
 
 ## 目的
 
-用训练好的检查点从图像中提取嵌入向量，产出供 `cluster`、`diversity` 与 `annotate` 使用的 `embeddings.csv`。可运行 PyTorch 模型，也可使用导出的 ONNX 模型（CPU 推理快 2-5 倍）。提供三种 token 模式：原始 CLS、`patch-topk` 与 `attention-pool`；有标签时还会输出质量指标与 UMAP。
+从检查点／ONNX 图提取图像级嵌入或空间 patch 网格，也可在不推理的情况下重读已完成的空间产物。embedding 写出供 `cluster`、`diversity`、`annotate` 使用的 `embeddings.csv`；spatial 写出几何、support 和诊断。有标签时计算嵌入指标；`--spatial-eval` 评价同图几何对应。两者衡量的能力不同。
 
 ## 用法
 
@@ -15,13 +15,27 @@ otuformer extract \
     --out-dir runs/extract
 ```
 
+| 模式 | 最小输入 | 输出 |
+| --- | --- | --- |
+| Embedding（默认） | 图像＋checkpoint 或 embedding ONNX | 向量、可选标签指标／UMAP |
+| Spatial 图像提取 | `--output-kind spatial`、图像＋checkpoint 或 spatial ONNX | 网格、诊断、可选冻结对应评价 |
+| Spatial 读取 | `--output-kind spatial --spatial-input PRODUCT` | 独立目录中的报告，不需要模型 |
+
+```bash
+otuformer extract --output-kind spatial --checkpoint model.pt --input-images-dir ./images --spatial-eval --out-dir runs/spatial
+otuformer extract --output-kind spatial --spatial-input runs/spatial --spatial-eval --out-dir runs/spatial_report
+otuformer extract --checkpoint model.pt --input-images-dir ./images --feature-layers blocks.5 --dump-model-structure --out-dir runs/layer5
+```
+
+没有所有模式共同必需的输入选项，所以 help 不显示统一的必填 `*`；程序会在清理输出前校验各模式的条件要求。
+
 ## 参数
 
 ### `--checkpoint`
 
 **默认值：** `None`
 
-预训练或微调检查点路径。除非提供 --onnx-path 否则必填。
+预训练／微调检查点。图像提取需要 checkpoint 或 ONNX；空间产物读取两者都不需要。
 
 ### `--input-images-dir`
 
@@ -43,9 +57,9 @@ otuformer extract \
 
 ### `--feature-layers`
 
-**默认值：** `None`（最后一个完整块）
+**默认值：** `None`（spatial：最后一个完整块；embedding：保留既有输出路径）
 
-仅空间模式。逗号分隔的 backbone 相对完整块路径（例如 `blocks.5,blocks.11`）。省略时取最后一个完整块。请求顺序被保留；不支持区间、重复项或取平均。
+Spatial 可用逗号分隔多个完整块，例如 `blocks.5,blocks.11`，保留请求顺序。Checkpoint embedding 只接受一个完整的 `blocks.<index>`：施加 backbone 最终 norm 后取第零个 CLS token；要求 `--token-mode cls` 且不使用 projector。拒绝 ONNX、多层、patch-topk、attention-pool 组合。省略时保留既有 embedding 行为，不做多层平均／融合。`--feature-norm`／`--feature-l2-normalize` 仍仅用于 spatial；选层不会额外施加 embedding L2。
 
 ### `--feature-norm`
 
@@ -69,7 +83,7 @@ otuformer extract \
 
 **默认值：** `No`
 
-启用冻结的同图跨视图对应（协议 spatial-geometry-v1）。在当前构建中，评测任务尚未交付前一律拒绝，绝不静默跳过。
+仅 spatial：启用冻结的同图跨视图对应（`spatial-geometry-v1`）。图像提取保存配对视图与查询计划；读取模式复用已保存计划，不做模型推理。缺少配对视图的产物不能通过补推理参与评价。
 
 ### `--spatial-eval-sample-size`
 
@@ -81,7 +95,7 @@ otuformer extract \
 
 **默认值：** `No`
 
-仅检查点的空间模式。把 backbone 相对模块路径及其空间可用性写入 `model_layers.txt`，然后继续抽取。在 embedding 输出下显式使用会被拒绝，而不是被静默忽略。
+Checkpoint embedding／spatial 共用：将 backbone 模块路径及空间、embedding-CLS 各自的完整块可用性写入 `model_layers.txt`，然后继续提取。不是无图像的单独列层命令，仍需要图像输入。ONNX 与空间读取显式拒绝。CSV／COCO 路径的有效 provenance 会记录 embedding 所选层。
 
 ### `--out-dir`
 
@@ -233,7 +247,7 @@ DataLoader 工作线程数。
 
 **默认值：** `None`
 
-用于推理的导出 ONNX 模型路径。提供时使用 ONNX Runtime 而非 PyTorch。仅支持 token-mode 'cls'（默认）。会覆盖 --checkpoint、--model-name、--use-student 与 --device。
+ONNX Runtime 模型来源。Embedding 读取固定 CLS 图输出，保留旧的 checkpoint 覆盖行为；拒绝显式选层与结构导出。Spatial 按图声明的多层／norm／尺寸契约读取，拒绝 checkpoint／model-name／use-student／dump 覆盖，只接受与图契约完全匹配的其他显式值。空间产物读取拒绝 ONNX 输入。
 
 ### `--seed`
 
@@ -286,7 +300,7 @@ otuformer extract \
     --input-images-dir ./images \
     --out-dir runs/extract
 
-# 使用 ONNX 模型（CPU 推理加速 2-5 倍）
+# 使用已导出的 embedding ONNX 图
 otuformer extract \
     --checkpoint runs/finetune/finetune_latest.pth \
     --input-images-dir ./images \
@@ -302,7 +316,61 @@ otuformer extract \
     --out-dir runs/extract
 ```
 
+<a id="如何理解输出指标"></a>
 ## 说明
+
+### 如何理解输出指标
+
+Embedding 与 spatial 评价回答不同问题。分数高或张量数值健康，都不等于证明了解剖同源性或独立测试集泛化。
+
+### Embedding：`metrics.csv`
+
+指标实现与 `pretrain` 的 `logs/metrics.pretrain.csv`、`finetune` 的 `logs/metrics.finetune.csv` 共用。Extract 评价选中且可选抽样后的有标签图像；训练 CSV 还包含 epoch／split，比较时必须对齐 split 和样本群体。`metrics.csv` 是 `metric,value` 两列；比例值 `0.8` 表示 80%。
+
+| 字段 | 含义与用途 | 如何判断 |
+| --- | --- | --- |
+| `Recall@1`、`Recall@5`、`Recall@10` | 排除查询自身后，余弦相似度前 k 个邻居中至少有一个同标签图像的查询比例；衡量检索成功率。 | 0–1，越高越好；只有一个样本的标签仍计入分母且无法成功。 |
+| `mAP` | 全部非自身候选排序的平均精度均值，奖励将所有同标签图像排在前面。 | 0–1，越高越好；没有其他同标签项的查询被排除，分母与 Recall 不同。 |
+| `kNN_Acc_k1/k5/k20` | 分层交叉验证下的余弦 k 近邻分类准确率。 | 0–1，越高越好；评价标签邻域，不代表 backbone 的独立测试泛化。 |
+| `Linear_Probing_Acc` | 冻结向量上逻辑回归的交叉验证准确率。 | 0–1，越高越好；衡量线性标签可分性。 |
+| `Linear_Probing_Balanced_Acc` | 同一次线性探测中各类别 recall 的均值。 | 0–1，越高越好；类别数量不均衡时更有参考价值。 |
+| `NMI` | 真实标签与 KMeans 分配之间的归一化互信息。 | 0–1，越高越好。 |
+| `ARI`／`AMI` | 经随机机会校正的配对一致性／互信息。 | 越高越好；1 完全一致，约 0 相当于随机，可为负。 |
+| `Purity` | 每个 KMeans 簇采用多数标签后的正确样本比例。 | 0–1，越高越好；受指定簇数影响。 |
+| `Silhouette_Score` | 以真实标签分组、余弦距离计算的簇内紧致／簇间分离程度；不是按预测簇计算。 | −1 到 1，较大表示分离较好，没有通用及格线。 |
+
+KMeans 输入 L2 归一化向量，簇数等于观察到的标签类别数。CV 使用 seed 42 的打乱分层折，折数为 `min(5, 最小类样本数)`。k 不合法、类别仅一个样本或向量退化等可使指标不可用：CSV 空值不等于零；共享路径 provenance 区分 unavailable 和 failed。`--metrics-sample-size` 会改变评价样本；`--disable-umap` 只关闭图，不关闭指标。UMAP 是可视化，不是准确率。可用性和版本规则见[共享嵌入指标](embedding-metrics.cn.md)。图像级 CV 不保证按标本／分组隔离，train split 结果也不是测试集泛化证据。
+
+### Spatial 诊断：`spatial_results.csv`
+
+每行对应一张图像 × 一个视图 × 一层，包括 base 和已保存的评价视图；`spatial_diagnostics.json` 提供汇总。这里检查数值与 support，不是匹配准确率。
+
+| 字段 | 含义与用途 |
+| --- | --- |
+| `sample_id`、`image_key`、`view_id`、`role`、`layer` | 稳定样本身份、视图与特征来源；按这些键对齐比较。 |
+| `shape`、`grid_hw`、`dtype` | H×W×C 特征形状、H×W patch 网格和保存的数据类型。 |
+| `finite_count`、`nonfinite_count` | 有限／非有限 token 向量数，不是通道标量数；出现非有限特征会使诊断失败。 |
+| `zero_count`、`near_zero_norm_count` | 范数为零／不超过 1e−12 的 token 数，用于发现不可用或接近不可用的向量。 |
+| `norm_min`、`norm_mean`、`norm_max` | token L2 范数统计；开启导出 L2 后约等于 1 是预期现象，不证明区分力。 |
+| `channel_variance_mean` | token 内部跨通道方差的均值，不是跨位置／跨图片方差，不能单独检测特征塌缩。 |
+| `coverage_min`、`coverage_mean`、`coverage_full_valid_fraction` | 像素级几何覆盖及完全覆盖比例，不是前景比例。 |
+| `pixel_valid_fraction`、`patch_valid_fraction` | 保守采样有效像素／整个 footprint 有效的 patch 比例；填充、插值会减少 support。 |
+| `support_version` | 覆盖／有效性规则版本，应按兼容契约比较。 |
+
+### Spatial 对应：`spatial_matches.csv` 与 `spatial_evaluation.json`
+
+`spatial_matches.csv` 每行是一条查询 × 方向 × 变换 × 层。`image_key`、`pair_id`、`direction`、`layer`、`query_index`、`row`、`column` 标识查询；`candidate_count` 为几何有效候选中心数，`invalid_candidate_count` 为其中特征不可用的数量。`match_status=matched` 只表示找到可用候选，不代表正确。`predicted_row/column` 是候选网格位置，`true_x/y`、`predicted_x/y` 是原图坐标。
+
+- `raw_error`：原图像素单位的欧氏距离，越低越好。
+- `normalized_error`：`raw_error / hypot(原图宽, 原图高)`，越低越好；分母是图像对角线，不是标本长度或包围框。
+- `quantization_error`：全部有效目标网格中心能达到的最小归一化误差，是纯几何下限，不是模型误差；粗网格可使严格阈值无法达到。
+- `pck_0p01`、`pck_0p02`、`pck_0p05`：**逐查询整数标记**，误差不超过 1%／2%／5% 为 1，否则为 0。匹配失败仍以零计入几何分母。例如误差 `0.0246` 对应 `0,0,1`；对标记求平均才得到比例。
+
+JSON 先逐图计算，再按方向对图像做宏平均；两个方向都可用时 `combined` 等权平均。因此 `0.64` 表示 64%；整个 CSV 按行求平均可能与正式宏平均不同。变换／层分别报告，不发布跨变换总分；no-overlap 不可用分支也不等于准确率为零。结合 eligibility、量化下限和大误差尾部解释 PCK，没有通用及格线。比较时固定图像、查询计划、特征契约与基线。同图几何对应不是跨标本解剖对应，也不能代替分类／检索评价。
+
+报告还给出几何 eligibility 和叠加图状态。可选 `spatial_overlays/` 使用固定长度的 SHA-256 键名；图标题／报告标识原图。读取器按 size／mtime／inode 身份验证一次 payload，各数组摘要仍逐次检查；这一优化假定源目录只读，不用于抵御恶意并发重写。匹配复用每个方向的固定候选几何，不改变冻结协议。
+
+### 其他空间契约
 
 **空间产物（`--output-kind spatial`）。**
 

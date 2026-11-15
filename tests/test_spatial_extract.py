@@ -122,7 +122,7 @@ def test_explicit_embedding_only_options_reject_spatial_even_at_default(name):
 
 @pytest.mark.parametrize(
     "name",
-    ["feature_layers", "feature_norm", "spatial_layout", "spatial_eval", "dump_model_structure"],
+    ["feature_norm", "spatial_layout", "spatial_eval"],
 )
 def test_explicit_spatial_only_options_reject_embedding(name):
     values = base_values(Path("/tmp"), output_kind="embedding")
@@ -652,3 +652,96 @@ def test_prepare_protects_selected_panoptic_masks(tmp_path):
             )
     finally:
         request.close()
+
+
+@pytest.mark.parametrize("name", ["spatial_results.csv", "model_layers.txt"])
+def test_extraction_refuses_a_planted_report_symlink(tmp_path, name):
+    """Checkpoint extraction claims the report names before writing payloads."""
+    images = write_images(tmp_path / "images", keys=("a.png",))
+    checkpoint = write_checkpoint(tmp_path / "model.pt")
+    out = tmp_path / "out"
+    out.mkdir()
+    outside = tmp_path / "user.csv"
+    outside.write_text("keep-me", encoding="utf-8")
+    (out / name).symlink_to(outside)
+    values = base_values(
+        tmp_path,
+        checkpoint=str(checkpoint),
+        input_images_dir=str(images),
+        out_dir=str(out),
+        dump_model_structure=name == "model_layers.txt",
+    )
+    request = prepare_spatial_request(
+        values, explicit_options=frozenset({"checkpoint", "input_images_dir"})
+    )
+    try:
+        with pytest.raises(SpatialRequestError, match="already holds"):
+            extract_spatial(request)
+    finally:
+        request.close()
+    assert outside.read_text(encoding="utf-8") == "keep-me"
+    assert not (out / "spatial_manifest.json").exists()
+
+
+@pytest.mark.parametrize("marker", ["spatial_manifest.json", "spatial_index.jsonl", "features/000001.npz"])
+def test_core_extraction_does_not_record_over_a_refused_product(tmp_path, marker):
+    from otuformer.spatial.records import SpatialRecordError
+
+    images = write_images(tmp_path / "images", keys=("a.png",))
+    checkpoint = write_checkpoint(tmp_path / "model.pt")
+    values = base_values(tmp_path, checkpoint=str(checkpoint), input_images_dir=str(images))
+    request = prepare_spatial_request(
+        values, explicit_options=frozenset({"checkpoint", "input_images_dir"})
+    )
+    existing = request.out_dir / marker
+    existing.parent.mkdir(parents=True, exist_ok=True)
+    existing.write_bytes(b"previous-product")
+    try:
+        with pytest.raises(SpatialRecordError, match="already holds"):
+            extract_spatial(request)
+    finally:
+        request.close()
+    assert existing.read_bytes() == b"previous-product"
+    assert not (request.out_dir / "run_provenance.json").exists()
+
+
+@pytest.mark.parametrize("fault", ["report", "hash", "rename", "interrupt"])
+def test_core_extraction_records_finalization_failure(tmp_path, monkeypatch, fault):
+    from otuformer.spatial import extractor as module
+
+    images = write_images(tmp_path / "images", keys=("a.png",))
+    checkpoint = write_checkpoint(tmp_path / "model.pt")
+    values = base_values(tmp_path, checkpoint=str(checkpoint), input_images_dir=str(images))
+    request = prepare_spatial_request(
+        values, explicit_options=frozenset({"checkpoint", "input_images_dir"})
+    )
+
+    def boom(*args, **kwargs):
+        if fault == "interrupt":
+            raise KeyboardInterrupt()
+        raise OSError("simulated core finalization failure")
+
+    if fault == "report":
+        monkeypatch.setattr(module, "write_csv_rows", boom)
+    elif fault == "rename":
+        original = Path.replace
+        failed = False
+
+        def replace(path, target):
+            nonlocal failed
+            if path.name == "run_provenance.json.part" and not failed:
+                failed = True
+                boom()
+            return original(path, target)
+
+        monkeypatch.setattr(Path, "replace", replace)
+    else:
+        monkeypatch.setattr(module, "_artifact_rows", boom)
+    try:
+        with pytest.raises(KeyboardInterrupt if fault == "interrupt" else OSError):
+            extract_spatial(request)
+    finally:
+        request.close()
+    envelope = json.loads((request.out_dir / "run_provenance.json").read_text())
+    assert envelope["status"] == ("interrupted" if fault == "interrupt" else "failed")
+    assert envelope["effective"]["mode"] == "checkpoint"

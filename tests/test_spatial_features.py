@@ -418,3 +418,59 @@ def test_forward_preserves_model_mode_and_rng():
         forward(fixed_input())
     assert encoder.training is True
     assert torch.equal(torch.random.get_rng_state(), before)
+
+
+def test_contract_values_are_validated_not_coerced():
+    """A stored contract describes a representation; malformed values are refused."""
+    from otuformer.vision.features import FeatureContract
+
+    encoder = tiny_encoder()
+    payload = contract_for(encoder, layers=("blocks.0",)).to_json()
+
+    cases = (
+        ({"norm": "banana"}, "norm must be one of"),
+        ({"epsilon": -1.0}, "epsilon must be finite and positive"),
+        ({"l2": "false"}, "l2 must be a Boolean"),
+        ({"prefix_tokens": -1}, "prefix_tokens must be non-negative"),
+        ({"prefix_tokens": 1.5}, "prefix_tokens must be an integer"),
+        ({"patch_hw": [0, 0]}, "patch_hw must be positive"),
+        ({"patch_hw": [24, 24]}, "does not tile"),
+        ({"norm_module": None}, "needs the resolved norm_module"),
+        (
+            {"layers": [dict(payload["layers"][0], block_index=9)]},
+            "does not match block_index",
+        ),
+    )
+    for patch, match in cases:
+        with pytest.raises(ValueError, match=match):
+            FeatureContract.from_json({**payload, **patch})
+
+
+def test_sampling_reports_non_finite_and_unrepresentable_coordinates_unusable():
+    grid = torch.zeros(1, 4, 4, 1)
+    valid = torch.ones(1, 4, 4, dtype=torch.bool)
+    # Finite in float64 but overflowing the float32 grid.
+    xy = torch.tensor(
+        [[[float("nan"), 8.0], [float("inf"), 8.0], [1e100, 24.0], [8.0, 8.0]]],
+        dtype=torch.float64,
+    )
+    _values, usable = sample_grid_features(grid, xy, patch_hw=(16, 16), valid=valid)
+    assert usable.tolist() == [[False, False, False, True]]
+
+
+def test_norm_module_identity_is_a_fixed_schema():
+    from otuformer.vision.features import FeatureContract
+
+    encoder = tiny_encoder()
+    payload = contract_for(encoder, layers=("blocks.0",)).to_json()
+    for module, match in (
+        ({}, "must hold exactly"),
+        ({"path": "norm"}, "must hold exactly"),
+        ({"bogus": "value"}, "must hold exactly"),
+        ({"path": "", "qualname": "q"}, "non-empty string"),
+        ({"path": "norm", "qualname": "q", "extra": "x"}, "must hold exactly"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            FeatureContract.from_json({**payload, "norm_module": module})
+    with pytest.raises(ValueError, match="must not record a norm_module"):
+        FeatureContract.from_json({**payload, "norm": "none"})

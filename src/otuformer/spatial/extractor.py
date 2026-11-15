@@ -39,11 +39,13 @@ from ..spatial.diagnostics import RESULT_FIELDS, diagnose_views
 from ..spatial.records import (
     DIRECTORY_FEATURES,
     FILENAME_DIAGNOSTICS,
+    FILENAME_EVALUATION,
     FILENAME_INDEX,
     FILENAME_LOG,
     FILENAME_MANIFEST,
     FILENAME_MATCHES,
     FILENAME_MODEL_LAYERS,
+    FILENAME_OVERLAYS,
     FILENAME_PROVENANCE,
     FILENAME_RESULTS,
     SpatialRecordError,
@@ -301,17 +303,30 @@ def prepare_spatial_request(
 
 
 def _overlay_inputs(images_dir: Path, reader: Any) -> list[FileSnapshot]:
-    """The selected original images an overlay would read."""
+    """The selected original images an overlay would read.
+
+    Containment is decided *before* any byte is read: a canonical key can still
+    name a symlink inside the root that resolves to a file outside it, and
+    hashing it here would already have read the escaping file.
+    """
+    from ..data.paths import require_contained
     from ..data.provenance import snapshot_bytes
 
     protected: list[FileSnapshot] = []
     for key in reader.image_keys:
         path = images_dir / key
-        if path.is_file():
-            try:
-                protected.append(snapshot_bytes(path)[1])
-            except OSError:  # pragma: no cover - unreadable image is reported later
-                continue
+        if not path.is_file():
+            continue
+        try:
+            resolved = require_contained(images_dir, path, key)
+        except ValueError:
+            # The overlay reports this image as unavailable; nothing to protect
+            # and nothing to read.
+            continue
+        try:
+            protected.append(snapshot_bytes(resolved)[1])
+        except OSError:  # pragma: no cover - unreadable image is reported later
+            continue
     return protected
 
 
@@ -743,21 +758,13 @@ def _torch_inference(prepared: PreparedSpatialRequest) -> Iterator[Any]:
 
 def _write_model_layers(out_dir: Path, encoder: Any) -> Path:
     path = out_dir / FILENAME_MODEL_LAYERS
-    lines = [
-        "# Named modules for --feature-layers",
-        "# Format: <name>\\t<class>\\t<spatial-eligible>",
-    ]
-    for row in describe_feature_layers(encoder.backbone):
-        lines.append(
-            f"{row['path']}\\t{row['module_class'].rsplit('.', 1)[-1]}"
-            f"\\t{'yes' if row['spatial_eligible'] else ''}"
-        )
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    return path
+    from ..vision.features import write_model_layers
+
+    return write_model_layers(path, encoder.backbone)
 
 
 def _run_checkpoint_extraction(
-    prepared: PreparedSpatialRequest,
+    prepared: PreparedSpatialRequest, writer: SpatialWriter,
 ) -> tuple[SpatialWriter, dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
     """Write payload/index/manifest, then return the sealed writer and reports."""
     import torch
@@ -766,13 +773,6 @@ def _run_checkpoint_extraction(
     assert prepared.contract is not None
     out_dir = prepared.out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
-    writer = SpatialWriter(
-        out_dir,
-        contract=prepared.contract,
-        layout=prepared.layout,
-        samples=list(prepared.samples),
-        annotations=prepared.annotations,
-    )
     records = list(prepared.bundle.records)
     # Resolve the evaluation subset before the first payload is written: an empty
     # intersection or a rejected plan must not reach an output that was already
@@ -1002,15 +1002,40 @@ def _evaluate_sealed_product(
 
 
 def _artifact_rows(out_dir: Path, *, include_log: bool) -> list[dict[str, Any]]:
-    """Final artifacts with their on-disk hashes, excluding the envelope itself."""
+    """Final artifacts with their on-disk hashes, excluding the envelope itself.
+
+    Only files this attempt owns are recorded: a symlink is never followed (a
+    planted one would make the run hash and register a file outside the output
+    directory), and an entry whose real path leaves the directory is refused.
+    """
+    root = Path(out_dir)
+    resolved_root = root.resolve()
+    owned = {
+        FILENAME_RESULTS, FILENAME_DIAGNOSTICS, FILENAME_EVALUATION,
+        FILENAME_MATCHES, FILENAME_MODEL_LAYERS,
+    }
+    if include_log:
+        owned.add(FILENAME_LOG)
+    manifest_path = root / FILENAME_MANIFEST
+    if manifest_path.is_file() and not manifest_path.is_symlink():
+        _refuse_symlink(manifest_path, root)
+        manifest = json.loads(manifest_path.read_bytes())
+        owned.add(FILENAME_MANIFEST)
+        owned.update(item["path"] for item in manifest["files"])
     rows: list[dict[str, Any]] = []
-    for path in sorted(out_dir.rglob("*")):
+    for path in sorted(root.rglob("*")):
+        if path.is_symlink():
+            continue
         if not path.is_file():
             continue
-        relative = path.relative_to(out_dir).as_posix()
-        if relative == FILENAME_PROVENANCE:
+        relative = path.relative_to(root).as_posix()
+        if relative not in owned and not relative.startswith(f"{FILENAME_OVERLAYS}/"):
             continue
-        if relative == FILENAME_LOG and not include_log:
+        try:
+            resolved = path.resolve()
+        except OSError:  # pragma: no cover - defensive
+            continue
+        if resolved_root not in resolved.parents:
             continue
         payload = path.read_bytes()
         rows.append(
@@ -1023,14 +1048,36 @@ def publish_spatial_run(
     out_dir: Path, record: Mapping[str, Any], *, include_log: bool = True
 ) -> dict[str, Any]:
     """Hash final artifacts and publish the completed envelope atomically."""
+    root = Path(out_dir)
     final = dict(record)
     if final.get("status") == "completed":
-        final["artifacts"] = _artifact_rows(Path(out_dir), include_log=include_log)
-    envelope = Path(out_dir) / FILENAME_PROVENANCE
+        final["artifacts"] = _artifact_rows(root, include_log=include_log)
+    envelope = root / FILENAME_PROVENANCE
     temporary = envelope.with_suffix(".json.part")
+    # Publication is still part of this attempt's ownership: a symlink planted at
+    # either name would otherwise send the envelope bytes outside the directory.
+    for path in (temporary, envelope):
+        _refuse_symlink(path, root)
     temporary.write_bytes(canonical_json_bytes(final))
     temporary.replace(envelope)
     return final
+
+
+def _refuse_symlink(path: Path, root: Path) -> None:
+    """Reject a symlink or an escaping parent before writing an attempt file."""
+    if path.is_symlink():
+        raise SpatialRequestError(
+            f"refusing to write through the symlink {path}; a run owns its own files"
+        )
+    try:
+        resolved_root = root.resolve()
+        parent = path.parent.resolve()
+    except OSError as error:  # pragma: no cover - defensive
+        raise SpatialRequestError(f"cannot resolve {path}: {error}") from error
+    if parent != resolved_root and resolved_root not in parent.parents:
+        raise SpatialRequestError(
+            f"refusing to write {path}; it resolves outside {resolved_root}"
+        )
 
 
 def extract_spatial(
@@ -1049,31 +1096,89 @@ def extract_spatial(
     started = _utc_now()
     out_dir = prepared.out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
-    writer, manifest, rows, summary = _run_checkpoint_extraction(prepared)
-    evaluation_summary = None
-    if prepared.values.get("spatial_eval"):
-        evaluation_summary = _evaluate_sealed_product(prepared, writer, manifest)
-    effective = (
-        _effective_onnx(prepared)
-        if prepared.mode == MODE_ONNX
-        else _effective_checkpoint(prepared)
+    _claim_report_directory(out_dir)
+    # Refusal to claim a previous product must not write a new failure over it.
+    writer = SpatialWriter(
+        out_dir,
+        contract=prepared.contract,
+        layout=prepared.layout,
+        samples=list(prepared.samples),
+        annotations=prepared.annotations,
     )
-    record = build_spatial_run_record(
-        requested=dict(prepared.values),
-        bundle=prepared.bundle,
-        source_product=None,
-        effective=effective,
-        used_files=prepared.protected_files,
-        evaluation=evaluation_summary,
-        status="completed",
-        started_at=started,
-        ended_at=_utc_now(),
-        artifacts=[],
-    )
-    if defer_publication:
+    try:
+        writer, manifest, rows, summary = _run_checkpoint_extraction(prepared, writer)
+        evaluation_summary = None
+        if prepared.values.get("spatial_eval"):
+            evaluation_summary = _evaluate_sealed_product(prepared, writer, manifest)
+        effective = (
+            _effective_onnx(prepared)
+            if prepared.mode == MODE_ONNX
+            else _effective_checkpoint(prepared)
+        )
+        record = build_spatial_run_record(
+            requested=dict(prepared.values),
+            bundle=prepared.bundle,
+            source_product=None,
+            effective=effective,
+            used_files=prepared.protected_files,
+            evaluation=evaluation_summary,
+            status="completed",
+            started_at=started,
+            ended_at=_utc_now(),
+            artifacts=[],
+        )
+        if defer_publication:
+            return {
+                "status": "completed",
+                "manifest": manifest,
+                "rows": rows,
+                "summary": summary,
+                "evaluation": evaluation_summary,
+                "envelope": record,
+                "out_dir": str(out_dir),
+                "deferred": True,
+            }
+        published = publish_spatial_run(out_dir, record, include_log=False)
         return {
             "status": "completed",
             "manifest": manifest,
+            "rows": rows,
+            "summary": summary,
+            "evaluation": evaluation_summary,
+            "envelope": published,
+            "out_dir": str(out_dir),
+            "deferred": False,
+        }
+    except BaseException as error:
+        _record_spatial_failure(out_dir, prepared, started, error)
+        raise
+
+
+def reevaluate_spatial(
+    prepared: PreparedSpatialRequest, *, defer_publication: bool = False
+) -> dict[str, Any]:
+    """Read a stored product and write report-only diagnostics beside it.
+
+    A public Python caller reaches this without the CLI's output preparation, so
+    the report directory is claimed here: existing files are refused rather than
+    overwritten, and a failure is recorded as this attempt's envelope instead of
+    leaving the previous attempt's status to describe the new run.
+    """
+    if prepared.mode != MODE_READ or prepared.reader is None:
+        raise SpatialRequestError("reevaluate_spatial needs a spatial read request")
+    reader = prepared.reader
+    out_dir = prepared.out_dir
+    started = _utc_now()
+    _claim_report_directory(out_dir)
+    try:
+        written = _write_read_reports(prepared, reader, out_dir, started)
+    except BaseException as error:
+        _record_spatial_failure(out_dir, prepared, started, error)
+        raise
+    rows, summary, evaluation_summary, record = written
+    if defer_publication:
+        return {
+            "status": "completed",
             "rows": rows,
             "summary": summary,
             "evaluation": evaluation_summary,
@@ -1081,10 +1186,15 @@ def extract_spatial(
             "out_dir": str(out_dir),
             "deferred": True,
         }
-    published = publish_spatial_run(out_dir, record, include_log=False)
+    # Publication also hashes and renames attempt files, so it can fail too; the
+    # failure belongs to this attempt's status, not outside the handler above.
+    try:
+        published = publish_spatial_run(out_dir, record, include_log=False)
+    except BaseException as error:
+        _record_spatial_failure(out_dir, prepared, started, error)
+        raise
     return {
         "status": "completed",
-        "manifest": manifest,
         "rows": rows,
         "summary": summary,
         "evaluation": evaluation_summary,
@@ -1094,16 +1204,78 @@ def extract_spatial(
     }
 
 
-def reevaluate_spatial(
-    prepared: PreparedSpatialRequest, *, defer_publication: bool = False
-) -> dict[str, Any]:
-    """Read a stored product and write report-only diagnostics beside it."""
-    if prepared.mode != MODE_READ or prepared.reader is None:
-        raise SpatialRequestError("reevaluate_spatial needs a spatial read request")
-    reader = prepared.reader
-    out_dir = prepared.out_dir
+def _claim_report_directory(out_dir: Path) -> None:
+    """Refuse a report directory that already holds this attempt's outputs.
+
+    The claim covers every name the attempt writes - reports, the publication
+    temporary and the overlay directory - and refuses a symlink at any of them.
+    Checking only the published report names let a planted
+    ``run_provenance.json.part`` symlink receive the completed envelope anywhere
+    on disk.
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
-    started = _utc_now()
+    claimed = (
+        FILENAME_RESULTS,
+        FILENAME_DIAGNOSTICS,
+        FILENAME_EVALUATION,
+        FILENAME_MATCHES,
+        FILENAME_PROVENANCE,
+        f"{Path(FILENAME_PROVENANCE).stem}.json.part",
+        FILENAME_OVERLAYS,
+        FILENAME_MODEL_LAYERS,
+    )
+    occupied: list[str] = []
+    for name in claimed:
+        path = out_dir / name
+        # ``lexists`` sees a dangling symlink that ``exists`` reports as absent.
+        if path.is_symlink() or path.exists():
+            occupied.append(name)
+    if occupied:
+        raise SpatialRequestError(
+            f"the read-report directory {out_dir} already holds "
+            + ", ".join(occupied)
+            + "; choose another --out-dir or clear it explicitly"
+        )
+
+
+def _record_spatial_failure(
+    out_dir: Path,
+    prepared: PreparedSpatialRequest,
+    started: str,
+    error: BaseException,
+) -> None:
+    """Publish this attempt's failed envelope, so no earlier status survives."""
+    reason = (
+        "interrupted by the user"
+        if isinstance(error, KeyboardInterrupt)
+        else str(error)
+    )
+    record = build_spatial_run_record(
+        requested=dict(prepared.values),
+        bundle=None,
+        source_product=prepared.source_product,
+        effective={"mode": prepared.mode},
+        used_files=prepared.protected_files,
+        evaluation=None,
+        status="interrupted" if isinstance(error, KeyboardInterrupt) else "failed",
+        failure={"reason": reason, "type": type(error).__name__},
+        started_at=started,
+        ended_at=_utc_now(),
+        artifacts=[],
+    )
+    try:
+        publish_spatial_run(out_dir, record, include_log=False)
+    except OSError:  # pragma: no cover - the original failure is what matters
+        pass
+
+
+def _write_read_reports(
+    prepared: PreparedSpatialRequest,
+    reader: Any,
+    out_dir: Path,
+    started: str,
+) -> tuple[Any, Any, Any, dict[str, Any]]:
+    """Compute and write the read reports; returns rows, summary and record."""
     rows, summary = diagnose_views(
         reader.iter_views(), reader.contract, plan=reader.evaluation_plan
     )
@@ -1163,26 +1335,7 @@ def reevaluate_spatial(
         ended_at=_utc_now(),
         artifacts=[],
     )
-    if defer_publication:
-        return {
-            "status": "completed",
-            "rows": rows,
-            "summary": summary,
-            "evaluation": evaluation_summary,
-            "envelope": record,
-            "out_dir": str(out_dir),
-            "deferred": True,
-        }
-    published = publish_spatial_run(out_dir, record, include_log=False)
-    return {
-        "status": "completed",
-        "rows": rows,
-        "summary": summary,
-        "evaluation": evaluation_summary,
-        "envelope": published,
-        "out_dir": str(out_dir),
-        "deferred": False,
-    }
+    return rows, summary, evaluation_summary, record
 
 
 def _forward_numpy(

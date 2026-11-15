@@ -58,6 +58,7 @@ from .records import (
     SpatialSample,
     SpatialView,
     layout_is_valid,
+    require_relative_key,
     require_schema_version,
     require_support_version,
     validate_view,
@@ -1164,6 +1165,39 @@ class SpatialReader:
                     f"index entry {identity} ref for {name!r} has no NPY row index"
                 )
 
+    def _check_sample_identity(
+        self, sample: Mapping[str, Any], identity: tuple[str, str]
+    ) -> None:
+        """A stored sample's own identity fields are schema, not free text."""
+        for field in ("image_sha256",):
+            value = sample.get(field)
+            if (
+                not isinstance(value, str)
+                or len(value) != 64
+                or any(character not in "0123456789abcdef" for character in value)
+            ):
+                raise SpatialRecordError(
+                    f"index entry {identity} has an unusable {field} {value!r}"
+                )
+        for field in ("width", "height"):
+            value = sample.get(field)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise SpatialRecordError(
+                    f"index entry {identity} has an unusable sample {field} {value!r}"
+                )
+
+    def _sample_identity_key(
+        self, sample: Mapping[str, Any], sample_id: int
+    ) -> tuple[Any, ...]:
+        """Everything a sample's views must agree on, in a comparable form."""
+        return (
+            int(sample_id),
+            str(sample["image_sha256"]),
+            int(sample["width"]),
+            int(sample["height"]),
+            canonical_json_bytes(dict(sample.get("metadata") or {})),
+        )
+
     def _check_trace_structure(
         self, entry: Mapping[str, Any], identity: tuple[str, str]
     ) -> None:
@@ -1184,6 +1218,14 @@ class SpatialReader:
             raise SpatialRecordError(
                 f"index entry {identity} stores canvas {trace.view_wh} but the "
                 f"feature contract fixes {self.contract.input_hw}"
+            )
+        sample = entry["sample"]
+        declared_source = (int(sample["width"]), int(sample["height"]))
+        if tuple(int(v) for v in trace.source_wh) != declared_source:
+            raise SpatialRecordError(
+                f"index entry {identity} traces a source of "
+                f"{tuple(int(v) for v in trace.source_wh)} but its sample declares "
+                f"{declared_source}"
             )
         for name in ("pixel_geometric_coverage", "pixel_sampling_valid"):
             descriptor = entry["arrays"][name]
@@ -1263,12 +1305,19 @@ class SpatialReader:
         entries: list[dict[str, Any]] = []
         seen: set[tuple[str, str]] = set()
         sample_ids: dict[int, str] = {}
+        # One key describes one source image: every view of it must agree on the
+        # sample's identity, or the product would pair views of different content
+        # as the same image.
+        sample_identities: dict[str, tuple[Any, ...]] = {}
         for line in payload.splitlines():
             if not line.strip():
                 continue
             entry = json.loads(line.decode("utf-8"))
             require_schema_version(entry.get("schema_version"))
             require_support_version(entry.get("support_version"))
+            # The key becomes a filesystem path for overlays, so an escaping key is
+            # not a naming detail: it would read outside the image root.
+            require_relative_key(entry["sample"]["image_key"])
             identity = (entry["sample"]["image_key"], entry["view_id"])
             if identity in seen:
                 raise SpatialRecordError(
@@ -1276,9 +1325,26 @@ class SpatialReader:
                     f"{entry['sample']['image_key']!r}"
                 )
             seen.add(identity)
-            sample_id = int(entry["sample_id"])
-            if sample_id < 1:
-                raise SpatialRecordError("sample ids start at 1")
+            # A strict integer, not ``int(1.9) == 1``: the id groups a sample's
+            # views, so a coerced value would silently merge two samples.
+            raw_sample_id = entry["sample_id"]
+            if (
+                isinstance(raw_sample_id, bool)
+                or not isinstance(raw_sample_id, int)
+                or raw_sample_id < 1
+            ):
+                raise SpatialRecordError(
+                    f"index entry {identity} has an unusable sample id "
+                    f"{raw_sample_id!r}; ids start at 1"
+                )
+            sample_id = raw_sample_id
+            self._check_sample_identity(entry["sample"], identity)
+            identity_key = self._sample_identity_key(entry["sample"], sample_id)
+            claimed_identity = sample_identities.setdefault(identity[0], identity_key)
+            if claimed_identity != identity_key:
+                raise SpatialRecordError(
+                    f"views of {identity[0]!r} disagree about their sample identity"
+                )
             # A sample id identifies one sample: two keys sharing it would make the
             # write-time identity and the read-time grouping disagree.
             claimed = sample_ids.setdefault(sample_id, identity[0])
@@ -2473,9 +2539,12 @@ class SpatialReader:
         small LRU, so a long read stays within a fixed descriptor budget and each
         evicted handle is released immediately.
         """
+        changed = self._ensure_payload(relative)
         cached = cache.pop(relative, None)
+        if cached is not None and changed:
+            closer(cached)
+            cached = None
         if cached is None:
-            self._ensure_payload(relative)
             cached = loader()
         cache[relative] = cached
         while len(cache) > self._open_limit:
@@ -2483,7 +2552,7 @@ class SpatialReader:
             closer(cache.pop(oldest))
         return cached
 
-    def _ensure_payload(self, relative: str) -> None:
+    def _ensure_payload(self, relative: str) -> bool:
         """Verify this payload once, unless its file identity changed since.
 
         Verification reads and hashes the whole file, and the handle cache is
@@ -2508,7 +2577,7 @@ class SpatialReader:
             raise SpatialRecordError(f"sealed payload is missing: {relative}")
         identity = (int(stat.st_size), int(stat.st_mtime_ns), int(stat.st_ino))
         if self._verified_stats.get(relative) == identity:
-            return
+            return False
         self._verified_stats.pop(relative, None)
         digest = sha256_bytes(path.read_bytes())
         if digest != item["sha256"]:
@@ -2516,6 +2585,7 @@ class SpatialReader:
         self._verified_stats[relative] = identity
         if relative not in self._verified_payloads:
             self._verified_payloads.append(relative)
+        return True
 
     def verification_scope(self, keys: Sequence[str] | None = None) -> VerificationScope:
         return VerificationScope(

@@ -949,3 +949,157 @@ def test_a_categorical_resize_matches_pillow_column_mapping():
     )
     # Pillow's own mapping, not floor((i + 0.5) * 8 / 12).
     assert record["mask"][0].tolist() == [1, 2, 2, 3, 3, 4, 5, 6, 6, 7, 8, 8]
+
+
+def test_a_multi_part_polygon_encloses_every_retained_part():
+    """The enclosure is the object's, not the largest part's."""
+    from otuformer.vision.geometry import transform_annotations, trace_operations
+
+    annotation = {
+        "id": 1,
+        "image_id": 1,
+        "category_id": 3,
+        "bbox": [0, 0, 100, 100],
+        "segmentation": [
+            [0, 0, 10, 0, 10, 10, 0, 10],
+            [80, 80, 100, 80, 100, 100, 80, 100],
+        ],
+    }
+    trace = trace_operations((100, 100), [])
+    record = transform_annotations(
+        [annotation], {"3": {"name": "x"}}, trace, role="instances"
+    )[0]
+    assert len(record["polygons_xy"]) == 2
+    assert record["bbox_xyxy"] == [0.0, 0.0, 100.0, 100.0]
+    assert record["area_retained"] == 500.0
+
+
+def test_a_stored_trace_must_replay_to_its_own_canvas_and_map():
+    """The matrix a reader uses and the chain a replay executes must agree."""
+    from otuformer.vision.geometry import GeometryOp, GeometryTrace
+
+    forward = {"from_wh": [32, 32], "to_wh": [16, 16], "canvas_wh": [16, 16],
+               "interpolation": "bicubic", "antialias": True}
+    payload = {
+        "source_wh": [32, 32],
+        "view_wh": [32, 32],  # the operations produce 16x16
+        "operations": [GeometryOp("resize", forward).to_json()],
+        "source_to_view": [[1, 0, 0], [0, 1, 0], [0, 0, 1]],
+        "view_to_source": [[1, 0, 0], [0, 1, 0], [0, 0, 1]],
+    }
+    with pytest.raises(ValueError, match="stored operations produce canvas"):
+        GeometryTrace.from_json(payload)
+
+
+def test_an_operation_cannot_declare_a_canvas_it_does_not_produce():
+    """The canvas is a consequence of the operation, not free evidence."""
+    from otuformer.vision.geometry import GeometryOp, trace_operations
+
+    crop = GeometryOp(
+        "crop",
+        {
+            "from_wh": [32, 32],
+            "left": 0.0,
+            "top": 0.0,
+            "width": 16,
+            "height": 16,
+            "canvas_wh": [32, 32],  # the window is 16x16
+        },
+    )
+    with pytest.raises(ValueError, match="crop op declares canvas"):
+        trace_operations((32, 32), [crop])
+
+
+@pytest.mark.parametrize(
+    "op",
+    [
+        pytest.param(
+            lambda: GeometryOp("hflip", {"from_wh": [32, 32], "canvas_wh": [16, 16]}),
+            id="hflip",
+        ),
+        pytest.param(
+            lambda: GeometryOp("vflip", {"from_wh": [32, 32], "canvas_wh": [16, 16]}),
+            id="vflip",
+        ),
+        pytest.param(
+            lambda: GeometryOp(
+                "affine",
+                {
+                    "from_wh": [32, 32],
+                    "canvas_wh": [16, 16],
+                    "angle": 0.0,
+                    "translate": [0.0, 0.0],
+                    "scale": 1.0,
+                    "center": [16.0, 16.0],
+                    "interpolation": "bilinear",
+                },
+            ),
+            id="affine",
+        ),
+        pytest.param(
+            lambda: GeometryOp(
+                "rotate",
+                {
+                    "from_wh": [32, 32],
+                    "canvas_wh": [16, 16],
+                    "angle": 15.0,
+                    "expand": False,
+                    "center": [16.0, 16.0],
+                    "interpolation": "bilinear",
+                },
+            ),
+            id="rotate-fixed",
+        ),
+    ],
+)
+@pytest.mark.parametrize("extra_to_wh", [False, True])
+def test_size_preserving_operations_cannot_shrink_their_declared_canvas(op, extra_to_wh):
+    from otuformer.vision.geometry import trace_operations
+
+    operation = op()
+    if extra_to_wh:
+        operation.params["to_wh"] = [16, 16]
+    with pytest.raises(ValueError, match="declares canvas"):
+        trace_operations((32, 32), [operation])
+
+
+@pytest.mark.parametrize("size", [(13, 20), (20, 13)])
+@pytest.mark.parametrize("angle", [0, 15, 45, 90, 180, 270, -15])
+@pytest.mark.parametrize("off_center", [False, True])
+def test_expanding_rotation_size_matches_backend_without_pixel_allocation(
+    monkeypatch, size, angle, off_center
+):
+    from PIL import Image
+    from otuformer.vision.geometry import GeometryTrace, trace_operations
+
+    center = [size[0] / 2, size[1] / 2]
+    if off_center:
+        center = [2.25, 5.75]
+    expected = Image.new("RGB", size).rotate(angle, expand=True, center=center).size
+    operation = GeometryOp("rotate", {
+        "from_wh": list(size), "canvas_wh": list(expected), "center": center,
+        "angle": angle, "expand": True, "interpolation": "bilinear",
+    })
+
+    def no_pixels(*args, **kwargs):
+        raise AssertionError("trace size validation must not allocate image pixels")
+
+    monkeypatch.setattr(Image, "new", no_pixels)
+    trace = trace_operations(size, [operation])
+    assert GeometryTrace.from_json(trace.to_json()).view_wh == expected
+
+
+def test_expanding_rotation_size_is_bounded_for_large_source(monkeypatch):
+    from PIL import Image
+    from otuformer.vision.geometry import trace_operations
+
+    def no_pixels(*args, **kwargs):
+        raise AssertionError("large stored source must not allocate image pixels")
+
+    monkeypatch.setattr(Image, "new", no_pixels)
+    operation = GeometryOp("rotate", {
+        "from_wh": [100000, 100000], "canvas_wh": [100000, 100000],
+        "center": [50000.0, 50000.0], "angle": 0.0, "expand": True,
+        "interpolation": "bilinear",
+    })
+    assert trace_operations((100000, 100000), [operation]).view_wh == (100000, 100000)

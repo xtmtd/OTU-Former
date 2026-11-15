@@ -603,7 +603,7 @@ def _record_feature_chain(
     if projector_used:
         ops = ["projector"]
     elif token_mode == "cls":
-        ops = ["cls_token_index_0"]
+        ops = (["selected_complete_block", "backbone_final_norm"] if effective.get("feature_layer") else []) + ["cls_token_index_0"]
     elif token_mode == "patch-topk":
         ops = ["topk_by_patch_l2_norm", "flatten"]
         policy = effective.get("patch_topk_pca") or {}
@@ -847,7 +847,12 @@ def _extract_one_dir(
         for imgs, names in tqdm(loader, desc=desc, ncols=120):
             imgs = imgs.to(device)
             if isinstance(model, OTUFormerEncoder):
-                feats = model.backbone.forward_features(imgs)
+                if effective is not None and effective.get("feature_layer"):
+                    from otuformer.vision.features import embedding_block_tokens
+
+                    feats = embedding_block_tokens(model.backbone, imgs, effective["feature_layer"])
+                else:
+                    feats = model.backbone.forward_features(imgs)
                 if isinstance(feats, dict):
                     feats = feats["x"]
             else:
@@ -955,11 +960,16 @@ def _extract_one_csv(
                 imgs, names = batch
                 samples = None
             imgs = imgs.to(device)
-            feats = (
-                model.backbone.forward_features(imgs)
-                if isinstance(model, OTUFormerEncoder)
-                else None
-            )
+            if isinstance(model, OTUFormerEncoder) and effective is not None and effective.get("feature_layer"):
+                from otuformer.vision.features import embedding_block_tokens
+
+                feats = embedding_block_tokens(model.backbone, imgs, effective["feature_layer"])
+            else:
+                feats = (
+                    model.backbone.forward_features(imgs)
+                    if isinstance(model, OTUFormerEncoder)
+                    else None
+                )
             if isinstance(feats, dict):
                 feats = feats["x"]
 
@@ -1391,6 +1401,8 @@ def extract_embeddings(
     eval_transform: str = "center-crop",
     *,
     records: DataBundle | None = None,
+    feature_layers: str | None = None,
+    model_structure_path: Path | None = None,
 ) -> pd.DataFrame:
     """Extract embeddings and return DataFrame (see ``_extract_embeddings_result``)."""
     return _extract_embeddings_result(
@@ -1414,6 +1426,8 @@ def extract_embeddings(
         onnx_path=onnx_path,
         eval_transform=eval_transform,
         records=records,
+        feature_layers=feature_layers,
+        model_structure_path=model_structure_path,
     ).frame
 
 
@@ -1439,6 +1453,8 @@ def _extract_embeddings_result(
     eval_transform: str = "center-crop",
     *,
     records: DataBundle | None = None,
+    feature_layers: str | None = None,
+    model_structure_path: Path | None = None,
 ) -> ExtractionResult:
     """Extract embeddings and return the frame plus what actually ran.
 
@@ -1455,6 +1471,15 @@ def _extract_embeddings_result(
       - ``attention-pool``: attention pool patch tokens (learned pool if available,
         otherwise CLS-query pooling)
     """
+    from otuformer.spatial.request import validate_extract_mode_options
+
+    validate_extract_mode_options(
+        {"feature_layers": feature_layers, "token_mode": token_mode,
+         "use_projector_output": use_projector_output, "onnx_path": onnx_path},
+        explicit_options=frozenset(
+            {"feature_layers"} if feature_layers is not None else set()
+        ) | frozenset({"dump_model_structure"} if model_structure_path is not None else set()),
+    )
     if token_mode not in TOKEN_MODES:
         raise ValueError(
             f"Unsupported token_mode '{token_mode}', choose from: "
@@ -1572,6 +1597,17 @@ def _extract_embeddings_result(
     def _result(frame: pd.DataFrame) -> ExtractionResult:
         if norm_probe:
             effective["backbone_output_norm"] = _backbone_norm_record(norm_probe[0])
+        if effective.get("feature_layer"):
+            effective["backbone_output_norm"] = {
+                "status": "applied", "stage": "selected_block_before_cls",
+                "layers": ["backbone.norm"],
+                "detail": "the final backbone norm is applied to the selected block before CLS selection",
+            }
+        if model_structure_path is not None:
+            from otuformer.vision.features import write_model_layers
+
+            write_model_layers(Path(model_structure_path), model.backbone)
+            effective["model_structure"] = str(model_structure_path)
         _persist_pool()
         return ExtractionResult(
             frame=frame, effective=dict(effective), used_files=tuple(used_files)
@@ -1657,6 +1693,14 @@ def _extract_embeddings_result(
     validate_input_size(
         requested_size, model, getattr(model, "model_name", model_name)
     )
+    if feature_layers is not None:
+        from otuformer.vision.features import resolve_feature_layers
+
+        feature_layers = resolve_feature_layers(model.backbone, feature_layers)[0]
+        if getattr(model.backbone, "cls_token", None) is None:
+            raise ValueError("embedding --feature-layers requires a backbone CLS token")
+        effective["feature_layer"] = feature_layers
+        effective["feature_layer_norm"] = "backbone.norm"
     effective["input_size"] = requested_size
     effective["preprocessing"] = {
         "eval_transform": eval_transform,

@@ -16,6 +16,67 @@ from otuformer.embedding.extractor import (
 from otuformer.utils.size import resolve_onnx_input_size
 
 
+def test_explicit_embedding_layer_is_normalized_cls_and_keeps_hooks_clean(tmp_path):
+    from otuformer.embedding.extractor import _extract_embeddings_result
+    from otuformer.training.dataset import build_eval_transform
+
+    checkpoint = make_checkpoint(tmp_path)
+    images = tmp_path / "layer_images"
+    make_images(images, n=1)
+    model, _ = _load_model(checkpoint, "vit_tiny_patch16_224", torch.device("cpu"))
+    image = next(images.iterdir())
+    with Image.open(image) as opened:
+        tensor = build_eval_transform("center-crop", 224)(opened.convert("RGB")).unsqueeze(0)
+    captured = []
+    handle = model.backbone.blocks[5].register_forward_hook(
+        lambda _module, _inputs, output: captured.append(output.detach().clone())
+    )
+    with torch.no_grad():
+        model.backbone.forward_features(tensor)
+        expected = model.backbone.norm(captured[0])[:, 0].numpy()
+    handle.remove()
+    result = _extract_embeddings_result(
+        checkpoint, images, device="cpu", num_workers=0, feature_layers="blocks.5",
+    )
+    np.testing.assert_allclose(result.frame.filter(like="dim_").values, expected, atol=1e-5)
+    assert result.effective["feature_layer"] == "blocks.5"
+    assert result.effective["backbone_output_norm"]["stage"] == "selected_block_before_cls"
+    default = extract_embeddings(checkpoint, images, device="cpu", num_workers=0)
+    final = extract_embeddings(
+        checkpoint, images, device="cpu", num_workers=0, feature_layers="blocks.11",
+    )
+    np.testing.assert_allclose(final.filter(like="dim_"), default.filter(like="dim_"), atol=1e-5)
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"feature_layers": "blocks.1,blocks.2"},
+    {"feature_layers": "blocks.1", "token_mode": "patch-topk"},
+    {"feature_layers": "blocks.1", "use_projector_output": True},
+    {"feature_layers": "blocks.1", "onnx_path": Path("missing.onnx")},
+])
+def test_embedding_layer_conflicts_reject_before_model_access(kwargs):
+    with pytest.raises(ValueError, match="feature-layers|single|one|checkpoint|CLS"):
+        extract_embeddings(Path("missing.pt"), Path("missing_images"), **kwargs)
+
+
+def test_selected_embedding_hook_is_removed_when_forward_fails():
+    from otuformer.vision.features import embedding_block_tokens
+
+    class Backbone(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.blocks = torch.nn.ModuleList([torch.nn.Identity()])
+
+        def forward_features(self, images):
+            self.blocks[0](images)
+            raise RuntimeError("deliberate failure")
+
+    backbone = Backbone()
+    with pytest.raises(RuntimeError, match="deliberate failure"):
+        embedding_block_tokens(backbone, torch.zeros(1, 2, 3), "blocks.0")
+    assert not backbone.blocks[0]._forward_hooks
+
+
 def relational_bundle() -> dict:
     """A canonical SSL relational recipe, as a pretrain checkpoint records it."""
     return {

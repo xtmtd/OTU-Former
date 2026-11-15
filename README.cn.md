@@ -75,6 +75,8 @@ otuformer cluster --embeddings runs/extract/embeddings.csv --out-dir runs/cluste
 
 每个命令都有自己的参考文档；见文末命令表中的链接，或运行 `otuformer <命令> --help`。
 
+`extract` 默认输出 embedding。使用 `--output-kind spatial --spatial-eval` 提取 patch 网格并评价同图几何对应；使用 `--output-kind spatial --spatial-input PRODUCT` 在独立输出目录生成不需要模型的报告。Checkpoint 提取共用 `--dump-model-structure`；embedding 的 `--feature-layers blocks.5` 选择经过最终 norm 的单层 CLS，省略时保留原行为。[extract 模式与指标解释](docs/commands/extract.cn.md#如何理解输出指标)说明检索／分类指标、空间诊断、PCK 比例及量化限制；它们不是可互换的质量总分。
+
 <a id="doctor-command"></a>
 ## doctor 命令
 

@@ -1039,6 +1039,19 @@ def test_a_verified_payload_is_not_rehashed_when_its_handle_is_reopened(tmp_path
     assert len([size for size in hashed if size in payload_bytes]) == len(keys)
 
 
+def test_changed_payload_identity_is_checked_even_on_a_cached_handle(tmp_path):
+    root = tmp_path / "product"
+    build_product(root, keys=("a.png",))
+    with SpatialReader(root, _staging=True) as reader:
+        reader.get_view("a.png", "base")
+        relative = next(iter(reader._open_npz))
+        # A ZIP permits trailing bytes, so array digests alone cannot detect this.
+        with (root / relative).open("ab") as handle:
+            handle.write(b"changed sealed trailer")
+        with pytest.raises(SpatialRecordError, match="payload bytes do not match"):
+            reader.get_view("a.png", "base")
+
+
 def test_selector_overlay_reports_labels_without_rewriting_the_product(tmp_path):
     root = tmp_path / "product"
     build_product(root)
@@ -2030,5 +2043,138 @@ def test_a_tampered_plan_is_recomputed_not_trusted_from_its_counts(tmp_path):
         with pytest.raises(SpatialRecordError, match=message):
             open_spatial_product(root)
     store(original)
+    reader = open_spatial_product(root)
+    reader.close()
+
+
+def test_an_escaping_image_key_is_refused_at_both_boundaries(tmp_path):
+    """A key becomes a filesystem path for overlays, so it must stay relative."""
+    from otuformer.spatial.records import SpatialSample
+
+    for key in ("../outside.png", "/abs.png", "a/../b.png", "a//b.png", "C:/x.png"):
+        with pytest.raises(SpatialRecordError):
+            SpatialSample(
+                image_key=key, image_sha256="a" * 64, width=8, height=8
+            )
+    # The reader re-checks the stored index, not only the writer's records.
+    root = tmp_path / "product"
+    build_product(root)
+    index_path = root / "spatial_index.jsonl"
+    lines = [
+        json.loads(line)
+        for line in index_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    lines[0]["sample"]["image_key"] = "../outside.png"
+    payload = b"\n".join(
+        json.dumps(line, sort_keys=True).encode("utf-8") for line in lines
+    ) + b"\n"
+    index_path.write_bytes(payload)
+    manifest = _rewrite_manifest(root)
+    manifest["index"]["sha256"] = sha256_bytes(payload)
+    manifest["index"]["bytes"] = len(payload)
+    for item in manifest["files"]:
+        if item["path"] == "spatial_index.jsonl":
+            item["sha256"] = sha256_bytes(payload)
+            item["bytes"] = len(payload)
+    _store_manifest(root, manifest)
+    with pytest.raises(SpatialRecordError, match="canonical relative path"):
+        open_spatial_product(root)
+
+
+def test_sample_identity_and_trace_source_are_strict(tmp_path):
+    """A readable product's ids, digests, sizes and trace source agree."""
+    root = tmp_path / "product"
+    build_product(root)
+    original = (root / "spatial_index.jsonl").read_text(encoding="utf-8")
+
+    def store(lines):
+        payload = b"\n".join(
+            json.dumps(line, sort_keys=True).encode("utf-8") for line in lines
+        ) + b"\n"
+        (root / "spatial_index.jsonl").write_bytes(payload)
+        manifest = _rewrite_manifest(root)
+        manifest["index"]["sha256"] = sha256_bytes(payload)
+        manifest["index"]["bytes"] = len(payload)
+        for item in manifest["files"]:
+            if item["path"] == "spatial_index.jsonl":
+                item["sha256"] = sha256_bytes(payload)
+                item["bytes"] = len(payload)
+        _store_manifest(root, manifest)
+
+    def lines():
+        return [
+            json.loads(line)
+            for line in original.splitlines()
+            if line.strip()
+        ]
+
+    cases = (
+        ({"sample_id": 1.9}, "unusable sample id"),
+        ({"img": {"image_sha256": "not-a-digest"}}, "unusable image_sha256"),
+        ({"img": {"width": 0}}, "unusable sample width"),
+        (
+            {"sample": {"width": 1, "height": 1, "image_sha256": "a" * 64,
+                        "image_key": "a/one.png", "metadata": {}}},
+            "declares|traces a source",
+        ),
+    )
+    for patch, message in cases:
+        mutated = lines()
+        for name in ("sample_id", "sample"):
+            if name in patch:
+                mutated[0][name] = patch[name]
+        if "img" in patch:
+            mutated[0]["sample"].update(patch["img"])
+        store(mutated)
+        with pytest.raises(SpatialRecordError, match=message):
+            open_spatial_product(root)
+    # The untouched index still opens.
+    (root / "spatial_index.jsonl").write_text(original, encoding="utf-8")
+    store(lines())
+    reader = open_spatial_product(root)
+    reader.close()
+
+
+def test_every_view_of_a_key_must_share_one_sample_identity(tmp_path):
+    """A key describes one source image; its views cannot disagree about it."""
+    root = tmp_path / "product"
+    build_product(root, views_per_key=2)
+    original = (root / "spatial_index.jsonl").read_text(encoding="utf-8")
+
+    def store(lines):
+        payload = b"\n".join(
+            json.dumps(line, sort_keys=True).encode("utf-8") for line in lines
+        ) + b"\n"
+        (root / "spatial_index.jsonl").write_bytes(payload)
+        manifest = _rewrite_manifest(root)
+        manifest["index"]["sha256"] = sha256_bytes(payload)
+        manifest["index"]["bytes"] = len(payload)
+        for item in manifest["files"]:
+            if item["path"] == "spatial_index.jsonl":
+                item["sha256"] = sha256_bytes(payload)
+                item["bytes"] = len(payload)
+        _store_manifest(root, manifest)
+
+    def lines():
+        return [json.loads(line) for line in original.splitlines() if line.strip()]
+
+    cases = (
+        ({"sample_id": 2}, "disagree about their sample identity"),
+        ({"sample": {"image_sha256": "b" * 64}}, "disagree about their sample identity"),
+        ({"sample": {"metadata": {"label": "other"}}}, "disagree about their sample identity"),
+    )
+    for patch, message in cases:
+        mutated = lines()
+        second = mutated[1]
+        if "sample_id" in patch:
+            second["sample_id"] = patch["sample_id"]
+        else:
+            second["sample"].update(patch["sample"])
+        store(mutated)
+        with pytest.raises(SpatialRecordError, match=message):
+            open_spatial_product(root)
+    (root / "spatial_index.jsonl").write_text(original, encoding="utf-8")
+    store(lines())
     reader = open_spatial_product(root)
     reader.close()

@@ -4,7 +4,7 @@
 
 ## Purpose
 
-Extract embeddings from images with a trained checkpoint, producing the `embeddings.csv` that `cluster`, `diversity`, and `annotate` consume. It runs a PyTorch model or an exported ONNX model (2-5x faster on CPU). Three token modes are available — raw CLS, `patch-topk`, and `attention-pool` — and label-based quality metrics plus UMAP are written when labels are available.
+Extract image-level embedding vectors or spatial patch grids from a checkpoint/ONNX graph, or re-read a completed spatial product without inference. Embedding output writes `embeddings.csv` for `cluster`, `diversity`, and `annotate`; spatial output writes geometry, support and diagnostic records. Labels enable embedding-quality metrics; `--spatial-eval` enables same-image geometric correspondence. These measure different abilities.
 
 ## Usage
 
@@ -15,13 +15,27 @@ otuformer extract \
     --out-dir runs/extract
 ```
 
+| Mode | Minimum inputs | Output |
+| --- | --- | --- |
+| Embedding (default) | images + checkpoint or embedding ONNX | vectors, optional labelled metrics/UMAP |
+| Spatial image extraction | `--output-kind spatial`, images + checkpoint or spatial ONNX | grids, diagnostics, optional frozen correspondence |
+| Spatial read | `--output-kind spatial --spatial-input PRODUCT` | reports in a separate directory; no model needed |
+
+```bash
+otuformer extract --output-kind spatial --checkpoint model.pt --input-images-dir ./images --spatial-eval --out-dir runs/spatial
+otuformer extract --output-kind spatial --spatial-input runs/spatial --spatial-eval --out-dir runs/spatial_report
+otuformer extract --checkpoint model.pt --input-images-dir ./images --feature-layers blocks.5 --dump-model-structure --out-dir runs/layer5
+```
+
+No input option is required in every mode, so help has no universal required `*`; the mode-specific requirements above are enforced before output cleanup.
+
 ## Parameters
 
 ### `--checkpoint`
 
 **Default:** `None`
 
-Path to pretrain or finetune checkpoint. Required unless --onnx-path is provided.
+Pretrain/finetune checkpoint. Image extraction requires a checkpoint or ONNX; spatial read needs neither.
 
 ### `--input-images-dir`
 
@@ -43,9 +57,9 @@ Existing completed spatial product to read. Requires `--output-kind spatial`; no
 
 ### `--feature-layers`
 
-**Default:** `None` (last complete block)
+**Default:** `None` (spatial: last complete block; embedding: existing output path)
 
-Spatial only. Comma-separated backbone-relative complete block paths (for example 'blocks.5,blocks.11'). Omitted: the last complete block. Requested order is preserved; no ranges, duplicates or averaging.
+Complete backbone blocks. Spatial: ordered comma-separated paths, omitted means last block. Checkpoint embedding: exactly one block, final backbone norm then CLS; no projector/pooling. Omitted keeps legacy embedding behavior. No multi-layer embedding fusion. Use `blocks.5,blocks.11` for spatial or one `blocks.<index>` for embedding. Embedding requires `--token-mode cls`, rejects ONNX/patch-topk/attention-pool, and reads token zero before removing any prefixes. `--feature-norm`/`--feature-l2-normalize` remain spatial-only; selection adds no embedding L2.
 
 ### `--feature-norm`
 
@@ -69,7 +83,7 @@ Spatial extraction only. 'per-image' writes one uncompressed NPZ per sample; 'sh
 
 **Default:** `No`
 
-Enable frozen same-image cross-view correspondence (protocol spatial-geometry-v1). Rejected in this build until the evaluation task ships it; never silently skipped.
+Spatial only: evaluate frozen same-image cross-view correspondence (spatial-geometry-v1). Image mode saves paired views; read mode reuses the saved plan without model inference. A product without paired views cannot be evaluated by inventing missing views.
 
 ### `--spatial-eval-sample-size`
 
@@ -81,7 +95,7 @@ Spatial evaluation only. Maximum number of deterministically selected images for
 
 **Default:** `No`
 
-Checkpoint spatial only. Write backbone-relative module paths with their spatial eligibility to model_layers.txt, then continue. Explicit use in embedding output is rejected rather than silently ignored.
+Checkpoint embedding/spatial: write module paths and block eligibility to model_layers.txt, then continue extraction. Rejected for ONNX/read. Spatial and embedding-CLS eligibility are listed separately. This is not a model-only command: images remain required. The selected embedding layer is recorded in effective provenance for CSV/COCO runs.
 
 ### `--out-dir`
 
@@ -233,7 +247,7 @@ Device: auto / cpu / cuda / mps.
 
 **Default:** `None`
 
-Path to exported ONNX model for inference. When provided, uses ONNX Runtime instead of PyTorch. Only supports token-mode 'cls' (default). Overrides --checkpoint, --model-name, --use-student, and --device.
+Exported ONNX graph. Embedding: CLS graph output, legacy checkpoint override. Spatial: fixed multi-layer contract; cannot combine with checkpoint/model-name/use-student/dump overrides. Not used in spatial read. Explicit embedding layer selection/structure export are rejected; spatial contract overrides must exactly match the graph.
 
 ### `--seed`
 
@@ -293,7 +307,7 @@ otuformer extract \
     --input-images-dir ./images \
     --out-dir runs/extract
 
-# Using ONNX model (2-5x faster on CPU)
+# Using an exported embedding ONNX graph
 otuformer extract \
     --checkpoint runs/finetune/finetune_latest.pth \
     --input-images-dir ./images \
@@ -309,7 +323,61 @@ otuformer extract \
     --out-dir runs/extract
 ```
 
+<a id="understanding-the-output-metrics"></a>
 ## Notes
+
+### Understanding the output metrics
+
+Embedding and spatial evaluation answer different questions. Neither a high score nor a healthy tensor proves anatomical homology or independent-test generalization.
+
+### Embedding: `metrics.csv`
+
+These are the same metric implementations used by `pretrain` (`logs/metrics.pretrain.csv`) and `finetune` (`logs/metrics.finetune.csv`). Extract uses the selected, optionally subsampled labelled images. Training CSVs also carry epoch/split columns: always compare the same split and evaluation population. `metrics.csv` is written as `metric,value`; a value of `0.8` means 80% for rate metrics.
+
+| Field | Meaning and use | Interpretation |
+| --- | --- | --- |
+| `Recall@1`, `Recall@5`, `Recall@10` | Fraction of queries with at least one same-label image among the top-k cosine neighbours; the query itself is excluded. Measures retrieval success. | Higher is better, 0–1; singleton-label queries stay in the denominator and cannot succeed. |
+| `mAP` | Mean average precision of the full non-self cosine ranking; rewards placing all same-label images early. | Higher is better, 0–1; queries without any other same-label item are excluded. Different denominator from Recall. |
+| `kNN_Acc_k1/k5/k20` | Cosine k-nearest-neighbour classification accuracy under stratified cross-validation. | Higher is better, 0–1; tests label neighbourhoods, not an independently held-out backbone. |
+| `Linear_Probing_Acc` | Cross-validated logistic-regression accuracy on frozen vectors. | Higher is better, 0–1; tests linear label separation. |
+| `Linear_Probing_Balanced_Acc` | Mean per-class recall from the same linear-probe CV pass. | Higher is better, 0–1; more informative with unequal class counts. |
+| `NMI` | Normalized mutual information between labels and KMeans assignments. | Higher is better, 0–1. |
+| `ARI` / `AMI` | Chance-adjusted pair agreement / mutual information between labels and KMeans assignments. | Higher is better; 1 is perfect, about 0 is chance, negative values are possible. |
+| `Purity` | Fraction correct after assigning each KMeans cluster its majority label. | Higher is better, 0–1; depends on the chosen cluster count. |
+| `Silhouette_Score` | Cosine cohesion/separation using the true labels, not predicted KMeans labels. | −1 to 1; larger means better separation in this representation, not a universal pass mark. |
+
+KMeans uses L2-normalized vectors and as many clusters as observed label classes. CV uses shuffled stratified folds, seed 42, with `min(5, smallest class count)` folds. Invalid k, singleton classes or degenerate vectors can make a metric unavailable: empty CSV fields are not zero; shared-path provenance distinguishes unavailable from failed. `--metrics-sample-size` changes the scored population; `--disable-umap` disables the plot, not metrics. UMAP is a visualization, not an accuracy score. See [the shared embedding-metric contract](embedding-metrics.md) for availability and version rules. Image-level CV does not guarantee specimen/group-safe holdout; train-split results do not establish test generalization.
+
+### Spatial diagnostics: `spatial_results.csv`
+
+One row is an image × view × layer, including base and stored evaluation views. `spatial_diagnostics.json` holds summaries. These inspect values/support, not matching accuracy.
+
+| Fields | Meaning and use |
+| --- | --- |
+| `sample_id`, `image_key`, `view_id`, `role`, `layer` | Stable sample identity, view and feature source; group comparisons by these keys. |
+| `shape`, `grid_hw`, `dtype` | H×W×C feature shape, H×W patch lattice and stored numeric type. |
+| `finite_count`, `nonfinite_count` | Counts of token vectors, not channel scalars. Nonfinite features fail diagnostics rather than becoming a quality score. |
+| `zero_count`, `near_zero_norm_count` | Token norms equal to zero / at most 1e−12; flag unusable or nearly unusable vectors. |
+| `norm_min`, `norm_mean`, `norm_max` | Token L2 norm statistics. Unit norms are expected when export L2 is enabled and do not prove discriminative features. |
+| `channel_variance_mean` | Mean within-token variance over channels; not variance across positions/images and not a collapse test. |
+| `coverage_min`, `coverage_mean`, `coverage_full_valid_fraction` | Pixel-level geometric coverage and fraction fully covered. Not foreground occupancy. |
+| `pixel_valid_fraction`, `patch_valid_fraction` | Conservative sampling-valid pixels / fully valid patch footprints. Filling/interpolation can reduce support. |
+| `support_version` | Version of coverage/validity rules; compare compatible contracts. |
+
+### Spatial correspondence: `spatial_matches.csv` and `spatial_evaluation.json`
+
+`spatial_matches.csv` is one query × direction × transform × layer. `image_key`, `pair_id`, `direction`, `layer`, `query_index`, `row`, `column` identify the query. `candidate_count` counts geometrically valid target centres; `invalid_candidate_count` counts unusable candidate features. `match_status=matched` means a usable candidate was found, not that it was correct. `predicted_row/column` locate that candidate; `true_x/y` and `predicted_x/y` are in original-image coordinates.
+
+- `raw_error`: Euclidean distance in original-image pixels; lower is better.
+- `normalized_error`: `raw_error / hypot(original_width, original_height)`; lower is better. The denominator is the image diagonal, not the specimen length or bounding box.
+- `quantization_error`: minimum normalized error achievable by any valid target grid centre. It is a geometry-only lower bound, not model error; a coarse grid can make strict thresholds impossible.
+- `pck_0p01`, `pck_0p02`, `pck_0p05`: **per-query integer bits**, 1 when normalized error ≤ 1%/2%/5%, otherwise 0. Failed queries remain zero in the geometric denominator. Example: error `0.0246` yields `0,0,1`; averaging bits yields a rate, not another integer.
+
+The JSON publishes per-image rates first, then image macro averages per direction and equal-weight bidirectional `combined` rates when both directions exist. Thus `0.64` means 64%; a global CSV-row mean can differ from the published macro average. Families/layers stay separate: there is no pooled overall score. An unavailable no-overlap branch is not zero accuracy. Examine eligibility counts and quantization alongside PCK and error tails; no universal PCK threshold is good for every dataset. Compare identical images, query plans, feature contracts and baselines. Same-image geometric correspondence is not cross-specimen anatomical correspondence, classification or retrieval performance.
+
+Reports include geometric eligibility and overlay status. Optional `spatial_overlays/` figures use bounded flat SHA-256 key names; the figure title/report identifies the image. The reader verifies a payload once per size/mtime/inode identity while per-array digests remain checked; this assumes a read-only source directory, not hostile concurrent rewriting. Candidate geometry is reused within each direction without changing the frozen protocol.
+
+### Additional spatial contracts
 
 **Spatial output (`--output-kind spatial`).**
 

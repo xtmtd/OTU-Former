@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import warnings
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import numpy as np
 import onnx
@@ -154,6 +154,7 @@ def export_to_onnx(
     feature_norm: str | None = None,
     feature_l2_normalize: bool | None = None,
     use_student: bool = False,
+    prepared_spatial: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Export an encoder graph.
 
@@ -188,6 +189,7 @@ def export_to_onnx(
         feature_norm=feature_norm,
         feature_l2_normalize=feature_l2_normalize,
         use_student=use_student,
+        prepared=prepared_spatial,
     )
 
 
@@ -360,11 +362,87 @@ def read_spatial_onnx_contract(path: Path) -> Any:
             raise ValueError(
                 f"spatial graph layout must be BHWC, got {payload['layout']!r}"
             )
-        return FeatureContract.from_json(payload["contract"])
+        if payload["per_image_layout"] != "HWC":
+            raise ValueError(
+                "spatial graph per-image layout must be HWC, got "
+                f"{payload['per_image_layout']!r}"
+            )
+        contract = FeatureContract.from_json(payload["contract"])
+        _check_onnx_graph_contract(proto, contract, declared=payload["outputs"])
+        return contract
     raise ValueError(
         "this ONNX graph declares no spatial feature contract "
         f"({SPATIAL_ONNX_METADATA_KEY}); it can only be used by the embedding path"
     )
+
+
+def _check_onnx_graph_contract(proto, contract, *, declared) -> None:
+    """Validate metadata and graph I/O against each other before any run.
+
+    A declared output list, input rank/dtype or output shape that contradicts the
+    graph turns every later use into a mysterious runtime failure; checking them
+    here makes the graph self-describing or plainly rejected.
+    """
+    expected_names = [
+        spatial_output_name(index) for index in range(len(contract.layers))
+    ]
+    if list(declared) != expected_names:
+        raise ValueError(
+            f"spatial graph metadata declares outputs {list(declared)}, but its "
+            f"contract produces {expected_names}"
+        )
+    inputs = list(proto.graph.input)
+    if len(inputs) != 1 or inputs[0].name != "input":
+        raise ValueError(
+            "spatial graph must have exactly one input named 'input', got "
+            f"{[item.name for item in inputs]}"
+        )
+    tensor = inputs[0].type.tensor_type
+    dimensions = tensor.shape.dim
+    if len(dimensions) != 4:
+        raise ValueError(
+            f"spatial graph input must be rank 4 (BCHW), got {len(dimensions)}"
+        )
+    if tensor.elem_type != onnx.TensorProto.FLOAT:
+        raise ValueError(
+            "spatial graph input must be float32, got element type "
+            f"{tensor.elem_type}"
+        )
+    channels = dimensions[1].dim_value
+    height, width = (int(v) for v in contract.input_hw)
+    if channels != 3:
+        raise ValueError(f"spatial graph input must have 3 channels, got {channels}")
+    declared_hw = (dimensions[2].dim_value, dimensions[3].dim_value)
+    if declared_hw != (height, width):
+        raise ValueError(
+            f"spatial graph input size {declared_hw} does not match the contract "
+            f"canvas {(height, width)}"
+        )
+    outputs = {output.name: output for output in proto.graph.output}
+    if sorted(outputs) != sorted(expected_names):
+        raise ValueError(
+            f"spatial graph outputs {sorted(outputs)} do not match the metadata "
+            f"{expected_names}"
+        )
+    for layer, name in zip(contract.layers, expected_names):
+        output = outputs[name].type.tensor_type
+        expected = [
+            "batch",
+            int(layer.grid_hw[0]),
+            int(layer.grid_hw[1]),
+            int(layer.channels),
+        ]
+        actual = [dim.dim_param or int(dim.dim_value) for dim in output.shape.dim]
+        if actual != expected:
+            raise ValueError(
+                f"spatial graph output {name} declares shape {actual}, but its "
+                f"contract layer is {expected} (batch, grid_h, grid_w, channels)"
+            )
+        if output.elem_type != onnx.TensorProto.FLOAT:
+            raise ValueError(
+                f"spatial graph output {name} must be float32, got element type "
+                f"{output.elem_type}"
+            )
 
 
 def validate_spatial_onnx_outputs(
@@ -471,18 +549,23 @@ def validate_spatial_onnx_outputs(
     }
 
 
-def _export_spatial(
+def _prepare_spatial_export(
     checkpoint_path: Path,
-    out_path: Path,
     *,
-    imgsz: int | None = None,
-    opset: int = 18,
-    model_name: str = "vit_tiny_patch16_224",
-    feature_layers: str | None = None,
-    feature_norm: str | None = None,
-    feature_l2_normalize: bool | None = None,
-    use_student: bool = False,
+    imgsz: int | None,
+    model_name: str,
+    feature_layers: str | None,
+    feature_norm: str | None,
+    feature_l2_normalize: bool | None,
+    use_student: bool,
 ) -> dict[str, Any]:
+    """Resolve the checkpoint capability and layer contract, writing nothing.
+
+    A spatial request can be rejected on its own arguments (an unknown layer, an
+    unsupported backbone, a size the contract cannot tile). Doing that here lets a
+    caller check the request *before* it clears an existing output, so a rejected
+    argument cannot delete an earlier graph.
+    """
     from otuformer.constants import IMAGENET_MEAN, IMAGENET_STD
     from otuformer.data.provenance import sha256_bytes
     from otuformer.vision.features import (
@@ -496,15 +579,15 @@ def _export_spatial(
     architecture = resolve_checkpoint(
         ckpt, model_name, prefer_student=bool(use_student)
     )
-    model_name = architecture.model_name
+    resolved_model_name = architecture.model_name
     checkpoint_size = resolve_training_image_size(ckpt)
     model, architecture = load_checkpoint_encoder(
         ckpt, architecture, image_size=checkpoint_size
     )
-    validate_input_size(checkpoint_size, model, model_name)
+    validate_input_size(checkpoint_size, model, resolved_model_name)
     model.eval()
     size = checkpoint_size if imgsz is None else int(imgsz)
-    validate_input_size(size, model, model_name)
+    validate_input_size(size, model, resolved_model_name)
     layers = resolve_feature_layers(model.backbone, feature_layers)
     contract = resolve_feature_contract(
         model,
@@ -513,7 +596,7 @@ def _export_spatial(
         norm=feature_norm or "backbone",
         l2=bool(feature_l2_normalize),
         model_identity={
-            "architecture": model_name,
+            "architecture": resolved_model_name,
             "checkpoint_sha256": sha256_bytes(checkpoint_path.read_bytes()),
             "weight_source": architecture.source_key,
             "register_tokens": architecture.actual_register_tokens,
@@ -527,7 +610,47 @@ def _export_spatial(
         },
     )
     forward = SpatialFeatureForward(model, contract)
-    module = _SpatialExportModule(model, forward).eval()
+    return {
+        "model_name": resolved_model_name,
+        "architecture": architecture,
+        "model": model,
+        "size": size,
+        "contract": contract,
+        "forward": forward,
+        "module": _SpatialExportModule(model, forward).eval(),
+    }
+
+
+def _export_spatial(
+    checkpoint_path: Path,
+    out_path: Path,
+    *,
+    imgsz: int | None = None,
+    opset: int = 18,
+    model_name: str = "vit_tiny_patch16_224",
+    feature_layers: str | None = None,
+    feature_norm: str | None = None,
+    feature_l2_normalize: bool | None = None,
+    use_student: bool = False,
+    prepared: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    checkpoint_path = Path(checkpoint_path)
+    if prepared is None:
+        prepared = _prepare_spatial_export(
+            checkpoint_path,
+            imgsz=imgsz,
+            model_name=model_name,
+            feature_layers=feature_layers,
+            feature_norm=feature_norm,
+            feature_l2_normalize=feature_l2_normalize,
+            use_student=use_student,
+        )
+    model_name = prepared["model_name"]
+    architecture = prepared["architecture"]
+    size = int(prepared["size"])
+    contract = prepared["contract"]
+    forward = prepared["forward"]
+    module = prepared["module"]
     output_names = [
         spatial_output_name(index) for index in range(len(contract.layers))
     ]

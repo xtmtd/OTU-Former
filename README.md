@@ -73,7 +73,7 @@ otuformer extract --checkpoint runs/finetune/finetune_latest.pth \
 otuformer cluster --embeddings runs/extract/embeddings.csv --out-dir runs/cluster
 ```
 
-Every command has its own reference document; they are linked from the table at the end of this file, and `otuformer <command> --help` shows the same link.
+Every command has its own reference document; see the table below or `otuformer <command> --help`. `extract` defaults to embedding vectors; `--output-kind spatial --spatial-eval` writes patch grids and same-image correspondence, while `--spatial-input PRODUCT` with spatial output reads reports without a model. Checkpoint extraction shares `--dump-model-structure`; embedding `--feature-layers blocks.5` selects one final-norm CLS layer, with omission unchanged. See [extract modes and metric interpretation](docs/commands/extract.md#understanding-the-output-metrics) for distinct embedding/spatial metrics and quantization limits.
 
 <a id="doctor-command"></a>
 ## Doctor Command

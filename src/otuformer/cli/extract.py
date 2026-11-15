@@ -20,14 +20,13 @@ from otuformer.constants import EVAL_TRANSFORM_CHOICES
 
 app = typer.Typer(
     help=(
-        "Extract embeddings from images.\n\n"
-        "Runs a trained model (PyTorch checkpoint or ONNX) over an image directory and\n"
-        "produces a CSV with embedding vectors. Supports multiple token modes (CLS,\n"
-        "patch-topk, attention-pool) and optional UMAP visualization.\n\n"
-        "Quick example:\n\n"
-        "  otuformer extract --checkpoint runs/finetune/best.pt --input-images-dir ./images\n"
-        "  otuformer extract --checkpoint runs/finetune/best.pt --input-images-dir ./images --label-csv labels.csv --token-mode attention-pool\n"
-        "  otuformer extract --onnx-path runs/export/encoder.onnx --input-images-dir ./images\n"
+        "Extract embedding vectors or spatial patch grids; re-read saved spatial products.\n\n"
+        "Modes: embedding (default) needs images + checkpoint/ONNX; spatial image mode\n"
+        "needs images + one model; spatial read needs only --spatial-input.\n\n"
+        "Minimal examples:\n\n"
+        "  otuformer extract --checkpoint model.pt --input-images-dir ./images --out-dir runs/vectors\n"
+        "  otuformer extract --output-kind spatial --checkpoint model.pt --input-images-dir ./images --spatial-eval --out-dir runs/spatial\n"
+        "  otuformer extract --output-kind spatial --spatial-input runs/spatial --spatial-eval --out-dir runs/report\n"
         "\nDocs:\n"
         f"  {docs_url('extract')}\n"
     )
@@ -185,79 +184,74 @@ def _run_spatial(ctx: typer.Context, values: dict) -> None:
         request.close()
         raise typer.BadParameter(str(error)) from None
 
-    tee = TeeLogger(out_dir / "logs" / "extract.log")
-    original_stdout, original_stderr = sys.stdout, sys.stderr
-    sys.stdout = tee
-    sys.stderr = tee
     from datetime import datetime, timezone
-
-    started = datetime.now(timezone.utc).isoformat()
-    result: dict | None = None
-    failure: dict | None = None
-    try:
-        print(f"Command: {cli_command}")
-        print("Parameters:")
-        print(json.dumps(log_values, ensure_ascii=False, indent=2, sort_keys=True))
-        print("-" * 80)
-        runner = (
-            reevaluate_spatial
-            if request.mode == "read"
-            else extract_spatial
-        )
-        result = runner(request, defer_publication=True)
-        print("Resolved:")
-        print(
-            json.dumps(
-                result.get("envelope", {}).get("effective", {}),
-                ensure_ascii=False,
-                indent=2,
-                sort_keys=True,
-                default=str,
-            )
-        )
-    except KeyboardInterrupt:
-        failure = {"reason": "interrupted by the user", "type": "KeyboardInterrupt"}
-    except Exception as error:  # noqa: BLE001 - recorded, then re-raised
-        failure = {"reason": str(error), "type": type(error).__name__}
-    finally:
-        sys.stdout = original_stdout
-        sys.stderr = original_stderr
-        try:
-            tee.close()
-        finally:
-            pass
-
-    if result is not None and failure is None:
-        envelope = result["envelope"]
-        published = publish_spatial_run(out_dir, envelope, include_log=True)
-        request.close()
-        product_id = result.get("manifest", {}).get("product_id", "")
-        print(f"Spatial product written to {out_dir}")
-        print(f"Product id: {product_id}")
-        return
-
     from otuformer.data.provenance import build_spatial_run_record
 
-    status = "interrupted" if (failure or {}).get("type") == "KeyboardInterrupt" else "failed"
-    record = build_spatial_run_record(
-        requested={"cli_command": cli_command, **log_values},
-        bundle=None,
-        source_product=request.source_product,
-        effective={"status": status, "mode": request.mode},
-        used_files=request.protected_files,
-        evaluation=None,
-        status=status,
-        started_at=started,
-        ended_at=None,
-        artifacts=[],
-        failure=failure,
-    )
-    publish_spatial_run(out_dir, record, include_log=True)
-    request.close()
-    if status == "interrupted":
-        raise typer.Exit(code=130)
-    message = (failure or {}).get("reason", "spatial extraction failed")
-    raise typer.BadParameter(message)
+    started = datetime.now(timezone.utc).isoformat()
+    original_stdout, original_stderr = sys.stdout, sys.stderr
+    tee = None
+    failure: dict | None = None
+    result: dict | None = None
+    try:
+        try:
+            tee = TeeLogger(out_dir / "logs" / "extract.log")
+            sys.stdout = tee
+            sys.stderr = tee
+            print(f"Command: {cli_command}")
+            print("Parameters:")
+            print(json.dumps(log_values, ensure_ascii=False, indent=2, sort_keys=True))
+            print("-" * 80)
+            runner = reevaluate_spatial if request.mode == "read" else extract_spatial
+            result = runner(request, defer_publication=True)
+            print("Resolved:")
+            print(json.dumps(
+                result.get("envelope", {}).get("effective", {}),
+                ensure_ascii=False, indent=2, sort_keys=True, default=str,
+            ))
+        except (Exception, KeyboardInterrupt) as error:
+            failure = {"reason": str(error), "type": type(error).__name__}
+        finally:
+            sys.stdout = original_stdout
+            sys.stderr = original_stderr
+            if tee is not None:
+                try:
+                    tee.close()
+                except (Exception, KeyboardInterrupt) as error:
+                    if failure is None:
+                        failure = {"reason": str(error), "type": type(error).__name__}
+
+        if result is not None and failure is None:
+            try:
+                publish_spatial_run(out_dir, result["envelope"], include_log=True)
+            except (Exception, KeyboardInterrupt) as error:
+                failure = {"reason": str(error), "type": type(error).__name__}
+            else:
+                product_id = result.get("manifest", {}).get("product_id", "")
+                print(f"Spatial product written to {out_dir}")
+                print(f"Product id: {product_id}")
+                return
+
+        status = "interrupted" if (failure or {}).get("type") == "KeyboardInterrupt" else "failed"
+        record = build_spatial_run_record(
+            requested={"cli_command": cli_command, **log_values},
+            bundle=None,
+            source_product=request.source_product,
+            effective={"status": status, "mode": request.mode},
+            used_files=request.protected_files,
+            evaluation=None,
+            status=status,
+            started_at=started,
+            ended_at=datetime.now(timezone.utc).isoformat(),
+            artifacts=[],
+            failure=failure,
+        )
+        publish_spatial_run(out_dir, record, include_log=True)
+        if status == "interrupted":
+            raise typer.Exit(code=130)
+        message = (failure or {}).get("reason", "spatial extraction failed")
+        raise typer.BadParameter(message)
+    finally:
+        request.close()
 
 @app.callback(invoke_without_command=True)
 def extract(
@@ -330,17 +324,16 @@ def extract(
     checkpoint: Path | None = typer.Option(
         None,
         "--checkpoint",
-        help="Path to pretrain or finetune checkpoint. Required unless --onnx-path is provided.",
+        help="Pretrain/finetune checkpoint. Image extraction requires a checkpoint or ONNX; spatial read needs neither.",
         rich_help_panel="Model and feature source",
     ),
     onnx_path: Path | None = typer.Option(
         None,
         "--onnx-path",
         help=(
-            "Path to exported ONNX model for inference. "
-            "When provided, uses ONNX Runtime instead of PyTorch. "
-            "Only supports token-mode 'cls' (default). "
-            "Overrides --checkpoint, --model-name, --use-student, and --device."
+            "Exported ONNX graph. Embedding: CLS graph output, legacy checkpoint "
+            "override. Spatial: fixed multi-layer contract; cannot combine with "
+            "checkpoint/model-name/use-student/dump overrides. Not used in spatial read."
         ),
         rich_help_panel="Model and feature source",
     ),
@@ -362,9 +355,10 @@ def extract(
         None,
         "--feature-layers",
         help=(
-            "Spatial only. Comma-separated backbone-relative complete block paths "
-            "(for example 'blocks.5,blocks.11'). Omitted: the last complete block. "
-            "Requested order is preserved; no ranges, duplicates or averaging."
+            "Complete backbone blocks. Spatial: ordered comma-separated paths, "
+            "omitted means last block. Checkpoint embedding: exactly one block, "
+            "final backbone norm then CLS; no projector/pooling. Omitted keeps "
+            "legacy embedding behavior. No multi-layer embedding fusion."
         ),
         rich_help_panel="Model and feature source",
     ),
@@ -400,8 +394,8 @@ def extract(
         False,
         "--dump-model-structure",
         help=(
-            "Checkpoint spatial only. Write backbone-relative module paths with "
-            "their spatial eligibility to model_layers.txt, then continue."
+            "Checkpoint embedding/spatial: write module paths and block eligibility "
+            "to model_layers.txt, then continue extraction. Rejected for ONNX/read."
         ),
         rich_help_panel="Model and feature source",
     ),
@@ -514,9 +508,9 @@ def extract(
         False,
         "--spatial-eval",
         help=(
-            "Enable frozen same-image cross-view correspondence "
-            "(protocol spatial-geometry-v1). Rejected in this build until the "
-            "evaluation task ships it; never silently skipped."
+            "Spatial only: evaluate frozen same-image cross-view correspondence "
+            "(spatial-geometry-v1). Image mode saves paired views; read mode reuses "
+            "the saved plan without model inference."
         ),
         rich_help_panel="Spatial evaluation and diagnostics",
     ),
@@ -549,6 +543,19 @@ def extract(
 ) -> None:
     if ctx.invoked_subcommand is not None:
         return
+
+    if output_kind != "spatial":
+        from otuformer.spatial.request import validate_extract_mode_options
+
+        try:
+            validate_extract_mode_options(
+                dict(output_kind=output_kind, spatial_input=spatial_input,
+                     feature_layers=feature_layers, onnx_path=onnx_path,
+                     token_mode=token_mode, use_projector_output=use_projector_output),
+                explicit_options=_cli_explicit_options(ctx, ctx.params),
+            )
+        except ValueError as error:
+            raise typer.BadParameter(str(error)) from None
 
     if spatial_input is not None and output_kind != "spatial":
         raise typer.BadParameter(
@@ -640,6 +647,8 @@ def extract(
             use_projector_output=use_projector_output,
             use_student=use_student,
             token_mode=token_mode,
+            feature_layers=feature_layers,
+            dump_model_structure=dump_model_structure,
             topk_patches=topk_patches,
             attention_pooling_type=attention_pooling_type,
             attention_pooling_epochs=attention_pooling_epochs,
@@ -705,6 +714,10 @@ def extract(
             "checkpoint": checkpoint, "onnx_path": onnx_path,
             "token_mode": token_mode, "attention_pooling_type": attention_pooling_type,
             "extract_size": requested_size,
+            "feature_layers": feature_layers,
+            "use_projector_output": use_projector_output,
+            "use_student": use_student,
+            "model_name": model_name,
         })
         selected_images = extraction_image_paths(input_images_dir, label_csv)
     except (ValueError, OSError) as error:
@@ -771,6 +784,8 @@ def extract(
             use_projector_output=use_projector_output,
             use_student=use_student,
             token_mode=token_mode,
+            feature_layers=feature_layers,
+            dump_model_structure=dump_model_structure,
             topk_patches=topk_patches,
             attention_pooling_type=attention_pooling_type,
             attention_pooling_epochs=attention_pooling_epochs,
@@ -814,6 +829,8 @@ def extract(
             attention_pooling_checkpoint_path=attention_pooling_checkpoint,
             onnx_path=onnx_path,
             eval_transform=eval_transform,
+            **({"feature_layers": feature_layers} if feature_layers is not None else {}),
+            **({"model_structure_path": out_dir / "model_layers.txt"} if dump_model_structure else {}),
         )
         out_path = out_dir / "embeddings.csv"
         write_csv(df, out_path)
@@ -1199,6 +1216,18 @@ def _preflight_extract_model(settings: dict, *, check_size: bool = True) -> None
             raise ValueError("--checkpoint is required when --onnx-path is not provided.")
         if not Path(checkpoint).is_file():
             raise FileNotFoundError(f"Checkpoint not found: {checkpoint}")
+        if settings.get("feature_layers") is not None and check_size:
+            from otuformer.embedding.extractor import _load_model
+            from otuformer.vision.features import resolve_feature_layers
+            import torch
+
+            model, _ = _load_model(
+                Path(checkpoint), settings.get("model_name", "vit_tiny_patch16_224"),
+                torch.device("cpu"), use_student=settings.get("use_student", False),
+            )
+            resolve_feature_layers(model.backbone, settings["feature_layers"])
+            if getattr(model.backbone, "cls_token", None) is None:
+                raise ValueError("embedding --feature-layers requires a backbone CLS token")
 
 
 def _run_new_data_path(*, settings: dict, inputs: dict[str, Path], params: dict) -> None:
@@ -1397,9 +1426,14 @@ def _run_new_data_path(*, settings: dict, inputs: dict[str, Path], params: dict)
             onnx_path=settings["onnx_path"],
             eval_transform=settings["eval_transform"],
             records=bundle,
+            **({"feature_layers": settings["feature_layers"]} if settings.get("feature_layers") is not None else {}),
+            **({"model_structure_path": out_dir / "model_layers.txt"} if settings.get("dump_model_structure") else {}),
         )
         frame = result.frame
         state["execution"] = result
+        model_report = result.effective.get("model_structure")
+        if model_report:
+            created.append(Path(model_report))
         # A pooling checkpoint written by this run is an output, not an input. It is
         # registered as created (so a failure removes it) and published in the final
         # provenance, which is the only record of which reusable weights this run
@@ -1460,6 +1494,7 @@ def _run_new_data_path(*, settings: dict, inputs: dict[str, Path], params: dict)
                 metrics_path,
                 out_dir / "umap.pdf" if Path(out_dir / "umap.pdf").exists() else None,
                 Path(written_pool) if pooling_created else None,
+                Path(model_report) if model_report else None,
             )
             if path is not None and Path(path).exists()
         ]

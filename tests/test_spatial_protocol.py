@@ -36,7 +36,7 @@ def contract(grid=2, channels=4, image_size=32) -> FeatureContract:
         patch_hw=(image_size // grid, image_size // grid),
         prefix_tokens=1,
         norm="backbone",
-        norm_module=None,
+        norm_module={"path": "norm", "qualname": "timm.layers.norm.LayerNorm"},
         l2=False,
         epsilon=1e-12,
         normalization={"mean": [0.5, 0.5, 0.5], "std": [0.5, 0.5, 0.5]},

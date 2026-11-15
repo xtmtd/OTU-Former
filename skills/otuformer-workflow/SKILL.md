@@ -82,6 +82,25 @@ step at a time. Never run an analysis because this Skill was loaded.
    extraction directory named by the report's `source_product`. Report
    coverage/validity support as geometry, not foreground, and never present
    diagnostics as correspondence quality.
+11. **Resolve checkpoint discovery and embedding layers explicitly.**
+    `--dump-model-structure` is shared by checkpoint embedding/spatial extraction;
+    it writes `model_layers.txt` and continues, requiring images. ONNX/read reject
+    it. Embedding `--feature-layers` means one single complete block with
+    checkpoint CLS output after the final backbone norm; reject projector,
+    patch-topk, attention-pool and multi-layer requests. Omission preserves the
+    existing vector path; never invent layer fusion or add spatial normalization
+    flags to embedding commands.
+12. **Read metrics at their own level.** Use the English/Chinese metric reference
+    in `docs/commands/extract.md` and `docs/commands/extract.cn.md`. Embedding
+    `metrics.csv` shares definitions with pretrain/finetune, but compare the same
+    population/split and do not call train-image CV independent-test performance.
+    Spatial diagnostics inspect numeric/support health, not foreground or
+    accuracy. In `spatial_matches.csv`, PCK columns are per-query 0/1 bits;
+    `spatial_evaluation.json` publishes image macro rates and equal-direction
+    combinations separately per transform/layer. Compare quantization lower
+    bounds and eligibility counts before judging strict PCK thresholds. Neither
+    matched status nor unit norms prove anatomical correspondence or absence of
+    collapse; do not pool all transform families into an invented overall score.
 
 Read-only inspection (schema, `--help`, logs, existing results) needs no
 approval. Analysis, installation, and version changes always do.

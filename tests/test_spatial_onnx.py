@@ -6,6 +6,7 @@ physical bytes and the backend identity differ.
 
 from __future__ import annotations
 
+import csv
 import json
 import shutil
 from pathlib import Path
@@ -18,6 +19,7 @@ from typer.testing import CliRunner
 
 from otuformer.cli.main import app
 from otuformer.spatial.diagnostics import diagnose_views
+from otuformer.spatial.records import FILENAME_MATCHES
 from otuformer.spatial.extractor import (
     SpatialRequestError,
     extract_spatial,
@@ -198,6 +200,63 @@ def test_onnx_and_checkpoint_share_spatial_product_semantics(tmp_path, graph, la
     assert checkpoint_result["manifest"]["product_id"] != (
         onnx_result["manifest"]["product_id"]
     )
+
+
+def test_paired_onnx_and_checkpoint_evaluation_matches_per_query(tmp_path, graph):
+    """The paired product must score the same way through both backends."""
+    checkpoint, onnx_path = graph
+    # Square, uniformly coloured image: the pad view keeps real content, so a
+    # constant image cannot collapse geometric eligibility to zero queries.
+    images = tmp_path / "images"
+    images.mkdir()
+    Image.new("RGB", (32, 32), (20, 60, 90)).save(images / "a.png")
+    shared = dict(
+        input_images_dir=str(images),
+        feature_layers="blocks.0,blocks.11",
+        spatial_eval=True,
+        spatial_eval_sample_size=1,
+    )
+    checkpoint_result = run_backend(
+        tmp_path,
+        values=base_values(
+            tmp_path,
+            checkpoint=str(checkpoint),
+            out_dir=str(tmp_path / "ckpt-eval"),
+            **shared,
+        ),
+        explicit=["checkpoint", "input_images_dir", "feature_layers"],
+    )
+    onnx_result = run_backend(
+        tmp_path,
+        values=base_values(
+            tmp_path,
+            onnx_path=str(onnx_path),
+            out_dir=str(tmp_path / "onnx-eval"),
+            **shared,
+        ),
+        explicit=["onnx_path", "input_images_dir"],
+    )
+    assert checkpoint_result["evaluation"]["status"] == "completed"
+    assert onnx_result["evaluation"]["status"] == "completed"
+
+    def matches(result):
+        with (Path(result["out_dir"]) / FILENAME_MATCHES).open(encoding="utf-8") as handle:
+            return list(csv.DictReader(handle))
+
+    left, right = matches(checkpoint_result), matches(onnx_result)
+    assert len(left) == len(right) > 0
+    for one, two in zip(left, right):
+        # The plan is identical (same seed, protocol, geometry), so the matched
+        # candidate and its status must agree query for query.
+        for field in ("image_key", "pair_id", "direction", "layer", "row", "column"):
+            assert one[field] == two[field]
+        assert one["match_status"] == two["match_status"]
+        assert one["predicted_row"] == two["predicted_row"]
+        assert one["predicted_column"] == two["predicted_column"]
+        for field in ("true_x", "true_y", "predicted_x", "predicted_y"):
+            assert float(one[field]) == pytest.approx(float(two[field]), abs=1e-4)
+        for field in ("raw_error", "normalized_error"):
+            assert float(one[field]) == pytest.approx(float(two[field]), abs=1e-4)
 
 
 def test_onnx_normalization_and_l2_come_from_the_graph(tmp_path, graph):

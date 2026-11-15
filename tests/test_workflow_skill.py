@@ -55,6 +55,15 @@ FORBIDDEN_BODY_FEATURES = (
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 
 
+def test_extract_guidance_distinguishes_layer_selection_and_metric_levels():
+    text = skill_text()
+    assert "checkpoint CLS" in text
+    assert "single complete block" in text
+    assert "per-query 0/1" in text
+    assert "quantization" in text
+    assert "docs/commands/extract" in text
+
+
 def skill_text() -> str:
     return (SKILL / "SKILL.md").read_text(encoding="utf-8")
 

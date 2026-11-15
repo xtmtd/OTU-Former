@@ -35,7 +35,7 @@ def contract(image_size=64, patch=16, channels=3, layers=("blocks.0", "blocks.1"
         patch_hw=(patch, patch),
         prefix_tokens=1,
         norm="backbone",
-        norm_module=None,
+        norm_module={"path": "norm", "qualname": "timm.layers.norm.LayerNorm"},
         l2=False,
         epsilon=1e-12,
         normalization={"mean": [0.5, 0.5, 0.5], "std": [0.5, 0.5, 0.5]},
