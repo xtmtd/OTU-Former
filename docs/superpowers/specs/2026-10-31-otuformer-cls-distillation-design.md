@@ -16,7 +16,7 @@ Approaches discussed:
 
 Within DINO, keep EMA centering and no KoLeo as the default baseline. Offer Sinkhorn-Knopp (SK) teacher assignments and a KoLeo regularizer as two independent, non-default options. Do not create complete DINOv2/DINOv3 recipe modes or claim that adding these mechanisms reproduces those systems.
 
-The existing global morphological barcode -> distance -> UPGMA -> morphOTU workflow remains the downstream purpose. Prototype indices are not species, anatomical parts, or OTUs. Coordinate development resumes separately from its [temporary notes](2026-10-31-otuformer-coordinate-temporary-design.md); it is not implemented here.
+The existing global morphological barcode -> distance -> UPGMA -> morphOTU workflow remains the downstream purpose. Prototype indices are not species, anatomical parts, or OTUs. Coordinate/ranking development is recorded in the [unified consistency design](2026-11-15-otuformer-coordinate-ranking-consistency-design.md); neither objective is implemented by this CLS design.
 
 ## 2. Confirmed command and method contract
 

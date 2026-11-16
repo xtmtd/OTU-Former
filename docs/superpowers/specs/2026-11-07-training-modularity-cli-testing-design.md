@@ -7,6 +7,8 @@ Authorization: the operator approved the written design and authorized implement
 
 Development-document language: English only for new local design specs, execution plans, and developer guides; no Chinese counterpart is required. This operator-directed exception applies to local development documentation, not a translation or deletion of existing user-facing README/command documents.
 
+**Dated follow-up (2026-11-15):** the [unified Coordinate/ranking design](2026-11-15-otuformer-coordinate-ranking-consistency-design.md) adds two optional dense objectives through these existing owners (`pretrain_recipe` resolution/recovery, one `pretrain_loop` step, `reporting` header migration). It creates no second trainer and does not change the rules above.
+
 ## 1. Intent and agreed direction
 
 Reduce the cost of extending training, finding CLI options, and validating small changes without weakening experiment recovery or filesystem safety. The operator selected responsibility-based modularization, a shared pretrain KoLeo regularizer for relational and DINO, complete task-grouped help with individually reviewed shortening, and impact-based verification with full regression at meaningful gates.
@@ -129,15 +131,15 @@ Native panel order follows the first option declaration assigned to each panel; 
 | Input and output | `--train-data`, `--input-images-dir`, `--out-dir` |
 | Model | `--model-name`, `--register-tokens`, `--out-dim` |
 | CLS objective | `--ssl-method` |
-| Relational targets | `--relational-teacher-views`, `--relational-center-source`, `--relational-pairing` |
+| Relational targets | `--relational-teacher-views`, `--relational-center-source`, `--relational-pairing`, `--relational-queue-size` |
 | DINO targets | `--dino-prototypes`, `--dino-centering` |
 | Shared regularization | `--koleo-weight` |
-| Patch objective | `--patch-loss`, `--masking-strategy`, `--mask-ratio`, `--ibot-prototypes`, `--lambda-mask` |
+| Patch objectives | `--patch-loss`, `--masking-strategy`, `--mask-ratio`, `--ibot-prototypes`, `--lambda-mask`, `--coordinate-weight`, `--dense-query-points`, `--ranking-weight`, `--ranking-reference-points` |
 | Views and augmentation | `--augmentation`, `--orientation-policy`, `--global-crop-size`, `--local-crop-size`, `--local-crops`, `--lambda-local` |
 | Optimization and teacher | `--max-epochs`, `--lr`, `--weight-decay`, `--no-norm-bias-weight-decay`, `--warmup-epochs`, `--teacher-momentum`, `--teacher-momentum-end`, `--student-temp`, `--teacher-temp-start`, `--teacher-temp-end`, `--teacher-temp-warmup-ratio` |
 | Evaluation and reporting | `--log-every-n-steps`, `--save-every-epochs`, `--keep-last-checkpoints`, `--visualize-data`, `--extract-size`, `--metrics-sample-size`, `--umap-n-neighbors`, `--umap-min-dist`, `--umap-metric`, `--visualize-class-number`, `--disable-embedding-metrics` |
 | Runtime and reproducibility | `--batch-size`, `--num-workers`, `--cpus`, `--device`, `--seed` |
-| Recovery and safety | `--resume`, `--overwrite` |
+| Recovery and safety | `--init-checkpoint`, `--init-source`, `--resume`, `--overwrite` |
 
 ### Finetune panel inventory
 

@@ -9,6 +9,8 @@ This document records the agreed design for upgrading OTU-Former's patch-level
 pretraining objectives and masking strategies. It was reviewed and approved,
 then implemented as described above.
 
+**Dated follow-up (2026-11-15):** the [Coordinate/ranking design](2026-11-15-otuformer-coordinate-ranking-consistency-design.md) consumes the ordinary unmasked patch tokens and coexistence with all four `patch_loss` modes; the masked/iBOT branches here are unchanged.
+
 ## 1. Context
 
 The current pretraining loop combines global and local teacher-student losses

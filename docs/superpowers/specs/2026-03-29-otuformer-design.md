@@ -170,6 +170,8 @@ All parameters migrated from `ref/ibot20260115.py` `get_parser()`, mode=pretrain
 - `--model-name` : a `vit_*` name alone does not establish compatibility (see Section 4.9)
 - Transform-level profile definitions live in [`2026-09-07-otuformer-training-augmentation-design.md`](2026-09-07-otuformer-training-augmentation-design.md).
 
+**Proposed dense extension (2026-11-15):** the [unified Coordinate and NeCo-style ranking design](2026-11-15-otuformer-coordinate-ranking-consistency-design.md) records independently weighted optional objectives, a shared geometry-aware training handoff and backbone-only new-run initialization. It is a draft for review, not implemented flags or a replacement for the existing mutually exclusive patch modes; full-design, plan and execution approvals remain separate.
+
 **Design history:**
 [pretrain alignment](2026-03-30-otuformer-pretrain-alignment-design.md),
 [v0.6 masked pretraining](2026-09-20-otuformer-masked-pretrain-v070-design.md)

@@ -148,6 +148,74 @@ Local crop resolution. Omit to use 96 for a new run or inherit the checkpoint va
 
 Number of local crops. Omit to use 6 for a new run or inherit the checkpoint value on --resume.
 
+### `--init-checkpoint`
+
+**Default:** `""` (omitted)
+
+Start a NEW run from a recognized OTU SSL checkpoint, transferring only the selected backbone branch. Mutually exclusive with --resume; heads, optimizer, schedules and history all start fresh, and the source file is hashed but never modified.
+
+### `--init-source`
+
+**Default:** `teacher` · **Allowed:** teacher / student
+
+Branch to transfer from --init-checkpoint: teacher (EMA) or student. The selected branch must exist; the other is never substituted. The chosen branch, file digest and source identity are recorded in `config.pretrain_initialization` and persist on later resumes without reopening the file.
+
+### `--coordinate-weight`
+
+**Default:** `0.0`
+
+Weight for the cross-view Coordinate consistency term. 0 (default) disables it. Finite and non-negative; fixed for the whole run. A positive weight enables the dense objectives, which add to (never replace) the selected --patch-loss mode. Under the hood it is an ordinary unmasked patch-to-patch `1 - cos` term between mapped view positions plus the dense geometry handoff. Changing the weight on `--resume` is rejected because the recipe identity includes it.
+
+### `--dense-query-points`
+
+**Default:** `49` · **Allowed:** 1..49
+
+Upper bound on correspondence query points per image and ordered view pair (1..49). A view with fewer eligible centres uses all of them and consumes no sampling draw, so this is a cap rather than a fixed count. Only applies when `--coordinate-weight` is positive; an explicit value on an all-off run is rejected.
+
+### `--ranking-weight`
+
+**Default:** `0.0`
+
+Weight for the NeCo-style neighbour-ranking term. 0 (default) disables it and imports no optional package. A positive weight enables the ranking objective, which adds to (never replaces) the selected --patch-loss mode and needs the qualified 'ranking' extra. The sorter, its source digests and the reference cap are recorded in the checkpoint, so resume fails if the installed implementation no longer matches.
+
+### `--ranking-reference-points`
+
+**Default:** `16` · **Allowed:** 2..49
+
+Reference-list size per sample for the ranking objective (2..49). Part of the saved recipe identity, so changing it requires a new run. A sample whose valid pool is smaller than this uses the whole pool and consumes no draw; a pool below two entries makes ranking unavailable for that sample without affecting Coordinate.
+
+### Choosing a weight for the dense objectives
+
+`--coordinate-weight` and `--ranking-weight` are additive terms with **different natural scales**, so the same
+number does not mean the same pressure. Measured on a tiny reference run (4 images, 64 px globals, 32 px locals,
+one local crop, `vit_tiny_patch16_224`, default augmentation, weights held at 1e-6 so the values are the terms'
+own scale, 8 logged steps):
+
+| Term | Observed raw value |
+| --- | --- |
+| `dense_coordinate_loss_raw` | 0.005 – 0.852 (median 0.78) |
+| `dense_ranking_loss_raw` | 1.04 – 2.08 (median 1.46) |
+| existing `global_loss` for comparison | 0.65 – 2.86 (median 0.75) |
+
+Two consequences:
+
+- **Ranking is roughly 2x the existing global loss at weight 1.0**, and its cross-entropy is not bounded by
+  `log(R)` — a badly mismatched ordering can be several times larger. A ranking weight of 1.0 is therefore an
+  aggressive starting point, not a neutral one.
+- **Coordinate starts near zero** when the geometry is close to identity (an exact-centre sample gives `1 - cos = 0`),
+  so its early signal is naturally weaker than its table range suggests.
+
+Provisional starting band, from those measurements and from the ratio to `global_loss`: **0.1–0.5 for
+`--ranking-weight`** and **0.5–1.0 for `--coordinate-weight`**. These are engineering starting points on the measured
+scale, not calibrated values, not a claim that either objective helps, and not comparable across different
+`--ranking-reference-points` settings (the reference cap changes both the achievable loss and its baseline).
+
+Check your own run rather than trusting this table: an enabled run logs `dense_coordinate_loss_raw`,
+`dense_coordinate_loss_weighted`, `dense_ranking_loss_raw` and `dense_ranking_loss_weighted` beside `global_loss` in
+`instant_metrics.pretrain.csv`. If a weighted dense term exceeds the existing loss by more than roughly one order of
+magnitude at the start, lower the weight before drawing conclusions from the run. Separating the two terms'
+gradient norms is not available from those logged scalars and needs a separate diagnostic pass.
+
 ### `--patch-loss`
 
 **Default:** `consistency` · **Allowed:** none / consistency / masked-feature / ibot
