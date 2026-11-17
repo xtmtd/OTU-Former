@@ -1,8 +1,8 @@
 # Coordinate and NeCo-Style Ranking Consistency — Design
 
 Date: 2026-11-15
-Status: Complete draft for operator review. The discussion selected the approach and decisions below; approval of this complete document, planning, and execution are separate gates. No training behavior described as proposed here is implemented by writing this document.
-Authorization: The operator approved consolidating the discussion into this single design and removing the superseded temporary record. No implementation, dependency installation, research training, commit, push, version change, tag, or release is authorized.
+Status: Implemented in the uncommitted working tree, with bounded verification and partial acceptance as of 2026-11-17. The implementation and subsequent repair audits are recorded below; long numerical streams, accelerator memory/production cost, exact full-trainer replay and scientific efficacy remain unaccepted.
+Authorization: The operator approved the unified design/plan, earlier bounded experiments and performance work, then the three remaining repairs and reasonable follow-up review fixes. This revision performs only those related repairs and bounded tests; no commit, push, dependency installation, version change, tag, release or new research training is authorized.
 
 ## 1. Intent, scope, and governing documents
 
@@ -129,7 +129,7 @@ L_total = L_existing + coordinate_weight * L_coord + ranking_weight * L_rank
 
 `L_existing` retains current global/local, selected patch loss, and any enabled KoLeo term; no coefficient, normalization, teacher center, mask ratio, or patch mode is reinterpreted. With L locals and both globals, there are 2 global-to-other-global and 2L global-to-local ordered pairs. At the default L=6, all-valid pair weighting is therefore 12:2 = **6:1**, or 6/7 local and 1/7 global, for each new objective. These are **pair-level objective shares, not point-count shares**. With patch16, query cap49, global224 and local96, per-image all-valid query counts are `2*49 : 12*36 = 98 : 432`, approximately **18.5% global / 81.5% local**; these counts do not override the selected hierarchical reduction. Both shares change when pairs or samples lack valid overlap. This local-heavy bias is the explicitly selected pair policy, not accidental balancing. Missing overlaps alter contributing denominators and can leave a pair supported by few points; log actual point/sample/pair counts by branch. Each objective computes its own denominator, so missing ranking references cannot remove a sample from Coordinate.
 
-Author numerical rules: reductions and normalization checks use float32. Require finite participating features with channel norm > `1e-6` before L2. Also check interpolation cancellation: for nonnegative nonzero bilinear weights w_i (sum 1) and contributing vectors f_i, define `m = sum_i w_i*f_i`, `s = sum_i w_i*norm(f_i)`, and `rho = norm(m)/s`. Require `s > 1e-6` and `rho > 1e-6`; exact-center sampling has rho=1. Apply this to Coordinate's raw teacher interpolation and ranking's pre-normalized projected teacher interpolation. Check original projected vectors before their initial L2, too. These are **provisional author numerical thresholds**, not calibrated representation-quality thresholds or results of an extreme-value analysis. Small CPU fixtures establish expected behavior, not long-run failure probability. The planned qualification sequence below must report minimum participating norm/rho and numerical failures before the versioned recipe freezes these thresholds. A failed finite/norm/rho check aborts the step with pair/sample context; it must not silently remove difficult points from the geometric denominator. Log minimum participating norm and rho from detached cached values. A rho of `1e-3` passes this numerical guard and is **not** thereby a validated directional target. If first-run diagnostics show a substantial recurring population below an indicative rho of `0.1`, review interpolation geometry, precision and feature statistics before accepting the recipe; one low minimum alone does not establish that population. The value 0.1 is a research-review trigger, not a hard guard, calibrated quality boundary or permission to change thresholds automatically within a run. Any revised guard is a versioned recipe decision followed by requalification; do not silently relax it or filter failing points. The absolute epsilon alone is not an anti-cancellation or anti-collapse test, and a cosine derivative contains an inverse feature norm, so it is not uniformly bounded as that norm approaches zero. No extra cosine clamp or factor of two is introduced. If all geometry pairs are unavailable, the zero contribution is reported as skipped, not observed perfect consistency. Nonfinite new losses or gradients abort before optimizer/EMA updates.
+Author numerical rules: reductions and normalization checks use float32. Require every participating feature to be finite with channel norm > `1e-6` before L2: selected student centres and each teacher contributor whose bilinear weight is positive. Unselected patches, empty rows and exact-zero-weight neighbours are outside this numerical population. Also check interpolation cancellation: for nonnegative nonzero bilinear weights w_i (sum 1) and contributing vectors f_i, define `m = sum_i w_i*f_i`, `s = sum_i w_i*norm(f_i)`, and `rho = norm(m)/s`. Require `s > 1e-6` and `rho > 1e-6`; exact-center sampling has rho=1. Apply this to Coordinate's raw teacher interpolation and ranking's pre-normalized projected teacher interpolation. Check original projected vectors before their initial L2, too. These are **provisional author numerical thresholds**, not calibrated representation-quality thresholds or results of an extreme-value analysis. Small CPU fixtures establish expected behavior, not long-run failure probability. The planned qualification sequence below must report minimum participating norm/rho and numerical failures before the versioned recipe freezes these thresholds. A failed finite/norm/rho check aborts the step with pair/sample context; it must not silently remove difficult points from the geometric denominator. Log minimum participating norm and rho from detached cached values. A rho of `1e-3` passes this numerical guard and is **not** thereby a validated directional target. If first-run diagnostics show a substantial recurring population below an indicative rho of `0.1`, review interpolation geometry, precision and feature statistics before accepting the recipe; one low minimum alone does not establish that population. The value 0.1 is a research-review trigger, not a hard guard, calibrated quality boundary or permission to change thresholds automatically within a run. Any revised guard is a versioned recipe decision followed by requalification; do not silently relax it or filter failing points. The absolute epsilon alone is not an anti-cancellation or anti-collapse test, and a cosine derivative contains an inverse feature norm, so it is not uniformly bounded as that norm approaches zero. No extra cosine clamp or factor of two is introduced. If all geometry pairs are unavailable, the zero contribution is reported as skipped, not observed perfect consistency. Nonfinite new losses or gradients abort before optimizer/EMA updates.
 
 Constant identical unit features give zero Coordinate loss. A less extreme shortcut is spatial over-smoothing: making neighboring feature directions similar can reduce interpolation-based mismatch without preserving discriminative local structure. The numerical cancellation check does not detect that shortcut. Record spatial neighbor similarity/feature diversity together with matching precision in separately authorized research evaluation, not just loss reduction. Nearest-neighbor targets, pre-L2 interpolation, and restricting subpatch offsets are potential **new research variants**, not silent runtime fallbacks or features in this delivery; each would require its own explicit recipe/approval. EMA/stop-gradient and active global SSL do not mathematically guarantee patch diversity or establish that smoothing is absent.
 
@@ -299,13 +299,61 @@ Emit a resolved dense config once, with applicability and requested/effective/in
 - selected/eligible query counts, contributing/skipped samples and ordered pairs, separated global/local;
 - actual ranking reference counts, shortages and objective-specific skip reasons;
 - attempted and contributing denominators, so a zero contribution is distinguishable from an observed zero loss;
-- minimum participating pre-L2 feature norm and interpolation cancellation ratio from already computed values, without a diagnostic backward.
+- minimum participating pre-L2 feature norm and interpolation cancellation ratio from already computed values, without a diagnostic backward. `dense_min_norm` is the Coordinate minimum across selected raw student-centre norms, raw teacher positive-weight contributor norms, and the teacher interpolated mixture norms before L2, reduced across contributing rows/pairs. It is not solely a contributor minimum or solely an interpolation minimum. Empty Coordinate populations leave it blank. Ranking projected-space diagnostics remain separate.
 
 Empty-population losses/norm/rho statistics are unavailable (`None` internally and empty/inapplicable in CSV), while genuine count0 remains numeric. Do not manufacture measured zeros to fit a numeric-only result type.
 
 Per-objective **backbone gradient norms are not obtainable from cached detached losses**. Separating them requires extra reverse-mode passes/VJPs, often retaining the graph; one existing total backward cannot recover the separate contributions. Do not add that work to normal logging or describe it as zero-cost. A separately authorized short diagnostic experiment may measure raw and weighted norms on the same declared backbone parameter set, before joint clipping, along with pairwise gradient agreement and measured overhead. Use those measurements to propose starting weights in a recorded experiment; no universal 0.1–1 prior or inferred equivalence from scalar CE/cosine is adopted, and no automatic runtime calibration is added. Reporting the **observed raw-loss scale** for an enabled objective is not a calibrated prior and is expected: the command reference states the measured magnitudes, the ratio to an existing loss term and a provisional starting band with its basis, and each enabled run logs its own raw/weighted value so an operator can check the ratio rather than trust a table.
 
 All-off old-schema logs must remain compatible. When extending instant/epoch CSVs, recognize the **actual current header** and its supported predecessors; migrate old rows with empty/inapplicable new fields and preserve values. Unknown/duplicate headers fail unchanged. Disabled metrics are unavailable, not fabricated observed zeros. Record available per-stage startup/first-batch/steady-state/evaluation timing and memory evidence before optimizing; do not claim local token reuse makes gradient retention or sorting free.
+
+### Reporting surfaces: CSV versus the training-curves PDF
+
+The instant CSV and the training-curves PDF are two different products of the same
+logger, and neither implies the other:
+
+- `logs/instant_metrics.pretrain.csv` carries the dense columns (raw and weighted
+  losses, eligible/selected queries, contributing samples and pairs, reference
+  population and reference count, shortage samples, minimum norm, minimum rho and
+  minimum student probability). An unavailable statistic is an empty cell, never a
+  measured zero.
+- `logs/training_curves_pretrain.pdf` is produced by the plotting step from that CSV.
+  An enabled run appends one diagnostics page to the existing page; an all-off run
+  keeps exactly the historical single page. The dense page draws the two raw losses
+  beside the existing total, the two weighted contributions, the query population,
+  the contributing denominators, reference population/count with shortages and
+  skipped log points, and separate panels for minimum norm, minimum rho and minimum
+  student permutation probability, because those scales are not comparable.
+- Writing a row to the CSV is **not** evidence that a panel exists in the PDF. The
+  panels exist only when the dense columns are present *and* the plotting step runs
+  for that run; a reader must verify the file, not infer it from the CSV.
+- Plotting never fabricates a series: an all-missing column is skipped rather than
+  drawn as a flat zero, and legend labels are collected across twin axes so an
+  all-blank panel cannot raise a warning instead of reporting absence.
+
+### Weight-calibration boundary
+
+The two weights are not calibrated quantities and this delivery performs no automatic
+calibration, but the **proxy used to choose them** is specified: calibrate on gradient
+pressure, not on loss magnitude. The loss ratio understates the pressure — on the
+recorded 100-image run the weighted Coordinate term was ~6–7% of the existing loss while
+taking ~9% of the backbone gradient norm, and the weighted ranking term was ~26% of the
+existing loss while taking ~8.5%. Per-objective backbone gradient norms are **not**
+recoverable from the cached logged scalars, so this calibration is a deliberate,
+separately authorized diagnostic pass (raw and weighted norms on a declared parameter
+set, before joint clipping), never a normal-logging feature and never a runtime
+auto-tuner.
+
+The command reference publishes the measured candidate settings (Coordinate 1.0,
+ranking 0.5, selected for roughly 8–10% median individual backbone gradient pressure)
+together with the exact configuration and the statement that they were frozen *before*
+the spatial evaluation. They are bounded candidates, not defaults, not an optimum and
+not evidence of benefit; the same document records that no across-cap or
+cross-recipe comparison is valid, and that a weighted dense term starting far above the
+existing loss is a reason to lower the weight rather than a result. The measured cost of
+that run (21 steps: baseline ~18 s versus 277/424/477 s for Coordinate/ranking/joint on
+MPS) is a performance finding, not a memory-fit certificate, and it neither closes nor
+replaces the outstanding production-shape memory gate.
 
 On an entirely unavailable ranking step, keep its student head disconnected so gradients remain `None` after zeroing, avoiding artificial AdamW weight decay; ensure stale gradients cannot survive. Teacher-head EMA still follows a successful optimizer step that updates other objectives. No references or sorting network state is committed. Performance evidence should separate backbone reuse, support/geometry, projection, reference construction, sorting and backward where measurable, not present a sorter microbenchmark as end-to-end cost.
 
@@ -343,6 +391,19 @@ Required checks include:
 - Stage timing and peak memory where measurable for baseline, Coordinate, ranking and joint modes; disclose device/dependency limitations and do not certify untested providers.
 
 Delivery stages: (1) shared geometry handoff plus complete Coordinate/recovery, with independently schedulable backbone initialization; (2) independent NeCo chain and combinations; (3) broader contract/consumer/packaging regression and documentation acceptance. Coordinate's geometry/norm-rho qualification does not require the optional sorter; ranking additionally requires its own package/permutation qualification. Frozen recipes still require their applicable gates. Stage 2 does not wait for Coordinate scientific improvement. Full-regression triggers remain those of the central policy. Existing spatial delivery's unresolved independent re-audit and production-cost gates are not retroactively declared closed by this design.
+
+**Acceptance boundary (author specification).** A task is accepted only with all three:
+failing-then-passing named tests for the behavior it claims; measured qualification
+evidence for each gate actually run on this host, with the exact code version,
+configuration and device recorded; and an explicit list of gates that remain
+unmeasured. Consequences: a CSV column is not reporting acceptance until a
+dense-enabled run renders its diagnostics page and an all-off run still renders one
+page; a preflight that accepts what the later restore rejects is not acceptance, so
+the same complete check must run in both places; an in-memory replay that reuses the
+live head/optimizer is not recovery evidence, because a no-op restore would pass it;
+and a plotting change is not verified by reading the CSV. Document edits, hand-written
+fixtures and reviewer-supplied measurements never substitute for a run in this
+repository.
 
 Research acceptance is separate: freeze split/checkpoint/layer/normalization/view protocol, compare existing objectives, plus Coordinate, plus ranking, and both. Use existing frozen same-image correspondence plus patch diversity/degeneracy and global barcode diagnostics. Loss reduction or correct geometry alone is not success; no biological gain threshold is invented here.
 
@@ -397,6 +458,156 @@ The operator approved the discussed scope, algorithms and consolidated proposals
 Only after approval to advance from design should writing-plans produce a separate execution plan for review. One plan may stage the common handoff, Coordinate and ranking while retaining independent objective acceptance. No training code, installation, research run, commit, push or release is bundled with this migration.
 
 **Planning handoff — 2026-11-15:** The operator subsequently requested “continue writing the plan document”, authorizing the transition to planning. The unified [implementation plan](../plans/2026-11-15-otuformer-coordinate-ranking-consistency.md) is now drafted for review. This records that later instruction without treating earlier audit/default approvals as complete-design approval, or approving plan details, implementation, dependency installation, numerical/performance runs, commits or releases.
+
+**Audit rounds 2-5 and the current status — 2026-11-15:** Operator-supplied
+re-reviews iteratively confirmed earlier fixes and found further gaps. The current status
+remains **partially closed, not closed**; each round below lists what changed.
+
+*Rounds 2-3 (fixed):* eligibility narrowed to the sampler's float32 contributor rule;
+DINO accepting a legally never-contributed ranking head; one shared head-entry rule;
+omitted `--model-name` inheriting the source backbone; cold replay rebuilding
+head/optimizer/runtime from disk; the dense diagnostics page; strict ranking AdamW step
+and moment validation including float64-overflow; a saved head checked against the frozen
+`D→2048→2048→256` recipe; strict integer schema versions; a real loader length; complete
+optimizer-state comparison in replay; `disabled` distinguished from `skipped`.
+
+*Rounds 4-5 (fixed in this revision):*
+
+- **Strict recovery is no longer FIFO-only.** An enabled dense resume runs the same
+  complete check: saved optimizer, center, RNG, and both encoder states are required and
+  loaded strictly, so a payload without them is rejected in preflight rather than
+  resumed with a fresh optimizer or randomly initialized teacher weights.
+- **Execution flags follow the real target.** The head-entry rule receives the saved
+  group flags *and* the device this invocation resolves to (not the saved `args.device`),
+  and the live validator rejects `capturable`/`fused` groups on a non-CUDA target.
+- **Initialization sources are validated completely.** The whole selected branch
+  (projector included) must match the rebuilt encoder, and every transferred tensor must
+  be finite after the cast to the training dtype; a NaN projector, a wrong projector
+  width, a missing projector bias or a float64 backbone value above the float32 range now
+  fails at preparation.
+- **`--overwrite` cannot be reached by any foreseeable failure.** A new enabled run also
+  proves it has at least one full batch; a selection smaller than one batch is
+  zero `drop_last` steps, not one.
+- **Ranking reports its own diagnostics.** The objective returns the norm/rho minima of
+  its projected teacher space, and the CSV/PDF carry them separately from Coordinate's;
+  the ranking loss no longer inherits another feature space's numbers.
+- **No panel is drawn without data**, including the weighted-contribution panel, and no
+  "existing objectives" curve is fabricated when the CSV has no total-loss column.
+- **The closed schema is strict at every level**: `ranking_config.version` must be an
+  integer, dependency records reject unknown fields, and head/sort recipe fields must
+  match the frozen types exactly (no `3.0` for `3`, no `1` for `True`). Resume applies the
+  same inactive-option applicability rule as a new run.
+- **Source verification follows the loader.** Digests are read from whatever loader
+  actually imported the package, so a source-readable zip is verified instead of being
+  rejected as "not a regular file"; a source-less distribution still fails with guidance.
+- **The qualification runner applies production guards**: a zero student permutation
+  entry is now a reported failure, and the replay covers the plan's fixed boundaries
+  (query 48/49/50/48, reference pool 15/16/17/15) plus one step past the last restore.
+
+*Round 6 (fixed in this revision):* the strict-resume RNG check now proves the snapshot
+restores on the target device instead of accepting any non-empty dict; the dense-log
+schema gained the 86-column predecessor so existing runs keep resuming; the fused-on-CPU
+optimizer branch is accepted (only non-fused `capturable` asserts CUDA); historical
+`projector.<i>.*` layouts are normalized before the strict source check; the replay
+varies the real candidate count under the fixed caps (48/49/50/48 with Q49, reference
+pool 15/16/17/15) and now round-trips a cold restore on the reference ladder; the
+numerical runner adds a production CE backward so a detached sorter is detected; and the
+ranking diagnostics report the raw pre-L2 projection norm next to the interpolated norm,
+with the reference minimums and unavailable-pair count exported.
+
+*Round 7 (fixed in this revision):* every header a previous revision actually wrote is
+now a supported migration predecessor (83, 86, 88 and the current 92 columns), so a legal
+earlier log never blocks its own resume; the reference-ladder cold restore now compares
+the same complete state as the main replay (both generators, losses, head, full optimizer
+moments, selected identity) and runs one step past its last boundary; the raw pre-L2
+projection norm is aggregated per `compute` over the views that actually contributed
+(`None` when none did, order-independent) instead of being overwritten per view; a payload
+carrying both `projector.<i>.*` and `projector.net.<i>.*` is rejected as ambiguous instead
+of silently keeping one; and the strict RNG check reuses the queue path's device policy,
+so a CUDA-shaped snapshot on a non-CUDA target is structurally validated and omitted from
+the restore copy, while a CUDA target demands one stream per visible device.
+
+*Authorized repair and execution audit — 2026-11-17:* the operator authorized fixing
+the remaining three findings and related execution defects. The trainer now retains the
+target-filtered RNG copy before output setup and uses it at the actual restore boundary;
+FIFO keeps its existing handoff, and legacy relational all-off recovery is unchanged.
+Replay snapshots and compares every student/teacher head tensor, not just `0.weight`;
+positive scaling of the last layer must fail even when L2 makes the loss invariant.
+Teacher projection norms are cached only inside one compute and reduced over the real
+queries' positive-weight bilinear contributors, excluding unused patches and empty rows.
+The projection/normalization order, guards, objective values, gradients and RNG recipe
+are unchanged; diagnostic support selection adds no forward or backward pass.
+
+The related plan audit found two unfinished contracts and repaired them: fixed Q49/R16
+mixed replay now holds row A at 5 while row B crosses 48/49/50/48, and uses selected
+(5,10)/(5,11)/(5,12)/(5,10) reference pools with exact draw-consumption checks. Each
+objective now reports global/local attempted/contributing/skipped sample/pair counts and
+eligible/selected points. The enabled CSV appends these columns (124 total), preserving
+native migrations from the frozen 83/86/88/92-column heads; new historical cells remain
+empty. The dense PDF adds separate global/local denominator panels, staying one appended
+page. Disabled-objective branch counts remain blank and the all-off header is unchanged.
+
+Bounded CPU tests now exercise all 2 SSL × 4 patch × 4 dense combinations through one
+real update, save and one resumed update, using synthetic data and offline backbone
+construction. This establishes small lifecycle compatibility, not exact multi-epoch
+trajectory equivalence or accelerator qualification. Separate actual-loop RNG tests cover
+relational+dense, DINO+dense and DINO without dense. These are inline implementation and
+verification results, not an independently dispatched review; earlier audit and benchmark
+records remain historical and are not relabelled as evidence for these sources.
+
+*Still open and explicitly not accepted:* accelerator memory, production-shape cost and
+first/steady-step timing, the long (10,000-iteration) numerical stream, reference-16
+memory fitness, exact full-trainer trajectory replay, multi-worker recovery, and
+held-out/multiseed efficacy. The combination matrix and actual RNG handoff now have bounded
+CPU coverage; this does not close the overall recipe acceptance.
+
+**Operator-supplied follow-up review — 2026-11-17:** The author checked the supplied
+nine findings against the current owners and repaired the supported findings inline.
+Enabled runs now print one resolved dense JSON record per invocation with requested,
+effective, applicability and requested/default/inherited sources. No all-off output or
+checkpoint schema is added. Dataset items now call the existing trace `to_json`; the
+collator transposes ragged records and emits canonical weak `None`; unpack calls the
+existing `from_json` once per ordinary record and validates the actual view canvas.
+Direct validated in-process traces remain supported at unpack, where old per-row weak
+None records are normalized; the pairing interface itself accepts canonical `None` only.
+
+Ranking guards now inspect selected student centres and positive-weight teacher support,
+not unused projected patches or noncontributing rows. A pool below two entries never
+enters ranking projection or its numerical guards. Raw Coordinate interpolation also
+checks each positive-weight original contributor, using its existing contributor pass;
+a healthy mixture cannot hide a zero contributor. Existing mixture-norm/rho guards,
+FP32 computation, no-clamp row CE, sampling order and projection cache lifetime remain
+unchanged. Raw-input and projection finite masks isolate unused nonfinite entries before
+MLP/normalization can poison interpolation or backward; the original invalid-location
+markers are retained in the norm grid and every participating invalid entry still raises.
+Real-MLP backward and NaN/Inf/zero controls verify both sides. Numerical failures report
+pair/row context, with row diagnosis only on the exceptional path. This tightens previously
+missing raw-contributor validation and removes
+the accidental whole-field ranking restriction; prior healthy-value equivalence is tested,
+but earlier throughput artifacts are not re-certified against these source changes.
+
+The three named startup-generator, contributed-then-skipped AdamW/EMA and register-prefix
+controls are now real trainer tests in `test_dense_pretrain.py`. The old proposed separate
+resume/reporting file references now point there; implementation checklist entries are
+marked only where narrowly complete, with qualification/commit compounds left open.
+Bilingual query-cap applicability now includes ranking-only. Five reported Rich failures
+were independently reproduced with ANSI enabled: two assertions stripped styles too late.
+The repair strips only ANSI SGR codes before whitespace normalization, preserving error,
+exit-code, traceback and input/sentinel assertions; CLI production behavior is unchanged.
+No independent reviewer/subagent, new research training, commit or release was invoked.
+
+**Remaining low-risk review — 2026-11-17:** Serialized-trace codec failures now carry
+geometry slot and batch-row indices while retaining the original codec message and
+chained exception; missing-field, bad-matrix and bad-type regressions cover this boundary.
+The plan distinguishes its seven reconciled checkboxes from the broader implemented,
+bounded-tested behaviors, and labels the original all-unchecked authorization as history.
+The Coordinate `dense_min_norm` aggregation is documented explicitly above and in both
+command languages. Pairs with fewer than two ranking entries remain unavailable before
+projection by the already documented policy; no recipe change is introduced. Current
+production cost remains unmeasured: earlier throughput numbers describe earlier source
+hashes, and performance-equivalence tests validate values/gradients/RNG, not throughput.
+No fresh production training or long performance qualification was launched for this
+review.
 
 **Inline cross-contract audit — 2026-11-15:** After the operator-supplied E1–E3 notes, the author re-read all17 chapters, all9 plan tasks and the connected batch/geometry/model/optimizer/checkpoint/test-policy owners. The plan now closes hidden runner dependencies, source-free initialization resume, explicit weak-layout/serialized-trace validation, unavailable statistics, sampling-device conversion, support-version identity, source model fallback and contribution/skip/update tests. This is an inline source/document audit, not a dispatched independent reviewer or installed-package/numerical/memory certification.
 

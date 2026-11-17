@@ -164,57 +164,25 @@ Branch to transfer from --init-checkpoint: teacher (EMA) or student. The selecte
 
 **Default:** `0.0`
 
-Weight for the cross-view Coordinate consistency term. 0 (default) disables it. Finite and non-negative; fixed for the whole run. A positive weight enables the dense objectives, which add to (never replace) the selected --patch-loss mode. Under the hood it is an ordinary unmasked patch-to-patch `1 - cos` term between mapped view positions plus the dense geometry handoff. Changing the weight on `--resume` is rejected because the recipe identity includes it.
+Weight for the cross-view Coordinate consistency term. 0 (default) disables it. Finite and non-negative; fixed for the whole run. A positive weight enables the dense objectives, which add to (never replace) the selected --patch-loss mode. Under the hood it is an ordinary unmasked patch-to-patch `1 - cos` term between mapped view positions plus the dense geometry handoff. Changing the weight on `--resume` is rejected because the recipe identity includes it. Calibrate it against gradient pressure rather than loss magnitude — see "Choosing weights for the dense objectives" under Notes.
 
 ### `--dense-query-points`
 
 **Default:** `49` · **Allowed:** 1..49
 
-Upper bound on correspondence query points per image and ordered view pair (1..49). A view with fewer eligible centres uses all of them and consumes no sampling draw, so this is a cap rather than a fixed count. Only applies when `--coordinate-weight` is positive; an explicit value on an all-off run is rejected.
+Upper bound on correspondence query points per image and ordered view pair (1..49). A view with fewer eligible centres uses all of them and consumes no sampling draw, so this is a cap rather than a fixed count. Applies when either `--coordinate-weight` or `--ranking-weight` is positive, including ranking-only runs; an explicit value when both weights are zero is rejected.
 
 ### `--ranking-weight`
 
 **Default:** `0.0`
 
-Weight for the NeCo-style neighbour-ranking term. 0 (default) disables it and imports no optional package. A positive weight enables the ranking objective, which adds to (never replaces) the selected --patch-loss mode and needs the qualified 'ranking' extra. The sorter, its source digests and the reference cap are recorded in the checkpoint, so resume fails if the installed implementation no longer matches.
+Weight for the NeCo-style neighbour-ranking term. 0 (default) disables it and imports no optional package. A positive weight enables the ranking objective, which adds to (never replaces) the selected --patch-loss mode and needs the qualified 'ranking' extra. The sorter, its source digests and the reference cap are recorded in the checkpoint, so resume fails if the installed implementation no longer matches. Its measured gradient pressure is much larger than its loss ratio suggests; see "Choosing weights for the dense objectives" under Notes.
 
 ### `--ranking-reference-points`
 
 **Default:** `16` · **Allowed:** 2..49
 
 Reference-list size per sample for the ranking objective (2..49). Part of the saved recipe identity, so changing it requires a new run. A sample whose valid pool is smaller than this uses the whole pool and consumes no draw; a pool below two entries makes ranking unavailable for that sample without affecting Coordinate.
-
-### Choosing a weight for the dense objectives
-
-`--coordinate-weight` and `--ranking-weight` are additive terms with **different natural scales**, so the same
-number does not mean the same pressure. Measured on a tiny reference run (4 images, 64 px globals, 32 px locals,
-one local crop, `vit_tiny_patch16_224`, default augmentation, weights held at 1e-6 so the values are the terms'
-own scale, 8 logged steps):
-
-| Term | Observed raw value |
-| --- | --- |
-| `dense_coordinate_loss_raw` | 0.005 – 0.852 (median 0.78) |
-| `dense_ranking_loss_raw` | 1.04 – 2.08 (median 1.46) |
-| existing `global_loss` for comparison | 0.65 – 2.86 (median 0.75) |
-
-Two consequences:
-
-- **Ranking is roughly 2x the existing global loss at weight 1.0**, and its cross-entropy is not bounded by
-  `log(R)` — a badly mismatched ordering can be several times larger. A ranking weight of 1.0 is therefore an
-  aggressive starting point, not a neutral one.
-- **Coordinate starts near zero** when the geometry is close to identity (an exact-centre sample gives `1 - cos = 0`),
-  so its early signal is naturally weaker than its table range suggests.
-
-Provisional starting band, from those measurements and from the ratio to `global_loss`: **0.1–0.5 for
-`--ranking-weight`** and **0.5–1.0 for `--coordinate-weight`**. These are engineering starting points on the measured
-scale, not calibrated values, not a claim that either objective helps, and not comparable across different
-`--ranking-reference-points` settings (the reference cap changes both the achievable loss and its baseline).
-
-Check your own run rather than trusting this table: an enabled run logs `dense_coordinate_loss_raw`,
-`dense_coordinate_loss_weighted`, `dense_ranking_loss_raw` and `dense_ranking_loss_weighted` beside `global_loss` in
-`instant_metrics.pretrain.csv`. If a weighted dense term exceeds the existing loss by more than roughly one order of
-magnitude at the start, lower the weight before drawing conclusions from the run. Separating the two terms'
-gradient norms is not available from those logged scalars and needs a separate diagnostic pass.
 
 ### `--patch-loss`
 
@@ -490,6 +458,111 @@ otuformer pretrain \
 ```
 
 ## Notes
+
+**Dense objective weights (Coordinate / NeCo-style ranking).** `--coordinate-weight` and
+`--ranking-weight` are additive terms on their own scales, so a weight that looks small
+can still dominate. **Calibrate on the gradient pressure, not on the loss ratio.** The
+loss ratio is a weak proxy: on the measured run below, the
+weighted Coordinate loss was only ~6–7% of the existing loss while its gradient took
+~9% of the backbone gradient norm, and the weighted ranking loss was ~26% of the
+existing loss while its gradient took ~8.5%. Loss magnitude and gradient pressure are
+not interchangeable, and neither of them tells you whether the objective helps.
+
+How to measure it yourself: run a short pilot, and compare the gradient norm of the
+backbone parameters from each dense term against the gradient norm from the existing
+losses, before joint clipping. The normal log does **not** carry that split — cached
+scalars cannot be decomposed into per-objective gradients — so it needs a deliberate
+diagnostic pass, kept out of production logging.
+
+Measured candidate settings, from a deliberately conservative calibration target of
+roughly 8–10% median individual backbone gradient pressure:
+
+| Term | Weight | Median weighted gradient fraction | Weighted loss fraction of existing loss |
+| --- | --- | --- | --- |
+| `--coordinate-weight` | 1.0 | 9.2% | 6.3–7.0% |
+| `--ranking-weight` | 0.5 | 8.5% | 25.4–26.2% |
+
+Those settings are a **bounded candidate, not a recommended default and not an
+optimum**: they were frozen before the spatial evaluation, so they are not tuned
+against the downstream result. At those weights the observed raw values were
+`dense_coordinate_loss_raw` 0.24–0.33 and `dense_ranking_loss_raw` 2.32–2.63 over 21
+steps, with `dense_min_rho` 0.65–0.71, `dense_min_norm` 21–38,
+`dense_ranking_min_probability` 2.8e-5–2.4e-4 and zero reference shortages.
+
+In current logs, Coordinate `dense_min_norm` is the minimum across selected raw
+student-centre norms, raw teacher contributor norms with positive interpolation weight,
+and interpolated teacher mixture norms before L2, over contributing rows/pairs. A missing
+Coordinate population leaves the cell blank. Ranking projected-space norms use their
+own columns. This definition describes current logging; the historical values above
+remain bound to their recorded source. Current production throughput has not been
+remeasured after the guard changes.
+
+Bound to one measurement, not to "current code". Identity of that measurement:
+
+- **Code**: git HEAD `edf95b4` with the working tree recorded as a 227-file SHA-256
+  manifest at measurement time. Numeric modules:
+  `dense_geometry.py 07e741cb`, `dense_objective.py 548940aa`,
+  `neighbor_ranking.py a66d247f`, `pretrain_loop.py 7bc034d8`,
+  `pretrain_recipe.py 03dd64da`, `dense_recipe.py abe20155`,
+  `cli/pretrain.py 6403eebac` (first 8 hex of each digest).
+- **Data**: `examples/Epidorcus/figs.csv`, SHA-256 `60c56316…`, 230 rows over two
+  labels (`Epidorcus_gracilis`, `Epidorcus_tonkinensis`); per-image digests were
+  recorded beside the run.
+- **Starting weights**: `runs/pretrain/SSL_latest.pth`, SHA-256 `4f4bc3fb…`,
+  epoch 49 / iteration 350, `--init-source teacher`.
+- **Environment**: torch 2.12.1, MPS, seed 42, 3 epochs / 21 steps, warmup 1,
+  `--patch-loss consistency`, `--augmentation global-barcode`,
+  `--orientation-policy sensitive`, `--batch-size 32`, 224 px globals, 96 px locals,
+  6 local crops, `--dense-query-points 49`, `--ranking-reference-points 16`.
+  The exact argv is recorded in the run's `*_invocation.json`.
+
+The **configuration** can be re-run with the command below. It is the joint case
+(`1.0` + `0.5`); the Coordinate-only and ranking-only cases differ only in the two
+weights:
+
+```bash
+otuformer pretrain --train-data examples/Epidorcus/figs.csv \
+  --input-images-dir examples/Epidorcus/images --out-dir runs/<your-run> \
+  --init-checkpoint runs/pretrain/SSL_latest.pth --init-source teacher \
+  --max-epochs 3 --warmup-epochs 1 --patch-loss consistency --batch-size 32 \
+  --global-crop-size 224 --local-crop-size 96 --local-crops 6 \
+  --augmentation global-barcode --orientation-policy sensitive --seed 42 \
+  --device mps --num-workers 4 --cpus 12 --log-every-n-steps 1 \
+  --save-every-epochs 3 --keep-last-checkpoints 1 --disable-embedding-metrics \
+  --coordinate-weight 1.0 --ranking-weight 0.5 \
+  --dense-query-points 49 --ranking-reference-points 16
+```
+
+Two limits of that command:
+
+- It reproduces the **configuration**, not the controlled comparison. The original
+  experiment isolated the ranking-head initialization with a forked RNG
+  (`fork_rng`) so all four cases shared one paired augmentation stream. A plain CLI
+  run initializes the head from the live global RNG, so the four cases no longer share
+  a byte-identical first batch under the same seed. Reproducing the paired comparison
+  needs the experiment driver, not this command.
+- The numbers are per-run measurements, not an expectation: the same command on
+  another machine/device will differ in timing and may differ slightly in numerics.
+
+The manifest, invocations, per-step CSV/PDF and calibration artifacts are local
+runtime products (`runs/` is not shipped). After the measurement the validation and
+reporting files changed (strict-recovery checks, the status vocabulary and the PDF
+panels); those do not alter the dense objective numerics, but any change to
+`dense_geometry.py`, `dense_objective.py` or `neighbor_ranking.py` — or to the caps,
+backbone, batch shape or augmentation — invalidates the table and requires a re-measure.
+
+**Check the cost before scaling.** In that same instrumented run, 21 steps took about
+18 s for the baseline but 277 s for Coordinate, 424 s for ranking and 477 s for joint —
+roughly a 16x/24x/27x step-time increase, which is dominated by the dense path rather
+than by the sorter alone. Resolve the dense-path bottleneck before planning a
+production-length run, and measure the intended shape rather than extrapolating from
+this one.
+
+An enabled run logs `dense_coordinate_loss_raw`, `dense_coordinate_loss_weighted`,
+`dense_ranking_loss_raw` and `dense_ranking_loss_weighted` beside `global_loss` in
+`logs/instant_metrics.pretrain.csv`, and renders the extra diagnostics page into
+`logs/training_curves_pretrain.pdf`. Those surfaces show the dense terms' own scale;
+they do not give the per-objective gradient split described above.
 
 **Patch-level objectives (v0.7.0).** `--patch-loss` selects the patch objective:
 

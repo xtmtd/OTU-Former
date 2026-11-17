@@ -164,52 +164,25 @@ cosine 学习率衰减前的 warmup epoch 数。
 
 **默认值：** `0.0`
 
-跨视角 Coordinate 一致性项的权重（0 表示关闭）。必须有限且非负，整个运行期间固定。正值启用密集目标：在映射后的视角位置之间加入普通的未掩码 patch 到 patch 的 `1 - cos` 项，并启用几何交接。它叠加在 `--patch-loss` 之上，绝不替换。由于配方身份包含该权重，`--resume` 时修改权重会被拒绝。
+跨视角 Coordinate 一致性项的权重（0 表示关闭）。必须有限且非负，整个运行期间固定。正值启用密集目标：在映射后的视角位置之间加入普通的未掩码 patch 到 patch 的 `1 - cos` 项，并启用几何交接。它叠加在 `--patch-loss` 之上，绝不替换。由于配方身份包含该权重，`--resume` 时修改权重会被拒绝。请按梯度压力而非损失量级来校准——详见"说明"中的"如何为密集目标选择权重"。
 
 ### `--dense-query-points`
 
 **默认值：** `49` · **允许值：** 1..49
 
-每张图像、每个有序视角对的对应点查询上限。有效 patch 中心少于该上限的视角会全部使用且不消耗抽样随机数，因此这是上限而非固定数量。仅在 `--coordinate-weight` 为正时适用；全关运行显式提供该值会被拒绝。
+每张图像、每个有序视角对的对应点查询上限。有效 patch 中心少于该上限的视角会全部使用且不消耗抽样随机数，因此这是上限而非固定数量。当 `--coordinate-weight` 或 `--ranking-weight` 任一为正时适用，包括仅启用 ranking 的运行；两个权重都为零时显式提供该值会被拒绝。
 
 ### `--ranking-weight`
 
 **默认值：** `0.0`
 
-NeCo 式近邻排序项的权重。0（默认）关闭该项且不导入任何可选包。正值启用排序目标，它叠加在已选的 --patch-loss 之上（绝不替换），并需要已验证的 'ranking' extra。排序器、其源码摘要与参考数量都会记入检查点，因此若已安装实现不再匹配，续训会失败。
+NeCo 式近邻排序项的权重。0（默认）关闭该项且不导入任何可选包。正值启用排序目标，它叠加在已选的 --patch-loss 之上（绝不替换），并需要已验证的 'ranking' extra。排序器、其源码摘要与参考数量都会记入检查点，因此若已安装实现不再匹配，续训会失败。它实测的梯度压力远大于损失比值所暗示的量级；详见"说明"中的"如何为密集目标选择权重"。
 
 ### `--ranking-reference-points`
 
 **默认值：** `16` · **允许值：** 2..49
 
 排序目标每个样本的参考列表长度（2..49）。属于保存配方身份的一部分，修改需要新运行。有效池小于该值的样本使用整个池且不消耗抽样随机数；池少于两个条目时该样本的排序不可用，但不影响 Coordinate。
-
-### 如何为密集目标选择权重
-
-`--coordinate-weight` 与 `--ranking-weight` 是叠加项，且**自然量级不同**，同一个数字并不等于同样的压力。在一个极小参考运行上实测
-（4 张图像、64 px 全局、32 px 局部、1 个局部裁剪、`vit_tiny_patch16_224`、默认增强、权重压到 1e-6 以读取各项自身量级、
-共 8 个记录步）：
-
-| 项 | 实测原始值 |
-| --- | --- |
-| `dense_coordinate_loss_raw` | 0.005 – 0.852（中位数 0.78） |
-| `dense_ranking_loss_raw` | 1.04 – 2.08（中位数 1.46） |
-| 既有 `global_loss`（对照） | 0.65 – 2.86（中位数 0.75） |
-
-由此有两点后果：
-
-- **权重取 1.0 时，排序项约为既有全局损失的 2 倍**，而且它的交叉熵并不以 `log(R)` 为上界——错排严重时还会明显更大。
-  因此排序权重 1.0 属于偏激进的起点，而不是中性值。
-- **Coordinate 在几何接近恒等时起始接近 0**（精确中心采样给出 `1 - cos = 0`），所以它的早期信号天然弱于上表区间暗示的强度。
-
-暂定起始区间（依据上述实测与相对 `global_loss` 的比例）：**`--ranking-weight` 取 0.1–0.5**、
-**`--coordinate-weight` 取 0.5–1.0**。这些是按实测尺度给出的工程起点，不是标定值，也不表示任一目标有效；
-不同 `--ranking-reference-points` 之间不可直接比较（参考数量会同时改变可达损失与其基线）。
-
-请以自己运行的数据为准：启用运行会在 `instant_metrics.pretrain.csv` 中，把 `dense_coordinate_loss_raw`、
-`dense_coordinate_loss_weighted`、`dense_ranking_loss_raw`、`dense_ranking_loss_weighted` 与 `global_loss` 并列记录。
-若某项加权后的密集损失在早期就超过既有损失一个数量级以上，应先降低权重，再判断运行结论。
-上述标量无法拆出两项各自的梯度范数，那需要单独的诊断通行。
 
 ### `--patch-loss`
 
@@ -485,6 +458,87 @@ otuformer pretrain \
 ```
 
 ## 说明
+
+**密集目标权重（Coordinate / NeCo 式 ranking）。** `--coordinate-weight` 与 `--ranking-weight`
+是各自量纲上的叠加项，看起来很小的权重也可能占主导。**请按梯度压力校准，而不是按损失比值。**
+损失比值是个弱代理：在下述实测运行里，加权后的 Coordinate 损失只占既有损失的
+约 6–7%，但其梯度占骨干梯度范数的约 9%；加权后的 ranking 损失占既有损失约 26%，其梯度却占约 8.5%。
+损失量级与梯度压力不可互换，而且两者都不能说明该目标是否有效。
+
+自行测量方法：跑一段短 pilot，在联合裁剪之前，分别比较每个密集项对骨干参数产生的梯度范数与既有损失产生的梯度范数。
+普通日志**不含**这个拆分——缓存的标量无法被分解为各目标梯度——因此它需要一次专门的诊断通行，并且不要放进生产日志。
+
+实测候选设置，校准目标刻意保守，取骨干个体梯度压力的中位约 8–10%：
+
+| 项 | 权重 | 加权梯度压力中位占比 | 加权损失占既有损失比例 |
+| --- | --- | --- | --- |
+| `--coordinate-weight` | 1.0 | 9.2% | 6.3–7.0% |
+| `--ranking-weight` | 0.5 | 8.5% | 25.4–26.2% |
+
+这些设置是**有界候选值，既不是推荐默认值，也不是最优点**：它们在空间评估之前就已冻结，因此并未针对下游结果调优。
+在此权重下，21 步内的观测原始值为 `dense_coordinate_loss_raw` 0.24–0.33、`dense_ranking_loss_raw` 2.32–2.63，
+`dense_min_rho` 0.65–0.71、`dense_min_norm` 21–38、`dense_ranking_min_probability` 2.8e-5–2.4e-4，
+参考池短缺样本数为 0。
+
+当前日志中的 Coordinate `dense_min_norm`，是在参与计算的行和视角对中，对选中的原始 student 中心向量、
+插值权重大于零的原始 teacher contributor，以及插值后、L2 前的 teacher 混合向量三类范数取最小值。
+Coordinate 没有参与样本时该单元格留空。ranking 投影空间的范数使用独立列。
+此定义说明当前日志；上面的历史数值仍绑定其记录的源码。守卫修改后的当前生产吞吐尚未重新测量。
+
+绑定的是**一次具体测量**，而不是"当前代码"。该次测量的身份：
+
+- **代码**：git HEAD `edf95b4`，测量时工作区以 227 个文件的 SHA-256 清单记录。数值相关模块：
+  `dense_geometry.py 07e741cb`、`dense_objective.py 548940aa`、
+  `neighbor_ranking.py a66d247f`、`pretrain_loop.py 7bc034d8`、
+  `pretrain_recipe.py 03dd64da`、`dense_recipe.py abe20155`、
+  `cli/pretrain.py 6403eebac`（各摘要前 8 位十六进制）。
+- **数据**：`examples/Epidorcus/figs.csv`，SHA-256 `60c56316…`，共 230 行、两个标签
+  （`Epidorcus_gracilis`、`Epidorcus_tonkinensis`）；每张图像的摘要记录在运行目录旁。
+- **起始权重**：`runs/pretrain/SSL_latest.pth`，SHA-256 `4f4bc3fb…`，
+  epoch 49 / iteration 350，`--init-source teacher`。
+- **环境**：torch 2.12.1、MPS、seed 42、3 个 epoch / 21 步、warmup 1、
+  `--patch-loss consistency`、`--augmentation global-barcode`、
+  `--orientation-policy sensitive`、`--batch-size 32`、224 px 全局、96 px 局部、
+  6 个局部裁剪、`--dense-query-points 49`、`--ranking-reference-points 16`。
+  完整 argv 记录在运行目录的 `*_invocation.json`。
+
+该**配置**可用下面的命令重跑。这是 joint 用例（`1.0` + `0.5`）；Coordinate-only 与
+ranking-only 用例仅两个权重不同：
+
+```bash
+otuformer pretrain --train-data examples/Epidorcus/figs.csv \
+  --input-images-dir examples/Epidorcus/images --out-dir runs/<your-run> \
+  --init-checkpoint runs/pretrain/SSL_latest.pth --init-source teacher \
+  --max-epochs 3 --warmup-epochs 1 --patch-loss consistency --batch-size 32 \
+  --global-crop-size 224 --local-crop-size 96 --local-crops 6 \
+  --augmentation global-barcode --orientation-policy sensitive --seed 42 \
+  --device mps --num-workers 4 --cpus 12 --log-every-n-steps 1 \
+  --save-every-epochs 3 --keep-last-checkpoints 1 --disable-embedding-metrics \
+  --coordinate-weight 1.0 --ranking-weight 0.5 \
+  --dense-query-points 49 --ranking-reference-points 16
+```
+
+该命令有两处边界：
+
+- 它复现的是**配置**，不是受控对照。原实验用 fork 的 RNG（`fork_rng`）隔离 ranking head
+  初始化，使四个用例共享同一配对增强流；直接用 CLI 运行时 head 由当前全局 RNG 初始化，
+  同 seed 下四个用例不再共享逐字节相同的第一批数据。要复现配对对照，需要实验驱动脚本，
+  而不是这条命令。
+- 这些数字是单次运行测量，不是预期值：换机器或设备重跑，计时会不同，数值也可能略有差异。
+
+清单、调用命令、逐步 CSV/PDF 与校准产物属于本地运行产物（`runs/` 不随仓库分发）。
+测量之后，校验与报告相关文件发生了变化（严格恢复校验、状态词表与 PDF 面板）；它们不改变密集目标的数值，
+但任何对 `dense_geometry.py`、`dense_objective.py`、`neighbor_ranking.py` 的改动，
+或对上上限、骨干、批形状、增强的改动，都会使上表失效，必须重新测量。
+
+**扩展规模前先看成本。** 在同一次带仪器运行中，21 步的基线约 18 秒，而 Coordinate 277 秒、ranking 424 秒、
+joint 477 秒——单步耗时约放大 16 倍 / 24 倍 / 27 倍，主导因素是密集通路本身，而不是排序器单独一项。
+在规划生产长度训练之前，先解决密集通路的性能瓶颈，并且按目标形状实测，不要用这一次外推。
+
+启用运行会在 `logs/instant_metrics.pretrain.csv` 中记录 `dense_coordinate_loss_raw`、
+`dense_coordinate_loss_weighted`、`dense_ranking_loss_raw`、`dense_ranking_loss_weighted`，与 `global_loss` 并列，
+并把额外的诊断页渲染进 `logs/training_curves_pretrain.pdf`。这些界面展示的是密集项自身的量级，
+并不提供上述按目标的梯度拆分。
 
 **patch 级目标（v0.7.0）。** `--patch-loss` 选择 patch 目标：
 
