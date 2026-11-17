@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
+import io
 import random
 import re
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any, Mapping, NamedTuple
 
 import numpy as np
 import torch
@@ -155,15 +158,30 @@ def normalize_legacy_projector_keys(state_dict: dict) -> dict:
     """Map ref-script ``projector.<i>.*`` names onto ``projector.net.<i>.*``.
 
     Returns ``state_dict`` unchanged (same object) when no key needs renaming.
+
+    A payload carrying *both* spellings of the same tensor is rejected instead of
+    silently keeping whichever came last: picking one by insertion order would let
+    a corrupt canonical tensor hide behind a healthy legacy alias (or the reverse),
+    which contradicts "the complete selected branch was validated".
     """
     renamed: dict[str, Any] = {}
+    conflicts: list[str] = []
     changed = False
     for key, value in state_dict.items():
         parts = key.split(".")
+        target = key
         if len(parts) > 2 and parts[0] == "projector" and parts[1].isdigit():
-            key = ".".join((parts[0], "net", *parts[1:]))
+            target = ".".join((parts[0], "net", *parts[1:]))
             changed = True
-        renamed[key] = value
+        if target in renamed:
+            conflicts.append(target)
+        renamed[target] = value
+    if conflicts:
+        raise ValueError(
+            "Checkpoint projector state is ambiguous: "
+            f"{sorted(set(conflicts))[:3]} appear under both the legacy "
+            "projector.<i> and the canonical projector.net.<i> spelling."
+        )
     return renamed if changed else state_dict
 
 
@@ -736,3 +754,364 @@ def apply_checkpoint_weights(model, architecture: CheckpointArchitecture) -> Non
     ):
         assert_complete_projector(state_dict, model.projector)
     model.load_state_dict(state_dict, strict=False)
+
+
+@dataclass(frozen=True)
+class PretrainInitialization:
+    """One validated backbone-only source for a new pretraining run.
+
+    This is not a resume: only ``backbone.*`` transfers, heads and optimizer
+    state start fresh, and the source file is never mutated.
+    """
+
+    path: str
+    sha256: str
+    source_key: str
+    source_identity: tuple[str, str] | None
+    architecture: "CheckpointArchitecture"
+    image_size: int
+    register_tokens: int
+    backbone_state: dict[str, Any]
+
+    def config_bundle(self) -> dict[str, Any]:
+        """The closed ``config.pretrain_initialization`` bundle (version 1)."""
+        identity = self.source_identity or (None, None)
+        return {
+            "version": 1,
+            "path": self.path,
+            "sha256": self.sha256,
+            "source_key": self.source_key,
+            "ssl_method": identity[0],
+            "ssl_head": identity[1],
+            "model_name": self.architecture.model_name,
+            "image_size": int(self.image_size),
+            "register_tokens": int(self.register_tokens),
+            "transfer": "backbone-only",
+        }
+
+
+_PRETRAIN_INIT_KEYS = frozenset(
+    {
+        "version",
+        "path",
+        "sha256",
+        "source_key",
+        "ssl_method",
+        "ssl_head",
+        "model_name",
+        "image_size",
+        "register_tokens",
+        "transfer",
+    }
+)
+
+
+def validate_pretrain_initialization_bundle(bundle: Mapping[str, Any]) -> None:
+    """Reject a malformed or contradicting initialization provenance bundle."""
+    if not isinstance(bundle, Mapping):
+        raise ValueError("config.pretrain_initialization must be a mapping.")
+    missing = sorted(_PRETRAIN_INIT_KEYS - set(bundle))
+    unexpected = sorted(set(bundle) - _PRETRAIN_INIT_KEYS)
+    if missing or unexpected:
+        raise ValueError(
+            "config.pretrain_initialization fields do not match version 1 "
+            f"(missing={missing}, unexpected={unexpected})."
+        )
+    if bundle["version"] != 1:
+        raise ValueError(
+            f"Unsupported pretrain_initialization version {bundle['version']!r}."
+        )
+    if bundle["transfer"] != "backbone-only":
+        raise ValueError(
+            "config.pretrain_initialization.transfer must be 'backbone-only'."
+        )
+    expected_sha = str(bundle["sha256"]).strip().lower()
+    if not _SHA256_HEX.match(expected_sha):
+        raise ValueError(
+            "config.pretrain_initialization.sha256 must be 64 hex characters."
+        )
+    if bundle["source_key"] not in ("teacher", "student"):
+        raise ValueError(
+            "config.pretrain_initialization.source_key must be teacher or student."
+        )
+
+
+def prepare_pretrain_initialization(
+    path: Path, *, source_key: str, default_model_name: str = ""
+) -> "PretrainInitialization":
+    """Load and validate one backbone-only source snapshot.
+
+    The digest is taken from the exact bytes that were read, so a concurrently
+    replaced file is detected before anything is copied into a new run. The
+    caller's ``default_model_name`` is the existing fallback for recognized
+    historical payloads that record no model metadata; recorded metadata always
+    wins and a selected-branch state is never substituted.
+    """
+    if source_key not in ("teacher", "student"):
+        raise ValueError(
+            f"init source must be 'teacher' or 'student', got {source_key!r}."
+        )
+    resolved = Path(path)
+    if not resolved.is_file():
+        raise ValueError(f"Initialization checkpoint {resolved} does not exist.")
+    raw = resolved.read_bytes()
+    digest = hashlib.sha256(raw).hexdigest()
+    checkpoint = torch.load(io.BytesIO(raw), map_location="cpu", weights_only=False)
+    if not isinstance(checkpoint, dict):
+        raise ValueError(
+            f"Initialization checkpoint {resolved} is not a mapping payload."
+        )
+
+    # The selected branch must exist exactly as requested: the shared reader's
+    # permissive fallback would silently initialize from the wrong weights.
+    if source_key not in checkpoint:
+        raise KeyError(
+            f"Initialization checkpoint has no '{source_key}' branch; the other "
+            "branch is never substituted."
+        )
+    state_dict = checkpoint[source_key]
+    if not isinstance(state_dict, dict):
+        raise ValueError(
+            f"Initialization checkpoint '{source_key}' branch is not a state dict."
+        )
+    backbone = {
+        key: value
+        for key, value in state_dict.items()
+        if key.startswith("backbone.")
+    }
+    if not backbone:
+        raise ValueError(
+            "Initialization checkpoint carries no 'backbone.*' tensors; raw and "
+            "third-party backbone-only payloads are outside this contract."
+        )
+    for key, value in backbone.items():
+        if not torch.is_tensor(value):
+            raise ValueError(f"Initialization tensor {key!r} is not a tensor.")
+        _require_finite_training_dtype(value, key)
+
+    identity = resolve_checkpoint_ssl_identity(checkpoint, state_dict)
+    if identity is None:
+        raise ValueError(
+            "Initialization checkpoint has no recognized SSL identity; metric, "
+            "ONNX and raw backbone payloads are not supported here."
+        )
+    (
+        architecture,
+        image_size,
+        register_tokens,
+        target_backbone,
+    ) = _pretrain_initialization_architecture(
+        checkpoint,
+        state_dict,
+        source_key=source_key,
+        default_model_name=default_model_name,
+    )
+    _require_backbone_fits(backbone, target_backbone, path=str(resolved))
+    # Only ``backbone.*`` is transferred, but a source with a corrupt projector
+    # is not a valid initialization identity: validate the complete selected
+    # branch instead of laundering it because the head is discarded.
+    # Historical ``projector.<i>.*`` names are a recognized layout the shared
+    # reader already normalizes; normalizing a *copy* keeps that compatibility
+    # without touching the payload the caller loaded.
+    _require_complete_source_branch(
+        normalize_legacy_projector_keys(dict(state_dict)),
+        target_state=target_backbone,
+        path=str(resolved),
+    )
+
+    return PretrainInitialization(
+        path=str(resolved),
+        sha256=digest,
+        source_key=source_key,
+        source_identity=identity,
+        architecture=architecture,
+        image_size=int(image_size),
+        register_tokens=int(register_tokens),
+        backbone_state=backbone,
+    )
+
+
+def _pretrain_initialization_architecture(
+    checkpoint: dict,
+    state_dict: dict,
+    *,
+    source_key: str,
+    default_model_name: str,
+) -> tuple["CheckpointArchitecture", int, int, dict[str, Any]]:
+    """Resolve the source architecture, size and register layout.
+
+    Recorded metadata outranks the caller's historical fallback, and the
+    selected branch is the only state ever inspected. The register layout is
+    resolved against an RNG-isolated ``pretrained=False`` native probe so a
+    native-versus-added distinction survives into the new run.
+    """
+    from otuformer.utils.size import resolve_training_image_size
+
+    cfg = _config(checkpoint)
+    model_name = cfg.get("model_name")
+    from_metadata = isinstance(model_name, str) and bool(model_name.strip())
+    if not from_metadata:
+        fallback = str(default_model_name or "").strip()
+        if not fallback:
+            raise ValueError(
+                "Initialization checkpoint records no model name and no caller "
+                "fallback model name was supplied; the source architecture cannot "
+                "be established from weights alone."
+            )
+        model_name = fallback
+    resolved_name = str(model_name).strip()
+    image_size = int(resolve_training_image_size(checkpoint))
+    embedding_dim = int(cfg.get("out_dim", 256))
+    head = resolve_checkpoint_embedding_head(checkpoint, state_dict)
+    with preserved_rng():
+        native = OTUFormerEncoder(
+            model_name=resolved_name,
+            out_dim=embedding_dim,
+            return_patch_tokens=True,
+            img_size=image_size,
+            pretrained=False,
+        )
+        actual, added = resolve_register_layout(checkpoint, state_dict, native.backbone)
+    target = native
+    if added:
+        target = OTUFormerEncoder(
+            model_name=resolved_name,
+            out_dim=embedding_dim,
+            return_patch_tokens=True,
+            img_size=image_size,
+            pretrained=False,
+            reg_tokens=4,
+        )
+    architecture = CheckpointArchitecture(
+        model_name=resolved_name,
+        embedding_dim=embedding_dim,
+        embedding_head=head,
+        state_dict=state_dict,
+        source_key=source_key,
+        model_name_from_metadata=from_metadata,
+        actual_register_tokens=actual,
+        added_register_tokens=added,
+        ssl_identity=resolve_checkpoint_ssl_identity(checkpoint, state_dict),
+    )
+    return architecture, image_size, actual, target.state_dict()
+
+
+def _require_finite_training_dtype(tensor: Any, label: str) -> None:
+    """Reject a tensor that is finite at its recorded precision but not after cast.
+
+    The trainer runs in float32, so a float64 value above the float32 range
+    becomes ``Inf`` on load. Checking only the saved dtype would accept it and
+    fail later, mid-training.
+    """
+    if not bool(torch.isfinite(tensor).all()):
+        raise ValueError(f"{label} contains non-finite values.")
+    try:
+        cast = tensor.to(torch.float32)
+    except (RuntimeError, TypeError) as exc:  # pragma: no cover - defensive
+        raise ValueError(f"{label} cannot be loaded as the training dtype: {exc}") from exc
+    if not bool(torch.isfinite(cast).all()):
+        raise ValueError(
+            f"{label} is not finite at the training float32 dtype; a value that is "
+            "finite at its recorded precision can still overflow on load."
+        )
+
+
+def _require_complete_source_branch(
+    state_dict: Mapping[str, Any], *, target_state: Mapping[str, Any], path: str
+) -> None:
+    """Validate the complete selected source encoder, not only ``backbone.*``.
+
+    A NaN projector bias, a wrong projector input width or a missing projector
+    layer means the payload is not a healthy training checkpoint, even though the
+    transfer itself copies only the encoder.
+    """
+    expected = {
+        key: value
+        for key, value in target_state.items()
+        if key.startswith("projector.")
+    }
+    missing = sorted(set(expected) - set(state_dict))
+    mismatched = sorted(
+        key
+        for key in set(expected) & set(state_dict)
+        if tuple(getattr(state_dict[key], "shape", ()))
+        != tuple(getattr(expected[key], "shape", ()))
+    )
+    unexpected = sorted(
+        key
+        for key in set(state_dict) - set(expected)
+        if key.startswith("projector.")
+    )
+    if missing or mismatched or unexpected:
+        raise ValueError(
+            f"Initialization checkpoint {path} does not carry a complete, "
+            f"compatible projector: {len(missing)} missing (e.g. {missing[:2]}), "
+            f"{len(mismatched)} shape mismatch(es) (e.g. {mismatched[:2]}) and "
+            f"{len(unexpected)} unexpected (e.g. {unexpected[:2]}). A corrupt source "
+            "head is not a valid initialization source."
+        )
+    for key in expected:
+        value = state_dict[key]
+        if not torch.is_tensor(value):
+            raise ValueError(f"Initialization tensor {key!r} is not a tensor.")
+        _require_finite_training_dtype(value, f"Initialization tensor {key!r}")
+
+
+def _require_backbone_fits(
+    backbone: Mapping[str, Any], target_state: Mapping[str, Any], *, path: str
+) -> None:
+    """Reject an incomplete or mismatched source before any output changes.
+
+    This runs at preparation time (the CLI does it before ``--overwrite`` can
+    clear a directory) instead of only at load time, so a source with missing or
+    differently shaped backbone tensors cannot destroy existing results first.
+    """
+    target = {
+        key: value
+        for key, value in target_state.items()
+        if key.startswith("backbone.")
+    }
+    missing = sorted(set(target) - set(backbone))
+    unexpected = sorted(set(backbone) - set(target))
+    mismatched = sorted(
+        key
+        for key in set(target) & set(backbone)
+        if tuple(getattr(target[key], "shape", ()))
+        != tuple(getattr(backbone[key], "shape", ()))
+    )
+    if missing or unexpected or mismatched:
+        raise ValueError(
+            f"Initialization checkpoint {path} does not carry a complete backbone "
+            f"for its recorded architecture: {len(missing)} missing, "
+            f"{len(unexpected)} unexpected, {len(mismatched)} shape mismatch(es) "
+            f"(e.g. {(missing + unexpected + mismatched)[0]})."
+        )
+
+
+def initialize_pretrain_backbone(
+    student: Any, prepared: "PretrainInitialization"
+) -> None:
+    """Copy only ``backbone.*`` from the prepared source into a fresh encoder."""
+    target = {
+        key: value
+        for key, value in student.state_dict().items()
+        if key.startswith("backbone.")
+    }
+    missing = sorted(set(target) - set(prepared.backbone_state))
+    unexpected = sorted(set(prepared.backbone_state) - set(target))
+    mismatched = sorted(
+        key
+        for key in set(target) & set(prepared.backbone_state)
+        if tuple(target[key].shape) != tuple(prepared.backbone_state[key].shape)
+    )
+    if missing or unexpected or mismatched:
+        raise ValueError(
+            "Initialization checkpoint backbone does not fit the new run: "
+            f"{len(missing)} missing, {len(unexpected)} unexpected, "
+            f"{len(mismatched)} shape mismatch(es) "
+            f"(e.g. {(missing + unexpected + mismatched)[0]})."
+        )
+    state = student.state_dict()
+    for key, tensor in prepared.backbone_state.items():
+        state[key] = tensor
+    student.load_state_dict(state, strict=True)

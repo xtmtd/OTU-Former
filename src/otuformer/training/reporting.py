@@ -18,6 +18,7 @@ from otuformer.embedding.evaluator import (
     compute_recall_at_k,
     run_umap,
 )
+from .dense_objective import BRANCH_COUNT_FIELDS
 from otuformer.training.dataset import (
     FINETUNE_AUGMENTATIONS,
     ORIENTATION_POLICIES,
@@ -208,6 +209,138 @@ _PRETRAIN_CURRENT_FIELDS = tuple(_PRETRAIN_PRE_FIFO_FIELDS) + tuple(
 )
 
 
+# Dense objectives append their own fields only for an enabled run; a disabled
+# run keeps the previous header exactly.
+_PRETRAIN_DENSE_FIELDS = [
+    "dense_coordinate_loss_raw",
+    "dense_coordinate_loss_weighted",
+    "dense_coordinate_status",
+    "dense_coordinate_points",
+    "dense_coordinate_samples",
+    "dense_coordinate_pairs",
+    "dense_min_norm",
+    "dense_min_rho",
+    "dense_ranking_loss_raw",
+    "dense_ranking_loss_weighted",
+    "dense_ranking_status",
+    "dense_ranking_points",
+    "dense_ranking_samples",
+    "dense_ranking_pairs",
+    "dense_ranking_references",
+    "dense_ranking_reference_count",
+    "dense_ranking_shortage_samples",
+    "dense_ranking_min_probability",
+    "dense_coordinate_eligible",
+    # The ranking objective's own projected-space diagnostics.
+    "dense_ranking_min_norm",
+    "dense_ranking_min_rho",
+    "dense_ranking_projection_min_norm",
+    "dense_ranking_reference_min",
+    "dense_ranking_reference_population_min",
+    "dense_ranking_unavailable_pairs",
+]
+
+
+_PRETRAIN_DENSE_FIELDS += [
+    f"dense_{objective}_{branch}_{field}"
+    for objective in ("coordinate", "ranking")
+    for branch in ("global", "local")
+    for field in BRANCH_COUNT_FIELDS
+]
+
+
+#: The dense header written before the ranking projected-space diagnostics were
+#: added (86 columns: the eligibility column, no ranking norm/rho). Existing runs
+#: with this header must keep resuming, so it stays a recognized predecessor and
+#: migrates by filling the two new columns empty.
+_PRETRAIN_DENSE_86_FIELDS = tuple(_PRETRAIN_CURRENT_FIELDS) + (
+    "dense_coordinate_loss_raw",
+    "dense_coordinate_loss_weighted",
+    "dense_coordinate_status",
+    "dense_coordinate_points",
+    "dense_coordinate_samples",
+    "dense_coordinate_pairs",
+    "dense_min_norm",
+    "dense_min_rho",
+    "dense_ranking_loss_raw",
+    "dense_ranking_loss_weighted",
+    "dense_ranking_status",
+    "dense_ranking_points",
+    "dense_ranking_samples",
+    "dense_ranking_pairs",
+    "dense_ranking_references",
+    "dense_ranking_reference_count",
+    "dense_ranking_shortage_samples",
+    "dense_ranking_min_probability",
+    "dense_coordinate_eligible",
+)
+
+
+#: The dense header written when the ranking projected-space diagnostics were
+#: added (88 columns). Every header a previous revision actually wrote stays a
+#: supported predecessor, otherwise a legal earlier log blocks its own resume.
+_PRETRAIN_DENSE_88_FIELDS = tuple(_PRETRAIN_CURRENT_FIELDS) + (
+    "dense_coordinate_loss_raw",
+    "dense_coordinate_loss_weighted",
+    "dense_coordinate_status",
+    "dense_coordinate_points",
+    "dense_coordinate_samples",
+    "dense_coordinate_pairs",
+    "dense_min_norm",
+    "dense_min_rho",
+    "dense_ranking_loss_raw",
+    "dense_ranking_loss_weighted",
+    "dense_ranking_status",
+    "dense_ranking_points",
+    "dense_ranking_samples",
+    "dense_ranking_pairs",
+    "dense_ranking_references",
+    "dense_ranking_reference_count",
+    "dense_ranking_shortage_samples",
+    "dense_ranking_min_probability",
+    "dense_coordinate_eligible",
+    "dense_ranking_min_norm",
+    "dense_ranking_min_rho",
+)
+
+
+#: The dense header written by the first delivery (before the ranking shortage
+#: and eligibility columns were added). It stays a recognized predecessor so an
+#: enabled run can still migrate its own earlier rows in place.
+_PRETRAIN_DENSE_TASK4_FIELDS = tuple(_PRETRAIN_CURRENT_FIELDS) + (
+    "dense_coordinate_loss_raw",
+    "dense_coordinate_loss_weighted",
+    "dense_coordinate_status",
+    "dense_coordinate_points",
+    "dense_coordinate_samples",
+    "dense_coordinate_pairs",
+    "dense_min_norm",
+    "dense_min_rho",
+    "dense_ranking_loss_raw",
+    "dense_ranking_loss_weighted",
+    "dense_ranking_status",
+    "dense_ranking_points",
+    "dense_ranking_samples",
+    "dense_ranking_pairs",
+    "dense_ranking_references",
+    "dense_ranking_min_probability",
+)
+
+
+# Keep predecessor definitions independent of future additions to the live list.
+_PRETRAIN_DENSE_92_FIELDS = _PRETRAIN_DENSE_88_FIELDS + (
+    "dense_ranking_projection_min_norm",
+    "dense_ranking_reference_min",
+    "dense_ranking_reference_population_min",
+    "dense_ranking_unavailable_pairs",
+)
+
+
+_PRETRAIN_DENSE_CURRENT_FIELDS = tuple(_PRETRAIN_CURRENT_FIELDS) + tuple(
+    _PRETRAIN_DENSE_FIELDS
+)
+
+
 _PRETRAIN_PLOT_NUMERIC_FIELDS = (
     _PRETRAIN_LEGACY_METRIC_FIELDS
     + _PRETRAIN_PATCH_FIELDS
@@ -229,11 +362,16 @@ _FINETUNE_FIELDS = [
 class InstantMetricsLogger:
     path: Path
     mode: str = "pretrain"
+    dense_enabled: bool = False
 
     def __post_init__(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         if self.mode == "pretrain":
-            self.fieldnames = list(_PRETRAIN_CURRENT_FIELDS)
+            self.fieldnames = list(
+                _PRETRAIN_DENSE_CURRENT_FIELDS
+                if self.dense_enabled
+                else _PRETRAIN_CURRENT_FIELDS
+            )
         else:
             self.fieldnames = list(_PRETRAIN_BASE_FIELDS) + list(_FINETUNE_FIELDS)
         if self.path.exists() and self.path.stat().st_size > 0:
@@ -278,11 +416,21 @@ class InstantMetricsLogger:
             )
         if header == self.fieldnames:
             return
-        if self.mode == "pretrain" and header in (
-            _PRETRAIN_LEGACY_FIELDS,
-            _PRETRAIN_V070_FIELDS,
-            _PRETRAIN_PRE_FIFO_FIELDS,
-        ):
+        recognized = (
+            list(_PRETRAIN_LEGACY_FIELDS),
+            list(_PRETRAIN_V070_FIELDS),
+            list(_PRETRAIN_PRE_FIFO_FIELDS),
+            list(_PRETRAIN_CURRENT_FIELDS),
+        )
+        if self.dense_enabled:
+            recognized += (
+                list(_PRETRAIN_DENSE_TASK4_FIELDS),
+                list(_PRETRAIN_DENSE_86_FIELDS),
+                list(_PRETRAIN_DENSE_88_FIELDS),
+                list(_PRETRAIN_DENSE_92_FIELDS),
+                list(_PRETRAIN_DENSE_CURRENT_FIELDS),
+            )
+        if self.mode == "pretrain" and header in recognized:
             self._migrate_pretrain_schema(header, rows)
             return
         raise ValueError(
@@ -346,6 +494,313 @@ class InstantMetricsLogger:
             return None
         values = df_instant[name]
         return None if values.isna().all() else values
+
+    def _dense_diagnostics_figure(self, df_instant, plt):
+        """One optional page of dense-objective diagnostics, or ``None``.
+
+        Only columns that carry at least one measured value are drawn: an
+        unavailable statistic is missing, never a fabricated zero. The panels
+        keep the CSV column meanings so a reader can move between the two.
+        """
+        if not self.dense_enabled:
+            return None
+        import pandas as pd
+
+        def _objective_enabled(status_column: str, *value_columns: str) -> bool:
+            """An objective ran if it was never logged ``disabled``."""
+            status = df_instant.get(status_column)
+            if status is not None:
+                tokens = set(status.astype("string").dropna().unique())
+                if tokens and tokens <= {"disabled", ""}:
+                    return False
+            return any(
+                self._plottable_series(df_instant, name) is not None
+                for name in value_columns
+            )
+
+        coordinate_enabled = _objective_enabled(
+            "dense_coordinate_status",
+            "dense_coordinate_loss_raw",
+            "dense_coordinate_points",
+        )
+        ranking_enabled = _objective_enabled(
+            "dense_ranking_status",
+            "dense_ranking_loss_raw",
+            "dense_ranking_points",
+        )
+
+        def series(name: str):
+            return self._plottable_series(df_instant, name)
+
+        dense_names = [
+            "dense_coordinate_loss_raw",
+            "dense_coordinate_loss_weighted",
+            "dense_ranking_loss_raw",
+            "dense_ranking_loss_weighted",
+            "dense_coordinate_points",
+            "dense_coordinate_samples",
+            "dense_coordinate_pairs",
+            "dense_coordinate_eligible",
+            "dense_ranking_points",
+            "dense_ranking_samples",
+            "dense_ranking_pairs",
+            "dense_ranking_references",
+            "dense_ranking_reference_count",
+            "dense_ranking_shortage_samples",
+            "dense_min_norm",
+            "dense_min_rho",
+            "dense_ranking_min_probability",
+            "dense_ranking_min_norm",
+            "dense_ranking_min_rho",
+            "dense_ranking_projection_min_norm",
+            "dense_ranking_reference_min",
+            "dense_ranking_reference_population_min",
+            "dense_ranking_unavailable_pairs",
+        ]
+        for name in dense_names:
+            if name in df_instant.columns:
+                df_instant[name] = pd.to_numeric(df_instant[name], errors="coerce")
+        if not any(series(name) is not None for name in dense_names):
+            return None
+
+        iterations = df_instant["iteration"]
+        fig, axes = plt.subplots(3, 4, figsize=(26, 15))
+        axes = axes.flatten()
+        slot = 0
+
+        def panel(title, ylabel):
+            nonlocal slot
+            ax = axes[slot]
+            slot += 1
+            ax.set_title(title)
+            ax.set_xlabel("Iteration")
+            ax.set_ylabel(ylabel)
+            ax.grid(True, alpha=0.3)
+            return ax
+
+        def close_if_empty(ax, drew):
+            """Turn a panel off when no series was drawn into it.
+
+            An objective that never ran must not leave a titled, empty axis in
+            the report; the caller's own ``drew`` flag decides.
+            """
+            if not drew:
+                ax.axis("off")
+                ax.set_title("")
+            return drew
+
+        def draw(ax, name, label, color=None, twin=None):
+            values = series(name)
+            if values is None:
+                return False
+            target = ax if twin is None else twin
+            target.plot(
+                iterations,
+                values,
+                label=label,
+                **({"color": color} if color else {}),
+            )
+            return True
+
+        def twinx_axis(ax, color, label):
+            twin = ax.twinx()
+            twin.set_ylabel(label, color=color)
+            twin.tick_params(axis="y", labelcolor=color)
+            return twin
+
+        def legend(ax, *twins):
+            """Legend across the panel and its twin axes; skip an empty one."""
+            handles, labels = ax.get_legend_handles_labels()
+            for twin in twins:
+                twin_handles, twin_labels = twin.get_legend_handles_labels()
+                handles += twin_handles
+                labels += twin_labels
+            if labels:
+                ax.legend(handles, labels, fontsize=8)
+
+        # 1. Raw losses beside the loss the existing objectives alone produce.
+        #    ``loss`` in the CSV already contains the weighted dense terms, so it
+        #    must not be labelled "existing": subtracting them recovers the
+        #    existing-only value exactly (total = existing + weighted dense).
+        ax = panel("Dense raw losses vs existing objectives", "Raw loss")
+        drew = draw(ax, "dense_coordinate_loss_raw", "Coordinate raw", "tab:blue")
+        drew = draw(ax, "dense_ranking_loss_raw", "Ranking raw", "tab:orange") or drew
+        twin = twinx_axis(ax, "tab:gray", "Existing objectives loss")
+        # Only when a real total-loss column exists: without it, subtracting the
+        # dense terms from nothing would fabricate a negative "existing" curve.
+        existing_only = df_instant.get("loss")
+        if existing_only is not None:
+            existing_only = pd.to_numeric(existing_only, errors="coerce")
+            if existing_only.isna().all():
+                existing_only = None
+        if existing_only is not None:
+            for name in (
+                "dense_coordinate_loss_weighted",
+                "dense_ranking_loss_weighted",
+            ):
+                column = df_instant.get(name)
+                if column is not None:
+                    filled = pd.to_numeric(column, errors="coerce").fillna(0.0)
+                    existing_only = existing_only - filled
+        if existing_only is not None:
+            twin.plot(
+                iterations,
+                existing_only,
+                label="Existing objectives (total minus dense)",
+                color="tab:gray",
+            )
+            drew = True
+        close_if_empty(ax, drew)
+        if drew:
+            legend(ax, twin)
+
+        # 2. Weighted contributions of the two new terms.
+        ax = panel("Dense weighted contribution", "Weighted loss")
+        drew = draw(
+            ax, "dense_coordinate_loss_weighted", "Coordinate weighted", "tab:blue"
+        )
+        drew = (
+            draw(ax, "dense_ranking_loss_weighted", "Ranking weighted", "tab:orange")
+            or drew
+        )
+        close_if_empty(ax, drew)
+        if drew:
+            legend(ax)
+
+        # 3. Query populations, pre-cap eligible and post-cap selected.
+        ax = panel("Dense query population", "Queries")
+        drew = draw(ax, "dense_coordinate_eligible", "Coordinate eligible", "tab:blue")
+        drew = (
+            draw(ax, "dense_coordinate_points", "Coordinate selected", "tab:cyan")
+            or drew
+        )
+        drew = draw(ax, "dense_ranking_points", "Ranking selected", "tab:orange") or drew
+        close_if_empty(ax, drew)
+        if drew:
+            legend(ax)
+
+        # 4. Contributing denominators, so a skip is visible as a dip to 0.
+        ax = panel("Dense contributing denominators", "Count")
+        drew = draw(
+            ax, "dense_coordinate_samples", "Coordinate samples", "tab:blue"
+        )
+        drew = (
+            draw(ax, "dense_coordinate_pairs", "Coordinate pairs", "tab:cyan") or drew
+        )
+        drew = draw(ax, "dense_ranking_samples", "Ranking samples", "tab:orange") or drew
+        drew = draw(ax, "dense_ranking_pairs", "Ranking pairs", "tab:red") or drew
+        close_if_empty(ax, drew)
+        if drew:
+            legend(ax)
+
+        for branch in ("global", "local"):
+            ax = panel(f"Dense {branch} denominators", "Count")
+            drew = False
+            for objective in ("coordinate", "ranking"):
+                for field in ("attempted_samples", "contributing_samples", "contributing_pairs"):
+                    drew = draw(
+                        ax, f"dense_{objective}_{branch}_{field}",
+                        f"{objective.title()} {field.replace('_', ' ')}",
+                    ) or drew
+            close_if_empty(ax, drew)
+            if drew:
+                legend(ax)
+
+        # 5. Reference population and the count actually used. Ranking-only: a
+        #    Coordinate-only run must not show an empty reference panel.
+        references = None
+        if ranking_enabled:
+            references = panel("Ranking references", "References")
+            drew = draw(
+                references, "dense_ranking_references", "Pool population (max)", "tab:purple"
+            )
+            drew = (
+                draw(
+                    references,
+                    "dense_ranking_reference_count",
+                    "Reference count (max)",
+                    "tab:green",
+                )
+                or drew
+            )
+            close_if_empty(references, drew)
+            if drew:
+                legend(references)
+
+        # 6. Shortages and unavailable populations. ``disabled`` is not a skip:
+        #    an objective that was switched off must not accumulate a skip count.
+        if ranking_enabled or coordinate_enabled:
+            ax = panel("Ranking shortages and skips", "Samples / pairs")
+            drew = draw(
+                ax, "dense_ranking_shortage_samples", "Shortage samples", "tab:red"
+            )
+            for name, label in (
+                ("dense_coordinate_status", "Coordinate skipped"),
+                ("dense_ranking_status", "Ranking skipped"),
+            ):
+                if name not in df_instant.columns:
+                    continue
+                mask = df_instant[name].astype("string") == "skipped"
+                if not bool(mask.any()):
+                    continue
+                ax.plot(
+                    iterations,
+                    mask.astype(int).cumsum(),
+                    label=label + " (cumulative)",
+                    linestyle=":",
+                )
+                drew = True
+            close_if_empty(ax, drew)
+            if drew:
+                legend(ax)
+
+        # 7-9. Numerical guards in separate panels: their scales differ.
+        ax = panel("Min participating norm", "Norm (log)")
+        drew = draw(ax, "dense_min_norm", "Min norm", "tab:blue")
+        close_if_empty(ax, drew)
+        if drew:
+            ax.set_yscale("log")
+            legend(ax)
+
+        ax = panel("Min interpolation rho", "rho")
+        drew = draw(ax, "dense_min_rho", "Min rho", "tab:green")
+        close_if_empty(ax, drew)
+        if drew:
+            all_rho = series("dense_min_rho")
+            if all_rho is not None and (all_rho <= 0).any():
+                ax.set_ylim(bottom=0.0)
+            legend(ax)
+
+        ax = panel("Ranking projected space (norm / rho)", "Value")
+        drew = draw(
+            ax,
+            "dense_ranking_projection_min_norm",
+            "Ranking pre-L2 projection norm",
+            "tab:purple",
+        )
+        drew = (
+            draw(ax, "dense_ranking_min_norm", "Ranking interpolated min norm", "tab:blue")
+            or drew
+        )
+        drew = (
+            draw(ax, "dense_ranking_min_rho", "Ranking min rho", "tab:green") or drew
+        )
+        close_if_empty(ax, drew)
+        if drew:
+            legend(ax)
+
+        ax = panel("Min student permutation probability", "P (log)")
+        drew = draw(ax, "dense_ranking_min_probability", "Min P", "tab:orange")
+        close_if_empty(ax, drew)
+        if drew:
+            ax.set_yscale("log")
+            legend(ax)
+
+        for index in range(slot, len(axes)):
+            axes[index].axis("off")
+        fig.suptitle("Dense diagnostics (Coordinate and NeCo-style ranking)")
+        fig.tight_layout()
+        return fig
 
     def plot(self, out_dir: Path, metrics_path: Path | None = None) -> None:
         if not self.path.exists():
@@ -905,8 +1360,19 @@ class InstantMetricsLogger:
 
         fig.tight_layout()
         out_path = out_dir / f"training_curves_{self.mode}.pdf"
-        fig.savefig(out_path, dpi=300, format="pdf", bbox_inches="tight")
-        plt.close(fig)
+        pages = [fig]
+        dense_fig = self._dense_diagnostics_figure(df_instant, plt)
+        if dense_fig is not None:
+            # A dense-enabled run appends one diagnostics page to the same PDF.
+            # Writing the CSV alone never produces these panels.
+            pages.append(dense_fig)
+        from matplotlib.backends.backend_pdf import PdfPages
+
+        with PdfPages(out_path) as pdf:
+            for page in pages:
+                pdf.savefig(page, dpi=300, bbox_inches="tight")
+        for page in pages:
+            plt.close(page)
         print(f"[Info] Saved training curves to {out_path}")
 
 

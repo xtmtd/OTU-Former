@@ -775,12 +775,12 @@ def _propagate_valid(valid: np.ndarray, op: GeometryOp) -> np.ndarray:
             radius *= max(
                 1.0, from_wh[0] / to_wh[0], from_wh[1] / to_wh[1]
             )
+        inverse = support.invert(matrix_for(op))
+        # Resize clamps taps to source edges, so all-valid input stays all-valid.
+        if valid.all():
+            return np.ones((to_wh[1], to_wh[0]), dtype=bool)
         return support.footprint_valid(
-            valid,
-            support.invert(matrix_for(op)),
-            to_wh,
-            radius=radius,
-            clamp=True,
+            valid, inverse, to_wh, radius=radius, clamp=True,
         )
     if kind in ("rotate", "affine"):
         canvas = [int(v) for v in params["canvas_wh"]]

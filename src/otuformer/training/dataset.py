@@ -1243,6 +1243,7 @@ class MultiCropDataset(Dataset):
         augmentation_config: dict[str, object] | None = None,
         weak_teacher_augmentation_config: dict[str, object] | None = None,
         prepared_relational_data: PreparedRelationalData | None = None,
+        return_geometry: bool = False,
     ) -> None:
         images_root = Path(images_dir)
         # Prepared state is the enabled-only handoff: when present it is the one
@@ -1260,6 +1261,9 @@ class MultiCropDataset(Dataset):
         self.local_crops = int(local_crops)
         self.augmentation_profile = augmentation_profile
         self.orientation_policy = orientation_policy
+        # Enabled-only handoff: traces are produced exactly when the dense
+        # objectives need them, and never on the historical all-off path.
+        self.return_geometry = bool(return_geometry)
         self.augmentation_config = (
             build_pretrain_augmentation_config(
                 augmentation_profile,
@@ -1329,10 +1333,33 @@ class MultiCropDataset(Dataset):
         fill: tuple[int, int, int],
         expected_size: int,
         view_name: str,
-    ) -> torch.Tensor:
+        *,
+        track: bool = False,
+    ) -> Any:
+        if track:
+            view, trace = transform.transform_with_geometry(image, fill)
+            _validate_view_shape(view, expected_size, view_name)
+            return view, trace
         view = transform(image, fill)
         _validate_view_shape(view, expected_size, view_name)
         return view
+
+    def _view_slots(self) -> list[tuple[Any, int, str, bool]]:
+        """Return ``(transform, size, name, is_weak)`` in the batch view order."""
+        slots: list[tuple[Any, int, str, bool]] = [
+            (self.global_tf1, self.global_crop_size, "global_tf1", False),
+            (self.global_tf2, self.global_crop_size, "global_tf2", False),
+        ]
+        for _ in range(self.local_crops):
+            slots.append((self.local_tf, self.local_crop_size, "local_tf", False))
+        if self.weak_teacher_tf1 is not None and self.weak_teacher_tf2 is not None:
+            slots.append(
+                (self.weak_teacher_tf1, self.global_crop_size, "weak_teacher_A", True)
+            )
+            slots.append(
+                (self.weak_teacher_tf2, self.global_crop_size, "weak_teacher_B", True)
+            )
+        return slots
 
     def __getitem__(self, idx: int) -> list[torch.Tensor] | dict[str, object]:
         with Image.open(self.image_paths[idx]) as im:
@@ -1342,44 +1369,76 @@ class MultiCropDataset(Dataset):
         else:
             # Legacy transforms ignore the fill argument (fixed black fill).
             fill = _BACKGROUND_FILL_FALLBACK
-        views = [
-            self._apply_view(
-                self.global_tf1, img, fill, self.global_crop_size, "global_tf1"
-            ),
-            self._apply_view(
-                self.global_tf2, img, fill, self.global_crop_size, "global_tf2"
-            ),
-        ]
-        for _ in range(self.local_crops):
-            views.append(
-                self._apply_view(
-                    self.local_tf, img, fill, self.local_crop_size, "local_tf"
-                )
-            )
-        if self.weak_teacher_tf1 is not None and self.weak_teacher_tf2 is not None:
-            views.append(
-                self._apply_view(
-                    self.weak_teacher_tf1,
-                    img,
-                    fill,
-                    self.global_crop_size,
-                    "weak_teacher_A",
-                )
-            )
-            views.append(
-                self._apply_view(
-                    self.weak_teacher_tf2,
-                    img,
-                    fill,
-                    self.global_crop_size,
-                    "weak_teacher_B",
-                )
-            )
+        views: list[torch.Tensor] = []
+        traces: list[object] = []
+        for transform, size, name, is_weak in self._view_slots():
+            # Only ordinary global/local views are tracked; weak-teacher views
+            # keep their tensor-only transform and RNG path.
+            track = self.return_geometry and not is_weak
+            result = self._apply_view(transform, img, fill, size, name, track=track)
+            if track:
+                view, trace = result
+                views.append(view)
+                traces.append(trace.to_json())
+            else:
+                views.append(result)
+                if self.return_geometry:
+                    traces.append(None)
+
+        if self.return_geometry:
+            payload: dict[str, object] = {"views": views, "geometry": traces}
+            if self.image_keys is not None:
+                payload["image_key"] = self.image_keys[idx]
+            return payload
         if self.image_keys is not None:
             # Enabled envelope: one key per row, aligned with the view list so
             # native collation keeps keys and views in the same row order.
             return {"views": views, "image_key": self.image_keys[idx]}
         return views
+
+
+def collate_pretrain_geometry(batch: list[object]) -> dict[str, object]:
+    """Collate an enabled dense batch, keeping per-view ragged traces.
+
+    Tensors collate by the historical behaviour (stack along a new batch axis).
+    Geometry stays per view and per row because realized operation sequences are
+    variable length, so it is never handed to the default collator.
+    """
+    if not batch or not isinstance(batch[0], dict):
+        raise ValueError(
+            "collate_pretrain_geometry expects enabled mapping rows, got "
+            f"{type(batch[0]).__name__ if batch else 'nothing'}."
+        )
+    allowed = {"views", "geometry", "image_key"}
+    for row in batch:
+        if not isinstance(row, dict) or not set(row) <= allowed:
+            raise ValueError(
+                f"unexpected dense batch row keys {sorted(row) if isinstance(row, dict) else row}."
+            )
+        if "views" not in row or "geometry" not in row:
+            raise ValueError("a dense batch row needs both 'views' and 'geometry'.")
+
+    view_count = len(batch[0]["views"])
+    if any(len(row["views"]) != view_count for row in batch):
+        raise ValueError("dense batch rows disagree on the view count.")
+    if any(len(row["geometry"]) != view_count for row in batch):
+        raise ValueError("geometry does not have one slot per view.")
+
+    views = [
+        torch.stack([row["views"][index] for row in batch])
+        for index in range(view_count)
+    ]
+    geometry = tuple(
+        None if all(row["geometry"][index] is None for row in batch)
+        else tuple(row["geometry"][index] for row in batch)
+        for index in range(view_count)
+    )
+    collated: dict[str, object] = {"views": views, "geometry": geometry}
+    if any("image_key" in row for row in batch):
+        if not all("image_key" in row for row in batch):
+            raise ValueError("only some dense batch rows carry an image key.")
+        collated["image_key"] = tuple(str(row["image_key"]) for row in batch)
+    return collated
 
 
 class MetricDataset(Dataset):

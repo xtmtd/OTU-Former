@@ -36,6 +36,9 @@ dev = [
 annotations = [
     "pycocotools>=2.0.7",
 ]
+ranking = [
+    "diffsort==0.2.0",
+]
 
 [project.scripts]
 otuformer = "otuformer.cli.main:app"

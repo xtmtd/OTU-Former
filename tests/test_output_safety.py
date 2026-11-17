@@ -255,6 +255,405 @@ def test_training_selected_images_survive_cleanup(tmp_path, checkpoint, monkeypa
         assert not real.exists()
 
 
+def test_pretrain_overwrite_cannot_delete_the_initialization_source(
+    tmp_path, monkeypatch
+):
+    """A --init-checkpoint living inside the output is input, never output."""
+    from otuformer.training.model import OTUFormerEncoder
+    from otuformer.utils import checkpoint as checkpoint_module
+
+    monkeypatch.setattr(
+        pretrain_loop_module, "run_pretrain", lambda *args, **kwargs: None
+    )
+    images = tmp_path / "images"
+    images.mkdir()
+    Image.new("RGB", (32, 32)).save(images / "a.png")
+    train = tmp_path / "train.csv"
+    pd.DataFrame({"image": ["a.png"]}).to_csv(train, index=False)
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "old_result.txt").write_text("previous run")
+
+    torch.manual_seed(0)
+    encoder = OTUFormerEncoder(
+        model_name="vit_tiny_patch16_224",
+        out_dim=16,
+        return_patch_tokens=True,
+        img_size=224,
+        pretrained=False,
+        reg_tokens=None,
+    )
+    source = out / "source.pth"
+    checkpoint_module.save_checkpoint(
+        {
+            "teacher": encoder.state_dict(),
+            "student": encoder.state_dict(),
+            "config": {
+                "model_name": "vit_tiny_patch16_224",
+                "image_size": 224,
+                "out_dim": 16,
+                "ssl_method": "relational",
+                "ssl_head": "projection_mlp_2048",
+                "register_tokens": 0,
+            },
+            "iteration": 0,
+            "epoch": 0,
+        },
+        source,
+    )
+    argv = [
+        "pretrain",
+        "--input-images-dir",
+        str(images),
+        "--train-data",
+        str(train),
+        "--out-dir",
+        str(out),
+        "--overwrite",
+        "--device",
+        "cpu",
+        "--init-checkpoint",
+        str(source),
+    ]
+    result = CliRunner().invoke(app, argv)
+    assert result.exit_code == 2, (result.output, repr(result.exception))
+    message = " ".join(result.output.replace("│", " ").split())
+    assert any(
+        text in message
+        for text in ("holds the input", "contains protected input", "is reached through")
+    )
+    # Neither the source weights nor the previous results were destroyed.
+    assert source.exists()
+    assert (out / "old_result.txt").read_text() == "previous run"
+
+
+def test_negative_dense_weight_preserves_existing_output(tmp_path, monkeypatch):
+    """An invalid dense weight must fail before --overwrite clears anything."""
+    monkeypatch.setattr(
+        pretrain_loop_module, "run_pretrain", lambda *args, **kwargs: None
+    )
+    images = tmp_path / "images"
+    images.mkdir()
+    Image.new("RGB", (32, 32)).save(images / "a.png")
+    train = tmp_path / "train.csv"
+    pd.DataFrame({"image": ["a.png"]}).to_csv(train, index=False)
+    out = tmp_path / "out"
+    out.mkdir()
+    sentinel = out / "old_result.txt"
+    sentinel.write_text("previous run")
+    result = CliRunner().invoke(
+        app,
+        [
+            "pretrain",
+            "--input-images-dir",
+            str(images),
+            "--train-data",
+            str(train),
+            "--out-dir",
+            str(out),
+            "--overwrite",
+            "--device",
+            "cpu",
+            "--coordinate-weight",
+            "-0.5",
+        ],
+    )
+    assert result.exit_code == 2, (result.output, repr(result.exception))
+    assert sentinel.read_text() == "previous run"
+
+
+def test_incomplete_initialization_source_preserves_existing_output(
+    tmp_path, monkeypatch
+):
+    """A source without its full backbone must fail before the cleanup too."""
+    from otuformer.training.model import OTUFormerEncoder
+    from otuformer.utils import checkpoint as checkpoint_module
+
+    monkeypatch.setattr(
+        pretrain_loop_module, "run_pretrain", lambda *args, **kwargs: None
+    )
+    images = tmp_path / "images"
+    images.mkdir()
+    Image.new("RGB", (32, 32)).save(images / "a.png")
+    train = tmp_path / "train.csv"
+    pd.DataFrame({"image": ["a.png"]}).to_csv(train, index=False)
+    out = tmp_path / "out"
+    out.mkdir()
+    sentinel = out / "old_result.txt"
+    sentinel.write_text("previous run")
+
+    torch.manual_seed(0)
+    encoder = OTUFormerEncoder(
+        model_name="vit_tiny_patch16_224",
+        out_dim=16,
+        return_patch_tokens=True,
+        img_size=224,
+        pretrained=False,
+        reg_tokens=None,
+    )
+    teacher = encoder.state_dict()
+    removed = sorted(key for key in teacher if key.startswith("backbone."))[0]
+    partial = {key: value for key, value in teacher.items() if key != removed}
+    source = tmp_path / "partial.pth"
+    checkpoint_module.save_checkpoint(
+        {
+            "teacher": partial,
+            "config": {
+                "model_name": "vit_tiny_patch16_224",
+                "image_size": 224,
+                "out_dim": 16,
+                "ssl_method": "relational",
+                "ssl_head": "projection_mlp_2048",
+                "register_tokens": 0,
+            },
+            "iteration": 0,
+            "epoch": 0,
+        },
+        source,
+    )
+    result = CliRunner().invoke(
+        app,
+        [
+            "pretrain",
+            "--input-images-dir",
+            str(images),
+            "--train-data",
+            str(train),
+            "--out-dir",
+            str(out),
+            "--overwrite",
+            "--device",
+            "cpu",
+            "--init-checkpoint",
+            str(source),
+        ],
+    )
+    assert result.exit_code == 2, (result.output, repr(result.exception))
+    assert sentinel.read_text() == "previous run"
+
+
+def test_steps_per_epoch_mismatch_fails_before_any_output_write(tmp_path, monkeypatch):
+    """The saved loader length is proven before logs/checkpoints are touched."""
+    from otuformer.training.model import OTUFormerEncoder
+    from otuformer.utils import checkpoint as checkpoint_module
+
+    monkeypatch.setattr(
+        pretrain_loop_module, "run_pretrain", lambda *args, **kwargs: None
+    )
+    images = tmp_path / "images"
+    images.mkdir()
+    for index in range(4):
+        Image.new("RGB", (32, 32)).save(images / f"a{index}.png")
+    train = tmp_path / "train.csv"
+    pd.DataFrame({"image": [f"a{i}.png" for i in range(4)]}).to_csv(train, index=False)
+    out = tmp_path / "out"
+    out.mkdir()
+    sentinel = out / "old_result.txt"
+    sentinel.write_text("previous run")
+
+    torch.manual_seed(0)
+    encoder = OTUFormerEncoder(
+        model_name="vit_tiny_patch16_224",
+        out_dim=16,
+        return_patch_tokens=True,
+        img_size=224,
+        pretrained=False,
+        reg_tokens=None,
+    )
+    from otuformer.training import dense_recipe
+
+    settings = dense_recipe.DenseSettings(
+        coordinate_weight=0.5, ranking_weight=0.0, query_cap=49, reference_cap=None
+    )
+    config = dense_recipe.dense_config_bundle(
+        settings, batch_size=2, steps_per_epoch=8, dependency=None
+    )
+    runtime = dense_recipe.new_dense_runtime(settings, seed=1)
+    state = dense_recipe.dense_state_bundle(
+        runtime, completed_steps=8, ranking=None
+    )
+    source = tmp_path / "with-dense.pth"
+    checkpoint_module.save_checkpoint(
+        {
+            "teacher": encoder.state_dict(),
+            "student": encoder.state_dict(),
+            "config": {
+                "model_name": "vit_tiny_patch16_224",
+                "image_size": 224,
+                "out_dim": 16,
+                "ssl_method": "relational",
+                "ssl_head": "projection_mlp_2048",
+                "register_tokens": 0,
+                dense_recipe.CONFIG_KEY: config,
+            },
+            dense_recipe.STATE_KEY: state,
+            "iteration": 8,
+            "epoch": 0,
+            "schedule": {
+                "original_max_epochs": 1,
+                "total_steps": 8,
+                "steps_per_epoch": 8,
+                "warmup_steps": 0,
+                "last_lr": 1e-3,
+                "final_lr": 1e-3,
+            },
+        },
+        source,
+    )
+    result = CliRunner().invoke(
+        app,
+        [
+            "pretrain",
+            "--input-images-dir",
+            str(images),
+            "--train-data",
+            str(train),
+            "--out-dir",
+            str(out),
+            "--device",
+            "cpu",
+            "--batch-size",
+            "2",
+            "--out-dim",
+            "16",
+            "--resume",
+            str(source),
+        ],
+    )
+    assert result.exit_code == 2, (result.output, repr(result.exception))
+    # Rejected in preflight, before setup: the previous result and the untouched
+    # directory stay exactly as they were (no log file, no checkpoint). A dense
+    # resume now fails on the earliest incomplete state it finds, which for this
+    # hand-built fixture is the missing optimizer, not the loader length.
+    assert sentinel.read_text() == "previous run"
+    assert sorted(p.name for p in out.iterdir()) == ["old_result.txt"]
+
+
+def test_zero_full_batches_is_rejected_before_output(tmp_path, monkeypatch):
+    """96 rows with batch 128 is zero drop_last steps, so a resume cannot run."""
+    from otuformer.training.model import OTUFormerEncoder
+    from otuformer.utils import checkpoint as checkpoint_module
+
+    monkeypatch.setattr(
+        pretrain_loop_module, "run_pretrain", lambda *args, **kwargs: None
+    )
+    images = tmp_path / "images"
+    images.mkdir()
+    for index in range(96):
+        Image.new("RGB", (32, 32)).save(images / f"a{index:03d}.png")
+    train = tmp_path / "train.csv"
+    pd.DataFrame({"image": [f"a{i:03d}.png" for i in range(96)]}).to_csv(
+        train, index=False
+    )
+    out = tmp_path / "out"
+    out.mkdir()
+    sentinel = out / "old_result.txt"
+    sentinel.write_text("previous run")
+
+    torch.manual_seed(0)
+    encoder = OTUFormerEncoder(
+        model_name="vit_tiny_patch16_224",
+        out_dim=16,
+        return_patch_tokens=True,
+        img_size=224,
+        pretrained=False,
+        reg_tokens=None,
+    )
+    source = tmp_path / "zero-steps.pth"
+    checkpoint_module.save_checkpoint(
+        {
+            "teacher": encoder.state_dict(),
+            "student": encoder.state_dict(),
+            "config": {
+                "model_name": "vit_tiny_patch16_224",
+                "image_size": 224,
+                "out_dim": 16,
+                "ssl_method": "relational",
+                "ssl_head": "projection_mlp_2048",
+                "register_tokens": 0,
+            },
+            "iteration": 4,
+            "epoch": 0,
+            "schedule": {
+                "original_max_epochs": 1,
+                "total_steps": 4,
+                "steps_per_epoch": 4,
+                "warmup_steps": 0,
+                "last_lr": 1e-3,
+                "final_lr": 1e-3,
+            },
+        },
+        source,
+    )
+    result = CliRunner().invoke(
+        app,
+        [
+            "pretrain",
+            "--input-images-dir",
+            str(images),
+            "--train-data",
+            str(train),
+            "--out-dir",
+            str(out),
+            "--device",
+            "cpu",
+            "--batch-size",
+            "128",
+            "--out-dim",
+            "16",
+            "--resume",
+            str(source),
+        ],
+    )
+    assert result.exit_code == 2, (result.output, repr(result.exception))
+    assert "0 steps" in " ".join(result.output.split())
+    assert sentinel.read_text() == "previous run"
+    assert sorted(p.name for p in out.iterdir()) == ["old_result.txt"]
+
+
+def test_new_dense_run_with_no_full_batch_is_rejected_before_output(
+    tmp_path, monkeypatch
+):
+    """A fresh enabled run also needs one full batch, not just a resume."""
+    monkeypatch.setattr(
+        pretrain_loop_module, "run_pretrain", lambda *args, **kwargs: None
+    )
+    images = tmp_path / "images"
+    images.mkdir()
+    for index in range(96):
+        Image.new("RGB", (32, 32)).save(images / f"a{index:03d}.png")
+    train = tmp_path / "train.csv"
+    pd.DataFrame({"image": [f"a{i:03d}.png" for i in range(96)]}).to_csv(
+        train, index=False
+    )
+    out = tmp_path / "out"
+    out.mkdir()
+    sentinel = out / "old_result.txt"
+    sentinel.write_text("previous run")
+    result = CliRunner().invoke(
+        app,
+        [
+            "pretrain",
+            "--input-images-dir",
+            str(images),
+            "--train-data",
+            str(train),
+            "--out-dir",
+            str(out),
+            "--overwrite",
+            "--device",
+            "cpu",
+            "--batch-size",
+            "128",
+            "--coordinate-weight",
+            "0.5",
+        ],
+    )
+    assert result.exit_code == 2, (result.output, repr(result.exception))
+    assert "0 steps" in " ".join(result.output.split())
+    assert sentinel.read_text() == "previous run"
+
+
 @pytest.mark.parametrize("nested_output", [False, True])
 def test_extract_nonempty_output_requires_overwrite_without_traceback(
     tmp_path, checkpoint, nested_output

@@ -40,6 +40,48 @@ from otuformer.constants import (
     SSL_METHODS,
 )
 
+def _pretrain_loader_steps(
+    ns, resume_state, relational_queue_preparation, *, batch_size: int
+) -> int:
+    """Predict ``len(loader)`` for the training loader before it exists.
+
+    The loader drops the last partial batch and reads one row per selected image,
+    so the count is a pure function of the resolved selection and batch size.
+    Returning the true count (rather than a "unknown" placeholder) lets a saved
+    ``steps_per_epoch`` be checked before any output is cleared.
+    """
+    if relational_queue_preparation is not None and relational_queue_preparation.active:
+        rows = len(relational_queue_preparation.data.image_keys)
+    else:
+        from otuformer.training.dataset import resolve_dataset_image_paths
+
+        rows = len(
+            resolve_dataset_image_paths(ns.train_data, ns.input_images_dir)
+        )
+    # The training loader is ``drop_last=True``, so a selection smaller than one
+    # batch yields **zero** steps. Flooring that to 1 would let a resume that the
+    # real loader cannot serve reach output preparation.
+    steps = rows // int(batch_size)
+    if steps < 1:
+        raise ValueError(
+            f"The training loader would yield 0 steps: {rows} selected row(s) "
+            f"with --batch-size {int(batch_size)} and drop_last=True. Select at "
+            "least one full batch."
+        )
+    return steps
+
+
+#! In-memory handoffs on the CLI namespace: never printed as parameters and
+#! never saved in the checkpoint ``args`` record.
+_CLI_HANDOFF_ARGS = frozenset(
+    {
+        "pretrain_initialization_prepared",
+        "pretrain_dense_settings",
+        "pretrain_dense_dependency",
+    }
+)
+
+
 app = typer.Typer(
     help=(
         "SSL self-supervised pre-training (DINO/iBOT style).\n\n"
@@ -242,7 +284,7 @@ def pretrain(
             "--ssl-method independently; both share the encoder and teacher "
             "temperature (ibot)."
         ),
-        rich_help_panel="Patch objective",
+        rich_help_panel="Patch objectives",
     ),
     masking_strategy: str = typer.Option(
         "random",
@@ -254,7 +296,7 @@ def pretrain(
             "Not applicable to none/consistency; the exact geometry limits are "
             f"documented at {docs_url('pretrain')}."
         ),
-        rich_help_panel="Patch objective",
+        rich_help_panel="Patch objectives",
     ),
     mask_ratio: str = typer.Option(
         "auto",
@@ -266,7 +308,7 @@ def pretrain(
             "share for consistency and as the masked student-input fraction "
             "for masked-feature/ibot."
         ),
-        rich_help_panel="Patch objective",
+        rich_help_panel="Patch objectives",
     ),
     ibot_prototypes: int = typer.Option(
         512,
@@ -278,7 +320,7 @@ def pretrain(
             "convenient habit, not a requirement. Not applicable to other "
             "patch modes."
         ),
-        rich_help_panel="Patch objective",
+        rich_help_panel="Patch objectives",
     ),
     lambda_mask: float = typer.Option(
         1.0,
@@ -288,7 +330,48 @@ def pretrain(
             "different scale from the cosine patch losses, so lower it (for "
             "example 0.25-0.5) when using --patch-loss ibot."
         ),
-        rich_help_panel="Patch objective",
+        rich_help_panel="Patch objectives",
+    ),
+    coordinate_weight: float = typer.Option(
+        0.0,
+        "--coordinate-weight",
+        help=(
+            "Weight for the cross-view Coordinate consistency term. 0 (default) "
+            "disables it. Finite and non-negative; fixed for the whole run. A "
+            "positive weight enables the dense objectives, which add to (never "
+            "replace) the selected --patch-loss mode."
+        ),
+        rich_help_panel="Patch objectives",
+    ),
+    dense_query_points: int = typer.Option(
+        49,
+        "--dense-query-points",
+        help=(
+            "Upper bound on correspondence query points per image and ordered "
+            "view pair (1..49). A view with fewer eligible centres uses all of "
+            "them and consumes no sampling draw."
+        ),
+        rich_help_panel="Patch objectives",
+    ),
+    ranking_weight: float = typer.Option(
+        0.0,
+        "--ranking-weight",
+        help=(
+            "Weight for the NeCo-style neighbour-ranking term. 0 (default) "
+            "disables it and imports no optional package. A positive weight "
+            "enables the ranking objective, which adds to (never replaces) the "
+            "selected --patch-loss mode and needs the qualified 'ranking' extra."
+        ),
+        rich_help_panel="Patch objectives",
+    ),
+    ranking_reference_points: int = typer.Option(
+        16,
+        "--ranking-reference-points",
+        help=(
+            "Reference-list size per sample for the ranking objective (2..49). "
+            "Part of the saved recipe identity, so changing it requires a new run."
+        ),
+        rich_help_panel="Patch objectives",
     ),
     augmentation: str | None = typer.Option(
         None,
@@ -499,6 +582,26 @@ def pretrain(
     ),
     seed: int = typer.Option(42, "--seed", help="Random seed.",
         rich_help_panel="Runtime and reproducibility",),
+    init_checkpoint: str = typer.Option(
+        "",
+        "--init-checkpoint",
+        help=(
+            "Start a NEW run from a recognized OTU SSL checkpoint, transferring "
+            "only the selected backbone branch. Mutually exclusive with --resume; "
+            "heads, optimizer, schedules and history all start fresh, and the "
+            "source file is hashed but never modified."
+        ),
+        rich_help_panel="Recovery and safety",
+    ),
+    init_source: str = typer.Option(
+        "teacher",
+        "--init-source",
+        help=(
+            "Branch to transfer from --init-checkpoint: teacher (EMA) or student. "
+            "The selected branch must exist; the other is never substituted."
+        ),
+        rich_help_panel="Recovery and safety",
+    ),
     resume: str = typer.Option(
         "",
         "--resume",
@@ -559,6 +662,11 @@ def pretrain(
             "no_norm_bias_weight_decay",
             "relational_queue_size",
             "batch_size",
+            "coordinate_weight",
+            "dense_query_points",
+            "ranking_weight",
+            "ranking_reference_points",
+            "init_source",
         )
     }
     requested_global_crop_size = _parse_size(
@@ -592,6 +700,9 @@ def pretrain(
         train_data=str(train_data) if train_data is not None else "",
         input_images_dir=str(input_images_dir),
         resume=resume,
+        init_checkpoint=init_checkpoint,
+        init_source=init_source,
+        init_source_explicit=explicit_sources["init_source"],
         ssl_method=ssl_method,
         ssl_method_explicit=explicit_sources["ssl_method"],
         relational_queue_size=relational_queue_size,
@@ -655,6 +766,16 @@ def pretrain(
         mask_ratio=requested_mask_ratio,
         lambda_local=lambda_local,
         lambda_mask=lambda_mask,
+        coordinate_weight=coordinate_weight,
+        coordinate_weight_explicit=explicit_sources["coordinate_weight"],
+        dense_query_points=dense_query_points,
+        dense_query_points_explicit=explicit_sources["dense_query_points"],
+        ranking_weight=ranking_weight,
+        ranking_weight_explicit=explicit_sources["ranking_weight"],
+        ranking_reference_points=ranking_reference_points,
+        ranking_reference_points_explicit=explicit_sources[
+            "ranking_reference_points"
+        ],
         patch_loss=patch_loss,
         patch_loss_explicit=explicit_sources["patch_loss"],
         masking_strategy=masking_strategy,
@@ -706,14 +827,37 @@ def pretrain(
         seed=seed,
     )
     from otuformer.training.pretrain_recipe import resolve_pretrain_ssl_config
+
     # Resolve through the loop module: it owns the run and is where a caller
     # patches these three, so a direct alias would bypass the patch.
     from otuformer.training import pretrain_loop as pretrain_loop_module
 
+    # The initialization source is loaded and hashed before anything can clear
+    # the output directory, and its architecture/size/register layout is what
+    # the omitted requests inherit. A malformed source therefore fails before
+    # --overwrite can destroy the source file or the previous results.
+    prepared_initialization = None
+    if str(init_checkpoint or ""):
+        from otuformer.utils.checkpoint import prepare_pretrain_initialization
+
+        try:
+            prepared_initialization = prepare_pretrain_initialization(
+                Path(str(init_checkpoint)),
+                source_key=str(init_source or "teacher"),
+                default_model_name=str(model_name or ""),
+            )
+        except (ValueError, KeyError, OSError, RuntimeError) as exc:
+            raise typer.BadParameter(str(exc)) from exc
+        ns.pretrain_initialization_prepared = prepared_initialization
+
     try:
         # One resolution feeds the preflight, the run and the saved recipe.
-        settings = pretrain_loop_module.resolve_pretrain_settings(ns, resume_state)
-        pretrain_loop_module.preflight_pretrain_run(ns, settings)
+        settings = pretrain_loop_module.resolve_pretrain_settings(
+            ns, resume_state, initialization=prepared_initialization
+        )
+        pretrain_loop_module.preflight_pretrain_run(
+            ns, settings, initialization=prepared_initialization
+        )
         recipe = pretrain_loop_module._resolve_pretrain_recipe(
             ns,
             resume_state,
@@ -728,10 +872,82 @@ def pretrain(
         )
     except (ValueError, KeyError, OSError, RuntimeError) as exc:
         raise typer.BadParameter(str(exc)) from exc
+    # Dense resolution and every fail-fast check that can be decided without the
+    # loader run here, before --overwrite may clear anything: a negative weight,
+    # an out-of-range cap or an unqualified sorter must not destroy old results.
+    dense_settings = None
+    dense_dependency = None
+    try:
+        from otuformer.training import dense_recipe as dense_recipe_module
+        from otuformer.training.runtime import _resolve_device
+
+        dense_settings = dense_recipe_module.resolve_dense_settings(
+            ns, resume_state
+        )
+        if dense_settings.ranking_enabled:
+            from otuformer.training.neighbor_ranking import (
+                probe_ranking_dependency,
+            )
+
+            dense_dependency = probe_ranking_dependency(
+                _resolve_device(str(device or "auto"))
+            )
+        if resume_state is not None:
+            resolved_batch = int(
+                relational_queue_preparation.effective_batch_size
+                if relational_queue_preparation is not None
+                and relational_queue_preparation.active
+                else ns.batch_size
+            )
+            # The loader length is deterministic here: the training loader is
+            # ``drop_last=True`` over one row per selected image. Resolving it
+            # now means a saved steps_per_epoch mismatch fails *before*
+            # --overwrite, not after the output directory was prepared.
+            dense_recipe_module.validate_dense_resume(
+                (resume_state.get("config") or {}).get(
+                    dense_recipe_module.CONFIG_KEY
+                ),
+                resume_state.get(dense_recipe_module.STATE_KEY),
+                iteration=int(resume_state.get("iteration", -1)),
+                batch_size=resolved_batch,
+                steps_per_epoch=_pretrain_loader_steps(
+                    ns,
+                    resume_state,
+                    relational_queue_preparation,
+                    batch_size=resolved_batch,
+                ),
+                dependency=dense_dependency,
+            )
+        elif dense_settings is not None and dense_settings.enabled:
+            # A new enabled run needs at least one full batch too: the startup
+            # probe takes one batch, so zero steps would fail after the output
+            # directory and log files already exist.
+            _pretrain_loader_steps(
+                ns,
+                resume_state,
+                relational_queue_preparation,
+                batch_size=int(
+                    relational_queue_preparation.effective_batch_size
+                    if relational_queue_preparation is not None
+                    and relational_queue_preparation.active
+                    else ns.batch_size
+                ),
+            )
+    except (ValueError, KeyError, OSError, RuntimeError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    ns.pretrain_dense_settings = dense_settings
+    ns.pretrain_dense_dependency = dense_dependency
+
     try:
         from otuformer.training.dataset import resolve_dataset_image_paths
 
         protected = [input_images_dir, train_data, resume]
+        if prepared_initialization is not None:
+            # A source inside the output directory is input, not output: clearing
+            # it before the transfer would lose the weights it was selected for.
+            protected.append(prepared_initialization.path)
+        elif str(init_checkpoint or ""):
+            protected.append(str(init_checkpoint))
         if (
             overwrite
             and out_dir.exists()
@@ -763,7 +979,11 @@ def pretrain(
     sys.stdout = tee
     sys.stderr = tee
     try:
-        params = vars(ns)
+        params = {
+            key: value
+            for key, value in vars(ns).items()
+            if key not in _CLI_HANDOFF_ARGS
+        }
         # ``Parameters:`` records the request, so an auto/none default reads as
         # the word the user used instead of the internal ``None`` placeholder.
         displayed = {

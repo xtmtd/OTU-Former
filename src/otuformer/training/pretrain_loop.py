@@ -26,6 +26,14 @@ from otuformer.constants import (
 )
 import argparse
 import json
+from otuformer.training.dataset import collate_pretrain_geometry
+from otuformer.training.dense_recipe import (
+    CONFIG_KEY,
+    STATE_KEY,
+    dense_config_bundle,
+    dense_state_bundle,
+    new_dense_runtime,
+)
 from otuformer.utils.checkpoint import (
     ARCFACE_EMBEDDING_HEAD,
     PROJECTION_EMBEDDING_HEAD,
@@ -102,6 +110,7 @@ from .pretrain_recipe import (
     _TRANSIENT_ARGS,
     _UNSAVED_ARGS,
     _validate_pretrain_optimizer_layout,
+    _verify_restorable_rng_state,
     KOLEO_STORED_KEYS,
     preflight_pretrain_run,
     prepare_pretrain_relational_queue,
@@ -173,21 +182,133 @@ def _restore_relational_center(
     reference.copy_(center.to(dtype=reference.dtype).to(device=device))
 
 
-def _unpack_pretrain_batch(
-    batch: object, *, queue_enabled: bool
-) -> tuple[list[torch.Tensor], tuple[str, ...] | None]:
-    """Split one loader batch into its views and (enabled only) image keys.
+def _to_feature_grid(
+    tokens: torch.Tensor, prefix: int, grid_size: tuple[int, int]
+) -> torch.Tensor:
+    """Reshape final-normalized patch tokens to BHWC using verified metadata."""
+    if prefix < 0:
+        raise ValueError(f"prefix must be non-negative, got {prefix}.")
+    patches = tokens[:, int(prefix) :, :]
+    grid_h, grid_w = int(grid_size[0]), int(grid_size[1])
+    if int(patches.shape[1]) != grid_h * grid_w:
+        raise ValueError(
+            f"{int(patches.shape[1])} patch token(s) do not fill the resolved grid "
+            f"{grid_size}; refusing to infer a grid from the token count."
+        )
+    return patches.reshape(
+        int(patches.shape[0]), grid_h, grid_w, int(patches.shape[-1])
+    )
 
-    A queue-off run keeps the historical list-of-views contract; an enabled run
-    requires the keyed mapping and never falls back to a silent list.
+
+def _dense_status(weight: float, raw: Any) -> str:
+    """Distinguish a switched-off objective from an enabled one with no signal.
+
+    Both used to be logged as ``skipped``, so a Coordinate-only run showed a
+    cumulative "ranking skipped" series for an objective it never ran.
     """
+    if weight <= 0.0:
+        return "disabled"
+    return "skipped" if raw is None else "observed"
+
+
+def _dense_stat_or_blank(value: Any) -> float | str:
+    """Render one dense statistic; ``None`` means unavailable, not measured zero."""
+    return "" if value is None else float(value)
+
+
+def _dense_terms(
+    settings: Any,
+    runtime: Any,
+    ranking_objective: Any,
+    student_grids: dict[int, torch.Tensor],
+    teacher_grids: dict[int, torch.Tensor],
+    batch_geometry: Any,
+    grid_hws: tuple[tuple[int, int], ...],
+    *,
+    patch_hw: tuple[int, int],
+) -> tuple[
+    torch.Tensor | None, dict[str, Any], torch.Tensor | None, dict[str, Any]
+]:
+    """Build the shared pairs once, then evaluate each enabled objective.
+
+    Coordinate and ranking share coordinates but keep separate feature spaces,
+    denominators and availability rules.
+    """
+    from otuformer.training import dense_geometry as _dense_geometry
+    from otuformer.training import dense_objective as _dense_objective
+
+    empty = {"contributing_pairs": 0, "selected_points": 0}
+    if not student_grids or len(teacher_grids) < 2:
+        return None, dict(empty), None, dict(empty)
+    pairs = _dense_geometry.build_dense_pairs(
+        batch_geometry,
+        grid_hws=grid_hws,
+        patch_hw=patch_hw,
+        local_crops=len(student_grids) - 2,
+        query_cap=int(settings.query_cap),
+        generator=runtime.query_generator,
+    )
+
+    coordinate_raw = None
+    coordinate_stats: dict[str, Any] = dict(empty)
+    if settings.coordinate_weight > 0.0:
+        result = _dense_objective.coordinate_loss(
+            student_grids, teacher_grids, pairs, patch_hw=patch_hw
+        )
+        coordinate_raw = result.raw
+        coordinate_stats = dict(result.statistics)
+        coordinate_stats["raw"] = (
+            None if result.raw is None else float(result.raw.detach())
+        )
+
+    ranking_raw = None
+    ranking_stats: dict[str, Any] = dict(empty)
+    if ranking_objective is not None and settings.ranking_enabled:
+        ranking_result = ranking_objective.compute(
+            student_grids,
+            teacher_grids,
+            pairs,
+            patch_hw=patch_hw,
+            reference_cap=int(settings.reference_cap),
+            generator=runtime.reference_generator,
+        )
+        ranking_raw = ranking_result.raw
+        ranking_stats = dict(ranking_result.statistics)
+        ranking_stats["raw"] = (
+            None if ranking_result.raw is None else float(ranking_result.raw.detach())
+        )
+        ranking_stats["ranking_contributed"] = ranking_result.raw is not None
+    return coordinate_raw, coordinate_stats, ranking_raw, ranking_stats
+
+
+def _unpack_pretrain_batch(
+    batch: object,
+    *,
+    queue_enabled: bool,
+    dense_enabled: bool = False,
+    local_crops: int | None = None,
+    include_weak_teacher_views: bool | None = None,
+) -> tuple[list[torch.Tensor], tuple[str, ...] | None, object | None]:
+    """Split one loader batch into views, (enabled only) keys and geometry.
+
+    A queue-off, dense-off run keeps the historical list-of-views contract. Each
+    enabled feature adds exactly one documented key and never falls back to a
+    silent alternative envelope.
+    """
+    if dense_enabled:
+        return _unpack_dense_batch(
+            batch,
+            queue_enabled=queue_enabled,
+            local_crops=local_crops,
+            include_weak_teacher_views=include_weak_teacher_views,
+        )
     if not queue_enabled:
         if isinstance(batch, dict) or not isinstance(batch, (list, tuple)):
             raise ValueError(
                 "The pretraining loader produced an unexpected batch envelope; a "
                 "queue-disabled run reads a list of view tensors."
             )
-        return list(batch), None
+        return list(batch), None, None
     if not isinstance(batch, dict):
         raise ValueError(
             "An enabled relational queue requires the keyed batch envelope from "
@@ -211,7 +332,123 @@ def _unpack_pretrain_batch(
                 f"{len(resolved_keys)} key(s) for {int(view.shape[0])} view "
                 "rows."
             )
-    return views, resolved_keys
+    return views, resolved_keys, None
+
+
+def _unpack_dense_batch(
+    batch: object,
+    *,
+    queue_enabled: bool,
+    local_crops: int | None,
+    include_weak_teacher_views: bool | None,
+) -> tuple[list[torch.Tensor], tuple[str, ...] | None, object | None]:
+    """Unpack an enabled dense batch and validate its exact view layout.
+
+    The two resolved layout values are required rather than inferred from
+    ``None`` records: a trace with a well-formed but wrongly placed weak slot
+    must fail instead of silently shifting every later view index.
+    """
+    from otuformer.training import dense_geometry as _dense_geometry
+
+    if local_crops is None or include_weak_teacher_views is None:
+        raise ValueError(
+            "An enabled dense batch requires the resolved local_crops and "
+            "include_weak_teacher_views values; weak slots are never inferred "
+            "from empty records."
+        )
+    if not isinstance(batch, dict):
+        raise ValueError(
+            "An enabled dense objective requires the geometry mapping envelope "
+            f"from MultiCropDataset(return_geometry=True); got {type(batch).__name__}."
+        )
+    expected = {"views", "geometry"}
+    if queue_enabled:
+        expected.add("image_key")
+    if set(batch) != expected:
+        raise ValueError(
+            f"An enabled dense batch requires exactly {sorted(expected)}, got "
+            f"{sorted(batch)}."
+        )
+
+    views = list(batch["views"])
+    ordinary = 2 + int(local_crops)
+    expected_views = ordinary + (2 if include_weak_teacher_views else 0)
+    if len(views) != expected_views:
+        raise ValueError(
+            f"The enabled dense batch has {len(views)} view(s); the resolved layout "
+            f"requires {expected_views} (2 globals + {local_crops} locals"
+            f"{' + 2 weak' if include_weak_teacher_views else ''})."
+        )
+
+    geometry = tuple(batch["geometry"])
+    if len(geometry) != len(views):
+        raise ValueError(
+            f"geometry has {len(geometry)} slot(s) for {len(views)} view(s)."
+        )
+    decoded_geometry = []
+    for index, slot in enumerate(geometry):
+        if index < ordinary:
+            if slot is None or len(slot) != len(views[index]):
+                raise ValueError(
+                    f"geometry slot {index} must carry one trace per batch row."
+                )
+            decoded_slot = []
+            for row, trace in enumerate(slot):
+                if isinstance(trace, dict):
+                    try:
+                        trace = _dense_geometry._geometry.GeometryTrace.from_json(trace)
+                    except (KeyError, TypeError, ValueError, OverflowError) as exc:
+                        raise ValueError(
+                            f"geometry slot {index} row {row} has an invalid serialized trace: {exc}"
+                        ) from exc
+                if not isinstance(trace, _dense_geometry._geometry.GeometryTrace):
+                    raise ValueError(
+                        f"geometry slot {index} row {row} carries a non-trace record."
+                    )
+                decoded_slot.append(trace)
+            decoded_geometry.append(tuple(decoded_slot))
+        else:
+            # Accept old collator envelopes only at this boundary; downstream is canonical.
+            if slot is not None and (
+                len(slot) != len(views[index]) or any(item is not None for item in slot)
+            ):
+                raise ValueError(
+                    f"geometry slot {index} is a weak-teacher view and must be None "
+                    "for every row; no support or trace is computed for weak views."
+                )
+            decoded_geometry.append(None)
+    geometry = tuple(decoded_geometry)
+
+    rows = int(views[0].shape[0])
+    for view in views:
+        if int(view.shape[0]) != rows:
+            raise ValueError(
+                "The enabled dense batch must align one row across every view."
+            )
+    for index, slot in enumerate(geometry):
+        if slot is None or index >= ordinary:
+            continue
+        for row, trace in enumerate(slot):
+            view = views[index][row]
+            if (int(view.shape[-1]), int(view.shape[-2])) != tuple(trace.view_wh):
+                raise ValueError(
+                    f"view {index} row {row} is {tuple(view.shape[-2:])} but its "
+                    f"trace says {trace.view_wh}."
+                )
+
+    if queue_enabled:
+        keys = batch["image_key"]
+        if isinstance(keys, (str, bytes)):
+            raise ValueError("The enabled batch envelope must carry image-key strings.")
+        resolved_keys = tuple(str(key) for key in keys)
+        if len(resolved_keys) != rows:
+            raise ValueError(
+                "The enabled batch envelope must align one image key per row: "
+                f"{len(resolved_keys)} key(s) for {rows} row(s)."
+            )
+    else:
+        resolved_keys = None
+    return views, resolved_keys, geometry
 
 
 def run_pretrain(
@@ -237,6 +474,31 @@ def run_pretrain(
     # and hands the result over.
     # Bound to the *current* resume path: changing args.resume must not keep
     # serving a previously loaded checkpoint.
+    # Initialization is a new-run entry point: reject a both-at-once request
+    # before the resume path can re-validate the source as a resume target.
+    init_requested = str(getattr(args, "init_checkpoint", "") or "")
+    if init_requested and str(getattr(args, "resume", "") or ""):
+        raise ValueError(
+            "--init-checkpoint and --resume are mutually exclusive: initialization "
+            "starts a new run with fresh heads and progress."
+        )
+    if bool(getattr(args, "init_source_explicit", False)) and not init_requested:
+        raise ValueError(
+            "--init-source requires --init-checkpoint; omit it for a fresh run."
+        )
+    # Prepared once, before the settings (which inherit the source architecture,
+    # size and register layout) and before any output directory is cleared. The
+    # CLI validates the same source before --overwrite can touch anything and
+    # hands the prepared snapshot over.
+    prepared_initialization = getattr(args, "pretrain_initialization_prepared", None)
+    if init_requested and prepared_initialization is None:
+        from otuformer.utils.checkpoint import prepare_pretrain_initialization
+
+        prepared_initialization = prepare_pretrain_initialization(
+            Path(init_requested),
+            source_key=str(getattr(args, "init_source", None) or "teacher"),
+            default_model_name=str(getattr(args, "model_name", "") or ""),
+        )
     resume_ckpt = resume_payload_for(args, handoff)
     # The queue preparation is model-free and runs before every probe: enabled
     # data identity, the batch/steps-per-epoch locks and the strict recovery
@@ -245,6 +507,20 @@ def run_pretrain(
     preparation = verify_relational_queue_preparation(
         handoff.relational_queue_preparation, args, resume_ckpt
     )
+    # Resolve once per invocation, before any output mutation. An omitted value
+    # inherits the saved recipe on resume; an explicit conflict is rejected.
+    from otuformer.training.dense_recipe import (
+        validate_dense_resume as _validate_dense_resume,
+    )
+    from otuformer.training.dense_recipe import (
+        resolve_dense_settings as _resolve_dense_settings,
+    )
+
+    # The CLI resolves and validates the dense recipe before it can clear an
+    # output directory; a direct caller resolves it here exactly once.
+    dense_settings = getattr(args, "pretrain_dense_settings", None)
+    if dense_settings is None:
+        dense_settings = _resolve_dense_settings(args, resume_ckpt)
     settings = handoff.settings
     if pretrain_recipe is not None and settings is None:
         raise ValueError(
@@ -252,8 +528,12 @@ def run_pretrain(
             "pass both or neither."
         )
     if settings is None:
-        settings = resolve_pretrain_settings(args, resume_ckpt)
-        preflight_pretrain_run(args, settings)
+        settings = resolve_pretrain_settings(
+            args, resume_ckpt, initialization=prepared_initialization
+        )
+        preflight_pretrain_run(
+            args, settings, initialization=prepared_initialization
+        )
     if pretrain_recipe is None:
         pretrain_recipe = _resolve_pretrain_recipe(
             args,
@@ -308,6 +588,60 @@ def run_pretrain(
         resume_ckpt,
         relational_queue_preparation=preparation,
     )
+    # Keep the target-filtered copy for the eventual restore, not the raw payload.
+    if preparation.active:
+        pending_rng_restore = preparation.rng_state_to_restore
+    elif resume_ckpt is not None and (
+        dense_settings.enabled or ssl_config["ssl_method"] == "dino"
+    ):
+        pending_rng_restore = _verify_restorable_rng_state(
+            resume_ckpt, label="pretrain resume", target_device=device
+        )
+    else:
+        pending_rng_restore = (
+            resume_ckpt.get("rng_state") if resume_ckpt is not None else None
+        )
+    # Backbone-only initialization transfers into the fresh encoder below.
+    init_source = getattr(args, "init_source", None) or "teacher"
+    if prepared_initialization is not None and prepared_initialization.source_key != init_source:
+        raise ValueError(
+            "The prepared initialization source "
+            f"({prepared_initialization.source_key}) does not match the requested "
+            f"--init-source {init_source}."
+        )
+    # The optional sorter is probed before any output exists: a missing or
+    # unqualified package must not clear or create the run directory.
+    if dense_settings is not None and dense_settings.ranking_enabled:
+        ranking_dependency = getattr(args, "pretrain_dense_dependency", None)
+        if ranking_dependency is None:
+            from otuformer.training.neighbor_ranking import probe_ranking_dependency
+
+            ranking_dependency = probe_ranking_dependency(torch.device(device))
+    else:
+        ranking_dependency = None
+    if dense_settings.enabled:
+        from otuformer.training.dense_recipe import _requested
+
+        resolved_dense = {}
+        for name, effective, applicable in (
+            ("coordinate_weight", dense_settings.coordinate_weight, True),
+            ("ranking_weight", dense_settings.ranking_weight, True),
+            ("dense_query_points", dense_settings.query_cap, True),
+            ("ranking_reference_points", dense_settings.reference_cap,
+             dense_settings.ranking_enabled),
+        ):
+            requested = _requested(args, name)
+            resolved_dense[name] = {
+                "requested": requested,
+                "effective": effective,
+                "applicable": applicable,
+                "source": (
+                    "not_applicable" if not applicable else
+                    "requested" if requested is not None else
+                    "inherited" if resume_ckpt is not None else "default"
+                ),
+            }
+        print("Resolved dense config: " + json.dumps(resolved_dense, sort_keys=True))
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -430,6 +764,7 @@ def run_pretrain(
         prepared_relational_data=(
             preparation.data if preparation.active else None
         ),
+        return_geometry=bool(dense_settings is not None and dense_settings.enabled),
     )
     loader = DataLoader(
         ds,
@@ -438,8 +773,25 @@ def run_pretrain(
         num_workers=args.num_workers,
         drop_last=True,
         persistent_workers=args.num_workers > 0,
+        collate_fn=(
+            collate_pretrain_geometry
+            if dense_settings is not None and dense_settings.enabled
+            else None
+        ),
     )
     _phase_done("dataset indexing and loader", phase)
+    if resume_ckpt is not None:
+        # Independent re-check with the real loader length: the CLI predicted it
+        # before --overwrite, and this confirms the prediction against the object
+        # that will actually run, still before any student/optimizer mutation.
+        _validate_dense_resume(
+            (resume_ckpt.get("config") or {}).get(CONFIG_KEY),
+            resume_ckpt.get(STATE_KEY),
+            iteration=int(resume_ckpt.get("iteration", -1)),
+            batch_size=int(effective_batch_size),
+            steps_per_epoch=len(loader),
+            dependency=ranking_dependency,
+        )
 
     ssl_method = str(ssl_config["ssl_method"])
     effective_out_dim = int(ssl_config["out_dim"])
@@ -460,6 +812,22 @@ def run_pretrain(
         student_kwargs.update(pretrained=False, reg_tokens=4)
     elif resume_register_mode == "native":
         student_kwargs.update(pretrained=False)
+    elif prepared_initialization is not None:
+        # The source supplies the complete backbone, so a timm download would be
+        # wasted work (and could silently differ from the transferred weights).
+        # The register layout is inherited from the same resolved source.
+        student_kwargs.update(pretrained=False)
+        requested_register = getattr(args, "register_tokens", None)
+        if prepared_initialization.architecture.added_register_tokens:
+            if requested_register not in (None, 4):
+                raise ValueError(
+                    "the initialization source carries four added register "
+                    f"tokens, but --register-tokens {requested_register} was "
+                    "requested; the layout cannot be reduced."
+                )
+            student_kwargs["reg_tokens"] = 4
+        elif requested_register is not None:
+            student_kwargs["reg_tokens"] = requested_register
     elif register_option is not None:
         # ``0`` must stay distinct from omission: only the explicit option
         # rejects a CLS-free backbone.
@@ -479,6 +847,12 @@ def run_pretrain(
     if cuda_rng_state is not None:
         torch.cuda.set_rng_state(cuda_rng_state)
 
+    if prepared_initialization is not None:
+        # Backbone-only transfer: heads, masks, centers, optimizer, schedules
+        # and relational history are all rebuilt fresh below.
+        from otuformer.utils.checkpoint import initialize_pretrain_backbone
+
+        initialize_pretrain_backbone(student, prepared_initialization)
     if resume_ckpt is None:
         # A fresh run starts the EMA pair from the same encoder state. Resumes
         # keep their saved, deliberately distinct student/teacher pair.
@@ -529,7 +903,40 @@ def run_pretrain(
     grid_size = student._patch_grid_size(
         torch.empty(1, 3, global_crop_size, global_crop_size)
     )
+    patch_size = int(student.backbone.patch_embed.patch_size[0]) if isinstance(
+        student.backbone.patch_embed.patch_size, (tuple, list)
+    ) else int(student.backbone.patch_embed.patch_size)
     patch_count = grid_size[0] * grid_size[1]
+    # Enabled-only dense state: one runtime, one grid-size tuple. The all-off
+    # path must not create generators, geometry requests or a head.
+    dense_grid_hws: tuple[tuple[int, int], ...] = ()
+    dense_runtime = None
+    if dense_settings is not None and dense_settings.enabled:
+        dense_runtime = new_dense_runtime(
+            dense_settings, seed=int(getattr(args, "seed", 0))
+        )
+        if resume_ckpt is not None:
+            from otuformer.training.dense_recipe import (
+                restore_dense_runtime as _restore_dense_runtime,
+            )
+
+            saved_state = resume_ckpt.get(STATE_KEY)
+            if saved_state is None:
+                raise ValueError(
+                    "The checkpoint enables a dense objective but carries no "
+                    "dense_training state bundle."
+                )
+            dense_runtime = _restore_dense_runtime(dense_settings, saved_state)
+        local_grid = student._patch_grid_size(
+            torch.empty(1, 3, int(args.local_crop_size), int(args.local_crop_size))
+        )
+        dense_grid_hws = (grid_size, grid_size) + (
+            (local_grid,) * int(args.local_crops)
+        )
+        if include_weak_teacher_views:
+            # Weak slots keep a grid entry so the slot/view contract is one
+            # shape; they are never consumed for pairing.
+            dense_grid_hws = dense_grid_hws + (grid_size, grid_size)
     if patch_mode != "none":
         if patch_strategy in ("blockwise", "hybrid"):
             _validate_blockwise_grid(grid_size)
@@ -542,8 +949,23 @@ def run_pretrain(
             )
 
     wd_policy = bool(ssl_config["norm_bias_weight_decay"])
+    ranking_objective = None
+    if dense_settings is not None and dense_settings.ranking_enabled:
+        from otuformer.training.neighbor_ranking import NeighborRankingObjective
+
+        hidden = int(student.backbone.embed_dim)
+        ranking_objective = NeighborRankingObjective(hidden).to(device)
+        if resume_ckpt is not None:
+            saved = resume_ckpt.get(STATE_KEY) or {}
+            ranking_state = saved.get("ranking") or {}
+            ranking_objective.student_head.load_state_dict(
+                ranking_state["student_head"], strict=True
+            )
+            ranking_objective.teacher_head.load_state_dict(
+                ranking_state["teacher_head"], strict=True
+            )
     has_decay_partition = wd_policy or not _pretrain_decay_partition_empty(
-        student, objective, dino_objective
+        student, objective, dino_objective, ranking_objective
     )
     optimizer = torch.optim.AdamW(
         _pretrain_optimizer_groups(
@@ -552,14 +974,18 @@ def run_pretrain(
             dino_objective,
             weight_decay=args.weight_decay,
             norm_bias_weight_decay=wd_policy,
+            ranking_objective=ranking_objective,
         ),
         lr=args.lr,
         weight_decay=args.weight_decay,
     )
+    dense_enabled = dense_settings is not None and dense_settings.enabled
     logs_dir = out_dir / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
     instant_logger = InstantMetricsLogger(
-        logs_dir / "instant_metrics.pretrain.csv", mode="pretrain"
+        logs_dir / "instant_metrics.pretrain.csv",
+        mode="pretrain",
+        dense_enabled=dense_settings is not None and dense_settings.enabled,
     )
     compute_embedding_metrics = bool(getattr(args, "compute_embedding_metrics", True))
     epoch_logger = (
@@ -583,12 +1009,20 @@ def run_pretrain(
             # validated complete encoder states, so this load is strict.
             student.load_state_dict(resume_ckpt["student"], strict=True)
             teacher.load_state_dict(resume_ckpt["teacher"], strict=True)
+        elif dense_enabled:
+            # An enabled dense resume was validated as complete in preflight, so
+            # a permissive load here would silently keep random weights for any
+            # tensor the payload lacks.
+            student.load_state_dict(resume_ckpt["student"], strict=True)
+            teacher.load_state_dict(resume_ckpt["teacher"], strict=True)
         elif "student" in resume_ckpt:
             student.load_state_dict(resume_ckpt["student"], strict=False)
         elif "model_state_dict" in resume_ckpt:
             student.load_state_dict(resume_ckpt["model_state_dict"], strict=False)
         if dino_objective is None and "teacher" in resume_ckpt:
-            teacher.load_state_dict(resume_ckpt["teacher"], strict=False)
+            teacher.load_state_dict(
+                resume_ckpt["teacher"], strict=dense_enabled
+            )
         saved_patch_state = resume_ckpt.get("patch_objective")
         if patch_mode in ("masked-feature", "ibot") and (
             not isinstance(saved_patch_state, dict) or not saved_patch_state
@@ -617,6 +1051,13 @@ def run_pretrain(
                     "Cannot resume: dino_objective state is missing or "
                     f"incompatible with the resolved DINO config: {exc}"
                 ) from exc
+        if "optimizer" not in resume_ckpt and dense_enabled:
+            # The preflight already rejects this; keep the loop honest for direct
+            # callers that bypass it.
+            raise ValueError(
+                "Cannot resume: an enabled dense run requires its saved optimizer "
+                "state; a fresh optimizer would silently change the trajectory."
+            )
         if "optimizer" in resume_ckpt:
             _validate_pretrain_optimizer_layout(
                 optimizer,
@@ -626,12 +1067,29 @@ def run_pretrain(
                 label="pretrain resume",
             )
             optimizer.load_state_dict(resume_ckpt["optimizer"])
+            if ranking_objective is not None:
+                # Method-agnostic: the restored head state must match the saved
+                # contribution count, whichever SSL recipe produced it.
+                from otuformer.training.dense_recipe import (
+                    validate_ranking_head_optimizer_state as _validate_head_state,
+                )
+
+                _validate_head_state(
+                    optimizer,
+                    ranking_objective.trainable_parameters(),
+                    contributed_steps=dense_runtime.ranking_contributed_steps,
+                )
             _report_restored_weight_decay(
                 optimizer,
                 requested_weight_decay=float(args.weight_decay),
                 norm_bias_weight_decay=wd_policy,
                 has_decay_partition=has_decay_partition,
                 label="pretrain resume",
+            )
+        if "center" not in resume_ckpt and dense_enabled and dino_objective is None:
+            raise ValueError(
+                "Cannot resume: an enabled dense relational run requires its saved "
+                "center; a fresh center would change the teacher targets."
             )
         if "center" in resume_ckpt:
             _restore_relational_center(
@@ -707,8 +1165,16 @@ def run_pretrain(
         sample_batch = next(iter(loader))
         # The startup sample never populates the queue: it is a compatibility
         # probe, not a successful optimization step.
-        sample_views, _sample_keys = _unpack_pretrain_batch(
-            sample_batch, queue_enabled=queue is not None
+        sample_views, _sample_keys, _sample_geometry = _unpack_pretrain_batch(
+            sample_batch,
+            queue_enabled=queue is not None,
+            dense_enabled=dense_settings is not None and dense_settings.enabled,
+            local_crops=int(args.local_crops),
+            include_weak_teacher_views=(
+                include_weak_teacher_views
+                if dense_settings is not None and dense_settings.enabled
+                else None
+            ),
         )
         sample_views = [v.to(device) for v in sample_views[:2]]
         s_out, _ = student(sample_views[0])
@@ -726,14 +1192,6 @@ def run_pretrain(
             f"[Info] Starting/Resuming with learning rate: {float(lr_schedule[min(global_step, total_steps - 1)]):.6f}"
         )
 
-    if queue is not None:
-        # Never bypass the validated copy: restoring the raw payload again could
-        # apply streams the target-aware validation explicitly excluded.
-        pending_rng_restore = preparation.rng_state_to_restore
-    else:
-        pending_rng_restore = (
-            resume_ckpt.get("rng_state") if resume_ckpt is not None else None
-        )
     if queue is None and resume_ckpt is not None and not pending_rng_restore:
         print(
             "[Warning] Legacy checkpoint has no RNG state; the random sequence "
@@ -752,8 +1210,16 @@ def run_pretrain(
         student.train()
         pbar = tqdm(loader, desc=f"Epoch {epoch + 1}/{args.max_epochs}", ncols=150)
         for step, batch in enumerate(pbar):
-            views, batch_keys = _unpack_pretrain_batch(
-                batch, queue_enabled=queue is not None
+            views, batch_keys, batch_geometry = _unpack_pretrain_batch(
+                batch,
+                queue_enabled=queue is not None,
+                dense_enabled=dense_settings is not None and dense_settings.enabled,
+                local_crops=int(args.local_crops),
+                include_weak_teacher_views=(
+                    include_weak_teacher_views
+                    if dense_settings is not None and dense_settings.enabled
+                    else None
+                ),
             )
             views = [v.to(device) for v in views]
             # One immutable candidate snapshot per step, taken before any model
@@ -784,17 +1250,26 @@ def run_pretrain(
             for group in optimizer.param_groups:
                 group["lr"] = float(lr_schedule[iter_idx])
 
+            prefix = student.backbone.num_prefix_tokens
             student_global: list[torch.Tensor] = []
             student_tokens: list[torch.Tensor] = []
-            for gv in global_views:
+            # Dense objectives read ordinary unmasked patch grids. Globals come
+            # from forward_pretrain (prefix still attached); locals reuse the
+            # encoder's already prefix-free patch output.
+            student_grids: dict[int, torch.Tensor] = {}
+            teacher_grids: dict[int, torch.Tensor] = {}
+            for view_index, gv in enumerate(global_views):
                 s_out = student.forward_pretrain(gv)
                 student_global.append(s_out.cls)
                 student_tokens.append(s_out.tokens)
+                if dense_enabled:
+                    student_grids[view_index] = _to_feature_grid(
+                        s_out.tokens, prefix, s_out.grid_size
+                    )
 
             teacher_tokens: list[torch.Tensor] = []
             teacher_final_four: list[list[torch.Tensor] | None] = []
             teacher_logits: list[torch.Tensor] = []
-            prefix = student.backbone.num_prefix_tokens
             center_before = teacher.center
             # Detached pre-center A/B teacher observations, cached for a
             # success-only queue commit; nothing is stored before the step wins.
@@ -806,6 +1281,8 @@ def run_pretrain(
                     dino_objective is not None
                     or patch_mode != "none"
                     or relational_center_source == "ordinary"
+                    # Both ordinary teacher globals are the dense feature source.
+                    or dense_enabled
                 )
                 ordinary_outputs = [
                     teacher.forward_pretrain(
@@ -847,7 +1324,11 @@ def run_pretrain(
                         )
                 else:
                     teacher_global = []
-                for t_out in ordinary_outputs:
+                for teacher_index, t_out in enumerate(ordinary_outputs):
+                    if dense_enabled:
+                        teacher_grids[teacher_index] = _to_feature_grid(
+                            t_out.tokens.detach(), prefix, t_out.grid_size
+                        )
                     if dino_objective is not None:
                         # DINO sends the unmodified normalized bottleneck to its
                         # prototype layer and bypasses the legacy center path.
@@ -985,9 +1466,16 @@ def run_pretrain(
             patch_loss_weighted = args.lambda_mask * patch_loss_raw
 
             local_student_projs: list[torch.Tensor] = []
-            for lv in local_views:
-                l_proj, _ = student(lv)
+            for local_index, lv in enumerate(local_views):
+                l_proj, l_tokens = student(lv)
                 local_student_projs.append(l_proj)
+                if dense_enabled:
+                    # ``OTUFormerEncoder.forward`` has already stripped the
+                    # CLS/register prefix, so this output must not be sliced.
+                    local_grid = student._patch_grid_size(lv)
+                    student_grids[2 + local_index] = _to_feature_grid(
+                        l_tokens, 0, local_grid
+                    )
             if dino_objective is None:
                 loss_local = _compute_local_loss(
                     local_student_projs,
@@ -1019,6 +1507,134 @@ def run_pretrain(
                     total_loss + float(ssl_config["koleo_weight"]) * koleo_raw
                 )
 
+            dense_step_stats: dict[str, Any] = {}
+            dense_metrics: dict[str, Any] = {}
+            if dense_settings is not None and dense_settings.enabled:
+                dense_coordinate, dense_stats, dense_ranking, ranking_stats = (
+                    _dense_terms(
+                        dense_settings,
+                        dense_runtime,
+                        ranking_objective,
+                        student_grids,
+                        teacher_grids,
+                        batch_geometry,
+                        dense_grid_hws,
+                        patch_hw=(patch_size, patch_size),
+                    )
+                )
+                dense_step_stats = {**dense_stats, **ranking_stats}
+                coordinate_raw = dense_stats.get("raw")
+                dense_metrics = {
+                    "dense_coordinate_loss_raw": (
+                        "" if coordinate_raw is None else float(coordinate_raw)
+                    ),
+                    "dense_coordinate_loss_weighted": (
+                        ""
+                        if coordinate_raw is None
+                        else float(coordinate_raw) * float(dense_settings.coordinate_weight)
+                    ),
+                    "dense_coordinate_status": _dense_status(
+                        float(dense_settings.coordinate_weight), coordinate_raw
+                    ),
+                    "dense_coordinate_points": int(
+                        dense_stats.get("selected_points", 0)
+                    ),
+                    "dense_coordinate_samples": int(
+                        dense_stats.get("contributing_samples", 0)
+                    ),
+                    "dense_coordinate_pairs": int(
+                        dense_stats.get("contributing_pairs", 0)
+                    ),
+                    # ``None`` populations stay empty: a missing measurement is
+                    # not an observed 0 norm or a perfect rho of 1.
+                    "dense_min_norm": _dense_stat_or_blank(dense_stats.get("min_norm")),
+                    "dense_min_rho": _dense_stat_or_blank(dense_stats.get("min_rho")),
+                    "dense_coordinate_eligible": int(
+                        dense_stats.get("eligible_points", 0)
+                    ),
+                }
+                ranking_raw = ranking_stats.get("raw")
+                dense_metrics.update(
+                    {
+                        "dense_ranking_loss_raw": (
+                            "" if ranking_raw is None else float(ranking_raw)
+                        ),
+                        "dense_ranking_loss_weighted": (
+                            ""
+                            if ranking_raw is None
+                            else float(ranking_raw) * float(dense_settings.ranking_weight)
+                        ),
+                        "dense_ranking_status": _dense_status(
+                            float(dense_settings.ranking_weight), ranking_raw
+                        ),
+                        "dense_ranking_points": int(
+                            ranking_stats.get("selected_points", 0)
+                        ),
+                        "dense_ranking_samples": int(
+                            ranking_stats.get("contributing_samples", 0)
+                        ),
+                        "dense_ranking_pairs": int(
+                            ranking_stats.get("contributing_pairs", 0)
+                        ),
+                        "dense_ranking_references": _dense_stat_or_blank(
+                            ranking_stats.get("reference_population")
+                        ),
+                        "dense_ranking_reference_count": _dense_stat_or_blank(
+                            ranking_stats.get("reference_count")
+                        ),
+                        "dense_ranking_shortage_samples": int(
+                            ranking_stats.get("reference_shortage_samples", 0)
+                        ),
+                        "dense_ranking_min_probability": _dense_stat_or_blank(
+                            ranking_stats.get("min_probability")
+                        ),
+                        # This objective's own projected-space diagnostics; the
+                        # Coordinate minima describe a different feature space.
+                        "dense_ranking_min_norm": _dense_stat_or_blank(
+                            ranking_stats.get("teacher_min_norm")
+                        ),
+                        "dense_ranking_min_rho": _dense_stat_or_blank(
+                            ranking_stats.get("teacher_min_rho")
+                        ),
+                        # Raw projection norm *before* per-patch L2: the value the
+                        # projection guard actually tests.
+                        "dense_ranking_projection_min_norm": _dense_stat_or_blank(
+                            ranking_stats.get("teacher_projection_min_norm")
+                        ),
+                        "dense_ranking_reference_min": _dense_stat_or_blank(
+                            ranking_stats.get("reference_count_min")
+                        ),
+                        "dense_ranking_reference_population_min": _dense_stat_or_blank(
+                            ranking_stats.get("reference_population_min")
+                        ),
+                        "dense_ranking_unavailable_pairs": int(
+                            ranking_stats.get("reference_unavailable_pairs", 0)
+                        ),
+                    }
+                )
+                from .dense_objective import BRANCH_COUNT_FIELDS
+
+                for objective_name, stats, enabled in (
+                    ("coordinate", dense_stats, dense_settings.coordinate_weight > 0),
+                    ("ranking", ranking_stats, dense_settings.ranking_enabled),
+                ):
+                    for branch in ("global", "local"):
+                        for field in BRANCH_COUNT_FIELDS:
+                            key = f"{branch}_{field}"
+                            dense_metrics[f"dense_{objective_name}_{key}"] = (
+                                int(stats.get(key, 0)) if enabled else ""
+                            )
+                if dense_coordinate is not None:
+                    total_loss = (
+                        total_loss
+                        + float(dense_settings.coordinate_weight) * dense_coordinate
+                    )
+                if dense_ranking is not None:
+                    total_loss = (
+                        total_loss
+                        + float(dense_settings.ranking_weight) * dense_ranking
+                    )
+
             if not torch.isfinite(total_loss):
                 raise ValueError(
                     "The pretraining loss became non-finite at iteration "
@@ -1026,7 +1642,13 @@ def run_pretrain(
                     "temperatures, learning rate and inputs."
                 )
 
-            optimizer.zero_grad()
+            if dense_enabled:
+                # Explicit set_to_none=True: a ranking head that becomes
+                # unavailable must not keep a stale gradient that would create or
+                # decay AdamW moments for a step it did not contribute to.
+                optimizer.zero_grad(set_to_none=True)
+            else:
+                optimizer.zero_grad()
             total_loss.backward()
             trainable_params = [
                 parameter
@@ -1060,17 +1682,23 @@ def run_pretrain(
                     "check does not."
                 ) from exc
             optimizer.step()
-            if queue is not None and not bool(torch.stack([
+            if (queue is not None or dense_enabled) and not bool(torch.stack([
                 torch.isfinite(parameter).all() for parameter in trainable_params
             ]).all()):
                 raise ValueError(
                     "The pretraining optimizer update became non-finite at "
-                    f"iteration {global_step}; refusing to advance the FIFO or "
+                    f"iteration {global_step}; refusing to advance the EMA, FIFO or "
                     "save a checkpoint. Check the optimizer coefficients."
                 )
 
             m = float(momentum_schedule[iter_idx])
             update_teacher(student, teacher, m)
+            if ranking_objective is not None:
+                # Ranking teacher head EMA and the contributed-step counter both
+                # follow a successful optimizer step, never a skipped one.
+                ranking_objective.update_teacher(m)
+                if dense_step_stats.get("ranking_contributed"):
+                    dense_runtime.ranking_contributed_steps += 1
             if dino_objective is not None:
                 # Name-matched EMA keeps both prototype layers aligned; the
                 # fixed scales stay one and are absent from the optimizer.
@@ -1242,6 +1870,7 @@ def run_pretrain(
                     **patch_metrics,
                     **ssl_metrics,
                     **queue_metrics,
+                    **dense_metrics,
                 )
 
             if step % 10 == 0 or step == len(loader) - 1:
@@ -1291,6 +1920,29 @@ def run_pretrain(
             if ssl_method != "dino" and not koleo_enabled:
                 for name in KOLEO_STORED_KEYS:
                     saved_ssl_config.pop(name, None)
+            # A resumed run keeps its recorded immediate source without
+            # reopening the file; a new run records the transfer it performed.
+            existing_initialization = (
+                (resume_ckpt.get("config") or {}).get("pretrain_initialization")
+                if resume_ckpt is not None
+                else None
+            )
+            if existing_initialization is not None:
+                from otuformer.utils.checkpoint import (
+                    validate_pretrain_initialization_bundle,
+                )
+
+                validate_pretrain_initialization_bundle(existing_initialization)
+            dense_config = (
+                dense_config_bundle(
+                    dense_settings,
+                    batch_size=int(effective_batch_size),
+                    steps_per_epoch=int(len(loader)),
+                    dependency=ranking_dependency,
+                )
+                if dense_settings is not None and dense_settings.enabled
+                else None
+            )
             ckpt = {
                 "epoch": epoch,
                 "iteration": global_step,
@@ -1320,6 +1972,25 @@ def run_pretrain(
                     RELATIONAL_TARGET_CONFIG_KEY: (
                         pretrain_recipe.relational_target_config
                     ),
+                    **(
+                        {CONFIG_KEY: dense_config}
+                        if dense_config is not None
+                        else {}
+                    ),
+                    **(
+                        {
+                            "pretrain_initialization": (
+                                prepared_initialization.config_bundle()
+                                if prepared_initialization is not None
+                                else existing_initialization
+                            )
+                        }
+                        if (
+                            prepared_initialization is not None
+                            or existing_initialization is not None
+                        )
+                        else {}
+                    ),
                 },
                 "schedule": {
                     **schedule_state,
@@ -1347,6 +2018,14 @@ def run_pretrain(
                     data_fingerprint=data.data_fingerprint,
                     data_image_count=len(data.image_keys),
                     data_size_bytes=data.data_size_bytes,
+                )
+            if dense_runtime is not None:
+                # Enabled runs persist the closed dense bundles at the existing
+                # epoch boundary; the all-off path writes neither key.
+                ckpt[STATE_KEY] = dense_state_bundle(
+                    dense_runtime,
+                    completed_steps=int(global_step),
+                    ranking=ranking_objective,
                 )
             ckpt_path = out_dir / f"SSL_epoch_{epoch + 1:04d}.pth"
             save_checkpoint(ckpt, ckpt_path)

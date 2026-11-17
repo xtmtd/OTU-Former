@@ -715,3 +715,85 @@ def test_fifo_queue_metrics_report_ages_and_branch_statistics():
         assert no_locals[f"relational_student_{name}_local"] is None, name
     assert metrics["relational_student_self_mass_global"] == pytest.approx(0.4)
     assert metrics["relational_student_self_mass_local"] == pytest.approx(0.3)
+
+
+def test_restoring_a_real_86_column_dense_log_migrates_in_place(tmp_path):
+    """The predecessor dense header (86 cols) must keep resuming."""
+    header = list(reporting_module._PRETRAIN_DENSE_86_FIELDS)
+    assert len(header) == 86
+    assert "dense_ranking_min_norm" not in header
+    rows = []
+    for index in range(3):
+        row = {name: "" for name in header}
+        row.update(
+            iteration=str(index), epoch="0", step=str(index),
+            loss="1.5", global_loss="0.7", lr="0.001",
+            dense_coordinate_loss_raw="0.3",
+            dense_coordinate_loss_weighted="0.3",
+            dense_coordinate_status="observed",
+            dense_coordinate_points="10",
+            dense_min_norm="2.0", dense_min_rho="0.9",
+            dense_coordinate_eligible="12",
+        )
+        rows.append(row)
+    path = tmp_path / "instant_metrics.pretrain.csv"
+    _write(path, header, [[row[name] for name in header] for row in rows])
+
+    logger = reporting_module.InstantMetricsLogger(path, dense_enabled=True)
+    assert logger.fieldnames == list(reporting_module._PRETRAIN_DENSE_CURRENT_FIELDS)
+    migrated = _read(path)
+    assert len(migrated) == 3
+    # Historical values survive; the new columns are empty, not zero.
+    assert migrated["dense_coordinate_loss_raw"].tolist() == ["0.3"] * 3
+    assert set(migrated["dense_ranking_min_norm"]) == {""}
+    assert set(migrated["dense_ranking_min_rho"]) == {""}
+
+
+def test_restoring_the_88_column_dense_log_keeps_norm_rho_values(tmp_path):
+    """The intermediate 88-column header is a supported predecessor too."""
+    header = list(reporting_module._PRETRAIN_DENSE_88_FIELDS)
+    assert len(header) == 88
+    assert "dense_ranking_min_norm" in header
+    assert "dense_ranking_projection_min_norm" not in header
+    rows = []
+    for index in range(3):
+        row = {name: "" for name in header}
+        row.update(
+            iteration=str(index), epoch="0", step=str(index),
+            loss="1.5", global_loss="0.7", lr="0.001",
+            dense_ranking_loss_raw="2.1",
+            dense_ranking_loss_weighted="1.05",
+            dense_ranking_status="observed",
+            dense_ranking_points="12",
+            dense_ranking_min_norm="1.0",
+            dense_ranking_min_rho="0.75",
+            dense_ranking_min_probability="0.001",
+            dense_ranking_reference_count="16",
+        )
+        rows.append(row)
+    path = tmp_path / "instant_metrics.pretrain.csv"
+    _write(path, header, [[row[name] for name in header] for row in rows])
+
+    logger = reporting_module.InstantMetricsLogger(path, dense_enabled=True)
+    assert logger.fieldnames == list(reporting_module._PRETRAIN_DENSE_CURRENT_FIELDS)
+    migrated = _read(path)
+    assert len(migrated) == 3
+    # The 88-column norm/rho values survive the migration.
+    assert migrated["dense_ranking_min_norm"].tolist() == ["1.0"] * 3
+    assert migrated["dense_ranking_min_rho"].tolist() == ["0.75"] * 3
+    # Columns added later are empty, never zero.
+    assert set(migrated["dense_ranking_projection_min_norm"]) == {""}
+
+
+def test_restoring_the_92_column_dense_log_keeps_every_existing_value(tmp_path):
+    header = list(reporting_module._PRETRAIN_DENSE_92_FIELDS)
+    assert len(header) == 92
+    values = [str(index + 0.25) for index in range(len(header))]
+    path = tmp_path / "instant_metrics.pretrain.csv"
+    _write(path, header, [values])
+    logger = reporting_module.InstantMetricsLogger(path, dense_enabled=True)
+    migrated = _read(path)
+    for name, value in zip(header, values):
+        assert migrated[name].tolist() == [value]
+    for name in set(logger.fieldnames) - set(header):
+        assert migrated[name].tolist() == [""]

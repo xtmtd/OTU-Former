@@ -7,7 +7,7 @@ import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, NamedTuple
+from typing import Any, Callable, Mapping, NamedTuple
 import numpy as np
 import torch
 import torch.nn as nn
@@ -94,6 +94,7 @@ def _student_optimizer_parameters(
     student: nn.Module,
     patch_objective: nn.Module | None,
     dino_objective: nn.Module | None = None,
+    ranking_objective: nn.Module | None = None,
 ) -> list[nn.Parameter]:
     """Student-side parameters plus each objective's trainable state.
 
@@ -107,6 +108,9 @@ def _student_optimizer_parameters(
         params.extend(patch_objective.trainable_parameters())
     if dino_objective is not None:
         params.extend(dino_objective.trainable_parameters())
+    if ranking_objective is not None:
+        # Student head only: the EMA teacher head is never optimized.
+        params.extend(ranking_objective.trainable_parameters())
     return params
 
 
@@ -128,6 +132,7 @@ def _no_decay_parameter_ids(
     student: nn.Module,
     patch_objective: nn.Module | None,
     dino_objective: nn.Module | None,
+    ranking_objective: nn.Module | None = None,
 ) -> set[int]:
     """Identity set of parameters that skip weight decay under the opt-in policy.
 
@@ -140,6 +145,10 @@ def _no_decay_parameter_ids(
     for objective in (patch_objective, dino_objective):
         if objective is not None:
             roots.append(objective)
+    if ranking_objective is not None:
+        # Only the student head is in the optimizer; add it as a root so its
+        # three biases follow the shared norm/bias policy.
+        roots.append(ranking_objective.student_head)
     ids: set[int] = set()
     for root in roots:
         for module in root.modules():
@@ -160,6 +169,7 @@ def _pretrain_optimizer_groups(
     *,
     weight_decay: float,
     norm_bias_weight_decay: bool,
+    ranking_objective: nn.Module | None = None,
 ) -> list[dict[str, Any]]:
     """Build the pretrain optimizer groups for the selected WD policy.
 
@@ -169,11 +179,13 @@ def _pretrain_optimizer_groups(
     by a no-decay group, each keeping source-relative order and empty groups
     omitted.
     """
-    params = _student_optimizer_parameters(student, patch_objective, dino_objective)
+    params = _student_optimizer_parameters(
+        student, patch_objective, dino_objective, ranking_objective
+    )
     if norm_bias_weight_decay:
         return [{"params": params}]
     no_decay_ids = _no_decay_parameter_ids(
-        student, patch_objective, dino_objective
+        student, patch_objective, dino_objective, ranking_objective
     )
     seen: set[int] = set()
     decay: list[nn.Parameter] = []
@@ -200,11 +212,14 @@ def _pretrain_decay_partition_empty(
     student: nn.Module,
     patch_objective: nn.Module | None,
     dino_objective: nn.Module | None,
+    ranking_objective: nn.Module | None = None,
 ) -> bool:
     """True when no trainable parameter keeps weight decay under the opt-in policy."""
-    params = _student_optimizer_parameters(student, patch_objective, dino_objective)
+    params = _student_optimizer_parameters(
+        student, patch_objective, dino_objective, ranking_objective
+    )
     no_decay_ids = _no_decay_parameter_ids(
-        student, patch_objective, dino_objective
+        student, patch_objective, dino_objective, ranking_objective
     )
     return all(id(parameter) in no_decay_ids for parameter in params)
 
@@ -1150,6 +1165,8 @@ def _resolve_dino_ssl_config(
             effective,
             resume_model,
             getattr(args, "max_epochs", None),
+            # The device this invocation resolves to, not the saved one.
+            target_device=_resolved_invocation_device(args, None),
         )
     return effective
 
@@ -1415,11 +1432,73 @@ def _validate_saved_progress(
         )
 
 
+def _probe_ranking_objective(
+    resume_ckpt: dict[str, Any] | None,
+    *,
+    backbone_width: int | None = None,
+):
+    """Rebuild the saved ranking head for optimizer-layout validation.
+
+    The head is not inferred from whatever tensors the checkpoint happens to
+    carry: it must match the frozen recipe (``D→2048→2048→256``) *and* the
+    resolved backbone width. Inferring the shape from the payload would accept a
+    substituted 192→16→16→8 head until the real 2048-wide head fails at load
+    time, after output has been prepared.
+    """
+    if not resume_ckpt:
+        return None
+    state = (resume_ckpt.get("dense_training") or {}).get("ranking")
+    if not state:
+        return None
+    from otuformer.training import dense_recipe as _dense_recipe
+    from otuformer.training.neighbor_ranking import NeighborRankingObjective
+
+    student = state.get("student_head") or {}
+    first = student.get("0.weight")
+    if first is None:
+        raise ValueError(
+            "dense_training.ranking is missing its student-head weights."
+        )
+    saved_width = int(first.shape[1])
+    if backbone_width is not None and saved_width != int(backbone_width):
+        raise ValueError(
+            "The saved ranking head expects backbone width "
+            f"{saved_width} but this checkpoint's encoder is "
+            f"{int(backbone_width)} wide; the objective would change."
+        )
+    expected = _dense_recipe.expected_head_shapes(
+        saved_width,
+        hidden=int(_dense_recipe.RANKING_HEAD["hidden_dim"]),
+        out_dim=int(_dense_recipe.RANKING_HEAD["output_dim"]),
+    )
+    actual = {
+        key: tuple(getattr(value, "shape", ())) for key, value in student.items()
+    }
+    if actual != expected:
+        mismatched = sorted(
+            key
+            for key in set(actual) | set(expected)
+            if actual.get(key) != expected.get(key)
+        )
+        raise ValueError(
+            "The saved ranking head does not match the frozen recipe "
+            f"D->{expected['0.weight'][0]}->{expected['2.weight'][0]}"
+            f"->{expected['4.weight'][0]}: {mismatched}. Reusing it would silently "
+            "change the objective."
+        )
+    return NeighborRankingObjective(
+        saved_width,
+        out_dim=int(_dense_recipe.RANKING_HEAD["output_dim"]),
+        hidden=int(_dense_recipe.RANKING_HEAD["hidden_dim"]),
+    )
+
+
 def _validate_dino_resume_payload(
     resume_ckpt: dict[str, Any] | None,
     effective: dict[str, Any],
     model_name: str,
     requested_max_epochs: int | None,
+    target_device: torch.device | None = None,
 ) -> None:
     """Strictly validate a DINO resume before any output is created."""
     from otuformer.utils.checkpoint import preserved_rng, resolve_register_layout
@@ -1448,25 +1527,9 @@ def _validate_dino_resume_payload(
                 f"DINO resume requires the saved {key!r} state; an incomplete "
                 "DINO payload is not resumable."
             )
-    rng_state = resume_ckpt["rng_state"]
-    if not isinstance(rng_state, dict) or not {"python", "numpy", "torch"} <= set(
-        rng_state
-    ):
-        raise ValueError(
-            "DINO resume requires a complete rng_state (python, numpy, torch); "
-            "resuming without it would restart the mask and shuffle sequence."
-        )
-    # Reuse the actual restore rule inside an RNG-preserving guard: a null or
-    # malformed stream fails here instead of mid-training.
-    from otuformer.utils.checkpoint import preserved_rng
-
-    try:
-        with preserved_rng():
-            _restore_rng_state(rng_state)
-    except Exception as exc:
-        raise ValueError(
-            f"DINO resume requires a restorable rng_state: {exc}"
-        ) from exc
+    _verify_restorable_rng_state(
+        resume_ckpt, label="DINO resume", target_device=target_device
+    )
 
     def integer(name: str, value: Any, minimum: int) -> int:
         if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
@@ -1708,12 +1771,16 @@ def _validate_dino_resume_payload(
             probe_patch.load_state_dict(resume_ckpt.get("patch_objective", {}), strict=True)
         except (TypeError, RuntimeError) as exc:
             raise ValueError(f"DINO resume has invalid patch_objective state: {exc}") from exc
+    probe_ranking = _probe_ranking_objective(
+        resume_ckpt, backbone_width=int(expected.backbone.num_features)
+    )
     probe_groups = _pretrain_optimizer_groups(
         expected,
         probe_patch,
         probe_objective,
         weight_decay=0.05,
         norm_bias_weight_decay=bool(effective["norm_bias_weight_decay"]),
+        ranking_objective=probe_ranking,
     )
     # The same layout validation the trainer uses for the real optimizer runs
     # here, so a payload it would reject never reaches output creation.
@@ -1724,7 +1791,7 @@ def _validate_dino_resume_payload(
         optimizer_state,
         norm_bias_weight_decay=bool(effective["norm_bias_weight_decay"]),
         decay_partition_empty=_pretrain_decay_partition_empty(
-            expected, probe_patch, probe_objective
+            expected, probe_patch, probe_objective, probe_ranking
         ),
         label="DINO resume",
     )
@@ -1739,9 +1806,39 @@ def _validate_dino_resume_payload(
             f"the checkpoint records {len(group_params)}."
         )
     frozen = probe_objective.trainable_parameters()[0]
+    saved_group_flags: dict[object, dict[str, Any]] = {}
+    for group in optimizer_state.get("param_groups") or []:
+        if not isinstance(group, dict):
+            continue
+        for state_key in group.get("params") or []:
+            saved_group_flags[state_key] = dict(group)
+    # A ranking head participates only on its contributing steps, so the DINO
+    # path applies the same participation rule as the relational one instead of
+    # demanding moments for a head that legally never contributed.
+    head_ids = (
+        {id(parameter) for parameter in probe_ranking.student_head.parameters()}
+        if probe_ranking is not None
+        else set()
+    )
+    contributed = (
+        _dense_ranking_contributed_steps(resume_ckpt, "DINO resume")
+        if probe_ranking is not None
+        else 0
+    )
     for state_key, parameter in zip(group_params, probe_parameters):
         if isinstance(state_key, bool) or not isinstance(state_key, int):
             raise ValueError("DINO resume optimizer parameter ids must be integers.")
+        if id(parameter) in head_ids:
+            _validate_ranking_head_entry(
+                optimizer_state["state"].get(state_key),
+                parameter,
+                contributed=contributed,
+                state_key=state_key,
+                label="DINO resume",
+                flags=_adamw_group_flags(saved_group_flags.get(state_key, {})),
+                target_device=target_device,
+            )
+            continue
         if state_key not in optimizer_state["state"]:
             if epoch == 0 and parameter is frozen:
                 continue
@@ -1779,6 +1876,38 @@ def _validate_dino_resume_payload(
                     f"DINO resume optimizer state {state_key} has {name} with "
                     f"the wrong shape; expected {tuple(parameter.shape)}."
                 )
+            if not bool(torch.isfinite(value).all()):
+                raise ValueError(
+                    f"DINO resume optimizer state {state_key} has a non-finite "
+                    f"{name}."
+                )
+
+
+def _dense_enabled_for(
+    args: argparse.Namespace, resume_ckpt: dict[str, Any] | None
+) -> bool:
+    """Whether this invocation resolves to an enabled dense recipe."""
+    from otuformer.training.dense_recipe import resolve_dense_settings
+
+    return bool(resolve_dense_settings(args, resume_ckpt).enabled)
+
+
+def _resolved_invocation_device(
+    args: argparse.Namespace, relational_queue_preparation: Any | None
+) -> torch.device | None:
+    """The device this run resolves to, for branch/device-specific checks."""
+    resolved = getattr(relational_queue_preparation, "resolved_device", None)
+    if resolved is not None:
+        return resolved
+    requested = getattr(args, "device", None)
+    if requested is None:
+        return None
+    try:
+        from otuformer.training.runtime import _resolve_device
+
+        return _resolve_device(str(requested))
+    except Exception:  # pragma: no cover - unresolvable request is rejected later
+        return None
 
 
 def _validate_relational_optimizer_preflight(
@@ -1787,6 +1916,7 @@ def _validate_relational_optimizer_preflight(
     effective: dict[str, Any],
     *,
     strict_fifo_state: bool = False,
+    strict_dense_state: bool = False,
     target_device: torch.device | None = None,
 ) -> None:
     """Prove the saved optimizer groups map onto the rebuilt relational layout.
@@ -1800,6 +1930,19 @@ def _validate_relational_optimizer_preflight(
         resolve_register_layout,
     )
 
+    if strict_fifo_state or strict_dense_state:
+        # Before any direct key access: a payload with no saved optimizer must be
+        # rejected here, not raise KeyError later or resume with a fresh one.
+        _require_strict_resume_payload(
+            resume_ckpt,
+            label="FIFO" if strict_fifo_state else "dense-enabled",
+            requires_center=not _is_dino_payload(resume_ckpt),
+        )
+        _verify_restorable_rng_state(
+            resume_ckpt,
+            label="FIFO" if strict_fifo_state else "dense-enabled",
+            target_device=target_device,
+        )
     state, _ = resolve_checkpoint_state_dict(resume_ckpt)
     image_size = resolve_training_image_size(resume_ckpt)
     out_dim = int(effective["out_dim"])
@@ -1830,12 +1973,16 @@ def _validate_relational_optimizer_preflight(
             expected.backbone.num_features,
             patch_config["ibot_prototypes"],
         )
+    probe_ranking = _probe_ranking_objective(
+        resume_ckpt, backbone_width=int(expected.backbone.num_features)
+    )
     probe_groups = _pretrain_optimizer_groups(
         expected,
         probe_patch,
         None,
         weight_decay=0.05,
         norm_bias_weight_decay=policy,
+        ranking_objective=probe_ranking,
     )
     with preserved_rng():
         probe_optimizer = torch.optim.AdamW(probe_groups, lr=0.0, weight_decay=0.0)
@@ -1844,16 +1991,29 @@ def _validate_relational_optimizer_preflight(
         resume_ckpt["optimizer"],
         norm_bias_weight_decay=policy,
         decay_partition_empty=_pretrain_decay_partition_empty(
-            expected, probe_patch, None
+            expected, probe_patch, None, probe_ranking
         ),
         label="pretrain resume",
     )
-    if not strict_fifo_state:
+    # A ranking head participates only on its contributing steps, so its saved
+    # moments are proven against ``ranking_contributed_steps`` and never against
+    # the loop iteration. This check is FIFO-independent.
+    head_expected = _validate_dense_head_moments(
+        probe_optimizer,
+        resume_ckpt.get("optimizer"),
+        probe_ranking=probe_ranking,
+        resume_ckpt=resume_ckpt,
+        label="pretrain resume",
+        target_device=target_device,
+    )
+    if not (strict_fifo_state or strict_dense_state):
         return
-    # Enabled recovery needs the usable state behind the layout: moments for the
+    # Any strict resume needs the usable state behind the layout: moments for the
     # parameters that already participated, the independent patch tensors, both
     # complete encoders and the exact relational center, all before any output
-    # exists.
+    # exists. Dense recovery is strict in exactly the same way as FIFO recovery;
+    # enabling it must not leave ``strict=False`` loads or a fresh optimizer in
+    # place of the saved one.
     completed_steps = resume_ckpt.get("iteration")
     if isinstance(completed_steps, bool) or not isinstance(completed_steps, int):
         completed_steps = 0
@@ -1866,6 +2026,7 @@ def _validate_relational_optimizer_preflight(
         completed_steps=completed_steps,
         label="pretrain resume",
         target_device=target_device,
+        expected_steps=head_expected,
     )
     _validate_fifo_patch_state(
         probe_patch,
@@ -1878,6 +2039,76 @@ def _validate_relational_optimizer_preflight(
     _validate_fifo_encoder_state("student", resume_ckpt.get("student"), expected)
     _validate_fifo_encoder_state("teacher", resume_ckpt.get("teacher"), expected)
     _validate_fifo_center(resume_ckpt.get("center"), out_dim)
+
+
+def _is_dino_payload(resume_ckpt: dict[str, Any]) -> bool:
+    """Whether this payload belongs to the DINO method."""
+    config = resume_ckpt.get("config")
+    method = config.get("ssl_method") if isinstance(config, dict) else None
+    return method == "dino"
+
+
+def _verify_restorable_rng_state(
+    resume_ckpt: dict[str, Any],
+    *,
+    label: str,
+    target_device: torch.device | None = None,
+) -> dict[str, object]:
+    """Return the restorable RNG copy under the target-device policy.
+
+    "A non-empty dict" is not evidence: a dict holding only ``torch`` raises
+    ``KeyError('python')`` and three ``"bad"`` values raise ``ValueError`` from
+    ``random.setstate``. Both must fail in preflight, not after the output
+    directory and log files exist.
+
+    This reuses :func:`_validate_fifo_rng_state`, so the device policy is the
+    same one the queue path applies: a CUDA-shaped payload on a non-CUDA target is
+    structurally checked and *omitted from the restore copy*, and a CUDA target
+    demands a stream per visible device. Restoring the raw dict instead would
+    apply a CUDA stream on CPU or silently ignore a missing one.
+    """
+    state = resume_ckpt.get("rng_state")
+    try:
+        return _validate_fifo_rng_state(
+            state, target_device=target_device, label=label
+        )
+    except ValueError as exc:
+        # Name the field and the device in every failure, whatever layer raised.
+        message = str(exc)
+        if "rng_state" not in message:
+            message = f"rng_state is not restorable: {message}"
+        raise ValueError(f"Cannot resume: the {label} {message}") from exc
+
+
+def _require_strict_resume_payload(
+    resume_ckpt: dict[str, Any], *, label: str, requires_center: bool = True
+) -> None:
+    """Every strict resume needs the complete state, not only FIFO.
+
+    A dense run whose optimizer, center, RNG or encoder states are absent would
+    otherwise resume with a fresh object and keep training silently. DINO keeps
+    its K-dimensional center inside ``dino_objective``, so it must not require a
+    top-level ``center``.
+    """
+    required = ["optimizer", "rng_state", "student", "teacher"]
+    if requires_center:
+        required.append("center")
+    missing = []
+    for name in required:
+        value = resume_ckpt.get(name)
+        if name == "center":
+            # The relational center is a tensor, not a state dict.
+            if not torch.is_tensor(value):
+                missing.append(name)
+            continue
+        if not isinstance(value, dict) or not value:
+            missing.append(name)
+    if missing:
+        raise ValueError(
+            f"Cannot resume: the {label} checkpoint has no usable "
+            f"{', '.join(missing)}; a strict resume cannot substitute a fresh "
+            "optimizer, center or encoder state."
+        )
 
 
 def resolve_pretrain_ssl_config(
@@ -1948,7 +2179,17 @@ def resolve_pretrain_ssl_config(
     model_name = str(_ssl_option(args, "model_name", ""))
     if method == "relational":
         effective = _resolve_relational_ssl_config(args, saved)
-        if resume_ckpt is not None and "optimizer" in resume_ckpt:
+        strict_dense_state = _dense_enabled_for(args, resume_ckpt)
+        strict_fifo_state = bool(
+            relational_queue_preparation is not None
+            and relational_queue_preparation.active
+        )
+        if resume_ckpt is not None and (
+            strict_dense_state or strict_fifo_state or "optimizer" in resume_ckpt
+        ):
+            # A strict (dense or FIFO) resume enters even without a saved
+            # optimizer, because a missing one is exactly what it must reject. An
+            # ordinary legacy resume keeps entering only when it has one.
             # The relational path never builds the training models here, so the
             # saved groups are proven against a rebuilt parameter partition
             # before any output exists.
@@ -1956,14 +2197,13 @@ def resolve_pretrain_ssl_config(
                 resume_ckpt,
                 model_name,
                 effective,
-                strict_fifo_state=bool(
-                    relational_queue_preparation is not None
-                    and relational_queue_preparation.active
-                ),
-                target_device=(
-                    relational_queue_preparation.resolved_device
-                    if relational_queue_preparation is not None
-                    else None
+                strict_fifo_state=strict_fifo_state,
+                strict_dense_state=strict_dense_state,
+                # The device this invocation will actually run on, not the one
+                # recorded in the saved args: the execution-flags rule is
+                # device dependent and must be judged against the real target.
+                target_device=_resolved_invocation_device(
+                    args, relational_queue_preparation
                 ),
             )
     else:
@@ -2100,6 +2340,9 @@ _UNSAVED_ARGS = frozenset(
         "resume_state",
         "resume_state_path",
         "pretrain_settings",
+        "pretrain_initialization_prepared",
+        "pretrain_dense_settings",
+        "pretrain_dense_dependency",
         "ssl_config_effective",
         "relational_queue_preparation",
     }
@@ -2141,13 +2384,19 @@ class PretrainSettings:
 
 
 def resolve_pretrain_settings(
-    args: argparse.Namespace, checkpoint: dict[str, Any] | None = None
+    args: argparse.Namespace,
+    checkpoint: dict[str, Any] | None = None,
+    *,
+    initialization: Any | None = None,
 ) -> PretrainSettings:
     """Resolve the backbone, sizes and patch configuration exactly once.
 
     Pure: the checkpoint is read, never mutated, and the ``auto`` native-size
     lookup is RNG-isolated so preflight cannot shift the student init a given
     ``--seed`` produces. Resume uses the checkpoint-resolved backbone and size.
+    A new run initialized from an existing backbone inherits the source
+    architecture, input size and register layout for every omitted request and
+    rejects an explicit conflict, so the transferred weights always fit.
     """
     from otuformer.utils.checkpoint import preserved_rng
 
@@ -2162,6 +2411,10 @@ def resolve_pretrain_settings(
                 "Start a new run for a different input size."
             )
         global_crop_size = recorded_size
+    elif initialization is not None:
+        model_name, global_crop_size = _resolve_initialized_architecture(
+            args, initialization, requested_size=requested_size
+        )
     else:
         model_name = args.model_name
         if requested_size is not None:
@@ -2183,8 +2436,42 @@ def resolve_pretrain_settings(
     )
 
 
+def _resolve_initialized_architecture(
+    args: argparse.Namespace, initialization: Any, *, requested_size: Any
+) -> tuple[str, int]:
+    """Inherit the initialization source's backbone and input size."""
+    architecture = initialization.architecture
+    source_name = str(architecture.model_name)
+    requested_name = str(getattr(args, "model_name", "") or "").strip()
+    # Only an explicit --model-name is a request. The CLI always carries a
+    # default value, so comparing it unconditionally would reject every run whose
+    # source is not that default.
+    explicit_name = bool(getattr(args, "model_name_explicit", False))
+    if explicit_name and requested_name and requested_name != source_name:
+        raise ValueError(
+            "an initialized run cannot change the backbone: the source records "
+            f"{source_name}, got --model-name {requested_name}. Start a plain new "
+            "run to use a different architecture."
+        )
+    source_size = int(initialization.image_size)
+    if requested_size is None:
+        global_crop_size = source_size
+    else:
+        global_crop_size = int(requested_size)
+        if global_crop_size != source_size:
+            raise ValueError(
+                "an initialized run cannot change the input size: the source "
+                f"records {source_size}, got --global-crop-size "
+                f"{global_crop_size}."
+            )
+    return source_name, global_crop_size
+
+
 def preflight_pretrain_run(
-    args: argparse.Namespace, settings: PretrainSettings
+    args: argparse.Namespace,
+    settings: PretrainSettings,
+    *,
+    initialization: Any | None = None,
 ) -> None:
     """Reject an impossible pretraining configuration before output setup.
 
@@ -2202,6 +2489,13 @@ def preflight_pretrain_run(
         if getattr(args, "resume", "")
         else getattr(args, "register_tokens", None)
     )
+    if (
+        register_tokens is None
+        and initialization is not None
+        and initialization.architecture.added_register_tokens
+    ):
+        # Omitted register option inherits the source's added-register layout.
+        register_tokens = 4
     with preserved_rng():
         probe = OTUFormerEncoder(
             model_name=settings.model_name,
@@ -3621,27 +3915,31 @@ def _validate_relational_queue_resume(
 
 
 def _validate_fifo_rng_state(
-    state: object, *, target_device: torch.device | None
+    state: object,
+    *,
+    target_device: torch.device | None,
+    label: str = "Queue-enabled resume",
 ) -> dict[str, object]:
     """Validate the saved RNG streams for the actual recovery target.
 
-    Missing, ``None`` or malformed streams are a hard error: an enabled queue
-    resume never falls back to a best-effort random sequence, and never seeds a
-    substitute CUDA stream. A CUDA-shaped payload recovered on a non-CUDA target
-    is structurally checked, omitted from the restore copy and reported.
+    Missing, ``None`` or malformed streams are a hard error: a strict resume never
+    falls back to a best-effort random sequence, and never seeds a substitute CUDA
+    stream. A CUDA-shaped payload recovered on a non-CUDA target is structurally
+    checked, omitted from the restore copy and reported. The caller restores the
+    returned copy, so the device policy is applied rather than only diagnosed.
     """
     from otuformer.utils.checkpoint import preserved_rng
 
     if not isinstance(state, dict) or not state:
         raise ValueError(
-            "Queue-enabled resume requires the saved rng_state; a legacy "
-            "checkpoint without one cannot continue an enabled queue run."
+            f"{label} requires the saved rng_state; a legacy checkpoint without "
+            "one cannot continue a strict resume."
         )
     for name in ("python", "numpy", "torch"):
         if name not in state or state[name] is None:
             raise ValueError(
-                f"Queue-enabled resume requires rng_state.{name}; the saved "
-                "streams must be complete."
+                f"{label} requires rng_state.{name}; the saved streams must be "
+                "complete."
             )
     restore_copy = dict(state)
     cuda = state.get("cuda")
@@ -3651,13 +3949,13 @@ def _validate_fifo_rng_state(
             entries = list(cuda)
         else:
             raise ValueError(
-                "Queue-enabled resume found a malformed rng_state.cuda payload; "
-                "it must be a sequence of CPU uint8 tensors."
+                f"{label} found a malformed rng_state.cuda payload; it must be a "
+                "sequence of CPU uint8 tensors."
             )
         if not entries:
             raise ValueError(
-                "Queue-enabled resume found an empty rng_state.cuda sequence; "
-                "an absent CUDA stream is recorded by omitting the key."
+                f"{label} found an empty rng_state.cuda sequence; an absent CUDA "
+                "stream is recorded by omitting the key."
             )
         for entry in entries:
             if (
@@ -3668,8 +3966,8 @@ def _validate_fifo_rng_state(
                 or entry.device.type != "cpu"
             ):
                 raise ValueError(
-                    "Queue-enabled resume found a malformed rng_state.cuda "
-                    "stream; each entry must be a nonempty 1-D CPU uint8 tensor."
+                    f"{label} found a malformed rng_state.cuda stream; each entry "
+                    "must be a nonempty 1-D CPU uint8 tensor."
                 )
         cuda_states = entries
 
@@ -3677,14 +3975,14 @@ def _validate_fifo_rng_state(
     if is_cuda_target:
         if cuda_states is None:
             raise ValueError(
-                "Queue-enabled resume targets CUDA but the checkpoint records no "
-                "CUDA RNG stream; a CPU-generated checkpoint cannot continue an "
-                "enabled run on CUDA."
+                f"{label} targets CUDA but the checkpoint records no CUDA RNG "
+                "stream; a CPU-generated checkpoint cannot continue a strict "
+                "resume on CUDA."
             )
         expected = torch.cuda.device_count()
         if len(cuda_states) != expected:
             raise ValueError(
-                "Queue-enabled resume found "
+                f"{label} found "
                 f"{len(cuda_states)} saved CUDA RNG stream(s) but this host "
                 f"exposes {expected}; the streams cannot be restored exactly."
             )
@@ -3695,10 +3993,9 @@ def _validate_fifo_rng_state(
     if cuda_states is not None:
         restore_copy.pop("cuda", None)
         print(
-            "[Info] Queue-enabled resume: the checkpoint records CUDA RNG "
-            "streams, but this target is not CUDA. Their structure was "
-            "validated and they are not applied; this is a non-CUDA recovery, "
-            "not a CUDA continuation."
+            f"[Info] {label}: the checkpoint records CUDA RNG streams, but this "
+            "target is not CUDA. Their structure was validated and they are not "
+            "applied; this is a non-CUDA recovery, not a CUDA continuation."
         )
     with preserved_rng():
         _restore_rng_state(restore_copy)
@@ -3811,6 +4108,215 @@ def _validate_fifo_step_format(
     return float(value)
 
 
+def _resume_target_device(
+    resume_ckpt: dict[str, Any],
+    label: str,
+    *,
+    fallback: torch.device | None = None,
+) -> torch.device | None:
+    """The device this resume will run on, or ``None`` when it is not recorded.
+
+    The step-format rule is branch *and* device dependent (a shaped step survives
+    only on the CPU differentiable path), so the check must use the real target.
+    """
+    if fallback is not None:
+        return fallback
+    saved_args = resume_ckpt.get("args")
+    device = saved_args.get("device") if isinstance(saved_args, dict) else None
+    if not isinstance(device, str) or not device.strip():
+        return None
+    try:
+        from otuformer.training.runtime import _resolve_device
+
+        return _resolve_device(device)
+    except Exception:
+        return None
+
+
+def _dense_ranking_contributed_steps(resume_ckpt: dict[str, Any], label: str) -> int:
+    """Read the saved ranking contribution count, rejecting a malformed value."""
+    dense_state = resume_ckpt.get("dense_training")
+    ranking_state = (
+        dense_state.get("ranking") if isinstance(dense_state, dict) else None
+    )
+    if not isinstance(ranking_state, dict):
+        raise ValueError(
+            f"Cannot resume: the {label} ranking recipe has no saved head state."
+        )
+    contributed = ranking_state.get("contributed_steps")
+    if isinstance(contributed, bool) or not isinstance(contributed, int):
+        raise ValueError(
+            f"Cannot resume: ranking contributed_steps must be an integer, got "
+            f"{contributed!r}."
+        )
+    if contributed < 0:
+        raise ValueError(
+            f"Cannot resume: ranking contributed_steps={contributed} is negative."
+        )
+    return int(contributed)
+
+
+def _adamw_group_flags(group: object) -> dict[str, bool]:
+    """The execution-branch flags of one rebuilt optimizer group."""
+    return {
+        name: bool(group.get(name, False)) if isinstance(group, dict) else False
+        for name in ("capturable", "fused", "foreach", "differentiable", "amsgrad")
+    }
+
+
+def _validate_ranking_head_entry(
+    entry: Any,
+    parameter: torch.nn.Parameter,
+    *,
+    contributed: int,
+    state_key: object,
+    label: str,
+    flags: dict[str, bool] | None = None,
+    target_device: torch.device | None = None,
+) -> None:
+    """One ranking head parameter's saved AdamW entry against its contribution count.
+
+    Shared by every resume path so the preflight cannot accept what the live
+    restore would reject: presence, step value, moment shapes and finiteness are
+    all decided here.
+    """
+    if entry is None:
+        if contributed == 0:
+            # A never-contributed head legitimately has no optimizer entry.
+            return
+        raise ValueError(
+            f"Cannot resume: the {label} ranking head contributed {contributed} "
+            f"step(s) but optimizer parameter {state_key} has no moments."
+        )
+    if not isinstance(entry, dict):
+        raise ValueError(
+            f"Cannot resume: the {label} ranking head optimizer state "
+            f"{state_key!r} is not a parameter state mapping."
+        )
+    if contributed == 0:
+        raise ValueError(
+            f"Cannot resume: the {label} ranking head carries optimizer state "
+            f"(step {entry.get('step')!r}) but contributed_steps is 0; fabricated "
+            "moments are not legitimate inactivity."
+        )
+    # Reuse the shared step rule against the *real* execution branch: a fixed
+    # all-false flag set accepted an integer tensor step that the foreach path
+    # then rejects at the next update.
+    resolved_flags = flags or {
+        "capturable": False,
+        "fused": False,
+        "foreach": False,
+        "differentiable": False,
+    }
+    step_value = _validate_fifo_step_format(
+        entry.get("step"),
+        flags=resolved_flags,
+        target_device=target_device,
+        label=f"ranking head optimizer step for parameter {state_key}",
+    )
+    measured = int(step_value)
+    if measured < 1:
+        raise ValueError(
+            f"Cannot resume: the {label} ranking head optimizer state {state_key} "
+            f"has an invalid AdamW step {entry.get('step')!r}."
+        )
+    if measured != contributed:
+        raise ValueError(
+            f"Cannot resume: the {label} ranking head parameter {state_key} has "
+            f"AdamW step {measured} but contributed_steps is {contributed}; the "
+            "head must be updated exactly on its contributing steps."
+        )
+    # Reuse the shared moment rule: shape, float dtype, finiteness *after* the
+    # cast to the parameter dtype, and non-negative second moments.
+    _validate_adamw_moment(
+        entry, "exp_avg", parameter, label=f"ranking head parameter {state_key}"
+    )
+    _validate_adamw_moment(
+        entry, "exp_avg_sq", parameter, label=f"ranking head parameter {state_key}"
+    )
+    if resolved_flags.get("amsgrad"):
+        # The AMSGrad branch reads max_exp_avg_sq on the next update, so a
+        # missing tensor is a mid-training KeyError rather than a resume error.
+        _validate_adamw_moment(
+            entry,
+            "max_exp_avg_sq",
+            parameter,
+            label=f"ranking head parameter {state_key}",
+        )
+
+
+def _validate_dense_head_moments(
+    optimizer: torch.optim.Optimizer,
+    saved_optimizer: object,
+    *,
+    probe_ranking: Any | None,
+    resume_ckpt: dict[str, Any],
+    label: str,
+    target_device: torch.device | None = None,
+) -> dict[int, int] | None:
+    """Prove the ranking head's saved moments match its contribution count.
+
+    Returns the per-parameter expected step mapping (``0`` = must be absent) so
+    the FIFO walker applies the same rule instead of demanding moments for a
+    head that never contributed.
+    """
+    if probe_ranking is None:
+        return None
+    contributed = _dense_ranking_contributed_steps(resume_ckpt, label)
+    head_ids = {id(parameter) for parameter in probe_ranking.student_head.parameters()}
+    teacher_ids = {
+        id(parameter) for parameter in probe_ranking.teacher_head.parameters()
+    }
+    if head_ids & teacher_ids:  # pragma: no cover - separate modules
+        raise ValueError("The ranking student and teacher heads share parameters.")
+    saved = saved_optimizer.get("state") if isinstance(saved_optimizer, dict) else None
+    if not isinstance(saved, dict):
+        raise ValueError(f"Cannot resume: the {label} optimizer state is missing.")
+    # The saved group flags decide which branch will run, so they decide which
+    # state the resume must actually carry.
+    # The device this invocation resolves to, not the saved args.device: the
+    # execution-flags rule is device dependent.
+    device = (
+        target_device
+        if target_device is not None
+        else _resume_target_device(resume_ckpt, label)
+    )
+    saved_groups = (
+        saved_optimizer.get("param_groups") if isinstance(saved_optimizer, dict) else None
+    )
+    saved_groups = saved_groups if isinstance(saved_groups, list) else []
+    index = 0
+    seen: set[int] = set()
+    for group_index, group in enumerate(optimizer.param_groups):
+        flags = _adamw_group_flags(
+            saved_groups[group_index] if group_index < len(saved_groups) else group
+        )
+        for parameter in group["params"]:
+            if id(parameter) in teacher_ids:
+                raise ValueError(
+                    f"Cannot resume: teacher ranking parameters must never appear "
+                    f"in the {label} optimizer groups."
+                )
+            if id(parameter) in head_ids:
+                seen.add(id(parameter))
+                _validate_ranking_head_entry(
+                    saved.get(index),
+                    parameter,
+                    contributed=contributed,
+                    state_key=index,
+                    label=label,
+                    flags=flags,
+                    target_device=device,
+                )
+            index += 1
+    if seen != head_ids:
+        raise ValueError(
+            f"Cannot resume: the {label} optimizer groups do not contain every "
+            "ranking student-head parameter exactly once."
+        )
+    return {parameter_id: contributed for parameter_id in head_ids}
+
+
 def _validate_fifo_adamw_state(
     optimizer: torch.optim.Optimizer,
     saved_optimizer: object,
@@ -3818,6 +4324,7 @@ def _validate_fifo_adamw_state(
     completed_steps: int,
     label: str,
     target_device: torch.device | None = None,
+    expected_steps: Mapping[int, int] | None = None,
 ) -> None:
     """Prove the usable per-parameter AdamW state, not only the group layout.
 
@@ -3848,7 +4355,26 @@ def _validate_fifo_adamw_state(
         amsgrad = bool(saved_group.get("amsgrad", False))
         for parameter in rebuilt_group["params"]:
             entry = state.get(index)
+            # ``expected_steps`` carries the *contribution-derived* step count of
+            # a parameter whose participation is not the loop iteration, e.g. a
+            # ranking head that only contributed on some steps. ``0`` means the
+            # parameter must have no moments at all.
+            expected = (
+                None
+                if expected_steps is None
+                else expected_steps.get(id(parameter))
+            )
             if entry is None:
+                if expected is not None and int(expected) == 0:
+                    index += 1
+                    continue
+                if expected is not None:
+                    raise ValueError(
+                        f"Cannot resume: the saved {label} optimizer state has no "
+                        f"moments for parameter {index}, but its contribution "
+                        f"count is {expected}; missing state is not proof of "
+                        "legitimate inactivity."
+                    )
                 if parameter.requires_grad:
                     raise ValueError(
                         f"Cannot resume: the saved {label} optimizer state has no "
@@ -3868,6 +4394,19 @@ def _validate_fifo_adamw_state(
                 target_device=target_device,
                 label=f"optimizer step for parameter {index}",
             )
+            if expected is not None and int(expected) == 0:
+                raise ValueError(
+                    f"Cannot resume: parameter {index} carries optimizer moments "
+                    "but its contribution count is 0; fabricated state is not "
+                    "legitimate inactivity."
+                )
+            if expected is not None and int(step_value) != int(expected):
+                raise ValueError(
+                    f"Cannot resume: optimizer step for parameter {index} is "
+                    f"{step_value} but its recorded contribution count is "
+                    f"{expected}; the head must be updated exactly on its "
+                    "contributing steps."
+                )
             if not 1 <= int(step_value) <= int(max(completed_steps, 1)):
                 raise ValueError(
                     f"Cannot resume: optimizer step for parameter {index} is "
