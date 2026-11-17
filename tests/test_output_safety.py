@@ -180,7 +180,7 @@ def test_downstream_cleanup_oserror_is_a_cli_error(
     assert calls == [out]
     assert result.exit_code == 2, (result.output, repr(result.exception))
     assert isinstance(result.exception, SystemExit)
-    output = " ".join(result.output.replace("│", " ").split())
+    output = " ".join(re.sub(r"\x1b\[[0-9;]*m", "", result.output).replace("│", " ").split())
     if error_type is None:
         assert "Output directory already contains files" in output
         assert "pass --overwrite" in output
@@ -274,7 +274,7 @@ def test_extract_nonempty_output_requires_overwrite_without_traceback(
     ])
     assert result.exit_code == 2, (result.output, repr(result.exception))
     assert isinstance(result.exception, SystemExit)
-    output = " ".join(result.output.replace("│", " ").split())
+    output = " ".join(re.sub(r"\x1b\[[0-9;]*m", "", result.output).replace("│", " ").split())
     assert "Output directory already contains files" in output
     assert "pass --overwrite" in output
     assert "Traceback" not in output
