@@ -203,3 +203,23 @@ speed claim is made.
 | E4 | implemented — benefit unqualified (no timing claim) | One seeded sorted index rule under `otuformer.embedding` used by the manifest, extract (both callsites) and cluster; tree-bootstrap and stratified silhouette sampling left untouched. |
 | E5 | implemented — benefit unqualified (documentation-only scope) | `--num-workers` scope is documented as training loaders only with serial evaluation; no worker implementation or `persistent_workers` change. |
 | E6 | implemented — benefit unqualified (fixture repair; no timing claim) | The six resume smoke nodes pass with no production-source change; the loader-step preflight keeps full resolution and reuses it where contracts match. |
+
+### Final-review fix pass (2026-11-19)
+
+The whole-branch review found one log-only defect and four deviations, fixed in
+`fda300d`, `0f2e921`, `008c888` with tests that failed first:
+
+- The evaluation-manifest phase reused the enclosing recovery phase's start
+  token, so `objective/loss, optimizer and recovery: done in Xs` measured the
+  manifest instead. Both loops now use a separate `manifest_phase` local; a
+  phase-token identity test guards it.
+- C2's masked-feature teacher path gathered after `pretrain_final_norm`; it now
+  gathers each of the four blocks before the pointwise LayerNorm, guarded by a
+  hook test on the norm's input rows.
+- C7's finetune half now reads the loss once per usable step for the epoch
+  total, the postfix and the log row; a read-count test pins it.
+- D1's embedding half now deserializes the bytes it snapshotted and keeps the
+  verified re-read as the drift check, instead of deserializing the second read.
+- The E1 reuse claim gained guards: a dataset-carrier test (matching identity
+  reuses, mismatched identity resolves) and a test asserting the manifest
+  preparation receives the carrier's identity-checked paths.
