@@ -529,3 +529,56 @@ def test_compute_pd_richness_norm_relation():
     n_otus = assignments["cluster"].nunique()
     expected_norm = result["MPD"] / n_otus
     assert abs(result["PD_richness_norm"] - expected_norm) < 1e-9
+
+
+def test_otu_table_diversity_does_not_expand_counts(monkeypatch):
+    otu = pd.DataFrame(
+        {"OTU_1": [100000, 0], "OTU_2": [3, 4], "OTU_3": [0, 0]},
+        index=["s1", "s2"],
+    )
+
+    def fail(*args, **kwargs):
+        raise AssertionError("OTU counts were expanded into assignment rows")
+
+    monkeypatch.setattr(pd.Index, "repeat", fail)
+    global_table, per_sample = build_diversity_tables_from_otu_table(
+        otu, [0, 2], None
+    )
+
+    assert set(global_table.columns) == {"min_abundance_0", "min_abundance_2"}
+    assert set(per_sample) == {"s1", "s2"}
+
+
+def test_otu_table_diversity_matches_the_expanded_reference(tmp_path: Path):
+    pytest.importorskip("skbio")
+    otu = pd.DataFrame(
+        {
+            "OTU_A": [100000, 0],
+            "OTU_B": [3, 4],
+            "OTU_C": [1, 1],
+            "OTU_D": [0, 0],
+        },
+        index=["s1", "s2"],
+    )
+    tree_path = tmp_path / "tree.nwk"
+    tree_path.write_text(
+        "((OTU_A:1.0,OTU_B:1.0):0.5,(OTU_C:0.5,OTU_D:0.5):1.0);", encoding="utf-8"
+    )
+    thresholds = [0, 1, 2, 5]
+
+    global_table, per_sample = build_diversity_tables_from_otu_table(
+        otu, thresholds, tree_path
+    )
+
+    def expanded(counts: pd.Series) -> pd.DataFrame:
+        return pd.DataFrame({"cluster": counts.index.repeat(counts.values.astype(int))})
+
+    reference_global = diversity_table(
+        expanded(otu.sum(axis=0)), thresholds, tree_newick_path=tree_path
+    )
+    pd.testing.assert_frame_equal(global_table, reference_global)
+    for sample, row in otu.iterrows():
+        reference = diversity_table(
+            expanded(row), thresholds, tree_newick_path=tree_path
+        )
+        pd.testing.assert_frame_equal(per_sample[str(sample)], reference)

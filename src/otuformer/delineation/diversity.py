@@ -291,21 +291,67 @@ def build_diversity_tables_from_otu_table(
     Returns (global_table, {sample: per_sample_table}).
     """
     global_counts = otu_table.sum(axis=0)
-    global_assignments = pd.DataFrame(
-        {"cluster": global_counts.index.repeat(global_counts.values.astype(int))}
-    )
-    global_table = diversity_table(
-        global_assignments, min_values, tree_newick_path=tree_newick_path
+    otu_ids = [str(name) for name in otu_table.columns]
+    global_table = diversity_table_from_counts(
+        otu_ids,
+        global_counts.to_numpy(),
+        min_values,
+        tree_newick_path=tree_newick_path,
     )
     per_sample = {}
     for sample, row in otu_table.iterrows():
-        assignments = pd.DataFrame(
-            {"cluster": row.index.repeat(row.values.astype(int))}
-        )
-        per_sample[str(sample)] = diversity_table(
-            assignments, min_values, tree_newick_path=tree_newick_path
+        per_sample[str(sample)] = diversity_table_from_counts(
+            otu_ids,
+            row.to_numpy(),
+            min_values,
+            tree_newick_path=tree_newick_path,
         )
     return global_table, per_sample
+
+
+def diversity_table_from_counts(
+    otu_ids: list[str],
+    counts: np.ndarray,
+    min_abundances: list[int],
+    tree_newick_path: Optional[Path] = None,
+) -> pd.DataFrame:
+    """The same alpha table as :func:`diversity_table`, computed on counts.
+
+    Expanding an abundance of 100,000 into 100,000 assignment rows only to count
+    them again is pure work: the formulas read the abundance vector, so the OTU
+    table path filters the counts directly. Zero-count OTUs stay excluded at
+    every threshold, and a threshold above 0 keeps only counts at or above it.
+    """
+    counts = np.asarray(counts, dtype=int)
+    records: dict[str, dict[str, float]] = {}
+    for min_ab in min_abundances:
+        keep = counts > 0
+        if min_ab > 0:
+            keep &= counts >= min_ab
+        col = f"min_abundance_{min_ab}"
+        if not keep.any():
+            records[col] = {}
+            continue
+        selected_ids = [otu_ids[i] for i in np.nonzero(keep)[0]]
+        selected_counts = counts[keep]
+        metrics = compute_alpha_diversity_from_counts(
+            np.sort(selected_counts)[::-1]
+        )
+        if tree_newick_path is not None:
+            try:
+                metrics.update(
+                    compute_mpd_from_counts(
+                        selected_ids, selected_counts, tree_newick_path
+                    )
+                )
+            except Exception:
+                metrics["MPD"] = float("nan")
+                metrics["MPD_w"] = float("nan")
+                metrics["PD_richness_norm"] = float("nan")
+        records[col] = metrics
+    df = pd.DataFrame(records)
+    df.index.name = "index"
+    return df
 
 
 def filter_by_min_abundance(
@@ -342,7 +388,11 @@ def _fisher_alpha(s: int, n: int, max_iter: int = 100, tol: float = 1e-6) -> flo
 
 
 def compute_alpha_diversity(assignments: pd.DataFrame) -> dict[str, float]:
-    counts = _abundance_vector(assignments)
+    return compute_alpha_diversity_from_counts(_abundance_vector(assignments))
+
+
+def compute_alpha_diversity_from_counts(counts: np.ndarray) -> dict[str, float]:
+    """Alpha metrics from an abundance vector sorted descending."""
     n = int(counts.sum())
     s = int(len(counts))
     if n == 0 or s == 0:
