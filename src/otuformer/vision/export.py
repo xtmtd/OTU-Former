@@ -155,6 +155,7 @@ def export_to_onnx(
     feature_l2_normalize: bool | None = None,
     use_student: bool = False,
     prepared_spatial: Mapping[str, Any] | None = None,
+    prepared_embedding: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Export an encoder graph.
 
@@ -177,7 +178,12 @@ def export_to_onnx(
             use_student=use_student,
         )
         return _export_embedding(
-            checkpoint_path, out_path, imgsz=imgsz, opset=opset, model_name=model_name
+            checkpoint_path,
+            out_path,
+            imgsz=imgsz,
+            opset=opset,
+            model_name=model_name,
+            prepared=prepared_embedding,
         )
     return _export_spatial(
         checkpoint_path,
@@ -193,31 +199,61 @@ def export_to_onnx(
     )
 
 
-def _export_embedding(
+def _prepare_embedding_export(
     checkpoint_path: Path,
-    out_path: Path,
-    imgsz: int | None = None,
-    opset: int = 18,
-    model_name: str = "vit_tiny_patch16_224",
+    *,
+    imgsz: int | None,
+    model_name: str,
 ) -> dict[str, Any]:
+    """Resolve the embedding checkpoint, model and sizes, writing nothing.
+
+    Doing this before a caller clears an existing output means an unacceptable
+    checkpoint or size cannot destroy a previous graph.
+    """
     ckpt = load_checkpoint(checkpoint_path)
     architecture = resolve_checkpoint(ckpt, model_name)
-    model_name = architecture.model_name
+    resolved_name = architecture.model_name
     out_dim = architecture.embedding_dim
     checkpoint_size = resolve_training_image_size(ckpt)
 
     model, architecture = load_checkpoint_encoder(
         ckpt, architecture, image_size=checkpoint_size
     )
-    validate_input_size(checkpoint_size, model, model_name)
+    validate_input_size(checkpoint_size, model, resolved_name)
     # Export the embedding output only; the shared loader builds the encoder
     # with patch tokens enabled for its other consumers.
     model.return_patch_tokens = False
     model.eval()
 
-    if imgsz is None:
-        imgsz = checkpoint_size
-    validate_input_size(imgsz, model, model_name)
+    size = checkpoint_size if imgsz is None else int(imgsz)
+    validate_input_size(size, model, resolved_name)
+    return {
+        "model_name": resolved_name,
+        "out_dim": int(out_dim),
+        "checkpoint_size": checkpoint_size,
+        "imgsz": size,
+        "model": model,
+        "architecture": architecture,
+    }
+
+
+def _export_embedding(
+    checkpoint_path: Path,
+    out_path: Path,
+    imgsz: int | None = None,
+    opset: int = 18,
+    model_name: str = "vit_tiny_patch16_224",
+    prepared: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    prepared = prepared or _prepare_embedding_export(
+        checkpoint_path, imgsz=imgsz, model_name=model_name
+    )
+    model_name = prepared["model_name"]
+    out_dim = prepared["out_dim"]
+    checkpoint_size = prepared["checkpoint_size"]
+    imgsz = prepared["imgsz"]
+    model = prepared["model"]
+    architecture = prepared["architecture"]
 
     dummy_input = torch.randn(1, 3, imgsz, imgsz)
     out_path = Path(out_path)

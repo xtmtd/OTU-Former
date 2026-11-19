@@ -136,6 +136,7 @@ def export(
     # output is prepared: a rejected layer list must not have already deleted an
     # existing graph.
     prepared_spatial = None
+    prepared_embedding = None
     if output_kind == "spatial":
         from otuformer.vision.export import _prepare_spatial_export
 
@@ -148,6 +149,19 @@ def export(
                 feature_norm=feature_norm,
                 feature_l2_normalize=feature_l2_normalize,
                 use_student=use_student,
+            )
+        except (ValueError, OSError, FileNotFoundError) as exc:
+            raise typer.BadParameter(str(exc)) from None
+    else:
+        # Same boundary for the embedding graph: a checkpoint or size that cannot
+        # be exported must not clear an existing publication first.
+        from otuformer.vision.export import _prepare_embedding_export
+
+        try:
+            prepared_embedding = _prepare_embedding_export(
+                checkpoint,
+                imgsz=_parse_size(imgsz, stage="--imgsz"),
+                model_name=model_name,
             )
         except (ValueError, OSError, FileNotFoundError) as exc:
             raise typer.BadParameter(str(exc)) from None
@@ -197,6 +211,7 @@ def export(
             ),
             use_student=use_student,
             prepared_spatial=prepared_spatial,
+            prepared_embedding=prepared_embedding,
         )
         typer.echo(f"Export complete: {onnx_path}")
         typer.echo(f"  Model:     {report['model_name']}")

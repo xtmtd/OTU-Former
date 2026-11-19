@@ -710,3 +710,47 @@ def test_dino_export_graph_excludes_training_objective(tmp_path: Path):
     np.testing.assert_allclose(
         np.linalg.norm(exported, axis=-1), np.ones(1), rtol=1e-4, atol=1e-5
     )
+
+
+def test_prepare_embedding_export_resolves_without_writing(tmp_path: Path):
+    from otuformer.vision.export import _prepare_embedding_export
+
+    checkpoint = make_checkpoint(tmp_path, out_dim=32)
+
+    prepared = _prepare_embedding_export(
+        checkpoint, imgsz=None, model_name="vit_tiny_patch16_224"
+    )
+
+    assert prepared["out_dim"] == 32
+    assert prepared["imgsz"] == prepared["checkpoint_size"] == 224
+    assert prepared["model"].return_patch_tokens is False
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["ckpt.pt"]
+
+
+def test_export_cli_rejects_an_invalid_embedding_size_before_overwrite(tmp_path: Path):
+    from typer.testing import CliRunner
+
+    from otuformer.cli.main import app
+
+    checkpoint = make_checkpoint(tmp_path, out_dim=32)
+    out = tmp_path / "out"
+    out.mkdir()
+    prior = out / "encoder.onnx"
+    prior.write_text("previous", encoding="utf-8")
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "export",
+            "--checkpoint",
+            str(checkpoint),
+            "--out-dir",
+            str(out),
+            "--overwrite",
+            "--imgsz",
+            "500",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert prior.read_text(encoding="utf-8") == "previous"

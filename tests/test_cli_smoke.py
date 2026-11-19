@@ -3474,6 +3474,10 @@ def test_export_forwards_model_name(monkeypatch, tmp_path):
         return {"model_name": kwargs["model_name"], "out_dim": 8, "validated": False}
 
     monkeypatch.setattr("otuformer.vision.export.export_to_onnx", fake_export)
+    # The pre-output preparation reads the checkpoint; this test owns forwarding.
+    monkeypatch.setattr(
+        "otuformer.vision.export._prepare_embedding_export", lambda *a, **k: {}
+    )
     result = runner.invoke(
         app,
         [

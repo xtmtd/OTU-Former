@@ -411,3 +411,23 @@ def test_graph_metadata_must_agree_with_the_graph_io(tmp_path):
         read_spatial_onnx_contract(rewrite(rename_output))
     with pytest.raises(ValueError, match="per-image layout"):
         read_spatial_onnx_contract(rewrite(change_layout))
+
+
+def test_prepare_spatial_export_writes_nothing(tmp_path):
+    from otuformer.vision.export import _prepare_spatial_export
+
+    checkpoint = tiny_checkpoint(tmp_path)
+
+    prepared = _prepare_spatial_export(
+        checkpoint,
+        imgsz=None,
+        model_name="vit_tiny_patch16_224",
+        feature_layers=None,
+        feature_norm="backbone",
+        feature_l2_normalize=False,
+        use_student=False,
+    )
+
+    assert prepared["size"] == 32
+    assert prepared["model"] is not None
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["model.pt"]
