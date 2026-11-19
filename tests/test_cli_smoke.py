@@ -282,6 +282,15 @@ def _make_tiny_pretrain_data(tmp_path):
     return csv_path
 
 
+def _make_resume_pretrain_csv(tmp_path, rows=32):
+    """Readable training CSV for resume preflight; image files need not exist."""
+    csv_path = tmp_path / "data.csv"
+    pd.DataFrame({"image": [f"img_{i}.jpg" for i in range(rows)]}).to_csv(
+        csv_path, index=False
+    )
+    return csv_path
+
+
 def _make_tiny_finetune_data(tmp_path):
     for i in range(4):
         Image.new("RGB", (224, 224), color=(i * 60, 20, 10)).save(
@@ -408,6 +417,7 @@ def test_training_rejects_resume_with_overwrite(tmp_path, command):
 
 
 def test_pretrain_resume_allows_existing_output_and_appends_log(tmp_path, monkeypatch):
+    _make_resume_pretrain_csv(tmp_path)
     checkpoint = _make_ckpt(tmp_path)
     out_dir = tmp_path / "pretrain_out"
     log_path = out_dir / "logs" / "pretrain.log"
@@ -2401,6 +2411,7 @@ def test_pretrain_resume_rejects_changed_input_size(tmp_path):
 
 
 def test_pretrain_resume_allows_equal_input_size(tmp_path, monkeypatch):
+    _make_resume_pretrain_csv(tmp_path)
     ckpt = _make_ckpt(tmp_path)  # 224 checkpoint
     seen = {}
 
@@ -3178,6 +3189,7 @@ def test_pretrain_resume_inherits_saved_local_views_without_explicit_flags(
 ):
     from otuformer.training import trainer
 
+    _make_resume_pretrain_csv(tmp_path)
     ckpt = _write_augmented_pretrain_checkpoint(
         tmp_path, local_crop_size=112, local_crops=0
     )
@@ -4651,10 +4663,10 @@ def _capture_initial_student(monkeypatch, seen):
 
     real_preflight = pretrain_loop_module.preflight_pretrain_run
 
-    def marking_preflight(args, settings):
+    def marking_preflight(args, settings, initialization=None):
         seen["in_preflight"] = True
         try:
-            return real_preflight(args, settings)
+            return real_preflight(args, settings, initialization=initialization)
         finally:
             seen["in_preflight"] = False
 
@@ -4859,6 +4871,8 @@ def test_pretrain_resume_trains_the_checkpoint_backbone(tmp_path, monkeypatch):
             "--out-dir", str(tmp_path / "resume_backbone_out"),
             # The checkpoint records out_dim 64, so the resume must rebuild it.
             "--out-dim", "64",
+            # Four-row fixture: the default batch size 32 would yield zero steps.
+            "--batch-size", "2",
         ],
     )
 
@@ -5434,6 +5448,7 @@ def test_pretrain_cli_hands_over_the_resume_payload_and_its_path(
             "--input-images-dir", str(tmp_path),
             "--out-dir", str(tmp_path / "out"),
             "--resume", str(resume),
+            "--batch-size", "1",
             "--device", "cpu",
         ],
     )
