@@ -2260,6 +2260,7 @@ def take_pretrain_handoff(args: argparse.Namespace) -> "_PretrainHandoff":
     resume_state_path = getattr(args, "resume_state_path", None)
     preparation = vars(args).pop("relational_queue_preparation", None)
     settings = vars(args).pop("pretrain_settings", None)
+    evaluation_manifest = vars(args).pop("evaluation_manifest", None)
     for name in ("ssl_config_effective", "resume_state", "resume_state_path"):
         setattr(args, name, None)
     return _PretrainHandoff(
@@ -2272,6 +2273,7 @@ def take_pretrain_handoff(args: argparse.Namespace) -> "_PretrainHandoff":
             if isinstance(preparation, _RelationalQueuePreparation)
             else None
         ),
+        evaluation_manifest=evaluation_manifest,
     )
 
 
@@ -2282,6 +2284,7 @@ class _PretrainHandoff:
     resume_state_path: str | None
     settings: "PretrainSettings | None"
     relational_queue_preparation: "_RelationalQueuePreparation | None" = None
+    evaluation_manifest: Any | None = None
 
 
 def resume_payload_for(
@@ -2345,6 +2348,8 @@ _UNSAVED_ARGS = frozenset(
         "pretrain_dense_dependency",
         "ssl_config_effective",
         "relational_queue_preparation",
+        "evaluation_manifest",
+        "pretrain_resolved_images",
     }
 )
 

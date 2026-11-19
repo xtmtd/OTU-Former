@@ -360,6 +360,82 @@ def test_pretrain_runs_one_epoch(tmp_path):
     assert "orientation_policy" not in saved["config"]
 
 
+def test_pretrain_manifest_failure_warns_once_in_terminal_and_log(tmp_path):
+    csv_path = _make_tiny_pretrain_data(tmp_path)
+    bad = tmp_path / "bad_eval.csv"
+    pd.DataFrame({"image": ["missing.png"]}).to_csv(bad, index=False)
+    out_dir = tmp_path / "pretrain_manifest_out"
+
+    result = runner.invoke(
+        app,
+        [
+            "pretrain",
+            "--train-data", str(csv_path),
+            "--input-images-dir", str(tmp_path),
+            "--out-dir", str(out_dir),
+            "--model-name", "vit_tiny_patch16_224",
+            "--out-dim", "64",
+            "--max-epochs", "1",
+            "--batch-size", "2",
+            "--num-workers", "0",
+            "--global-crop-size", "224",
+            "--local-crop-size", "96",
+            "--local-crops", "2",
+            "--visualize-data", str(bad),
+            "--device", "cpu",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    log_text = (out_dir / "logs" / "pretrain.log").read_text(encoding="utf-8")
+    for text in (result.output, log_text):
+        assert "[Phase] evaluation manifest: start" in text
+        assert "[Phase] evaluation manifest: done in " in text
+        assert text.count("[Warning] Periodic embedding evaluation is disabled") == 1
+
+
+def test_pretrain_cli_resolves_the_training_selection_once(tmp_path, monkeypatch):
+    """Loader-step preflight and dataset construction share one resolution."""
+    import otuformer.training.dataset as dataset_module
+
+    _make_resume_pretrain_csv(tmp_path)
+    checkpoint = _make_ckpt(tmp_path)
+    calls = []
+    real_resolve = dataset_module.resolve_dataset_image_paths
+
+    def counting_resolve(*args, **kwargs):
+        calls.append(1)
+        return real_resolve(*args, **kwargs)
+
+    monkeypatch.setattr(
+        dataset_module, "resolve_dataset_image_paths", counting_resolve
+    )
+    seen = {}
+
+    def spy(args, **kwargs):
+        seen["carrier"] = getattr(args, "pretrain_resolved_images", None)
+
+    monkeypatch.setattr(pretrain_loop_module, "run_pretrain", spy)
+
+    result = runner.invoke(
+        app,
+        [
+            "pretrain",
+            "--resume", str(checkpoint),
+            "--train-data", str(tmp_path / "data.csv"),
+            "--input-images-dir", str(tmp_path),
+            "--out-dir", str(tmp_path / "once_out"),
+            "--out-dim", "64",
+            "--device", "cpu",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert len(calls) == 1
+    assert seen["carrier"] is not None
+    assert len(seen["carrier"].paths) == 32
+
+
 def test_pretrain_runs_one_epoch_without_train_data(tmp_path):
     _make_tiny_pretrain_data(tmp_path)
     result = runner.invoke(

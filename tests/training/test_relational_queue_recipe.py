@@ -1351,12 +1351,16 @@ def test_fifo_handoff_is_consumed_once_and_retry_is_clean(tmp_path):
         ssl_config_effective=None,
         resume_state=None,
         resume_state_path=None,
+        evaluation_manifest="manifest-sentinel",
     )
     handoff = recipe.take_pretrain_handoff(args)
     assert handoff.relational_queue_preparation is preparation
+    assert handoff.evaluation_manifest == "manifest-sentinel"
     assert not hasattr(args, "relational_queue_preparation")
+    assert not hasattr(args, "evaluation_manifest")
     retry = recipe.take_pretrain_handoff(args)
     assert retry.relational_queue_preparation is None
+    assert retry.evaluation_manifest is None
 
     # A request change invalidates the reused preparation instead of silently
     # serving the old data.

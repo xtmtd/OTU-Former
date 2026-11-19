@@ -41,7 +41,12 @@ from otuformer.constants import (
 )
 
 def _pretrain_loader_steps(
-    ns, resume_state, relational_queue_preparation, *, batch_size: int
+    ns,
+    resume_state,
+    relational_queue_preparation,
+    *,
+    batch_size: int,
+    image_paths=None,
 ) -> int:
     """Predict ``len(loader)`` for the training loader before it exists.
 
@@ -52,6 +57,8 @@ def _pretrain_loader_steps(
     """
     if relational_queue_preparation is not None and relational_queue_preparation.active:
         rows = len(relational_queue_preparation.data.image_keys)
+    elif image_paths is not None:
+        rows = len(image_paths)
     else:
         from otuformer.training.dataset import resolve_dataset_image_paths
 
@@ -78,6 +85,7 @@ _CLI_HANDOFF_ARGS = frozenset(
         "pretrain_initialization_prepared",
         "pretrain_dense_settings",
         "pretrain_dense_dependency",
+        "pretrain_resolved_images",
     }
 )
 
@@ -877,6 +885,9 @@ def pretrain(
     # an out-of-range cap or an unqualified sorter must not destroy old results.
     dense_settings = None
     dense_dependency = None
+    # One training selection feeds loader-step preflight, overwrite protection
+    # and dataset construction; a queue-enabled run already carries its own.
+    resolved_training_paths = None
     try:
         from otuformer.training import dense_recipe as dense_recipe_module
         from otuformer.training.runtime import _resolve_device
@@ -891,6 +902,18 @@ def pretrain(
 
             dense_dependency = probe_ranking_dependency(
                 _resolve_device(str(device or "auto"))
+            )
+        queue_active = (
+            relational_queue_preparation is not None
+            and relational_queue_preparation.active
+        )
+        if not queue_active and (
+            resume_state is not None or dense_settings.enabled
+        ):
+            from otuformer.training.dataset import resolve_dataset_image_paths
+
+            resolved_training_paths = resolve_dataset_image_paths(
+                ns.train_data, input_images_dir
             )
         if resume_state is not None:
             resolved_batch = int(
@@ -915,6 +938,7 @@ def pretrain(
                     resume_state,
                     relational_queue_preparation,
                     batch_size=resolved_batch,
+                    image_paths=resolved_training_paths,
                 ),
                 dependency=dense_dependency,
             )
@@ -932,6 +956,7 @@ def pretrain(
                     and relational_queue_preparation.active
                     else ns.batch_size
                 ),
+                image_paths=resolved_training_paths,
             )
     except (ValueError, KeyError, OSError, RuntimeError) as exc:
         raise typer.BadParameter(str(exc)) from exc
@@ -958,7 +983,11 @@ def pretrain(
             # never a second, possibly different resolution.
             protected.extend(relational_queue_preparation.data.image_paths)
         elif overwrite and out_dir.exists() and (train_data is None or train_data.exists()):
-            protected.extend(resolve_dataset_image_paths(train_data, input_images_dir))
+            if resolved_training_paths is None:
+                resolved_training_paths = resolve_dataset_image_paths(
+                    train_data, input_images_dir
+                )
+            protected.extend(resolved_training_paths)
         if (
             overwrite and out_dir.exists() and not disable_embedding_metrics
             and visualize_data is not None and visualize_data.exists()
@@ -971,6 +1000,17 @@ def pretrain(
         )
     except (ValueError, OSError) as exc:
         raise typer.BadParameter(str(exc)) from exc
+    from otuformer.training.dataset import ResolvedTrainingImages
+
+    ns.pretrain_resolved_images = (
+        None
+        if resolved_training_paths is None
+        else ResolvedTrainingImages(
+            csv_path=str(train_data or ""),
+            images_dir=str(input_images_dir),
+            paths=tuple(resolved_training_paths),
+        )
+    )
     tee = TeeLogger(
         out_dir / "logs" / "pretrain.log",
         append=bool(resume),

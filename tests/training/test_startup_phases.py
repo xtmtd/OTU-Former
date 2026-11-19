@@ -17,6 +17,7 @@ import pytest
 from PIL import Image
 
 from otuformer.training import pretrain_loop as trainer
+from otuformer.training import reporting
 
 
 def _images(root: Path, rows: int = 4) -> tuple[Path, Path]:
@@ -181,3 +182,68 @@ def test_pretrain_phase_start_survives_a_failure_inside_the_phase(tmp_path):
     text = output.getvalue()
     assert "[Phase] dataset indexing and loader: start" in text
     assert "[Phase] dataset indexing and loader: done" not in text
+
+
+def _bad_eval_csv(root: Path) -> Path:
+    csv_path = root / "bad_eval.csv"
+    with csv_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["image"])
+        writer.writerow(["missing.png"])
+    return csv_path
+
+
+def test_evaluation_manifest_phase_warns_once_and_training_continues(
+    tmp_path, capsys
+):
+    args = _pretrain_args(tmp_path)
+    args.compute_embedding_metrics = True
+    args.visualize_data = str(_bad_eval_csv(tmp_path))
+
+    trainer.run_pretrain(args)
+
+    output = capsys.readouterr().out
+    assert output.count("[Phase] evaluation manifest: start") == 1
+    assert output.count("[Phase] evaluation manifest: done in ") == 1
+    assert output.index("[Phase] evaluation manifest: start") < output.index(
+        "[Phase] evaluation manifest: done"
+    )
+    assert output.count("[Warning] Periodic embedding evaluation is disabled") == 1
+    # The epoch logger and its curves input survive the disabled evaluator.
+    assert (tmp_path / "out" / "logs" / "metrics.pretrain.csv").exists()
+    assert (tmp_path / "out" / "SSL_latest.pth").exists()
+
+
+def test_evaluation_manifest_is_prepared_once_and_handed_to_the_evaluator(
+    tmp_path, monkeypatch
+):
+    args = _pretrain_args(tmp_path)
+    args.compute_embedding_metrics = True
+    args.visualize_data = str(tmp_path / "data.csv")
+    captured = []
+    monkeypatch.setattr(
+        trainer,
+        "_compute_and_log_all_metrics",
+        lambda **kwargs: captured.append(kwargs),
+    )
+
+    trainer.run_pretrain(args)
+
+    assert len(captured) == 1
+    manifest = captured[0]["manifest"]
+    assert isinstance(manifest, reporting.PreparedEvaluationManifest)
+    assert len(manifest.paths) == 4
+    assert all(path.is_file() for path in manifest.paths)
+
+
+def test_disabled_metrics_skip_manifest_preparation(tmp_path, monkeypatch):
+    args = _pretrain_args(tmp_path)  # compute_embedding_metrics=False
+    args.visualize_data = str(_bad_eval_csv(tmp_path))
+
+    def boom(*args, **kwargs):
+        raise AssertionError("manifest prepared while embedding metrics are disabled")
+
+    monkeypatch.setattr(trainer, "prepare_evaluation_manifest", boom)
+    trainer.run_pretrain(args)
+
+    assert not (tmp_path / "out" / "logs" / "metrics.pretrain.csv").exists()

@@ -61,6 +61,7 @@ from .augmentation import (
 )
 from .dataset import (
     MultiCropDataset,
+    ResolvedTrainingImages,
 )
 from .dino import (
     DINOObjective,
@@ -130,6 +131,7 @@ from .reporting import (
     _ibot_diagnostics,
     _mask_ratio_diagnostics,
     _relational_queue_metrics,
+    prepare_evaluation_manifest,
 )
 from .runtime import (
     _capture_rng_state,
@@ -764,6 +766,7 @@ def run_pretrain(
         prepared_relational_data=(
             preparation.data if preparation.active else None
         ),
+        prepared_images=getattr(args, "pretrain_resolved_images", None),
         return_geometry=bool(dense_settings is not None and dense_settings.enabled),
     )
     loader = DataLoader(
@@ -993,6 +996,39 @@ def run_pretrain(
         if compute_embedding_metrics
         else None
     )
+    # One evaluation snapshot per invocation, taken after the tee is active and
+    # before any save can decode images. A manifest that cannot be prepared
+    # disables periodic evaluation for this run without stopping training, and
+    # the epoch logger and its curves input stay exactly as before.
+    evaluation_manifest = handoff.evaluation_manifest
+    manifest_unavailable = False
+    evaluation_csv = getattr(args, "visualize_data", "") or getattr(
+        args, "train_data", ""
+    )
+    if compute_embedding_metrics and evaluation_manifest is None and evaluation_csv:
+        phase = _phase_start("evaluation manifest")
+        try:
+            resolved_training = getattr(args, "pretrain_resolved_images", None)
+            reuse = (
+                evaluation_csv == str(getattr(args, "train_data", "") or "")
+                and isinstance(resolved_training, ResolvedTrainingImages)
+                and resolved_training.csv_path == evaluation_csv
+                and resolved_training.images_dir == str(Path(args.input_images_dir))
+            )
+            evaluation_manifest = prepare_evaluation_manifest(
+                Path(evaluation_csv),
+                Path(args.input_images_dir),
+                max_samples=int(getattr(args, "metrics_sample_size", 10000)),
+                seed=int(args.seed),
+                image_paths=resolved_training.paths if reuse else None,
+            )
+        except (ValueError, OSError, KeyError) as exc:
+            manifest_unavailable = True
+            print(
+                "[Warning] Periodic embedding evaluation is disabled for this "
+                f"invocation: {exc}"
+            )
+        _phase_done("evaluation manifest", phase)
 
     if resume_ckpt is not None:
         if preparation.active:
@@ -1901,7 +1937,12 @@ def run_pretrain(
         should_save = (epoch + 1) % max(1, args.save_every_epochs) == 0 or (
             epoch + 1
         ) == args.max_epochs
-        if should_save and compute_embedding_metrics and epoch_logger is not None:
+        if (
+            should_save
+            and compute_embedding_metrics
+            and epoch_logger is not None
+            and not manifest_unavailable
+        ):
             # Epoch-end evaluation and UMAP must run before the RNG snapshot so
             # the saved state is the boundary after all logging.
             _compute_and_log_all_metrics(
@@ -1913,6 +1954,7 @@ def run_pretrain(
                 metrics_logger=epoch_logger,
                 eval_image_size=eval_image_size,
                 force_linear_probe=False,
+                manifest=evaluation_manifest,
             )
         if should_save:
             # Relational's canonical zero-weight encoding is absence: a disabled

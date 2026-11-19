@@ -419,6 +419,20 @@ def _resolve_image_path(
     return direct
 
 
+@dataclass(frozen=True)
+class ResolvedTrainingImages:
+    """Ordinary-run carrier: one already-resolved selection and its identity.
+
+    Only the ordered paths and the request they were resolved for travel here.
+    Queue runs use :class:`PreparedRelationalData` instead; that one also decodes,
+    fingerprints and rejects duplicates, which ordinary runs must not start doing.
+    """
+
+    csv_path: str
+    images_dir: str
+    paths: tuple[Path, ...]
+
+
 def resolve_dataset_image_paths(
     csv_path: Path | None, images_dir: Path, *, refs: list[str] | None = None
 ) -> list[Path]:
@@ -1243,6 +1257,7 @@ class MultiCropDataset(Dataset):
         augmentation_config: dict[str, object] | None = None,
         weak_teacher_augmentation_config: dict[str, object] | None = None,
         prepared_relational_data: PreparedRelationalData | None = None,
+        prepared_images: ResolvedTrainingImages | None = None,
         return_geometry: bool = False,
     ) -> None:
         images_root = Path(images_dir)
@@ -1251,7 +1266,15 @@ class MultiCropDataset(Dataset):
         # the run already identity-checked.
         self.prepared_relational_data = prepared_relational_data
         if prepared_relational_data is None:
-            self.image_paths = resolve_dataset_image_paths(csv_path, images_root)
+            reuse = prepared_images is not None and (
+                prepared_images.csv_path == str(csv_path or "")
+                and prepared_images.images_dir == str(images_root)
+            )
+            self.image_paths = (
+                list(prepared_images.paths)
+                if reuse
+                else resolve_dataset_image_paths(csv_path, images_root)
+            )
             self.image_keys: tuple[str, ...] | None = None
         else:
             self.image_paths = list(prepared_relational_data.image_paths)

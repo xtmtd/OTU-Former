@@ -34,6 +34,7 @@ from otuformer.training.dataset import (
     build_pretrain_augmentation_config,
     build_weak_teacher_augmentation_config,
     center_crop_eval_transform,
+    resolve_dataset_image_paths,
 )
 from otuformer.training.model import (
     PATCH_TARGET_LAYERS,
@@ -1682,6 +1683,89 @@ def _compute_instant_metrics(
     }
 
 
+@dataclass(frozen=True)
+class PreparedEvaluationManifest:
+    """One invocation's evaluation rows, resolved and capped before decoding.
+
+    The ordered rows, paths and labels are frozen together at startup, so a CSV
+    edited mid-run cannot change the live evaluation population.
+    """
+
+    csv_path: Path
+    paths: tuple[Path, ...]
+    labels: np.ndarray | None
+
+
+def prepare_evaluation_manifest(
+    csv_path: Path,
+    root_dir: Path,
+    *,
+    max_samples: int,
+    seed: int,
+    image_paths: tuple[Path, ...] | list[Path] | None = None,
+) -> PreparedEvaluationManifest:
+    """Resolve, validate and cap the evaluation rows before any image is opened.
+
+    Every resolved path must already be an existing file: a missing entry
+    outside the sample is a startup error, not a decode failure at save time.
+    ``image_paths`` is an already identity-checked selection for the same CSV and
+    root (an ordinary pretrain run reuses its training resolution); the cap and
+    the file checks still apply to it.
+    """
+    import pandas as pd
+
+    csv_path = Path(csv_path)
+    labels: np.ndarray | None = None
+    if image_paths is None:
+        frame = pd.read_csv(csv_path)
+        if "image" not in frame.columns:
+            raise ValueError(f"CSV {csv_path} missing required 'image' column")
+        paths = resolve_dataset_image_paths(
+            csv_path, Path(root_dir), refs=[str(value) for value in frame["image"]]
+        )
+        if "label" in frame.columns:
+            labels = frame["label"].astype(str).to_numpy()
+    else:
+        paths = [Path(path) for path in image_paths]
+        labels = _labels_for_rows(csv_path, len(paths))
+    missing = [path for path in paths if not Path(path).is_file()]
+    if missing:
+        raise FileNotFoundError(
+            f"{len(missing)} evaluation image(s) do not resolve to an existing "
+            f"file; first: {missing[0]}"
+        )
+    if 0 < max_samples < len(paths):
+        # Same seeded, sorted selection without replacement the legacy
+        # post-decode cap used; applied here it avoids the decode entirely.
+        rng = np.random.default_rng(seed)
+        idx = np.sort(rng.choice(len(paths), size=max_samples, replace=False))
+        paths = [paths[int(index)] for index in idx]
+        labels = None if labels is None else labels[idx]
+    return PreparedEvaluationManifest(
+        csv_path=csv_path,
+        paths=tuple(Path(path) for path in paths),
+        labels=labels,
+    )
+
+
+def _labels_for_rows(csv_path: Path, rows: int) -> np.ndarray | None:
+    """Labels of an already resolved CSV, read once for the snapshot."""
+    import pandas as pd
+
+    frame = pd.read_csv(csv_path)
+    if "image" not in frame.columns:
+        raise ValueError(f"CSV {csv_path} missing required 'image' column")
+    if "label" not in frame.columns:
+        return None
+    labels = frame["label"].astype(str).to_numpy()
+    if len(labels) != rows:
+        raise ValueError(
+            f"CSV {csv_path} changed while it was being prepared: {len(labels)} "
+            f"label rows for {rows} resolved paths."
+        )
+    return labels
+
+
 @torch.no_grad()
 def _compute_embeddings_from_csv(
     model: OTUFormerEncoder,
@@ -1691,27 +1775,34 @@ def _compute_embeddings_from_csv(
     device: torch.device,
     batch_size: int,
     num_workers: int,
+    paths: tuple[Path, ...] | list[Path] | None = None,
+    labels: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray | None]:
     import pandas as pd
     from PIL import Image
 
-    df = pd.read_csv(csv_path)
-    if "image" not in df.columns:
-        raise ValueError(f"CSV {csv_path} missing required 'image' column")
+    if paths is None:
+        df = pd.read_csv(csv_path)
+        if "image" not in df.columns:
+            raise ValueError(f"CSV {csv_path} missing required 'image' column")
 
-    refs = [str(v) for v in df["image"]]
-    missing_direct = [
-        ref
-        for ref in refs
-        if _supports_recursive_lookup(ref) and not (root_dir / Path(ref)).exists()
-    ]
-    by_relative, by_name = ({}, {})
-    if missing_direct:
-        by_relative, by_name = _build_recursive_index(root_dir)
-    image_paths = [
-        _resolve_image_path(root_dir, ref, by_relative, by_name) for ref in refs
-    ]
-    labels = df["label"].astype(str).to_numpy() if "label" in df.columns else None
+        refs = [str(v) for v in df["image"]]
+        missing_direct = [
+            ref
+            for ref in refs
+            if _supports_recursive_lookup(ref) and not (root_dir / Path(ref)).exists()
+        ]
+        by_relative, by_name = ({}, {})
+        if missing_direct:
+            by_relative, by_name = _build_recursive_index(root_dir)
+        image_paths = [
+            _resolve_image_path(root_dir, ref, by_relative, by_name) for ref in refs
+        ]
+        labels = df["label"].astype(str).to_numpy() if "label" in df.columns else None
+    else:
+        # A prepared manifest already resolved and capped the rows; rereading the
+        # CSV here would let a mid-run edit change the evaluation population.
+        image_paths = [Path(path) for path in paths]
 
     tf = center_crop_eval_transform(image_size)
     all_embs: list[np.ndarray] = []
@@ -1811,6 +1902,7 @@ def _compute_and_log_all_metrics(
     metrics_logger: EnhancedMetricsLogger,
     eval_image_size: int,
     force_linear_probe: bool = False,
+    manifest: PreparedEvaluationManifest | None = None,
 ) -> None:
     visualize_csv = getattr(args, "visualize_data", "") or getattr(
         args, "train_data", ""
@@ -1819,21 +1911,35 @@ def _compute_and_log_all_metrics(
 
     if visualize_csv:
         try:
-            feats, labels = _compute_embeddings_from_csv(
-                model=model,
-                csv_path=Path(visualize_csv),
-                root_dir=Path(args.input_images_dir),
-                image_size=eval_image_size,
-                device=device,
-                batch_size=max(1, args.batch_size),
-                num_workers=max(0, args.num_workers),
-            )
-            feats_eval, labels_eval = _maybe_subsample_for_metrics(
-                feats,
-                labels,
-                max_samples=args.metrics_sample_size,
-                seed=args.seed,
-            )
+            if manifest is not None:
+                feats, labels = _compute_embeddings_from_csv(
+                    model=model,
+                    csv_path=manifest.csv_path,
+                    root_dir=Path(args.input_images_dir),
+                    image_size=eval_image_size,
+                    device=device,
+                    batch_size=max(1, args.batch_size),
+                    num_workers=max(0, args.num_workers),
+                    paths=manifest.paths,
+                    labels=manifest.labels,
+                )
+                feats_eval, labels_eval = feats, labels
+            else:
+                feats, labels = _compute_embeddings_from_csv(
+                    model=model,
+                    csv_path=Path(visualize_csv),
+                    root_dir=Path(args.input_images_dir),
+                    image_size=eval_image_size,
+                    device=device,
+                    batch_size=max(1, args.batch_size),
+                    num_workers=max(0, args.num_workers),
+                )
+                feats_eval, labels_eval = _maybe_subsample_for_metrics(
+                    feats,
+                    labels,
+                    max_samples=args.metrics_sample_size,
+                    seed=args.seed,
+                )
             metrics = _compute_all_metrics(
                 feats_eval, labels_eval, compute_linear_probe=compute_lp
             )

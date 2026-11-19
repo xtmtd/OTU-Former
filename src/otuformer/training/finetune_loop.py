@@ -81,6 +81,7 @@ from .finetune_support import (
     _write_pseudo_outputs,
     preflight_finetune_source,
     resolve_pseudo_ssl_source,
+    take_finetune_handoff,
 )
 from .model import (
     ArcFaceEmbeddingHead,
@@ -92,6 +93,7 @@ from .reporting import (
     _compute_and_log_all_metrics,
     _compute_grad_norm,
     _compute_instant_metrics,
+    prepare_evaluation_manifest,
 )
 from .runtime import (
     _phase_done,
@@ -108,6 +110,9 @@ def run_finetune(
     explicit_options: frozenset[str] | set[str] = frozenset(),
     source_checkpoint: dict[str, Any] | None = None,
 ) -> None:
+    # Take this invocation's private handoff before any check can raise, so a
+    # rejected call never leaves an answer behind for a retry.
+    handoff = take_finetune_handoff(args)
     _set_seed(args.seed)
     _set_cpus(args.cpus)
     device = _resolve_device(args.device)
@@ -662,6 +667,30 @@ def run_finetune(
         if getattr(args, "extract_size", None) is not None
         else finetune_image_size
     )
+    # One evaluation snapshot per invocation, prepared after the tee is active
+    # and before any save can decode images. A manifest that cannot be prepared
+    # disables periodic evaluation for this run without stopping training.
+    evaluation_manifest = handoff.manifest
+    manifest_unavailable = False
+    evaluation_csv = getattr(args, "visualize_data", "") or getattr(
+        args, "train_data", ""
+    )
+    if compute_embedding_metrics and evaluation_manifest is None and evaluation_csv:
+        phase = _phase_start("evaluation manifest")
+        try:
+            evaluation_manifest = prepare_evaluation_manifest(
+                Path(evaluation_csv),
+                Path(args.input_images_dir),
+                max_samples=int(getattr(args, "metrics_sample_size", 10000)),
+                seed=int(args.seed),
+            )
+        except (ValueError, OSError, KeyError) as exc:
+            manifest_unavailable = True
+            print(
+                "[Warning] Periodic embedding evaluation is disabled for this "
+                f"invocation: {exc}"
+            )
+        _phase_done("evaluation manifest", phase)
     validate_input_size(eval_image_size, model, model_name)
     if args.extract_size is None:
         print(f"[Info] Auto eval crop size from model img_size: {eval_image_size}")
@@ -908,7 +937,12 @@ def run_finetune(
                         print(f"[Info] Deleted old checkpoint {old_ckpt.name}")
 
         # Compute embedding metrics at save epochs (mirrors ref compute_and_log_all_metrics)
-        if should_save and compute_embedding_metrics and epoch_logger is not None:
+        if (
+            should_save
+            and compute_embedding_metrics
+            and epoch_logger is not None
+            and not manifest_unavailable
+        ):
             _compute_and_log_all_metrics(
                 args=args,
                 model=model,
@@ -918,6 +952,7 @@ def run_finetune(
                 metrics_logger=epoch_logger,
                 eval_image_size=eval_image_size,
                 force_linear_probe=True,
+                manifest=evaluation_manifest,
             )
 
     instant_logger.plot(

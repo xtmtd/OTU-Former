@@ -7,6 +7,7 @@ import csv
 import hashlib
 import json
 import math
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, NamedTuple
 import torch
@@ -283,6 +284,24 @@ def _empty_loss_diagnostic_counts(num_classes: int, k: int) -> dict[str, object]
         "margin_hits": 0,
         "samples": 0,
     }
+
+
+@dataclass(frozen=True)
+class _FinetuneHandoff:
+    """Private preparation for one finetune invocation, never saved.
+
+    Path-bound like the pretrain handoff: a payload is reused only for the path
+    it was loaded from. The manifest slot holds this invocation's evaluation
+    snapshot; the resume/decision slots are added by the preparation work.
+    """
+
+    manifest: Any | None = None
+
+
+def take_finetune_handoff(args: argparse.Namespace) -> "_FinetuneHandoff":
+    """Take this invocation's private handoff and clear the slot."""
+    supplied = vars(args).pop("finetune_handoff", None)
+    return supplied if isinstance(supplied, _FinetuneHandoff) else _FinetuneHandoff()
 
 
 @torch.no_grad()

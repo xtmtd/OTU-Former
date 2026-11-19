@@ -563,6 +563,111 @@ def test_sampled_single_class_evaluation_reports_skipped_metrics(
     assert "fewer than two label classes after sampling" in capsys.readouterr().out
 
 
+def test_evaluation_manifest_selects_before_decode_with_the_legacy_rule(tmp_path):
+    csv_path, images = _eval_manifest_fixture(tmp_path)
+
+    manifest = reporting_module.prepare_evaluation_manifest(
+        csv_path, images, max_samples=4, seed=7
+    )
+
+    idx, _ = reporting_module._maybe_subsample_for_metrics(
+        np.arange(10), None, max_samples=4, seed=7
+    )
+    expected = [int(index) for index in idx]
+    assert [path.name for path in manifest.paths] == [f"e{i}.png" for i in expected]
+    assert list(manifest.labels) == [f"c{i % 3}" for i in expected]
+
+
+def test_evaluation_manifest_requires_existing_files_outside_the_sample(tmp_path):
+    csv_path, images = _eval_manifest_fixture(tmp_path, rows=6)
+    (images / "e5.png").unlink()
+
+    with pytest.raises(FileNotFoundError, match="existing"):
+        reporting_module.prepare_evaluation_manifest(
+            csv_path, images, max_samples=2, seed=1
+        )
+
+
+def test_evaluation_manifest_rejects_malformed_and_ambiguous_csvs(tmp_path):
+    images = tmp_path / "amb_images"
+    images.mkdir()
+    for sub in ("one", "two"):
+        (images / sub).mkdir()
+        Image.new("RGB", (8, 8)).save(images / sub / "same.png")
+    bad = tmp_path / "bad.csv"
+    pd.DataFrame({"img": ["x.png"]}).to_csv(bad, index=False)
+    with pytest.raises(ValueError, match="missing required 'image'"):
+        reporting_module.prepare_evaluation_manifest(bad, images, max_samples=0, seed=1)
+
+    ambiguous = tmp_path / "ambiguous.csv"
+    pd.DataFrame({"image": ["same.png"]}).to_csv(ambiguous, index=False)
+    with pytest.raises(FileNotFoundError, match="Ambiguous"):
+        reporting_module.prepare_evaluation_manifest(
+            ambiguous, images, max_samples=0, seed=1
+        )
+
+
+def test_evaluation_manifest_leaves_the_torch_rng_alone(tmp_path):
+    csv_path, images = _eval_manifest_fixture(tmp_path)
+    state = torch.get_rng_state().clone()
+
+    reporting_module.prepare_evaluation_manifest(
+        csv_path, images, max_samples=3, seed=1
+    )
+
+    assert torch.equal(torch.get_rng_state(), state)
+
+
+def test_prepared_manifest_does_not_reread_the_csv(tmp_path):
+    """The snapshot survives a mid-run edit; only the next invocation refreshes."""
+
+    class StubBackbone:
+        def forward_features(self, images):
+            return torch.zeros(images.shape[0], 3, 4)
+
+    class StubModel:
+        backbone = StubBackbone()
+
+        def eval(self):
+            return self
+
+    csv_path, images = _eval_manifest_fixture(tmp_path, rows=4)
+    manifest = reporting_module.prepare_evaluation_manifest(
+        csv_path, images, max_samples=0, seed=1
+    )
+    csv_path.write_text("image\n", encoding="utf-8")
+
+    features, labels = reporting_module._compute_embeddings_from_csv(
+        model=StubModel(),
+        csv_path=manifest.csv_path,
+        root_dir=images,
+        image_size=8,
+        device=torch.device("cpu"),
+        batch_size=2,
+        num_workers=0,
+        paths=manifest.paths,
+        labels=manifest.labels,
+    )
+
+    assert features.shape[0] == 4
+    assert len(labels) == 4
+
+
+def _eval_manifest_fixture(tmp_path, rows=10):
+    images = tmp_path / "eval_images"
+    images.mkdir(exist_ok=True)
+    for index in range(rows):
+        Image.new("RGB", (16, 16), (index * 10, 0, 0)).save(images / f"e{index}.png")
+    csv_path = tmp_path / "eval.csv"
+    pd.DataFrame(
+        {
+            "image": [f"e{index}.png" for index in range(rows)],
+            "label": [f"c{index % 3}" for index in range(rows)],
+        }
+    ).to_csv(csv_path, index=False)
+    return csv_path, images
+
+
 def test_teacher_momentum_updates_after_optimizer_step(tmp_path, monkeypatch):
     """The EMA update happens after ``optimizer.step()``, observed at runtime.
 
@@ -751,7 +856,14 @@ def test_finetune_resolves_and_persists_checkpoint_size(tmp_path):
     assert resolve_training_image_size(saved) == 32
 
 
-def _tiny_finetune_run(tmp_path, out_dir, log_every_n_steps):
+def _tiny_finetune_run(
+    tmp_path,
+    out_dir,
+    log_every_n_steps,
+    *,
+    compute_embedding_metrics=False,
+    visualize_data="",
+):
     from otuformer.training.model import OTUFormerEncoder
 
     encoder = OTUFormerEncoder(
@@ -800,9 +912,9 @@ def _tiny_finetune_run(tmp_path, out_dir, log_every_n_steps):
         log_every_n_steps=log_every_n_steps,
         save_every_epochs=1,
         keep_last_checkpoints=0,
-        compute_embedding_metrics=False,
+        compute_embedding_metrics=compute_embedding_metrics,
         extract_size=None,
-        visualize_data="",
+        visualize_data=visualize_data,
         metrics_sample_size=10000,
     )
     finetune_loop_module.run_finetune(args)
@@ -825,6 +937,26 @@ def test_finetune_grad_norm_is_computed_only_on_logged_steps(tmp_path, monkeypat
     calls.clear()
     _tiny_finetune_run(tmp_path, tmp_path / "ft_logged", log_every_n_steps=1)
     assert calls == [1, 1]
+
+
+def test_finetune_manifest_failure_warns_once_and_continues(tmp_path, capsys):
+    bad = tmp_path / "bad_ft_eval.csv"
+    pd.DataFrame({"image": ["missing.png"]}).to_csv(bad, index=False)
+
+    _tiny_finetune_run(
+        tmp_path,
+        tmp_path / "ft_manifest",
+        log_every_n_steps=50,
+        compute_embedding_metrics=True,
+        visualize_data=str(bad),
+    )
+
+    output = capsys.readouterr().out
+    assert output.count("[Phase] evaluation manifest: start") == 1
+    assert output.count("[Phase] evaluation manifest: done in ") == 1
+    assert output.count("[Warning] Periodic embedding evaluation is disabled") == 1
+    assert (tmp_path / "ft_manifest" / "logs" / "metrics.finetune.csv").exists()
+    assert (tmp_path / "ft_manifest" / "finetune_latest.pth").exists()
 
 
 # --- Augmentation continuity ---------------------------------------------------------
