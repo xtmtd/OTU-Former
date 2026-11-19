@@ -247,3 +247,105 @@ def test_disabled_metrics_skip_manifest_preparation(tmp_path, monkeypatch):
     trainer.run_pretrain(args)
 
     assert not (tmp_path / "out" / "logs" / "metrics.pretrain.csv").exists()
+
+
+def test_evaluation_manifest_phase_keeps_the_recovery_timer(tmp_path, monkeypatch):
+    """The nested phase must not overwrite the enclosing recovery start."""
+    starts = {}
+    done = []
+    real_start = trainer._phase_start
+    real_done = trainer._phase_done
+
+    def start(label):
+        token = real_start(label)
+        starts[label] = token
+        return token
+
+    def finish(label, token):
+        done.append((label, token))
+        return real_done(label, token)
+
+    monkeypatch.setattr(trainer, "_phase_start", start)
+    monkeypatch.setattr(trainer, "_phase_done", finish)
+    args = _pretrain_args(tmp_path)
+    args.compute_embedding_metrics = True
+    args.visualize_data = str(tmp_path / "data.csv")
+
+    trainer.run_pretrain(args)
+
+    recovery = [
+        token for label, token in done if label == "objective, optimizer and recovery"
+    ]
+    assert recovery == [starts["objective, optimizer and recovery"]]
+    assert any(label == "evaluation manifest" for label, _ in done)
+
+
+def test_evaluation_manifest_reuses_the_training_selection_when_it_matches(
+    tmp_path, monkeypatch
+):
+    from otuformer.training.dataset import (
+        ResolvedTrainingImages,
+        resolve_dataset_image_paths,
+    )
+
+    args = _pretrain_args(tmp_path)
+    args.compute_embedding_metrics = True
+    args.visualize_data = str(tmp_path / "data.csv")
+    paths = tuple(resolve_dataset_image_paths(tmp_path / "data.csv", tmp_path / "images"))
+    args.pretrain_resolved_images = ResolvedTrainingImages(
+        csv_path=str(tmp_path / "data.csv"),
+        images_dir=str(tmp_path / "images"),
+        paths=paths,
+    )
+    captured = {}
+
+    def fake_prepare(csv_path, root_dir, **kwargs):
+        captured.update(kwargs)
+        return reporting.PreparedEvaluationManifest(
+            csv_path=csv_path, paths=paths, labels=None
+        )
+
+    monkeypatch.setattr(trainer, "prepare_evaluation_manifest", fake_prepare)
+    monkeypatch.setattr(trainer, "_compute_and_log_all_metrics", lambda **k: None)
+
+    trainer.run_pretrain(args)
+
+    assert captured["image_paths"] == paths
+
+
+def test_dataset_reuses_a_matching_prepared_selection(tmp_path, monkeypatch):
+    from dataclasses import replace
+
+    from otuformer.training import dataset as dataset_module
+
+    images, manifest = _images(tmp_path)
+    real = dataset_module.resolve_dataset_image_paths
+    calls = []
+    monkeypatch.setattr(
+        dataset_module,
+        "resolve_dataset_image_paths",
+        lambda *args, **kwargs: calls.append(1) or real(*args, **kwargs),
+    )
+    paths = tuple(real(manifest, images))
+    carrier = dataset_module.ResolvedTrainingImages(
+        csv_path=str(manifest), images_dir=str(images), paths=paths
+    )
+
+    def build(prepared_images):
+        return dataset_module.MultiCropDataset(
+            csv_path=manifest,
+            images_dir=images,
+            global_crop_size=32,
+            local_crop_size=16,
+            local_crops=0,
+            augmentation_profile="global-barcode",
+            orientation_policy="sensitive",
+            prepared_images=prepared_images,
+        )
+
+    dataset = build(carrier)
+    assert calls == []
+    assert dataset.image_paths == list(paths)
+
+    build(replace(carrier, csv_path=str(tmp_path / "other.csv")))
+    assert calls == [1]

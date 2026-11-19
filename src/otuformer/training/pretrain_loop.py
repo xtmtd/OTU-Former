@@ -1008,7 +1008,8 @@ def run_pretrain(
         args, "train_data", ""
     )
     if compute_embedding_metrics and evaluation_manifest is None and evaluation_csv:
-        phase = _phase_start("evaluation manifest")
+        # A separate timer: the enclosing recovery phase is still open here.
+        manifest_phase = _phase_start("evaluation manifest")
         try:
             resolved_training = getattr(args, "pretrain_resolved_images", None)
             reuse = (
@@ -1030,7 +1031,7 @@ def run_pretrain(
                 "[Warning] Periodic embedding evaluation is disabled for this "
                 f"invocation: {exc}"
             )
-        _phase_done("evaluation manifest", phase)
+        _phase_done("evaluation manifest", manifest_phase)
 
     if resume_ckpt is not None:
         if preparation.active:
@@ -1460,7 +1461,7 @@ def run_pretrain(
                         # Gather each pointwise block to the selected rows first:
                         # averaging and normalizing commute with the selection.
                         layers = [
-                            final_norm(block)[:, prefix:][mask]
+                            final_norm(block[:, prefix:][mask])
                             for block in teacher_final_four[index]
                         ]
                         target = F.normalize(

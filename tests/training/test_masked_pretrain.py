@@ -3647,3 +3647,24 @@ def test_total_loss_scalar_is_read_once_per_logged_step(tmp_path, monkeypatch):
     # it a second time.
     assert len(captured) >= 3
     assert len(reads) == 3
+
+
+def test_masked_feature_teacher_norm_sees_only_selected_rows(tmp_path, monkeypatch):
+    rows = []
+
+    def hook(module, args):
+        rows.append(int(args[0].shape[0]))
+
+    def register(student, teacher):
+        teacher.pretrain_final_norm.register_forward_pre_hook(hook)
+
+    obs = _run_tiny_pretrain(
+        tmp_path,
+        monkeypatch,
+        patch_loss="masked-feature",
+        on_first_step=register,
+    )
+    selected = [int(m["mask"].sum()) for m in obs["masks"]]
+    # Four teacher blocks per global view, each narrowed before the pointwise
+    # final LayerNorm.
+    assert rows == [selected[0]] * 4 + [selected[1]] * 4
