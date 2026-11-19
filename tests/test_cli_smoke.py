@@ -3423,6 +3423,7 @@ def test_run_pretrain_resume_inherits_new_style_augmentation_into_dataset(
     inherited from a new-style checkpoint to the pretrain dataset."""
     from otuformer.training import trainer
 
+    _make_resume_pretrain_csv(tmp_path)
     ckpt = _write_augmented_pretrain_checkpoint(
         tmp_path,
         local_crop_size=112,
@@ -5009,6 +5010,7 @@ def test_pretrain_re_resolves_a_reused_namespace(tmp_path, monkeypatch):
     monkeypatch.setattr(pretrain_loop_module, "MultiCropDataset", capturing_dataset)
     monkeypatch.setattr(pretrain_loop_module, "PatchObjective", RecordingObjective)
 
+    _make_tiny_pretrain_data(tmp_path)
     args = _pretrain_run_namespace(
         tmp_path,
         global_crop_size=224,
@@ -5021,7 +5023,6 @@ def test_pretrain_re_resolves_a_reused_namespace(tmp_path, monkeypatch):
     assert captured["datasets"][-1]["global_crop_size"] == 224
     assert captured["datasets"][-1]["local_crops"] == 0
 
-    _make_tiny_pretrain_data(tmp_path)
     stop["at"] = "objective"
     args.global_crop_size = 112
     args.local_crop_size = 80
@@ -6294,3 +6295,53 @@ def test_fifo_schema_conditional_resume_and_argv(tmp_path):
                 "relational_queue_size": 0,
             },
         )
+
+
+def test_cam_collects_the_manifest_once_for_directory_and_csv(tmp_path, monkeypatch):
+    pytest.importorskip("pytorch_grad_cam")
+    pytest.importorskip("cv2")
+    import otuformer.vision.cam as cam_module
+
+    ckpt = _make_ckpt(tmp_path)
+    img_dir = tmp_path / "images"
+    img_dir.mkdir()
+    for name in ("a.jpg", "b.jpg"):
+        Image.new("RGB", (224, 224)).save(img_dir / name)
+    labels = tmp_path / "labels.csv"
+    pd.DataFrame({"image": ["a.jpg", "b.jpg"], "label": ["x", "y"]}).to_csv(
+        labels, index=False
+    )
+
+    real_collect = cam_module.collect_image_rows
+    real_rglob = Path.rglob
+    for index, extra in enumerate(([], ["--label-csv", str(labels)])):
+        collects = []
+        walks = []
+
+        def counting_collect(*args, **kwargs):
+            collects.append(1)
+            return real_collect(*args, **kwargs)
+
+        def counting_rglob(self, pattern):
+            walks.append(1)
+            return real_rglob(self, pattern)
+
+        monkeypatch.setattr(cam_module, "collect_image_rows", counting_collect)
+        monkeypatch.setattr(Path, "rglob", counting_rglob)
+        result = runner.invoke(
+            app,
+            [
+                "cam",
+                "--checkpoint", str(ckpt),
+                "--images-dir", str(img_dir),
+                "--out-dir", str(tmp_path / f"cam_once_{index}"),
+                "--cam-method", "eigencam",
+                "--max-images", "1",
+                "--cam-batch-size", "1",
+                "--device", "cpu",
+                *extra,
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert len(collects) == 1, extra
+        assert len(walks) == 1, extra

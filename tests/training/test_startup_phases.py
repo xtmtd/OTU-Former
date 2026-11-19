@@ -349,3 +349,40 @@ def test_dataset_reuses_a_matching_prepared_selection(tmp_path, monkeypatch):
 
     build(replace(carrier, csv_path=str(tmp_path / "other.csv")))
     assert calls == [1]
+
+
+def test_ordinary_run_resolves_the_training_selection_once(tmp_path, monkeypatch):
+    """The dataset and the evaluation manifest share one resolution."""
+    from otuformer.training import dataset as dataset_module
+
+    args = _pretrain_args(tmp_path)
+    args.compute_embedding_metrics = True
+    args.visualize_data = str(tmp_path / "data.csv")
+    calls = []
+    real_dataset = dataset_module.resolve_dataset_image_paths
+    real_reporting = reporting.resolve_dataset_image_paths
+    monkeypatch.setattr(
+        dataset_module,
+        "resolve_dataset_image_paths",
+        lambda *a, **k: calls.append(1) or real_dataset(*a, **k),
+    )
+    monkeypatch.setattr(
+        reporting,
+        "resolve_dataset_image_paths",
+        lambda *a, **k: calls.append(1) or real_reporting(*a, **k),
+    )
+    captured = {}
+    real_prepare = reporting.prepare_evaluation_manifest
+
+    def spy(csv_path, root_dir, **kwargs):
+        captured.update(kwargs)
+        return real_prepare(csv_path, root_dir, **kwargs)
+
+    monkeypatch.setattr(trainer, "prepare_evaluation_manifest", spy)
+    monkeypatch.setattr(trainer, "_compute_and_log_all_metrics", lambda **k: None)
+
+    trainer.run_pretrain(args)
+
+    assert len(calls) == 1
+    assert captured["image_paths"] is not None
+    assert len(captured["image_paths"]) == 4

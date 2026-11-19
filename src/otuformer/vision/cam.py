@@ -459,6 +459,15 @@ def prepare_cam(
     return cam, target_layers, reshape_transform
 
 
+def _image_files(images_dir: Path) -> list[Path]:
+    """Every image under the root, sorted; one traversal per caller."""
+    return [
+        path
+        for path in sorted(images_dir.rglob("*"))
+        if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+    ]
+
+
 def collect_image_rows(images_dir: Path, label_csv: Optional[Path]) -> pd.DataFrame:
     if label_csv is not None:
         df = pd.read_csv(label_csv)
@@ -468,25 +477,31 @@ def collect_image_rows(images_dir: Path, label_csv: Optional[Path]) -> pd.DataFr
             df["label"] = ""
         return df[["image", "label"]]
     images = [
-        p.relative_to(images_dir).as_posix()
-        for p in sorted(images_dir.rglob("*"))
-        if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
+        path.relative_to(images_dir).as_posix() for path in _image_files(images_dir)
     ]
     return pd.DataFrame({"image": images, "label": [""] * len(images)})
 
 
 def selected_image_paths(
-    images_dir: Path, label_csv: Optional[Path], max_images: Optional[int] = None
+    images_dir: Path,
+    label_csv: Optional[Path],
+    max_images: Optional[int] = None,
+    *,
+    rows: Optional[pd.DataFrame] = None,
 ) -> list[Path]:
-    """Keep cleanup protection and CAM image selection identical."""
-    rows = collect_image_rows(images_dir, label_csv)
+    """Keep cleanup protection and CAM image selection identical.
+
+    ``rows`` is an already-collected row frame, so one invocation collects the
+    manifest once instead of walking the tree again inside the selector.
+    """
+    if rows is None:
+        rows = collect_image_rows(images_dir, label_csv)
     if max_images is not None:
         rows = rows.head(max(0, max_images))
     image_map = {}
     if label_csv is not None:
-        for path in images_dir.rglob("*"):
-            if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS:
-                image_map[path.name] = path
+        for path in _image_files(images_dir):
+            image_map[path.name] = path
     return [image_map.get(ref, images_dir / ref) for ref in rows["image"]]
 
 
@@ -648,9 +663,11 @@ def run_cam(
 
     if selection is None:
         rows_df = collect_image_rows(images_dir, label_csv)
+        paths = selected_image_paths(
+            images_dir, label_csv, max_images, rows=rows_df
+        )
         if max_images is not None:
             rows_df = rows_df.head(max_images)
-        paths = selected_image_paths(images_dir, label_csv, max_images)
     else:
         rows_df, paths = selection
     results = []

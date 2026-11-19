@@ -748,8 +748,39 @@ def run_pretrain(
         ssl_config["ssl_method"] == "relational" and relational_views == "weak"
     )
     phase = _phase_start("dataset indexing and loader")
-    # Path/CSV resolution happens inside the dataset constructor, so the phase
-    # must start before it or its cost is attributed to nothing.
+    # An ordinary run resolves its training selection once here and shares it
+    # with the dataset and, when the same CSV and root feed periodic evaluation,
+    # with the evaluation manifest. Queue runs reuse the selection they already
+    # identity-checked. Path/CSV resolution therefore never happens twice for one
+    # source inside this phase.
+    resolved_images = getattr(args, "pretrain_resolved_images", None)
+    evaluation_csv = getattr(args, "visualize_data", "") or getattr(
+        args, "train_data", ""
+    )
+    shares_training_source = (
+        bool(getattr(args, "train_data", ""))
+        and evaluation_csv == str(args.train_data)
+        and bool(getattr(args, "compute_embedding_metrics", True))
+    )
+    if resolved_images is None and shares_training_source:
+        if preparation.active and preparation.data is not None:
+            resolved_images = ResolvedTrainingImages(
+                csv_path=str(args.train_data),
+                images_dir=str(Path(args.input_images_dir)),
+                paths=tuple(preparation.data.image_paths),
+            )
+        else:
+            from otuformer.training.dataset import resolve_dataset_image_paths
+
+            resolved_images = ResolvedTrainingImages(
+                csv_path=str(args.train_data),
+                images_dir=str(Path(args.input_images_dir)),
+                paths=tuple(
+                    resolve_dataset_image_paths(
+                        Path(args.train_data), Path(args.input_images_dir)
+                    )
+                ),
+            )
     ds = MultiCropDataset(
         csv_path=Path(args.train_data) if getattr(args, "train_data", "") else None,
         images_dir=Path(args.input_images_dir),
@@ -768,7 +799,7 @@ def run_pretrain(
         prepared_relational_data=(
             preparation.data if preparation.active else None
         ),
-        prepared_images=getattr(args, "pretrain_resolved_images", None),
+        prepared_images=resolved_images,
         return_geometry=bool(dense_settings is not None and dense_settings.enabled),
     )
     loader = DataLoader(
@@ -1011,7 +1042,7 @@ def run_pretrain(
         # A separate timer: the enclosing recovery phase is still open here.
         manifest_phase = _phase_start("evaluation manifest")
         try:
-            resolved_training = getattr(args, "pretrain_resolved_images", None)
+            resolved_training = resolved_images
             reuse = (
                 evaluation_csv == str(getattr(args, "train_data", "") or "")
                 and isinstance(resolved_training, ResolvedTrainingImages)
