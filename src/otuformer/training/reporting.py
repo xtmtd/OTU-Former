@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, NamedTuple
@@ -1532,19 +1533,31 @@ def _compute_grad_norm(model: nn.Module) -> float:
     return _compute_grad_norm_parameters(model.parameters())
 
 
-def _compute_grad_norm_parameters(params) -> float:
+def _compute_grad_norm_parameters(params, *, numeric: bool = True) -> float:
     """A finite check, not the reduction ``clip_grad_norm_`` performs.
 
     Per-parameter norms squared in Python floats stay finite where the float32
     accumulation inside the clipping call overflows, so a finite value here does
     not license the clip; the clip refuses its own non-finite total.
+
+    ``numeric=False`` guards only: it returns 0.0 for a finite set instead of the
+    value, so the per-tensor norms make one batched host transfer rather than one
+    synchronization each. A non-finite set still returns a non-finite float, which
+    the caller's ``isfinite`` check rejects.
     """
-    total = 0.0
-    for p in params:
-        if p.grad is not None:
-            n = p.grad.data.norm(2)
-            total += float(n.item() ** 2)
-    return float(total**0.5)
+    grads = [p.grad.data for p in params if p.grad is not None]
+    if not grads:
+        return 0.0
+    try:
+        norms = torch._foreach_norm(grads, 2)
+    except (RuntimeError, NotImplementedError):
+        # Backends without the batched kernel keep the per-tensor path.
+        norms = [grad.norm(2) for grad in grads]
+    stacked = torch.stack(norms)
+    if not numeric:
+        return 0.0 if bool(torch.isfinite(stacked).all()) else math.inf
+    values = stacked.tolist()
+    return float(sum(value * value for value in values) ** 0.5)
 
 
 @torch.no_grad()

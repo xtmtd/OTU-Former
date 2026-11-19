@@ -1660,7 +1660,10 @@ def run_pretrain(
                 # Zero gradients are not enough: AdamW would still decay it.
                 for parameter in dino_objective.trainable_parameters():
                     parameter.grad = None
-            grad_norm = _compute_grad_norm_parameters(trainable_params)
+            logged_step = global_step % max(1, args.log_every_n_steps) == 0
+            grad_norm = _compute_grad_norm_parameters(
+                trainable_params, numeric=logged_step
+            )
             if not math.isfinite(grad_norm):
                 raise ValueError(
                     "The pretraining gradient norm became non-finite at iteration "
@@ -1739,7 +1742,7 @@ def run_pretrain(
                         teacher_global[0].mean(dim=0, keepdim=True),
                     ).item()
 
-            if global_step % max(1, args.log_every_n_steps) == 0:
+            if logged_step:
                 with torch.no_grad():
                     instant_metrics = _compute_instant_metrics(
                         student, global_views[0], device

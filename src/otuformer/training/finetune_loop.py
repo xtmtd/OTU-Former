@@ -726,7 +726,6 @@ def run_finetune(
 
             optimizer.zero_grad()
             loss.backward()
-            grad_norm = _compute_grad_norm(model)
             optimizer.step()
 
             usable += 1
@@ -741,6 +740,9 @@ def run_finetune(
 
             # Log instant metrics every N steps (mirrors ref per-iteration logging)
             if global_step % max(1, args.log_every_n_steps) == 0:
+                # The norm only feeds this row; a non-logged step skips the
+                # readback entirely.
+                grad_norm = _compute_grad_norm(model)
                 with torch.no_grad():
                     instant_metrics = _compute_instant_metrics(model, imgs, device)
                 instant_logger.log(

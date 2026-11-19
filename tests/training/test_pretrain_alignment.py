@@ -751,6 +751,82 @@ def test_finetune_resolves_and_persists_checkpoint_size(tmp_path):
     assert resolve_training_image_size(saved) == 32
 
 
+def _tiny_finetune_run(tmp_path, out_dir, log_every_n_steps):
+    from otuformer.training.model import OTUFormerEncoder
+
+    encoder = OTUFormerEncoder(
+        model_name="vit_tiny_patch16_224",
+        out_dim=16,
+        pretrained=False,
+        img_size=32,
+    )
+    ckpt_path = tmp_path / "norm_pretrain_32.pth"
+    torch.save(
+        {
+            "model_state_dict": encoder.state_dict(),
+            "config": {"model_name": "vit_tiny_patch16_224", "out_dim": 16},
+            "args": {"global_crop_size": 32},
+        },
+        ckpt_path,
+    )
+    img_dir = tmp_path / "norm_images"
+    img_dir.mkdir(exist_ok=True)
+    for i in range(4):
+        Image.new("RGB", (64, 64), color=(i * 50, 0, 0)).save(img_dir / f"n_{i}.jpg")
+    csv_path = tmp_path / "norm_labels.csv"
+    pd.DataFrame(
+        {
+            "image": [f"n_{i}.jpg" for i in range(4)],
+            "label": ["classA", "classA", "classB", "classB"],
+        }
+    ).to_csv(csv_path, index=False)
+    args = argparse.Namespace(
+        seed=42,
+        cpus=0,
+        device="cpu",
+        out_dir=str(out_dir),
+        checkpoint=str(ckpt_path),
+        resume="",
+        train_data=str(csv_path),
+        input_images_dir=str(img_dir),
+        model_name="vit_tiny_patch16_224",
+        metric_embed_dim=16,
+        finetune_epochs=1,
+        finetune_lr=1e-4,
+        freeze_ratio=0.7,
+        loss="arcface",
+        batch_size=2,
+        num_workers=0,
+        log_every_n_steps=log_every_n_steps,
+        save_every_epochs=1,
+        keep_last_checkpoints=0,
+        compute_embedding_metrics=False,
+        extract_size=None,
+        visualize_data="",
+        metrics_sample_size=10000,
+    )
+    finetune_loop_module.run_finetune(args)
+
+
+def test_finetune_grad_norm_is_computed_only_on_logged_steps(tmp_path, monkeypatch):
+    """The finetune norm is logging-only; it must not synchronize every step."""
+    real = finetune_loop_module._compute_grad_norm
+    calls = []
+
+    def spy(model):
+        calls.append(1)
+        return real(model)
+
+    monkeypatch.setattr(finetune_loop_module, "_compute_grad_norm", spy)
+
+    _tiny_finetune_run(tmp_path, tmp_path / "ft_quiet", log_every_n_steps=50)
+    assert calls == [1]  # global_step 0 is the only logged step
+
+    calls.clear()
+    _tiny_finetune_run(tmp_path, tmp_path / "ft_logged", log_every_n_steps=1)
+    assert calls == [1, 1]
+
+
 # --- Augmentation continuity ---------------------------------------------------------
 
 

@@ -224,14 +224,14 @@ def test_dino_epoch_zero_freeze_then_joint_clip(tmp_path, monkeypatch):
     real_norm = pretrain_loop_module._compute_grad_norm_parameters
     real_clip = torch.nn.utils.clip_grad_norm_
 
-    def norm_spy(params):
+    def norm_spy(params, **kwargs):
         direction = captured[0].trainable_parameters()[0]
         observed["prototype_in_joint_norm_and_clip"].append(
             any(parameter is direction for parameter in params)
             and direction.grad is not None
         )
         observed["direction"].append(direction.detach().clone())
-        return real_norm(params)
+        return real_norm(params, **kwargs)
 
     def clip_spy(params, max_norm, **kwargs):
         direction = captured[0].trainable_parameters()[0]
@@ -700,7 +700,7 @@ def test_dino_ce_only_backward_reaches_backbone_projector_and_prototypes(
     calls = {"count": 0}
     observed: dict = {}
 
-    def norm_spy(params):
+    def norm_spy(params, **kwargs):
         calls["count"] += 1
         if calls["count"] == 2 and not observed:
             student, teacher, objective = students[-1], teachers[-1], captured[-1]
@@ -719,7 +719,7 @@ def test_dino_ce_only_backward_reaches_backbone_projector_and_prototypes(
                 objective.student_prototypes.weight_g.grad,
                 objective.teacher_prototypes.weight_g.grad,
             ]
-        return real_norm(params)
+        return real_norm(params, **kwargs)
 
     monkeypatch.setattr(pretrain_loop_module, "_compute_grad_norm_parameters", norm_spy)
     pretrain_loop_module.run_pretrain(
@@ -755,7 +755,9 @@ def test_non_finite_gradient_norm_stops_the_step(tmp_path, monkeypatch):
     """A finite loss is not enough: the backward pass can still overflow."""
     _images(tmp_path)
     monkeypatch.setattr(
-        pretrain_loop_module, "_compute_grad_norm_parameters", lambda params: float("inf")
+        pretrain_loop_module,
+        "_compute_grad_norm_parameters",
+        lambda params, **kwargs: float("inf"),
     )
     with pytest.raises(ValueError, match="gradient norm became non-finite"):
         pretrain_loop_module.run_pretrain(_args(tmp_path))
@@ -794,3 +796,44 @@ def test_clip_reduction_overflow_stops_the_step(tmp_path, monkeypatch):
     assert steps["count"] == 0
     assert not (tmp_path / "out" / "SSL_latest.pth").exists()
     assert not (tmp_path / "out" / "SSL_epoch_0001.pth").exists()
+
+
+def test_grad_norm_runs_once_per_step_and_numerically_only_when_logged(
+    tmp_path, monkeypatch
+):
+    """One guard per effective step; the numeric norm only feeds logged rows."""
+    _images(tmp_path)
+    real_norm = pretrain_loop_module._compute_grad_norm_parameters
+    numeric = []
+    pre_clip = []
+
+    def norm_spy(params, **kwargs):
+        numeric.append(kwargs.get("numeric", True))
+        return real_norm(params, **kwargs)
+
+    real_clip = torch.nn.utils.clip_grad_norm_
+
+    def clip_spy(params, max_norm, **kwargs):
+        total = 0.0
+        for parameter in params:
+            if parameter.grad is not None:
+                total += float(parameter.grad.data.norm(2).item() ** 2)
+        pre_clip.append(float(total**0.5))
+        return real_clip(params, max_norm, **kwargs)
+
+    monkeypatch.setattr(pretrain_loop_module, "_compute_grad_norm_parameters", norm_spy)
+    monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", clip_spy)
+
+    pretrain_loop_module.run_pretrain(_args(tmp_path, max_epochs=4, log_every_n_steps=2))
+
+    # global_step 0..3 with cadence 2: logged on 0 and 2.
+    assert numeric == [True, False, True, False]
+    assert len(pre_clip) == 4
+    rows = list(
+        csv.DictReader(
+            (tmp_path / "out" / "logs" / "instant_metrics.pretrain.csv").open()
+        )
+    )
+    assert [float(row["grad_norm"]) for row in rows] == pytest.approx(
+        [pre_clip[0], pre_clip[2]], rel=1e-6
+    )

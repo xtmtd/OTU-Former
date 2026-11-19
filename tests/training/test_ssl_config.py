@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import math
 import random
 
 import numpy as np
@@ -1206,6 +1207,56 @@ def test_pretrain_wd_default_preserves_parameter_order():
     # Two separate required checks: the identity/order list above, and the full
     # saved group dictionary below (which alone cannot authenticate identity).
     assert actual.state_dict()["param_groups"] == baseline.state_dict()["param_groups"]
+
+
+def _grad_norm_params():
+    first = torch.nn.Parameter(torch.zeros(3))
+    first.grad = torch.tensor([3.0, 4.0, 0.0])
+    second = torch.nn.Parameter(torch.zeros(2))
+    second.grad = torch.tensor([0.0, 12.0])
+    return [first, second]
+
+
+def test_grad_norm_numeric_matches_python_float_sum():
+    params = _grad_norm_params()
+    expected = float(((5.0) ** 2 + (12.0) ** 2) ** 0.5)
+    assert pretrain_loop_module._compute_grad_norm_parameters(params) == pytest.approx(
+        expected, rel=1e-6
+    )
+
+
+def test_grad_norm_reads_host_values_once_without_per_tensor_item(monkeypatch):
+    """Neither mode may synchronize once per gradient tensor."""
+    params = _grad_norm_params()
+    calls = {"item": 0}
+    real_item = torch.Tensor.item
+
+    def counting_item(self):
+        calls["item"] += 1
+        return real_item(self)
+
+    monkeypatch.setattr(torch.Tensor, "item", counting_item)
+    assert pretrain_loop_module._compute_grad_norm_parameters(params, numeric=False) == 0.0
+    assert pretrain_loop_module._compute_grad_norm_parameters(params) == pytest.approx(
+        13.0, rel=1e-6
+    )
+    assert calls["item"] == 0
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), 1e38])
+def test_grad_norm_finite_only_rejects_non_finite_or_overflowing_tensor(bad):
+    params = _grad_norm_params()
+    params[1].grad = torch.tensor([0.0, bad])
+    assert not math.isfinite(
+        pretrain_loop_module._compute_grad_norm_parameters(params, numeric=False)
+    )
+    assert not math.isfinite(pretrain_loop_module._compute_grad_norm_parameters(params))
+
+
+def test_grad_norm_without_gradients_is_zero():
+    assert pretrain_loop_module._compute_grad_norm_parameters(
+        [torch.nn.Parameter(torch.zeros(2))], numeric=False
+    ) == 0.0
 
 
 def test_pretrain_joint_clip_includes_no_decay_group():
