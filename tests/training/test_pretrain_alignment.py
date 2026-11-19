@@ -4861,3 +4861,21 @@ def test_finetune_does_not_copy_the_ssl_relational_bundle(tmp_path):
     )
     assert pretrain_loop_module.RELATIONAL_TARGET_CONFIG_KEY not in saved["config"]
     assert saved["config"]["loss"] == "arcface"
+
+
+def test_finetune_reads_the_loss_once_per_step(tmp_path, monkeypatch):
+    reads = []
+    real_item = torch.Tensor.item
+
+    def counting_item(self):
+        if self.ndim == 0 and self.requires_grad:
+            reads.append(round(float(real_item(self)), 4))
+        return real_item(self)
+
+    monkeypatch.setattr(torch.Tensor, "item", counting_item)
+    _tiny_finetune_run(tmp_path, tmp_path / "ft_once", log_every_n_steps=1)
+
+    # Two steps, one host read each: the epoch total, the postfix and the log row
+    # share it.
+    assert len(reads) == 2
+    assert len(set(reads)) == 2

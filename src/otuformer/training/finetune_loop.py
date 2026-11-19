@@ -681,7 +681,8 @@ def run_finetune(
         args, "train_data", ""
     )
     if compute_embedding_metrics and evaluation_manifest is None and evaluation_csv:
-        phase = _phase_start("evaluation manifest")
+        # A separate timer: the enclosing recovery phase is still open here.
+        manifest_phase = _phase_start("evaluation manifest")
         try:
             evaluation_manifest = prepare_evaluation_manifest(
                 Path(evaluation_csv),
@@ -695,7 +696,7 @@ def run_finetune(
                 "[Warning] Periodic embedding evaluation is disabled for this "
                 f"invocation: {exc}"
             )
-        _phase_done("evaluation manifest", phase)
+        _phase_done("evaluation manifest", manifest_phase)
     validate_input_size(eval_image_size, model, model_name)
     if args.extract_size is None:
         print(f"[Info] Auto eval crop size from model img_size: {eval_image_size}")
@@ -763,12 +764,15 @@ def run_finetune(
             optimizer.step()
 
             usable += 1
-            running += float(loss.item())
+            # One host value feeds the epoch total, the progress bar and the log
+            # row; the epoch accumulation keeps its per-step synchronization.
+            loss_value = float(loss.item())
+            running += loss_value
             valid_anchors += int(getattr(loss_fn, "last_valid_anchors", 0))
             _accumulate_loss_diagnostics(counts, loss_fn, emb, labels)
 
             pbar.set_postfix(
-                loss=f"{loss.item():.4f}",
+                loss=f"{loss_value:.4f}",
                 lr=f"{optimizer.param_groups[0]['lr']:.2e}",
             )
 
@@ -783,7 +787,7 @@ def run_finetune(
                     iteration=global_step,
                     epoch=epoch,
                     step=step,
-                    loss=float(loss.item()),
+                    loss=loss_value,
                     lr=float(optimizer.param_groups[0]["lr"]),
                     grad_norm=float(grad_norm),
                     **instant_metrics,
