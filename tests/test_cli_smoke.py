@@ -4026,6 +4026,63 @@ def test_finetune_command_replay_keeps_explicit_auto_extract_size(
     assert "--extract-size auto" in result.output
 
 
+def test_finetune_cli_reads_a_resume_checkpoint_once(tmp_path, monkeypatch):
+    """Inheritance and source preflight share one deserialization of the file."""
+    import otuformer.utils.checkpoint as checkpoint_module
+
+    _make_tiny_finetune_data(tmp_path)
+    first = runner.invoke(
+        app,
+        [
+            "finetune",
+            "--checkpoint", str(_write_init_checkpoint(tmp_path / "source.pth")),
+            "--train-data", str(tmp_path / "labels.csv"),
+            "--input-images-dir", str(tmp_path),
+            "--out-dir", str(tmp_path / "ft_first"),
+            "--model-name", "vit_tiny_patch16_224",
+            "--metric-embed-dim", "16",
+            "--finetune-epochs", "1",
+            "--batch-size", "2",
+            "--num-workers", "0",
+            "--device", "cpu",
+            "--disable-embedding-metrics",
+        ],
+    )
+    assert first.exit_code == 0, first.output
+    resume = tmp_path / "ft_first" / "finetune_latest.pth"
+    saved = torch.load(resume, map_location="cpu", weights_only=False)
+    saved["epoch"] = 0
+    saved["config"]["finetune_epochs"] = 2
+    torch.save(saved, resume)
+
+    loads = []
+    real_load = checkpoint_module.load_checkpoint
+
+    def counting_load(path):
+        loads.append(str(path))
+        return real_load(path)
+
+    monkeypatch.setattr(checkpoint_module, "load_checkpoint", counting_load)
+    monkeypatch.setattr(
+        "otuformer.training.finetune_loop.run_finetune", lambda *a, **k: None
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "finetune",
+            "--resume", str(resume),
+            "--train-data", str(tmp_path / "labels.csv"),
+            "--input-images-dir", str(tmp_path),
+            "--out-dir", str(tmp_path / "ft_second"),
+            "--device", "cpu",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert loads.count(str(resume)) == 1
+
+
 def test_finetune_resume_rejects_legacy_compact_k_conflict_before_output(tmp_path):
     """A compact checkpoint with subcenters=None was trained at the fixed K=2.
 

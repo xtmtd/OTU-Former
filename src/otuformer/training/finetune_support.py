@@ -286,22 +286,47 @@ def _empty_loss_diagnostic_counts(num_classes: int, k: int) -> dict[str, object]
     }
 
 
+#: Sentinel: no payload was supplied by the caller.
+_UNLOADED = object()
+
+
 @dataclass(frozen=True)
 class _FinetuneHandoff:
     """Private preparation for one finetune invocation, never saved.
 
-    Path-bound like the pretrain handoff: a payload is reused only for the path
-    it was loaded from. The manifest slot holds this invocation's evaluation
-    snapshot; the resume/decision slots are added by the preparation work.
+    Path-bound like the pretrain handoff: the payload and the decisions derived
+    from it are reused only for the path they were loaded from. ``_UNLOADED``
+    distinguishes "nothing handed over" from an explicitly supplied ``None``.
     """
 
     manifest: Any | None = None
+    source_path: str | None = None
+    source_checkpoint: Any = _UNLOADED
+    loss_config: dict[str, Any] | None = None
 
 
 def take_finetune_handoff(args: argparse.Namespace) -> "_FinetuneHandoff":
     """Take this invocation's private handoff and clear the slot."""
     supplied = vars(args).pop("finetune_handoff", None)
     return supplied if isinstance(supplied, _FinetuneHandoff) else _FinetuneHandoff()
+
+
+def finetune_payload_for(
+    handoff: "_FinetuneHandoff", path: Path | None
+) -> tuple[Any, bool]:
+    """The handed-over payload for *this* path, else a fresh load.
+
+    Returns ``(payload, bound)``; ``bound`` is true only when the payload came
+    from the path still requested, so the decisions derived from it may be
+    reused. The same path may hold a newer checkpoint, so an unbound call reads
+    the file again rather than serving a stale payload.
+    """
+    requested = "" if path is None else str(path)
+    if handoff.source_checkpoint is not _UNLOADED and handoff.source_path == requested:
+        return handoff.source_checkpoint, True
+    if path is None:
+        return None, False
+    return load_checkpoint(Path(path)), False
 
 
 @torch.no_grad()

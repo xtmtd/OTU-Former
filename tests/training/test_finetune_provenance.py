@@ -143,6 +143,51 @@ def test_expert_path_identity_ambiguous_bare_name_rejected(tmp_path):
     assert "ambiguous expert reference" in reason
 
 
+def test_finetune_payload_is_bound_to_its_path_and_reloads_otherwise(
+    tmp_path, monkeypatch
+):
+    payload = {"config": {}}
+    handoff = finetune_support_module._FinetuneHandoff(
+        source_path=str(tmp_path / "a.pth"),
+        source_checkpoint=payload,
+        loss_config={"loss": "arcface"},
+    )
+
+    assert finetune_support_module.finetune_payload_for(
+        handoff, tmp_path / "a.pth"
+    ) == (payload, True)
+
+    loads = []
+
+    def fake_load(path):
+        loads.append(str(path))
+        return {"fresh": True}
+
+    monkeypatch.setattr(finetune_support_module, "load_checkpoint", fake_load)
+    fresh, bound = finetune_support_module.finetune_payload_for(
+        handoff, tmp_path / "b.pth"
+    )
+    assert fresh == {"fresh": True}
+    assert bound is False
+    assert loads == [str(tmp_path / "b.pth")]
+
+
+def test_explicitly_none_payload_differs_from_an_unloaded_handoff():
+    supplied = finetune_support_module._FinetuneHandoff(
+        source_path="", source_checkpoint=None
+    )
+    assert finetune_support_module.finetune_payload_for(supplied, None) == (
+        None,
+        True,
+    )
+
+    unloaded = finetune_support_module.take_finetune_handoff(argparse.Namespace())
+    assert finetune_support_module.finetune_payload_for(unloaded, None) == (
+        None,
+        False,
+    )
+
+
 def test_pseudo_source_status_requires_arcface_family_and_ssl_hash():
     eligible, reason = finetune_loop_module._pseudo_source_status(
         loss="arcface", ssl_initialization_sha256="deadbeef", expert_reason=None

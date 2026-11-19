@@ -618,6 +618,7 @@ def finetune(
         explicit_options=explicit_options,
     )
     from otuformer.training.finetune_support import (
+        _FinetuneHandoff,
         _assert_pseudo_source_identity,
         _classify_finetune_source,
         _resolve_finetune_loss_config,
@@ -640,6 +641,7 @@ def finetune(
     pseudo_round_data = None
     progress_lines: list[str] = []
     inherit_cfg: dict | None = None
+    resume_payload: dict | None = None
     if pseudo_label_from and not resume:
         try:
             pseudo_source_cfg = (
@@ -673,7 +675,8 @@ def finetune(
         # Resume takes accepted rows and settings from its own checkpoint;
         # --pseudo-label-from only validates the recorded source SHA-256.
         try:
-            resume_cfg = load_checkpoint(Path(resume)).get("config") or {}
+            resume_payload = load_checkpoint(Path(resume))
+            resume_cfg = resume_payload.get("config") or {}
         except OSError as exc:
             raise typer.BadParameter(str(exc)) from exc
         if pseudo_label_from:
@@ -768,9 +771,13 @@ def finetune(
             Path(resume) if resume else (Path(checkpoint) if checkpoint else None)
         )
     try:
-        source_checkpoint = (
-            load_checkpoint(source_path) if source_path is not None else None
-        )
+        if resume_payload is not None:
+            # Inheritance and source preflight share one read of the checkpoint.
+            source_checkpoint = resume_payload
+        else:
+            source_checkpoint = (
+                load_checkpoint(source_path) if source_path is not None else None
+            )
         resolved_loss = _resolve_finetune_loss_config(
             loss_preflight,
             source_checkpoint if resume else None,
@@ -924,6 +931,7 @@ def finetune(
         # The pseudo diagnostics payload can be thousands of rows; it is
         # summarized below and written to the output files instead of the log.
         displayed.pop("pseudo_round_data", None)
+        displayed.pop("finetune_handoff", None)
         cli_command = format_user_command(
             ctx,
             # The CLI option, not its inverted core argument, is what reruns.
@@ -942,6 +950,13 @@ def finetune(
         # entry point on its owner, and a direct alias would bypass that.
         from otuformer.training import finetune_loop as finetune_loop_module
 
+        # Hand over the payload the preflight already read, bound to the path it
+        # came from, plus the loss decision resolved from it.
+        ns.finetune_handoff = _FinetuneHandoff(
+            source_path="" if source_path is None else str(source_path),
+            source_checkpoint=source_checkpoint,
+            loss_config=resolved_loss,
+        )
         # Hand over the checkpoint the preflight already read; passing it only
         # when present keeps direct callers (and their mocks) unchanged.
         extra = (

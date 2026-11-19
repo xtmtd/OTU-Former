@@ -7,7 +7,6 @@ import os
 from otuformer.utils.checkpoint import (
     ARCFACE_EMBEDDING_HEAD,
     PROJECTION_EMBEDDING_HEAD,
-    load_checkpoint,
     recorded_register_count,
     resolve_checkpoint,
     resolve_checkpoint_embedding_head,
@@ -79,6 +78,7 @@ from .finetune_support import (
     _warn_pseudo_resume_drift,
     _weighted_ce,
     _write_pseudo_outputs,
+    finetune_payload_for,
     preflight_finetune_source,
     resolve_pseudo_ssl_source,
     take_finetune_handoff,
@@ -134,8 +134,9 @@ def run_finetune(
         # The CLI preflight already read this checkpoint; reusing it keeps the
         # validation read and the training read from diverging.
         ckpt = source_checkpoint
+        bound = handoff.source_checkpoint is source_checkpoint
     else:
-        ckpt = load_checkpoint(ckpt_path)
+        ckpt, bound = finetune_payload_for(handoff, ckpt_path)
     cfg = ckpt.get("config", {})
     source_kind = _classify_finetune_source(ckpt)
     previous_centers: torch.Tensor | None = None
@@ -430,10 +431,14 @@ def run_finetune(
         _warn_pseudo_resume_drift(cfg, args, out_dir)
 
     n_classes = len(ds.class_to_idx)
-    loss_config = _resolve_finetune_loss_config(
-        args,
-        ckpt if resume_path is not None else None,
-        explicit_options=explicit_options,
+    loss_config = (
+        handoff.loss_config
+        if bound and handoff.loss_config is not None
+        else _resolve_finetune_loss_config(
+            args,
+            ckpt if resume_path is not None else None,
+            explicit_options=explicit_options,
+        )
     )
     # Building the loss allocates prototypes/centers on the device; it is part
     # of the preparation block, so its cost must not land outside every phase.

@@ -856,7 +856,7 @@ def test_finetune_resolves_and_persists_checkpoint_size(tmp_path):
     assert resolve_training_image_size(saved) == 32
 
 
-def _tiny_finetune_run(
+def _tiny_finetune_args(
     tmp_path,
     out_dir,
     log_every_n_steps,
@@ -917,7 +917,13 @@ def _tiny_finetune_run(
         visualize_data=visualize_data,
         metrics_sample_size=10000,
     )
-    finetune_loop_module.run_finetune(args)
+    return args
+
+
+def _tiny_finetune_run(tmp_path, out_dir, log_every_n_steps, **kwargs):
+    finetune_loop_module.run_finetune(
+        _tiny_finetune_args(tmp_path, out_dir, log_every_n_steps, **kwargs)
+    )
 
 
 def test_finetune_grad_norm_is_computed_only_on_logged_steps(tmp_path, monkeypatch):
@@ -937,6 +943,35 @@ def test_finetune_grad_norm_is_computed_only_on_logged_steps(tmp_path, monkeypat
     calls.clear()
     _tiny_finetune_run(tmp_path, tmp_path / "ft_logged", log_every_n_steps=1)
     assert calls == [1, 1]
+
+
+def test_run_finetune_reuses_the_prepared_loss_config(tmp_path, monkeypatch):
+    """A handed-over loss decision is consumed, not resolved a second time."""
+    from otuformer.training import finetune_support as finetune_support_module
+    from otuformer.utils.checkpoint import load_checkpoint
+
+    args = _tiny_finetune_args(tmp_path, tmp_path / "ft_prepared", 50)
+    payload = load_checkpoint(Path(args.checkpoint))
+    prepared = {
+        "loss": "arcface",
+        "subcenters": None,
+        "compact_weight": None,
+        "compact_cap": None,
+        "supcon_temperature": None,
+    }
+    args.finetune_handoff = finetune_support_module._FinetuneHandoff(
+        source_path=str(args.checkpoint),
+        source_checkpoint=payload,
+        loss_config=prepared,
+    )
+
+    def boom(*args, **kwargs):
+        raise AssertionError("loss config resolved again after it was handed over")
+
+    monkeypatch.setattr(finetune_loop_module, "_resolve_finetune_loss_config", boom)
+    finetune_loop_module.run_finetune(args)
+
+    assert (tmp_path / "ft_prepared" / "finetune_latest.pth").exists()
 
 
 def test_finetune_manifest_failure_warns_once_and_continues(tmp_path, capsys):
@@ -3106,7 +3141,9 @@ def test_run_finetune_uses_a_preloaded_resume_checkpoint(tmp_path, monkeypatch):
     def fail(*_args, **_kwargs):
         raise AssertionError("resume checkpoint was loaded a second time")
 
-    monkeypatch.setattr(finetune_loop_module, "load_checkpoint", fail)
+    # The path-bound handoff owns the load seam now; patching the owner keeps
+    # this a real guard instead of a dead attribute.
+    monkeypatch.setattr(finetune_support_module, "load_checkpoint", fail)
     args = _finetune_args(
         tmp_path,
         source,
