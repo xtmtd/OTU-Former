@@ -178,7 +178,7 @@ otuformer finetune \
 
 **默认值：** `4`
 
-DataLoader 工作线程数。
+训练 DataLoader 的工作线程数。周期性评估与 UMAP 提取是串行的，忽略该值；评估图像在主进程中打开。
 
 ### `--cpus`
 
@@ -235,6 +235,10 @@ PyTorch/MKL 使用的 CPU 线程数。
 **默认值：** `10000`
 
 周期性指标与 UMAP 的最大样本数（<=0 表示不设上限）。
+
+抽样在解码任何图像之前完成：启动时冻结评估行的顺序、解析后的路径与标签，再沿用原有的带种子、排序后的子集规则。因此大于上限的清单不会被完整解码，运行中修改 CSV 也不会改变本次评估的样本集合；下一次调用（包括 `--resume`）会重新读取。所有选中的路径必须已经是存在的文件，且该校验覆盖整份清单，而不只是抽样后的行。
+
+如果清单无法准备（缺失、格式错误、引用歧义或不是文件），运行只打印一条警告，本次调用跳过周期性嵌入评估并继续训练。epoch 指标记录器仍会创建并传给训练曲线绘图，因此评估始终失败的运行会留下只有表头的 `metrics.finetune.csv`；`--disable-embedding-metrics` 是另一个显式开关，会跳过记录器并绕过清单准备工作。
 
 ### `--umap-n-neighbors`
 
@@ -347,6 +351,8 @@ otuformer finetune --train-data labels.csv --input-images-dir DATA_ROOT/dorsal \
 ## 说明
 
 单独的、仅含图像的 `--visualize-data` CSV 可用于 UMAP；监督指标至少需要两个标签类别。
+
+周期性评估在启动时依据配置的清单准备一次，后续保存 epoch 不会重试。若准备失败，运行只警告一次并在没有周期性评估的情况下继续训练；修复 CSV 或图像路径后，在下一次调用（`--resume` 会重新读取清单）中生效。
 
 **SSL 来源谱系。** 微调输出记录自身的度量 `embedding_head`，并在来源身份已知且有 `ssl_initialization_checkpoint_sha256` 锚定时，单独记录 `ssl_source_method`/`ssl_source_head` 来源字段（例如由 DINO 初始化的 ArcFace 头）。这些字段只表示来源谱系：微调检查点从不声明活动的 `ssl_method`，从不继承 DINO 的原型/瓶颈头，也不保存训练目标状态。缺少该字段对的历史微调检查点仍然有效，续跑会保留其自身检查点中的记录。
 

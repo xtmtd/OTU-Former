@@ -320,6 +320,21 @@ Image size for periodic metrics/UMAP embedding extraction. 'auto' uses the model
 
 Max samples for periodic metrics and UMAP (<=0 means no cap).
 
+Selection happens before any image is decoded: at startup the run snapshots the
+ordered evaluation rows, their resolved paths and labels, then keeps the same
+seeded, sorted subset this cap always produced. A manifest larger than the cap
+is therefore never fully decoded, and a CSV edited mid-run does not change the
+live evaluation population; the next invocation (including `--resume`) reads it
+again. Every selected path must already be an existing file, and that check
+covers the whole manifest, not only the sampled rows.
+
+If the manifest cannot be prepared (missing, malformed, ambiguous or non-file
+entries), the run prints one warning, skips periodic embedding evaluation for
+this invocation, and keeps training. The epoch metrics logger is still created
+and passed to the training-curves plot, so a run whose evaluation never succeeds
+keeps a header-only `metrics.pretrain.csv`; `--disable-embedding-metrics` is the
+separate explicit switch that omits the logger and bypasses manifest work.
+
 ### `--umap-n-neighbors`
 
 **Default:** `15`
@@ -360,7 +375,8 @@ Batch size.
 
 **Default:** `4`
 
-DataLoader workers.
+Training DataLoader workers. Periodic evaluation and UMAP extraction are serial
+and ignore this value; the evaluation images are opened in the main process.
 
 ### `--cpus`
 
@@ -653,6 +669,11 @@ by themselves establish anatomical part semantics or dense morphology
 supervision, and v0.7.0 makes no dense-representation claim.
 
 When `--visualize-data` has no `label` column, periodic supervised metrics are skipped and UMAP is still generated from the visualization embeddings.
+
+Periodic evaluation is prepared once at startup from the configured manifest and
+is not retried at later save epochs. If that preparation fails, the run warns
+once and trains without periodic evaluation; repair the CSV or image paths and
+start the next invocation (a `--resume` reads the manifest again).
 
 To continue pretraining after adding images, create a CSV containing both old and
 new images, keep the same `--out-dir`, pass the latest checkpoint to `--resume`,
