@@ -1873,6 +1873,44 @@ def test_cam_command(tmp_path):
     assert (tmp_path / "cam_out" / "logs" / "cam.log").exists()
 
 
+def test_cam_selects_images_once_for_protection_and_execution(tmp_path, monkeypatch):
+    pytest.importorskip("pytorch_grad_cam")
+    pytest.importorskip("cv2")
+    import otuformer.vision.cam as cam_module
+
+    ckpt = _make_ckpt(tmp_path)
+    img_dir = tmp_path / "images"
+    img_dir.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", (224, 224)).save(img_dir / "test.jpg")
+
+    calls = []
+    real_select = cam_module.selected_image_paths
+
+    def counting_select(*args, **kwargs):
+        calls.append(1)
+        return real_select(*args, **kwargs)
+
+    monkeypatch.setattr(cam_module, "selected_image_paths", counting_select)
+
+    result = runner.invoke(
+        app,
+        [
+            "cam",
+            "--checkpoint", str(ckpt),
+            "--images-dir", str(img_dir),
+            "--out-dir", str(tmp_path / "cam_once"),
+            "--cam-method", "eigencam",
+            "--max-images", "1",
+            "--cam-batch-size", "1",
+            "--device", "cpu",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert len(calls) == 1
+    assert (tmp_path / "cam_once" / "cam_summary.csv").exists()
+
+
 def test_cam_command_does_not_leave_closed_logging_stream(monkeypatch, tmp_path):
     from otuformer.utils.logging import TeeLogger
 

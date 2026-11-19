@@ -594,7 +594,13 @@ def run_cam(
     cam_batch_size: int = 1,
     device: str = "auto",
     eval_transform: str = "center-crop",
+    selection: Optional[tuple[pd.DataFrame, list[Path]]] = None,
 ) -> None:
+    """Render CAM heatmaps for one ordered image selection.
+
+    ``selection`` is the CLI's already-prepared ``(rows, paths)`` pair, so output
+    protection and execution share one selection; a direct call prepares its own.
+    """
     from otuformer.utils.io import write_csv
 
     _validate_save_mode(save_npy)
@@ -640,11 +646,13 @@ def run_cam(
         )
         logging.info("Model layer names written to %s", out_dir / "model_layers.txt")
 
-    rows_df = collect_image_rows(images_dir, label_csv)
-    if max_images is not None:
-        rows_df = rows_df.head(max_images)
-
-    paths = selected_image_paths(images_dir, label_csv, max_images)
+    if selection is None:
+        rows_df = collect_image_rows(images_dir, label_csv)
+        if max_images is not None:
+            rows_df = rows_df.head(max_images)
+        paths = selected_image_paths(images_dir, label_csv, max_images)
+    else:
+        rows_df, paths = selection
     results = []
     for (_, row), selected_path in zip(rows_df.iterrows(), paths):
         img_path = selected_path.resolve()

@@ -190,10 +190,15 @@ def cam(
     from otuformer.utils.io import prepare_output_dir
 
     try:
-        from otuformer.vision.cam import selected_image_paths
+        from otuformer.vision.cam import collect_image_rows, selected_image_paths
 
+        # One ordered selection serves overwrite protection and execution.
+        selection_rows = collect_image_rows(images_dir, label_csv)
+        if max_images is not None:
+            selection_rows = selection_rows.head(max_images)
+        selection_paths = selected_image_paths(images_dir, label_csv, max_images)
         protected = [checkpoint, images_dir, label_csv]
-        protected.extend(selected_image_paths(images_dir, label_csv, max_images))
+        protected.extend(selection_paths)
         prepare_output_dir(out_dir, overwrite=overwrite, protected_paths=protected)
     except (ValueError, OSError) as exc:
         raise typer.BadParameter(str(exc)) from exc
@@ -253,6 +258,7 @@ def cam(
             cam_batch_size=max(1, min(cam_batch_size, 8)),
             device=device,
             eval_transform=eval_transform,
+            selection=(selection_rows, selection_paths),
         )
     except Exception:
         traceback.print_exc(file=tee)
