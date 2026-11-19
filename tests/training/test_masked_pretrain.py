@@ -1095,7 +1095,14 @@ def _tiny_vit_factory(*args, **kwargs):
     )
 
 
-def _run_tiny_pretrain(tmp_path, monkeypatch, label="", on_first_step=None, **overrides):
+def _run_tiny_pretrain(
+    tmp_path,
+    monkeypatch,
+    label="",
+    on_first_step=None,
+    image_count=4,
+    **overrides,
+):
     """Run one epoch of a tiny CPU pretrain with call tracing."""
     import pandas as pd
     import timm as timm_module
@@ -1104,7 +1111,7 @@ def _run_tiny_pretrain(tmp_path, monkeypatch, label="", on_first_step=None, **ov
     import otuformer.training.model as model_module
 
     image_names = []
-    for index in range(4):
+    for index in range(image_count):
         path = tmp_path / f"img_{index}.jpg"
         Image.new("RGB", (64, 64), color=(index * 40, 30, 20)).save(path)
         image_names.append(path.name)
@@ -3579,3 +3586,64 @@ def test_masked_feature_predictor_and_target_see_only_selected_rows(
         rows for name, rows in obs["head_inputs"] if name == "predictor"
     ]
     assert predictor_rows == selected
+
+
+def test_cosine_similarity_runs_only_on_consuming_steps(tmp_path, monkeypatch):
+    """C5: the value is materialized only for the CSV row or the postfix."""
+    calls = []
+    real_cosine = torch.nn.functional.cosine_similarity
+
+    def counting(*args, **kwargs):
+        calls.append(1)
+        return real_cosine(*args, **kwargs)
+
+    monkeypatch.setattr(torch.nn.functional, "cosine_similarity", counting)
+    _run_tiny_pretrain(
+        tmp_path,
+        monkeypatch,
+        image_count=8,
+        batch_size=2,
+        max_epochs=3,
+        log_every_n_steps=2,
+    )
+
+    # Twelve steps: CSV rows at 0, 2, 4, 6, 8, 10; postfix at 0, 3, 4, 7, 8,
+    # 11. Steps 1, 5 and 9 consume nothing, so they must not materialize the
+    # value. The one-time startup similarity is separate from the per-step gate.
+    assert len(calls) == 10
+
+
+def test_total_loss_scalar_is_read_once_per_logged_step(tmp_path, monkeypatch):
+    """C7: the CSV row and the postfix share one host value of the total loss."""
+    captured = []
+    reads = []
+    real_isfinite = torch.isfinite
+
+    def recording_isfinite(tensor, *args, **kwargs):
+        if tensor.ndim == 0:
+            captured.append(tensor)
+            loss_ids.add(id(tensor))
+        return real_isfinite(tensor, *args, **kwargs)
+
+    real_item = torch.Tensor.item
+
+    def counting_item(self):
+        if id(self) in loss_ids:
+            reads.append(1)
+        return real_item(self)
+
+    loss_ids: set[int] = set()
+    monkeypatch.setattr(torch, "isfinite", recording_isfinite)
+    monkeypatch.setattr(torch.Tensor, "item", counting_item)
+    _run_tiny_pretrain(
+        tmp_path,
+        monkeypatch,
+        image_count=6,
+        batch_size=2,
+        max_epochs=1,
+        log_every_n_steps=1,
+    )
+    # The guard ran once per step on the total loss; the display must not read
+    # it a second time.
+    assert len(captured) >= 3
+    assert len(reads) == 3

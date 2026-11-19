@@ -1781,17 +1781,24 @@ def run_pretrain(
                 # have already succeeded.
                 queue_commit = queue.commit(batch_keys, observation_pair, step=global_step)
 
-            if dino_objective is None:
+            needs_display = step % 10 == 0 or step == len(loader) - 1
+            # One host read per scalar for every consumer of this step: the CSV
+            # row and the progress postfix. Steps that consume neither stay
+            # unsynchronized.
+            step_values: dict[str, float] = {}
+            if logged_step or needs_display:
+                step_values = {
+                    "total": float(total_loss.item()),
+                    "global": float(loss_global.item()),
+                    "local": float(loss_local.item()),
+                    "mask": float(loss_mask.item()),
+                }
+            cosine_sim = 0.0
+            if dino_objective is None and (logged_step or needs_display):
                 with torch.no_grad():
                     cosine_sim = F.cosine_similarity(
                         student_global[0].mean(dim=0, keepdim=True),
                         ordinary_teacher[0].mean(dim=0, keepdim=True),
-                    ).item()
-            else:
-                with torch.no_grad():
-                    cosine_sim = F.cosine_similarity(
-                        student_global[0].mean(dim=0, keepdim=True),
-                        teacher_global[0].mean(dim=0, keepdim=True),
                     ).item()
 
             if logged_step:
@@ -1799,7 +1806,6 @@ def run_pretrain(
                     instant_metrics = _compute_instant_metrics(
                         student, global_views[0], device
                     )
-                total_value = float(total_loss.item())
                 weighted_value = float(patch_loss_weighted.item())
                 ssl_metrics: dict[str, object] = {
                     "ssl_method": ssl_method,
@@ -1812,9 +1818,9 @@ def run_pretrain(
                     # including zero, so a default relational row states the
                     # regularizer is off instead of leaving it unrecorded.
                     "koleo_weight": float(ssl_config["koleo_weight"]),
-                    "global_loss_weighted": float(loss_global.item()),
+                    "global_loss_weighted": step_values["global"],
                     "local_loss_weighted": float(
-                        args.lambda_local * loss_local.item()
+                        args.lambda_local * step_values["local"]
                     ),
                 }
                 # KoLeo diagnostics are method-independent; only the DINO
@@ -1847,8 +1853,8 @@ def run_pretrain(
                         None
                         if koleo_enabled
                         else (
-                            weighted_value / total_value
-                            if total_value != 0.0
+                            weighted_value / step_values["total"]
+                            if step_values["total"] != 0.0
                             else 0.0
                         )
                     ),
@@ -1906,10 +1912,10 @@ def run_pretrain(
                     iteration=global_step,
                     epoch=epoch,
                     step=step,
-                    loss=float(total_loss.item()),
-                    global_loss=float(loss_global.item()),
-                    local_loss=float(loss_local.item()),
-                    mask_loss=float(loss_mask.item()),
+                    loss=step_values["total"],
+                    global_loss=step_values["global"],
+                    local_loss=step_values["local"],
+                    mask_loss=step_values["mask"],
                     lr=float(optimizer.param_groups[0]["lr"]),
                     teacher_temp=float(temp_teacher),
                     grad_norm=float(grad_norm),
@@ -1928,7 +1934,7 @@ def run_pretrain(
                     **dense_metrics,
                 )
 
-            if step % 10 == 0 or step == len(loader) - 1:
+            if needs_display:
                 cos_display = (
                     "N/A"
                     if dino_objective is not None
@@ -1939,10 +1945,10 @@ def run_pretrain(
                     )
                 )
                 pbar.set_postfix(
-                    L=f"{total_loss.item():.2e}",
-                    GL=f"{loss_global.item():.2e}",
-                    LocL=f"{loss_local.item():.2e}",
-                    ML=f"{loss_mask.item():.2e}",
+                    L=f"{step_values['total']:.2e}",
+                    GL=f"{step_values['global']:.2e}",
+                    LocL=f"{step_values['local']:.2e}",
+                    ML=f"{step_values['mask']:.2e}",
                     COS=cos_display,
                     LR=f"{optimizer.param_groups[0]['lr']:.2e}",
                     MOM=f"{m:.4f}",
