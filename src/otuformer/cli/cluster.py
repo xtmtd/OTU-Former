@@ -1086,13 +1086,10 @@ def cluster(
                     metrics_sample_size > 0
                     and len(true_labels_arr) > metrics_sample_size
                 ):
-                    rng = np.random.default_rng(random_state)
-                    sample_idx = np.sort(
-                        rng.choice(
-                            len(true_labels_arr),
-                            size=metrics_sample_size,
-                            replace=False,
-                        )
+                    from otuformer.embedding.sampling import sorted_sample_indices
+
+                    sample_idx = sorted_sample_indices(
+                        len(true_labels_arr), metrics_sample_size, random_state
                     )
                     true_labels_arr = true_labels_arr[sample_idx]
                     x_for_metrics = x_for_metrics[sample_idx]

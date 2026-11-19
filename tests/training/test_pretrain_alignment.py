@@ -21,6 +21,7 @@ from otuformer.utils.size import (
     validate_input_size,
 )
 import otuformer.training.dataset as dataset_module
+from otuformer.embedding.sampling import sorted_sample_indices
 import otuformer.training.finetune_loop as finetune_loop_module
 import otuformer.training.model as model_module
 import otuformer.training.objectives as objectives_module
@@ -408,12 +409,10 @@ def test_unlabeled_periodic_evaluation_still_generates_umap(
 def test_zero_metrics_sample_size_does_not_subsample():
     embeddings = np.arange(20, dtype=np.float32).reshape(10, 2)
 
-    sampled, labels = reporting_module._maybe_subsample_for_metrics(
-        embeddings, None, max_samples=0, seed=42
-    )
+    idx = sorted_sample_indices(len(embeddings), 0, 42)
 
-    assert sampled is embeddings
-    assert labels is None
+    assert np.array_equal(embeddings[idx], embeddings)
+    assert len(idx) == 10
 
 
 def test_single_class_periodic_evaluation_skips_supervised_metrics():
@@ -529,13 +528,6 @@ def test_sampled_single_class_evaluation_reports_skipped_metrics(
             np.array(["one"] * 10),
         ),
     )
-    monkeypatch.setattr(
-        reporting_module, "_maybe_subsample_for_metrics",
-        lambda embeddings, labels, max_samples, seed: (
-            embeddings[:5],
-            np.array(["one"] * 5),
-        ),
-    )
     args = argparse.Namespace(
         visualize_data="images.csv",
         train_data="",
@@ -570,10 +562,9 @@ def test_evaluation_manifest_selects_before_decode_with_the_legacy_rule(tmp_path
         csv_path, images, max_samples=4, seed=7
     )
 
-    idx, _ = reporting_module._maybe_subsample_for_metrics(
-        np.arange(10), None, max_samples=4, seed=7
-    )
-    expected = [int(index) for index in idx]
+    expected = np.sort(
+        np.random.default_rng(7).choice(10, size=4, replace=False)
+    ).tolist()
     assert [path.name for path in manifest.paths] == [f"e{i}.png" for i in expected]
     assert list(manifest.labels) == [f"c{i % 3}" for i in expected]
 
@@ -2092,17 +2083,17 @@ def _write_v070_enhanced_csv(path):
         writer.writerow(["1", "train"] + ["0.10"] * (len(_V070_ENHANCED_HEADER) - 2))
 
 
-def test_maybe_subsample_for_metrics_returns_sorted_indices():
-    embeddings = np.arange(30, dtype=np.float32).reshape(-1, 1)
-    labels = np.arange(30)
-
-    sampled, sampled_labels = reporting_module._maybe_subsample_for_metrics(
-        embeddings, labels, max_samples=10, seed=42
-    )
-
+def test_sorted_sample_indices_returns_sorted_unique_rows():
     expected = np.sort(np.random.default_rng(42).choice(30, size=10, replace=False))
-    assert np.array_equal(sampled[:, 0].astype(int), expected)
-    assert np.array_equal(sampled_labels, expected)
+
+    idx = sorted_sample_indices(30, 10, 42)
+
+    assert np.array_equal(idx, expected)
+    assert len(set(idx.tolist())) == 10
+    # A cap at least as large as the population, or a nonpositive one, keeps
+    # every row in order.
+    assert np.array_equal(sorted_sample_indices(30, 30, 42), np.arange(30))
+    assert np.array_equal(sorted_sample_indices(30, -1, 42), np.arange(30))
 
 
 def test_compute_all_metrics_uses_empty_strings_for_unavailable_metrics():

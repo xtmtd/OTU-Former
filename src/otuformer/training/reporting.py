@@ -19,6 +19,7 @@ from otuformer.embedding.evaluator import (
     compute_recall_at_k,
     run_umap,
 )
+from otuformer.embedding.sampling import sorted_sample_indices
 from .dense_objective import BRANCH_COUNT_FIELDS
 from otuformer.training.dataset import (
     FINETUNE_AUGMENTATIONS,
@@ -1737,8 +1738,7 @@ def prepare_evaluation_manifest(
     if 0 < max_samples < len(paths):
         # Same seeded, sorted selection without replacement the legacy
         # post-decode cap used; applied here it avoids the decode entirely.
-        rng = np.random.default_rng(seed)
-        idx = np.sort(rng.choice(len(paths), size=max_samples, replace=False))
+        idx = sorted_sample_indices(len(paths), max_samples, seed)
         paths = [paths[int(index)] for index in idx]
         labels = None if labels is None else labels[idx]
     return PreparedEvaluationManifest(
@@ -1827,21 +1827,6 @@ def _compute_embeddings_from_csv(
         else np.zeros((0, 1), dtype=np.float32)
     )
     return embs, labels
-
-
-def _maybe_subsample_for_metrics(
-    embeddings: np.ndarray,
-    labels: np.ndarray | None,
-    max_samples: int,
-    seed: int,
-) -> tuple[np.ndarray, np.ndarray | None]:
-    if max_samples <= 0 or len(embeddings) <= max_samples:
-        return embeddings, labels
-    rng = np.random.default_rng(seed)
-    idx = np.sort(rng.choice(len(embeddings), size=max_samples, replace=False))
-    if labels is None:
-        return embeddings[idx], None
-    return embeddings[idx], labels[idx]
 
 
 def _compute_all_metrics(
@@ -1934,12 +1919,13 @@ def _compute_and_log_all_metrics(
                     batch_size=max(1, args.batch_size),
                     num_workers=max(0, args.num_workers),
                 )
-                feats_eval, labels_eval = _maybe_subsample_for_metrics(
-                    feats,
-                    labels,
-                    max_samples=args.metrics_sample_size,
-                    seed=args.seed,
-                )
+                feats_eval, labels_eval = feats, labels
+                if 0 < args.metrics_sample_size < len(feats):
+                    idx = sorted_sample_indices(
+                        len(feats), args.metrics_sample_size, args.seed
+                    )
+                    feats_eval = feats[idx]
+                    labels_eval = None if labels is None else labels[idx]
             metrics = _compute_all_metrics(
                 feats_eval, labels_eval, compute_linear_probe=compute_lp
             )

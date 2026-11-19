@@ -878,11 +878,11 @@ def extract(
 
             n = len(embeddings)
             if metrics_sample_size > 0 and n > metrics_sample_size:
-                rng = np.random.default_rng(seed)
-                # Sorted indices: trainer._maybe_subsample_for_metrics applies the
-                # same seeded, sorted subsample order so both paths score the same
-                # rows in the same order.
-                idx = np.sort(rng.choice(n, size=metrics_sample_size, replace=False))
+                from otuformer.embedding.sampling import sorted_sample_indices
+
+                # The shared seeded, sorted rule keeps this path and the trainer's
+                # evaluation on the same rows in the same order.
+                idx = sorted_sample_indices(n, metrics_sample_size, seed)
                 embeddings = embeddings[idx]
                 if labels is not None:
                     labels = labels[idx]
@@ -1046,11 +1046,13 @@ def _evaluate_records(
     raw_labels = [record.metadata.get("label", "") for record in bundle.records]
     total = len(embeddings)
 
+    from otuformer.embedding.sampling import sorted_sample_indices
+
     sampled = list(range(total))
     excluded: list[int] = []
     if sample_size > 0 and total > sample_size:
-        rng = np.random.default_rng(seed)
-        sampled = np.sort(rng.choice(total, size=sample_size, replace=False)).tolist()
+        sampled = sorted_sample_indices(total, sample_size, seed).tolist()
+        # The excluded complement belongs to this consumer, not to the rule.
         excluded = sorted(set(range(total)) - set(sampled))
         print(
             f"[Info] Visualization subsample: {len(sampled)}/{total} samples (seed={seed})"
