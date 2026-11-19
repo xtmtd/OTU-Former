@@ -189,7 +189,7 @@ speed claim is made.
 | C3 | implemented — benefit unqualified (authorization pending) | Prototype counts batched into one host transfer; exact counts, ties, margin totals, one-class and SupCon no-op verified; per-sample readback count asserted, step time not measured. |
 | C4 | implemented — benefit unqualified (authorization pending) | One `_compute_grad_norm_parameters` call per effective step, finite-only non-log mode, numeric parity and clip-overflow mapping verified; device timing not measured. |
 | C5 | implemented — benefit unqualified (authorization pending) | The cosine value is materialized only on steps consumed by the CSV row or the postfix; call counts asserted; timing not measured. |
-| C6 | not pursued — not measured: authorization pending; no code change; claim open | The existing scan share of representative real step time was not measured, so the <1% close gate could not be applied. |
+| C6 | not pursued — not measured: authorization pending; no code change; claim open | The existing scan share of representative real step time was not measured, so the <1% close gate could not be applied. This is not a measured no-benefit result. |
 | C7 | implemented — benefit unqualified (authorization pending) | One host value per step feeds both consumers; total-loss readback count asserted; timing not measured. |
 | D1 | implemented — benefit unqualified (timing and peak memory not measured) | The spatial checkpoint digest, deserialized model and protected-input snapshot now come from one read (three reads to one); explicit-layer CLI preflight keeps its CPU probe rather than handing a live model to the device-placed extractor. |
 | D2 | implemented — benefit unqualified (correctness correction plus one-linkage parity; no performance gate at the default pair limit) | Monophyly is scored on the fixed output tree with labeled tips only; the pre-fix sampled-tree misalignment is pinned as a characterization value, not expected behavior; one metrics linkage asserted. |
@@ -197,7 +197,7 @@ speed claim is made.
 | D4 | implemented — benefit unqualified (memory and timing not measured) | The OTU-table path filters counts directly with parity against the expanded reference; expansion is asserted absent; NJ base-tree copy reuse omitted for lack of exact topology/support proof. |
 | D5 | implemented — benefit unqualified (timing not measured) | One ordered selection serves protection and execution; selector call count 2 to 1 asserted; prediction/overlay/array alignment covered by existing tests. |
 | D6 | implemented — benefit unqualified (correctness gate only) | The embedding model and size are prepared before the overwrite boundary and reused by export; prior-publication sentinel verified for an invalid size. |
-| E1 | implemented — benefit unqualified (measurement not authorized) | Startup-once manifest, `_PretrainHandoff` slot lifecycle, ordinary-run path-only carrier and one CLI training resolution verified by tests; resolution counts and timing not measured. |
+| E1 | implemented — benefit unqualified (measurement not authorized) | Startup-once manifest, `_PretrainHandoff` slot lifecycle and the ordinary-run path-only carrier verified by tests. Inside the dataset phase one resolution now feeds both the dataset and the evaluation manifest for the same CSV and root (queue runs reuse their identity-checked selection); a resolution-count test asserts one call for an ordinary fresh run. Wall time not measured. |
 | E2 | implemented — benefit unqualified (correctness/duplicate-load gate) | Private path-bound finetune handoff with explicit-None versus unloaded semantics; reload on path change verified. |
 | E3 | not pursued (bounded moves executed elsewhere; `_evaluate_records` stays in CLI) | `_evaluate_records` reads a parsed bundle and publishes the UMAP artifact, so moving it would carry publication out of the CLI; the shared sampling rule and within-group summary moved to their owners under E4/D3. |
 | E4 | implemented — benefit unqualified (no timing claim) | One seeded sorted index rule under `otuformer.embedding` used by the manifest, extract (both callsites) and cluster; tree-bootstrap and stratified silhouette sampling left untouched. |
@@ -223,3 +223,20 @@ The whole-branch review found one log-only defect and four deviations, fixed in
 - The E1 reuse claim gained guards: a dataset-carrier test (matching identity
   reuses, mismatched identity resolves) and a test asserting the manifest
   preparation receives the carrier's identity-checked paths.
+
+### Second audit round (2026-11-19)
+
+A follow-up audit of the same range found two remaining reuse gaps, fixed with
+tests that failed first:
+
+- A fresh ordinary run supplied no carrier, so `MultiCropDataset` resolved the
+  training CSV and the evaluation manifest resolved it again when evaluation used
+  the same CSV. `run_pretrain` now resolves that selection once inside the
+  dataset phase (or reuses the queue preparation's identity-checked paths) and
+  hands the same carrier to the dataset and the manifest; a resolution-count test
+  asserts one call.
+- `selected_image_paths` collected the manifest again, so the CAM CLI and
+  `run_cam` each walked the image tree twice for directory input. The selector
+  now accepts the already-collected rows, both callers pass them, and the CLI
+  test counts `collect_image_rows` calls and directory traversals (one each) for
+  both directory and CSV input.
