@@ -81,6 +81,15 @@ def load_checkpoint(path: Path, map_location: str = "cpu") -> dict[str, Any]:
     return torch.load(path, map_location=map_location, weights_only=False)
 
 
+def load_checkpoint_bytes(data: bytes, map_location: str = "cpu") -> dict[str, Any]:
+    """Deserialize exactly the bytes a caller already read and verified.
+
+    Keeps the deserialized model and the recorded digest bound to one read: a
+    second open could see a replaced file.
+    """
+    return torch.load(io.BytesIO(data), map_location=map_location, weights_only=False)
+
+
 def _linear_weight(state_dict: dict, keys: tuple[str, ...]) -> torch.Tensor | None:
     for key in keys:
         value = state_dict.get(key)

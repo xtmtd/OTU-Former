@@ -139,8 +139,9 @@ def _resolve_size(values: Mapping[str, Any], checkpoint_payload: dict) -> int:
 
 
 def _load_checkpoint_encoder(values: Mapping[str, Any]):
+    from ..data.provenance import snapshot_bytes
     from ..utils.checkpoint import (
-        load_checkpoint,
+        load_checkpoint_bytes,
         load_checkpoint_encoder,
         resolve_checkpoint,
     )
@@ -150,7 +151,10 @@ def _load_checkpoint_encoder(values: Mapping[str, Any]):
         raise SpatialRequestError(
             f"checkpoint does not exist: {values.get('checkpoint')!r}"
         )
-    payload = load_checkpoint(checkpoint_path, map_location="cpu")
+    # One read: the digest, the deserialized model and the protected-input
+    # snapshot all describe the same bytes.
+    data, checkpoint_snapshot = snapshot_bytes(checkpoint_path)
+    payload = load_checkpoint_bytes(data)
     architecture = resolve_checkpoint(
         payload,
         str(values.get("model_name") or "vit_tiny_patch16_224"),
@@ -164,7 +168,15 @@ def _load_checkpoint_encoder(values: Mapping[str, Any]):
     from ..utils.size import validate_input_size
 
     validate_input_size(image_size, encoder, architecture.model_name)
-    return encoder, payload, architecture, resolved, image_size, checkpoint_path
+    return (
+        encoder,
+        payload,
+        architecture,
+        resolved,
+        image_size,
+        checkpoint_path,
+        checkpoint_snapshot,
+    )
 
 
 def _protected_inputs(bundle) -> list[FileSnapshot]:
@@ -474,9 +486,9 @@ def _prepare_checkpoint(
         raise SpatialRequestError(
             "--input-images-dir is required for spatial image extraction"
         )
-    encoder, payload, architecture, resolved, image_size, checkpoint_path = (
-        _load_checkpoint_encoder(values)
-    )
+    encoder, payload, architecture, resolved, image_size, checkpoint_path, (
+        checkpoint_snapshot
+    ) = _load_checkpoint_encoder(values)
     bundle = read_dataset(
         images_dir,
         manifest=_as_path(values.get("label_csv")),
@@ -497,7 +509,7 @@ def _prepare_checkpoint(
         l2=bool(values.get("feature_l2_normalize")),
         model_identity={
             "architecture": architecture.model_name,
-            "checkpoint_sha256": sha256_bytes(checkpoint_path.read_bytes()),
+            "checkpoint_sha256": checkpoint_snapshot.sha256,
             "weight_source": resolved.source_key,
             "register_tokens": resolved.actual_register_tokens,
             "added_register_tokens": resolved.added_register_tokens,
@@ -523,9 +535,7 @@ def _prepare_checkpoint(
     samples = tuple(samples_from_records(bundle.records))
     _require_evaluable_selection(values, samples)
     protected = _protected_inputs(bundle)
-    from ..data.provenance import snapshot_bytes
-
-    protected.append(snapshot_bytes(checkpoint_path)[1])
+    protected.append(checkpoint_snapshot)
     return PreparedSpatialRequest(
         mode=MODE_CHECKPOINT,
         values=values,

@@ -185,6 +185,42 @@ def test_unrunnable_requests_fail_before_any_output(tmp_path):
         )
 
 
+def test_spatial_checkpoint_is_read_once_and_the_digest_binds_those_bytes(
+    tmp_path, monkeypatch
+):
+    import otuformer.utils.checkpoint as checkpoint_module
+    from otuformer.data.provenance import sha256_bytes
+
+    checkpoint = write_checkpoint(tmp_path / "once.pth")
+    reads = []
+    real_read_bytes = Path.read_bytes
+
+    def counting_read_bytes(self):
+        if self == checkpoint:
+            reads.append(1)
+        return real_read_bytes(self)
+
+    monkeypatch.setattr(Path, "read_bytes", counting_read_bytes)
+
+    def fail(*args, **kwargs):
+        raise AssertionError("checkpoint was deserialized through a second read")
+
+    monkeypatch.setattr(checkpoint_module, "load_checkpoint", fail)
+
+    _, request = prepared(
+        tmp_path,
+        checkpoint=str(checkpoint),
+        input_images_dir=str(write_images(tmp_path / "images")),
+    )
+    request.close()
+
+    assert reads == [1]
+    snapshot = next(
+        entry for entry in request.protected_files if entry.path == checkpoint
+    )
+    assert snapshot.sha256 == sha256_bytes(real_read_bytes(checkpoint))
+
+
 def test_prepare_protects_selected_inputs_and_records_the_contract(tmp_path):
     images = write_images(tmp_path / "images")
     checkpoint = write_checkpoint(tmp_path / "model.pt")
