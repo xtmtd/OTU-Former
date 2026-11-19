@@ -883,3 +883,18 @@ def test_relational_queue_metadata_is_relational_only():
         "relational",
         "projection_mlp_2048",
     )
+
+
+def test_load_checkpoint_bytes_deserializes_exactly_those_bytes(tmp_path):
+    import torch
+
+    from otuformer.utils.checkpoint import load_checkpoint_bytes
+
+    path = tmp_path / "payload.pth"
+    torch.save({"config": {"marker": "first"}}, path)
+    data = path.read_bytes()
+    torch.save({"config": {"marker": "second"}}, path)  # the file changes afterwards
+
+    payload = load_checkpoint_bytes(data)
+
+    assert payload["config"]["marker"] == "first"

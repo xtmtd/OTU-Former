@@ -1673,13 +1673,14 @@ def _extract_embeddings_result(
     if records is not None and checkpoint_path is not None:
         from otuformer.data.provenance import read_verified_bytes
 
+        from otuformer.utils.checkpoint import load_checkpoint_bytes
+
         checkpoint_bytes, checkpoint_snapshot = snapshot_bytes(checkpoint_path)
         used_files.append(checkpoint_snapshot)
-        checkpoint_payload = torch.load(
-            io.BytesIO(read_verified_bytes(checkpoint_snapshot)),
-            map_location="cpu",
-            weights_only=False,
-        )
+        # Deserialize the bytes this invocation snapshotted, then re-read once as
+        # the drift check. Deserializing the second read held two live copies.
+        checkpoint_payload = load_checkpoint_bytes(checkpoint_bytes)
+        read_verified_bytes(checkpoint_snapshot)
         del checkpoint_bytes
     model, checkpoint_size = _load_model(
         checkpoint_path,
