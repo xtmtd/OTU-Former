@@ -10,6 +10,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from .distance import within_group_summary
+
 
 _RAW_NAME_RE = re.compile(r"^partition_(?P<cutoff>.+)_assignments\.csv$")
 
@@ -342,19 +344,11 @@ def summarize_intra_class_distances(
             )
             continue
         block = dist_matrix[np.ix_(idx, idx)]
-        vals = block[np.triu_indices_from(block, k=1)]
         rows.append(
             {
                 "class": cluster,
                 "n_samples": n_samples,
-                "n_pairs": int(len(vals)),
-                "mean": float(np.mean(vals)),
-                "median": float(np.median(vals)),
-                "std": float(np.std(vals)),
-                "min": float(np.min(vals)),
-                "max": float(np.max(vals)),
-                "q25": float(np.percentile(vals, 25)),
-                "q75": float(np.percentile(vals, 75)),
+                **within_group_summary(block),
             }
         )
     return pd.DataFrame(rows)

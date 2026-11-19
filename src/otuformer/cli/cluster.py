@@ -101,19 +101,13 @@ def _intra_class_distance_stats(
             )
             continue
         class_dist = dist_matrix[np.ix_(label_idx, label_idx)]
-        intra = class_dist[np.triu_indices_from(class_dist, k=1)]
+        from otuformer.delineation.distance import within_group_summary
+
         rows.append(
             {
                 "class": label,
                 "n_samples": n_samples,
-                "n_pairs": int(len(intra)),
-                "mean": float(np.mean(intra)),
-                "median": float(np.median(intra)),
-                "std": float(np.std(intra)),
-                "min": float(np.min(intra)),
-                "max": float(np.max(intra)),
-                "q25": float(np.percentile(intra, 25)),
-                "q75": float(np.percentile(intra, 75)),
+                **within_group_summary(class_dist),
             }
         )
     return pd.DataFrame(rows)

@@ -84,3 +84,23 @@ def auto_select_k(n_samples: int, strategy: str = "adaptive") -> int:
             k = int(5 * math.log2(n_samples))
         k = max(5, min(k, 100))
     return min(k, n_samples - 1)
+
+
+def within_group_summary(block: np.ndarray) -> dict[str, object]:
+    """Upper-triangle count and dispersion for one within-group distance block.
+
+    Shared by ``cluster`` and ``annotate`` so the same-named report columns mean
+    the same statistic. Each command keeps its own group selection, ordering,
+    singleton rows, missing labels and empty-output behavior.
+    """
+    values = block[np.triu_indices_from(block, k=1)]
+    return {
+        "n_pairs": int(len(values)),
+        "mean": float(np.mean(values)),
+        "median": float(np.median(values)),
+        "std": float(np.std(values)),
+        "min": float(np.min(values)),
+        "max": float(np.max(values)),
+        "q25": float(np.percentile(values, 25)),
+        "q75": float(np.percentile(values, 75)),
+    }
