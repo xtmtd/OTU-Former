@@ -728,44 +728,43 @@ def _plot_metrics_dashboard(metrics_df, out_path: Path) -> None:
 
 
 def _compute_monophyly_proportion_upgma(
-    z, ids: list[str], true_labels: list[str]
+    z, ids: list[str], id_to_label: dict[str, str]
 ) -> float | None:
+    """Monophyly of labeled species on this exact topology.
+
+    Only labeled tips are scored: a represented species is monophyletic when its
+    labeled tips are exactly the labeled descendants of some clade, so an
+    unlabeled tip neither joins nor breaks it. The denominator is the number of
+    species represented by a labeled tip in this tree. A represented singleton
+    counts as monophyletic (existing convention).
+    """
     from scipy.cluster import hierarchy
 
-    if len(ids) != len(true_labels):
+    present = [tip for tip in ids if tip in id_to_label]
+    if not present:
         return None
-
-    id_to_label = {ids[i]: true_labels[i] for i in range(len(ids))}
-    unique_species = set(true_labels)
-    if not unique_species:
-        return None
+    present_set = set(present)
+    species = {id_to_label[tip] for tip in present}
 
     root = hierarchy.to_tree(z, rd=False)
-    all_clades = []
+    clades: list[set[str]] = []
 
-    def _collect(node):
+    def _collect(node) -> set[str]:
         if node.left is None and node.right is None:
-            return {ids[node.id]}
-        left = _collect(node.left)
-        right = _collect(node.right)
-        clade = left | right
-        all_clades.append(clade)
-        return clade
+            tip = ids[node.id]
+            return {tip} if tip in present_set else set()
+        labeled = _collect(node.left) | _collect(node.right)
+        clades.append(labeled)
+        return labeled
 
     _collect(root)
 
     monophyletic = 0
-    for species in unique_species:
-        species_tips = {
-            tip_id for tip_id, label in id_to_label.items() if label == species
-        }
-        if len(species_tips) <= 1:
+    for name in species:
+        tips = {tip for tip in present_set if id_to_label[tip] == name}
+        if len(tips) <= 1 or any(clade == tips for clade in clades):
             monophyletic += 1
-            continue
-        if any(clade == species_tips for clade in all_clades):
-            monophyletic += 1
-
-    return monophyletic / len(unique_species)
+    return monophyletic / len(species)
 
 
 def _parse_bool_option(name: str, value: str) -> bool:
@@ -1039,8 +1038,6 @@ def cluster(
         print("[6/7] UPGMA tree built")
 
         true_labels_arr = None
-        ids_for_metrics = None
-        labels_for_metrics = None
         id_to_label = None
         x_for_metrics = None
         d_for_metrics = d
@@ -1070,11 +1067,8 @@ def cluster(
                 id_to_row = {v: i for i, v in enumerate(ids)}
                 merged_idx = [id_to_row[i] for i in merged["id"].astype(str)]
                 true_labels_arr = merged["label"].to_numpy()
-                ids_for_metrics = merged["id"].astype(str).tolist()
-                labels_for_metrics = merged["label"].astype(str).tolist()
                 x_for_metrics = x[merged_idx]
                 d_for_metrics = d[np.ix_(merged_idx, merged_idx)]
-                z_metrics = build_upgma(d_for_metrics)
 
                 if (
                     metrics_sample_size > 0
@@ -1088,7 +1082,9 @@ def cluster(
                     true_labels_arr = true_labels_arr[sample_idx]
                     x_for_metrics = x_for_metrics[sample_idx]
                     d_for_metrics = d_for_metrics[np.ix_(sample_idx, sample_idx)]
-                    z_metrics = build_upgma(d_for_metrics)
+                # One metrics linkage, from the already-computed distances of the
+                # aligned (and possibly sampled) cohort submatrix.
+                z_metrics = build_upgma(d_for_metrics)
             else:
                 typer.echo(
                     "[Warning] No overlapping IDs between embeddings and --label-csv."
@@ -1162,10 +1158,13 @@ def cluster(
         print("[7/7] Partition tables and tree panels saved")
 
         if true_labels_arr is not None:
+            # Monophyly is a property of the fixed output topology and the
+            # labels, independent of --metrics-sample-size and the cutoff. The
+            # partition metrics below keep their own aligned cohort linkage.
             monophyly_prop = _compute_monophyly_proportion_upgma(
-                z_metrics,
-                ids_for_metrics,
-                labels_for_metrics,
+                z,
+                ids,
+                id_to_label or {},
             )
             parts_for_metrics = build_partitions_from_linkage(z_metrics, cutoffs)
             metrics = compute_partition_metrics(

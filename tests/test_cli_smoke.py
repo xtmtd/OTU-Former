@@ -1348,6 +1348,45 @@ def test_cluster_respects_max_distance_pairs(tmp_path):
     assert "max-distance-pairs" in result.output.lower()
 
 
+def test_cluster_uses_one_metrics_linkage_and_fixed_tree_monophyly(tmp_path, monkeypatch):
+    import otuformer.delineation.tree as tree_module
+
+    emb_path, labels_path = _make_embeddings_and_labels(tmp_path)
+    calls = []
+    real_build = tree_module.build_upgma
+
+    def counting_build(*args, **kwargs):
+        calls.append(1)
+        return real_build(*args, **kwargs)
+
+    monkeypatch.setattr(tree_module, "build_upgma", counting_build)
+
+    values = {}
+    for label, sample_size in (("capped", "2"), ("full", "0")):
+        out_dir = tmp_path / f"cluster_mono_{label}"
+        result = runner.invoke(
+            app,
+            [
+                "cluster",
+                "--embeddings", str(emb_path),
+                "--out-dir", str(out_dir),
+                "--labels", str(labels_path),
+                "--custom-cutoffs", "0.5",
+                "--metrics-sample-size", sample_size,
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        # The full output tree plus exactly one metrics linkage.
+        assert len(calls) == 2
+        calls.clear()
+        metrics = pd.read_csv(out_dir / "UPGMA" / "metrics.csv")
+        assert metrics["monophyly_proportion"].nunique() == 1
+        values[label] = set(metrics["monophyly_proportion"])
+
+    # Sampling and cutoffs do not change the fixed-output-tree value.
+    assert values["capped"] == values["full"]
+
+
 def test_cluster_without_label_csv_skips_partition_metrics(tmp_path):
     emb_path, _ = _make_embeddings_and_labels(tmp_path)
     out_dir = tmp_path / "cluster_out_no_labels"
