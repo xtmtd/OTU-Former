@@ -180,6 +180,16 @@ CPU 线程数。
 - `UPGMA/metrics_dashboard.pdf` — 指标面板（提供 `--label-csv` 时）
 - `distance_statistics/` — 距离统计与分布图
 
+### `metrics.csv` 字段
+
+`UPGMA/metrics.csv` 每个 cutoff 一行。分区列描述的是基于对齐后带标签队列（及其带种子的 `--metrics-sample-size` 子集）重建的指标树。`monophyly_proportion` 不是分区列：它在固定的输出 UPGMA 树上计算一次，并在所有行中重复。
+
+| 字段 | 定义 |
+| --- | --- |
+| `monophyly_proportion` | 带标签物种中，其带标签叶恰好构成固定输出树某一演化支的全部带标签后代的物种占比。标签不完整时只评估带标签的叶：未标注的叶既不会并入也不会拆散某个物种，被表示的单一物种仍计为单系。分母为被匹配标签表示的物种数。与 `--metrics-sample-size`、抽样种子和 cutoff 无关。 |
+
+该值是固定输出拓扑与标签的属性，而不是抽样分区树的属性；参见[工作流执行效率设计](../superpowers/specs/2026-11-18-workflow-execution-efficiency-design.md)及其[实施计划](../superpowers/plans/2026-11-19-workflow-execution-efficiency.md)（2026-11-19）。
+
 ## 示例
 
 ```bash

@@ -180,6 +180,23 @@ Clear an existing non-empty output directory.
 - `UPGMA/metrics_dashboard.pdf` — Metrics dashboard (when `--label-csv` is provided)
 - `distance_statistics/` — Distance statistics and distribution plots
 
+### `metrics.csv` fields
+
+`UPGMA/metrics.csv` holds one row per cutoff. The partition columns describe the
+metrics linkage rebuilt from the aligned labeled cohort and its seeded
+`--metrics-sample-size` subset. `monophyly_proportion` is not a partition
+column: it is computed once on the fixed output UPGMA tree and repeated across
+rows.
+
+| Field | Definition |
+| --- | --- |
+| `monophyly_proportion` | Share of labeled species whose labeled tips are exactly the labeled descendants of one clade of the fixed output tree. Under partial coverage only labeled tips are scored: an unlabeled tip neither joins nor breaks a species, and a represented singleton species counts as monophyletic. The denominator is the number of species represented by a matched label. Independent of `--metrics-sample-size`, the sampling seed and the cutoff. |
+
+This value is a property of the fixed output topology and the labels, not of the
+sampled partition tree; see the [workflow execution efficiency design](../superpowers/specs/2026-11-18-workflow-execution-efficiency-design.md)
+and its [implementation plan](../superpowers/plans/2026-11-19-workflow-execution-efficiency.md)
+(2026-11-19).
+
 ## Examples
 
 ```bash

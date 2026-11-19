@@ -18,6 +18,7 @@ to them rather than restating them.
 | `otuformer pretrain` | `logs/metrics.pretrain.csv` | [pretrain](pretrain.md) |
 | `otuformer finetune` | `logs/metrics.finetune.csv` | [finetune](finetune.md) |
 | `otuformer extract` | `metrics.csv` in the output directory | [extract](extract.md) |
+| `otuformer cluster` | `UPGMA/metrics.csv` (partition and tree metrics, not the shared fields below) | [cluster](cluster.md) |
 
 ## Metrics
 
@@ -50,6 +51,12 @@ to them rather than restating them.
 All three commands use the same field names: `kNN_Acc_k1`, `kNN_Acc_k5`,
 `kNN_Acc_k20`, `Linear_Probing_Acc`, `Linear_Probing_Balanced_Acc`, `mAP`,
 `Recall@k`, and `Silhouette_Score`.
+
+`cluster` also writes a `metrics.csv`, but it is a different product: one row per
+cutoff with partition-quality columns and the tree-level `monophyly_proportion`,
+which is measured on the fixed output UPGMA tree and is documented in
+[cluster](cluster.md). It does not use the shared embedding-metric field names
+above.
 
 ## Version Notes
 

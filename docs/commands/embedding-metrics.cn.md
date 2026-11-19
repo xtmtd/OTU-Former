@@ -16,6 +16,7 @@
 | `otuformer pretrain` | `logs/metrics.pretrain.csv` | [pretrain](pretrain.cn.md) |
 | `otuformer finetune` | `logs/metrics.finetune.csv` | [finetune](finetune.cn.md) |
 | `otuformer extract` | 输出目录下的 `metrics.csv` | [extract](extract.cn.md) |
+| `otuformer cluster` | `UPGMA/metrics.csv`（分区与树指标，不使用下方共享字段） | [cluster](cluster.cn.md) |
 
 ## 指标
 
@@ -40,6 +41,8 @@
 `extract` 在 `--label-csv` 至少包含两个类别时写入 `metrics.csv`。三个命令使用相同的字段名：
 `kNN_Acc_k1`、`kNN_Acc_k5`、`kNN_Acc_k20`、`Linear_Probing_Acc`、
 `Linear_Probing_Balanced_Acc`、`mAP`、`Recall@k`、`Silhouette_Score`。
+
+`cluster` 也会写入 `metrics.csv`，但它是另一种产物：每个 cutoff 一行，包含分区质量列与树级的 `monophyly_proportion`；后者在固定的输出 UPGMA 树上计算，详见 [cluster](cluster.cn.md)。它不使用上面的共享嵌入指标字段名。
 
 ## 版本注记
 
