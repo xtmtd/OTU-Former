@@ -3284,6 +3284,86 @@ def test_loss_diagnostics_margin_hits_use_margin_adjusted_target_logit():
     assert counts["samples"] == 2
 
 
+def test_loss_diagnostics_counts_are_batched_without_per_sample_readback(monkeypatch):
+    """Uneven batch, three classes, two centers: counts stay exact, reads batched."""
+    from otuformer.training.loss import SubCenterArcFaceLoss
+
+    loss = SubCenterArcFaceLoss(embed_dim=4, num_classes=3, k=2)
+    with torch.no_grad():
+        loss.head.weight[0] = torch.tensor([[1.0, 0, 0, 0], [0, 1.0, 0, 0]])
+        loss.head.weight[1] = torch.tensor([[0, 0, 1.0, 0], [0, 0, 0, 1.0]])
+        loss.head.weight[2] = torch.tensor([[-1.0, 0, 0, 0], [0, -1.0, 0, 0]])
+
+    embeddings = torch.tensor(
+        [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, -1.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+        ]
+    )
+    labels = torch.tensor([0, 0, 2, 2, 1])
+
+    calls = {"int": 0}
+    real_int = torch.Tensor.__int__
+
+    def counting_int(self):
+        calls["int"] += 1
+        return real_int(self)
+
+    monkeypatch.setattr(torch.Tensor, "__int__", counting_int)
+    counts = finetune_loop_module._empty_loss_diagnostic_counts(3, 2)
+    finetune_loop_module._accumulate_loss_diagnostics(counts, loss, embeddings, labels)
+
+    assert counts["global"] == [[2, 1], [1, 0], [0, 1]]
+    assert counts["local"] == [[2, 0], [1, 0], [0, 2]]
+    assert counts["samples"] == 5
+    assert calls["int"] == 1  # the margin total only; no per-sample readback
+
+
+def test_loss_diagnostics_ties_pick_the_first_center():
+    from otuformer.training.loss import SubCenterArcFaceLoss
+
+    loss = SubCenterArcFaceLoss(embed_dim=4, num_classes=2, k=2)
+    with torch.no_grad():
+        loss.head.weight[0] = torch.tensor([[1.0, 0, 0, 0], [1.0, 0, 0, 0]])
+        loss.head.weight[1] = torch.zeros(2, 4)
+
+    counts = finetune_loop_module._empty_loss_diagnostic_counts(2, 2)
+    finetune_loop_module._accumulate_loss_diagnostics(
+        counts, loss, torch.tensor([[1.0, 0.0, 0.0, 0.0]]), torch.tensor([0])
+    )
+
+    assert counts["local"] == [[1, 0], [0, 0]]
+    assert counts["global"] == [[1, 0], [0, 0]]
+    assert counts["samples"] == 1
+
+
+def test_loss_diagnostics_one_class_has_no_margin_and_supcon_is_a_noop():
+    from otuformer.training.loss import SubCenterArcFaceLoss, SupConLoss
+
+    one_class = SubCenterArcFaceLoss(embed_dim=4, num_classes=1, k=2)
+    counts = finetune_loop_module._empty_loss_diagnostic_counts(1, 2)
+    finetune_loop_module._accumulate_loss_diagnostics(
+        counts,
+        one_class,
+        torch.tensor([[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]]),
+        torch.tensor([0, 0]),
+    )
+    assert counts["margin_hits"] == 0
+    assert counts["samples"] == 2
+
+    untouched = finetune_loop_module._empty_loss_diagnostic_counts(2, 1)
+    finetune_loop_module._accumulate_loss_diagnostics(
+        untouched,
+        SupConLoss(),
+        torch.tensor([[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]]),
+        torch.tensor([0, 1]),
+    )
+    assert untouched == finetune_loop_module._empty_loss_diagnostic_counts(2, 1)
+
+
 def test_loss_diagnostics_compact_hinge_stats_match_prescribed_centers():
     from otuformer.training.loss import ArcFaceLoss, SubCenterArcFaceLoss
 

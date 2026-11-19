@@ -310,10 +310,13 @@ def _accumulate_loss_diagnostics(
     rows = torch.arange(features.shape[0], device=features.device)
     global_winners = cosine.reshape(features.shape[0], -1).argmax(dim=1)
     local_winners = cosine[rows, labels].argmax(dim=1)
-    for row in range(features.shape[0]):
-        winner = int(global_winners[row])
+    # One host transfer for the whole batch; per-sample ``int(tensor)`` would
+    # synchronize once per sample.
+    for winner, local, label in torch.stack(
+        (global_winners, local_winners, labels), dim=1
+    ).tolist():
         counts["global"][winner // k][winner % k] += 1
-        counts["local"][int(labels[row])][int(local_winners[row])] += 1
+        counts["local"][label][local] += 1
     if num_classes >= 2:
         logits = loss_fn.head(embeddings.detach(), labels)
         target = logits.gather(1, labels[:, None]).squeeze(1)
