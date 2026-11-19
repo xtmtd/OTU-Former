@@ -179,7 +179,7 @@ def test_relational_global_pair_sets(monkeypatch, pairing, expected):
     teacher = [torch.tensor([[3.0]]), torch.tensor([[4.0]])]
     calls = []
 
-    def fake_ssl_loss(s, t, *_):
+    def fake_ssl_loss(s, t, *_, **__):
         calls.append((float(s.item()), float(t.item())))
         return torch.tensor(1.0)
 
@@ -238,7 +238,7 @@ def test_local_loss_averages_all_local_to_teacher_global_pairs(monkeypatch):
     teacher = [torch.tensor([[4.0]]), torch.tensor([[5.0]])]
     calls = []
 
-    def fake_ssl_loss(s, t, *_):
+    def fake_ssl_loss(s, t, *_, **__):
         calls.append((float(s.item()), float(t.item())))
         return torch.tensor(0.0)
 

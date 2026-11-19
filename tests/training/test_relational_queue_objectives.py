@@ -6,6 +6,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+import otuformer.training.objectives as objectives_module
 from otuformer.training.objectives import (
     _compute_global_loss,
     _compute_local_loss,
@@ -296,3 +297,128 @@ def test_fifo_loss_rejects_one_sided_rectangular_inputs():
         _ssl_loss(student, teacher, 0.2, 0.1, candidates=teacher)
     with pytest.raises(ValueError, match="supplied together"):
         _ssl_loss(student, teacher, 0.2, 0.1, teacher_probs=teacher)
+
+
+# --- Non-FIFO target reuse (C1) ------------------------------------------------------
+
+_PAIR_SETS = {
+    "cross": ((0, 1), (1, 0)),
+    "full": ((0, 0), (0, 1), (1, 0), (1, 1)),
+    "same": ((0, 0), (1, 1)),
+}
+
+
+def _reference_pair(student, teacher, temp_student, temp_teacher):
+    student_sim = student @ teacher.T / temp_student
+    with torch.no_grad():
+        teacher_sim = teacher @ teacher.T / temp_teacher
+        teacher_sim = teacher_sim - teacher_sim.mean(dim=1, keepdim=True)
+        probs = F.softmax(teacher_sim, dim=1)
+    return -(probs * F.log_softmax(student_sim, dim=1)).sum(dim=1).mean()
+
+
+def _reference_global(student_global, teacher_global, pairing, temp_student, temp_teacher):
+    return torch.stack(
+        [
+            _reference_pair(
+                student_global[student_index],
+                teacher_global[teacher_index],
+                temp_student,
+                temp_teacher,
+            )
+            for student_index, teacher_index in _PAIR_SETS[pairing]
+        ]
+    ).mean()
+
+
+def _reference_local(local_students, teacher_global, temp_student, temp_teacher):
+    return torch.stack(
+        [
+            _reference_pair(student, teacher, temp_student, temp_teacher)
+            for student in local_students
+            for teacher in teacher_global
+        ]
+    ).mean()
+
+
+@pytest.mark.parametrize("pairing", ["cross", "full", "same"])
+@pytest.mark.parametrize("local_count", [0, 2])
+def test_non_fifo_teacher_targets_are_built_once_per_used_slot(
+    pairing, local_count, monkeypatch
+):
+    _, current, _ = _fixture()
+    builds = []
+    real = objectives_module._batch_teacher_probs
+
+    def counting(teacher_out, temp_teacher):
+        builds.append(1)
+        return real(teacher_out, temp_teacher)
+
+    monkeypatch.setattr(objectives_module, "_batch_teacher_probs", counting)
+    student_global = [slot.clone().requires_grad_(True) for slot in current]
+    local_students = [
+        current[0].clone().requires_grad_(True) for _ in range(local_count)
+    ]
+    reference_students = [slot.clone().requires_grad_(True) for slot in current]
+    reference_locals = [
+        current[0].clone().requires_grad_(True) for _ in range(local_count)
+    ]
+    cache: dict[int, torch.Tensor] = {}
+
+    actual_global = _compute_global_loss(
+        student_global,
+        current,
+        0.2,
+        0.1,
+        relational_pairing=pairing,
+        teacher_cache=cache,
+    )
+    actual_local = (
+        _compute_local_loss(local_students, current, 0.2, 0.1, teacher_cache=cache)
+        if local_count
+        else torch.zeros(())
+    )
+    expected_global = _reference_global(
+        reference_students, current, pairing, 0.2, 0.1
+    )
+    expected_local = (
+        _reference_local(reference_locals, current, 0.2, 0.1)
+        if local_count
+        else torch.zeros(())
+    )
+
+    # Two teacher slots, however many pairs consume them.
+    assert len(builds) == 2
+    assert all(not probs.requires_grad for probs in cache.values())
+    torch.testing.assert_close(actual_global, expected_global)
+    if local_count:
+        torch.testing.assert_close(actual_local, expected_local)
+
+    students = student_global + local_students
+    reference = reference_students + reference_locals
+    actual_grads = torch.autograd.grad(actual_global + actual_local, students)
+    expected_grads = torch.autograd.grad(
+        expected_global + expected_local, reference
+    )
+    for actual, expected in zip(actual_grads, expected_grads):
+        torch.testing.assert_close(actual, expected)
+
+
+def test_non_fifo_targets_rebuild_without_a_shared_step_cache(monkeypatch):
+    _, current, _ = _fixture()
+    builds = []
+    real = objectives_module._batch_teacher_probs
+
+    def counting(teacher_out, temp_teacher):
+        builds.append(1)
+        return real(teacher_out, temp_teacher)
+
+    monkeypatch.setattr(objectives_module, "_batch_teacher_probs", counting)
+    _compute_global_loss(
+        [slot.clone() for slot in current],
+        current,
+        0.2,
+        0.1,
+        relational_pairing="full",
+    )
+    assert len(builds) == 2

@@ -1404,6 +1404,9 @@ def run_pretrain(
             student_stats: list[dict[str, torch.Tensor]] | None = (
                 [] if relational_targets is not None and diagnostics_step else None
             )
+            # Non-FIFO teacher targets are per-slot constants within a step: one
+            # build each, shared by every global and local pair.
+            teacher_cache: dict[int, torch.Tensor] = {}
             if dino_objective is None:
                 loss_global = _compute_global_loss(
                     student_global,
@@ -1413,6 +1416,7 @@ def run_pretrain(
                     relational_pairing=relational_pairing,
                     relational_targets=relational_targets,
                     student_stats=student_stats,
+                    teacher_cache=teacher_cache,
                 )
             else:
                 with torch.no_grad():
@@ -1520,6 +1524,7 @@ def run_pretrain(
                     temp_teacher,
                     relational_targets=relational_targets,
                     student_stats=student_stats,
+                    teacher_cache=teacher_cache,
                 )
             else:
                 loss_local = _compute_dino_local_loss(

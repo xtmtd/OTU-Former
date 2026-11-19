@@ -219,6 +219,31 @@ def _relational_pair_loss(
     return loss
 
 
+def _batch_teacher_probs(
+    teacher_out: torch.Tensor, temp_teacher: float
+) -> torch.Tensor:
+    """Detached batch-only teacher distribution for one teacher slot."""
+    with torch.no_grad():
+        teacher_sim = teacher_out @ teacher_out.T / temp_teacher
+        teacher_sim = teacher_sim - teacher_sim.mean(dim=1, keepdim=True)
+        return F.softmax(teacher_sim, dim=1)
+
+
+def _pair_teacher_probs(
+    teacher_global: list[torch.Tensor],
+    teacher_index: int,
+    temp_teacher: float,
+    cache: dict[int, torch.Tensor] | None,
+) -> torch.Tensor:
+    """This slot's target, built once per step when a cache is supplied."""
+    if cache is not None and teacher_index in cache:
+        return cache[teacher_index]
+    probs = _batch_teacher_probs(teacher_global[teacher_index], temp_teacher)
+    if cache is not None:
+        cache[teacher_index] = probs
+    return probs
+
+
 def _compute_global_loss(
     student_global: list[torch.Tensor],
     teacher_global: list[torch.Tensor],
@@ -228,6 +253,7 @@ def _compute_global_loss(
     relational_pairing: str,
     relational_targets: _RelationalStepTargets | None = None,
     student_stats: list[dict[str, torch.Tensor]] | None = None,
+    teacher_cache: dict[int, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """Average the selected global student/teacher view pairs.
 
@@ -235,8 +261,11 @@ def _compute_global_loss(
     product, and the internal ``same`` pairing keeps the historical
     matching-index terms for legacy checkpoints. With ``relational_targets`` the
     pair selects its matching slot's rectangular candidate matrix instead of the
-    batch-only teacher-output relation.
+    batch-only teacher-output relation. ``teacher_cache`` reuses each non-FIFO
+    slot's target within the step; ``None`` gives this call its own cache.
     """
+    if teacher_cache is None:
+        teacher_cache = {}
     pairs = _RELATIONAL_PAIR_SETS.get(relational_pairing)
     if pairs is None:
         raise ValueError(
@@ -265,6 +294,10 @@ def _compute_global_loss(
             teacher_global[teacher_index],
             temp_student,
             temp_teacher,
+            candidates=teacher_global[teacher_index],
+            teacher_probs=_pair_teacher_probs(
+                teacher_global, teacher_index, temp_teacher, teacher_cache
+            ),
         )
     if student_stats is not None:
         _merge_student_statistics(collected, student_stats)
@@ -279,16 +312,20 @@ def _compute_local_loss(
     *,
     relational_targets: _RelationalStepTargets | None = None,
     student_stats: list[dict[str, torch.Tensor]] | None = None,
+    teacher_cache: dict[int, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """Compute local-to-global distillation loss following ref/ibot20260115.py.
 
     Averages over all local_student x teacher_global pairs. Local views are
     student queries only: with ``relational_targets`` each teacher slot keeps its
     current-plus-history candidate matrix, and the student statistics are
-    aggregated per contributing pair.
+    aggregated per contributing pair. ``teacher_cache`` is the same per-step
+    non-FIFO slot cache as :func:`_compute_global_loss`.
     """
     if not local_views_student:
         return torch.tensor(0.0, device=teacher_global[0].device)
+    if teacher_cache is None:
+        teacher_cache = {}
     device = local_views_student[0].device
     loss = torch.tensor(0.0, device=device)
     collected: list[dict[str, torch.Tensor]] = []
@@ -303,7 +340,16 @@ def _compute_local_loss(
                     collected if student_stats is not None else None,
                 )
                 continue
-            loss += _ssl_loss(lv, t, temp_student, temp_teacher)
+            loss += _ssl_loss(
+                lv,
+                t,
+                temp_student,
+                temp_teacher,
+                candidates=t,
+                teacher_probs=_pair_teacher_probs(
+                    teacher_global, slot, temp_teacher, teacher_cache
+                ),
+            )
     if student_stats is not None:
         _merge_student_statistics(collected, student_stats)
     loss /= max(1, len(local_views_student) * len(teacher_global))
@@ -487,10 +533,7 @@ def _ssl_loss(
             )
         return -(teacher_probs * student_log_probs).sum(dim=1).mean()
     student_sim = student_out @ teacher_out.T / temp_student
-    with torch.no_grad():
-        teacher_sim = teacher_out @ teacher_out.T / temp_teacher
-        teacher_sim = teacher_sim - teacher_sim.mean(dim=1, keepdim=True)
-        teacher_probs = F.softmax(teacher_sim, dim=1)
+    teacher_probs = _batch_teacher_probs(teacher_out, temp_teacher)
     student_log_probs = F.log_softmax(student_sim, dim=1)
     return -(teacher_probs * student_log_probs).sum(dim=1).mean()
 
