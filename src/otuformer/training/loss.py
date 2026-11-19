@@ -186,8 +186,24 @@ def masked_patch_cosine_loss(
             f"{tuple(student.shape)} and {tuple(teacher.shape)}."
         )
     _validate_patch_mask(mask, student)
-    s = F.normalize(student[mask], dim=-1)
-    t = F.normalize(teacher[mask].detach(), dim=-1)
+    return selected_patch_cosine_loss(student[mask], teacher[mask])
+
+
+def selected_patch_cosine_loss(
+    student: torch.Tensor, teacher: torch.Tensor
+) -> torch.Tensor:
+    """Cosine regression on rows the caller already selected.
+
+    Same reduction as :func:`masked_patch_cosine_loss`; the caller gathers the
+    selected tokens before a pointwise head so only those rows reach it.
+    """
+    if student.shape != teacher.shape:
+        raise ValueError(
+            f"student and teacher patch tokens must match, got "
+            f"{tuple(student.shape)} and {tuple(teacher.shape)}."
+        )
+    s = F.normalize(student, dim=-1)
+    t = F.normalize(teacher.detach(), dim=-1)
     return (2.0 - 2.0 * (s * t).sum(dim=-1)).mean()
 
 
@@ -211,10 +227,32 @@ def ibot_patch_loss(
             f"{tuple(student_logits.shape)} and {tuple(teacher_logits.shape)}."
         )
     _validate_patch_mask(mask, student_logits)
-    teacher_probs = F.softmax(
-        (teacher_logits[mask].detach() - patch_center) / teacher_temp, dim=-1
+    return ibot_selected_patch_loss(
+        student_logits[mask],
+        teacher_logits[mask],
+        patch_center,
+        student_temp,
+        teacher_temp,
     )
-    student_log_probs = F.log_softmax(student_logits[mask] / student_temp, dim=-1)
+
+
+def ibot_selected_patch_loss(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    patch_center: torch.Tensor,
+    student_temp: float,
+    teacher_temp: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The same centered cross-entropy on rows the caller already selected."""
+    if student_logits.shape != teacher_logits.shape:
+        raise ValueError(
+            f"student and teacher patch logits must match, got "
+            f"{tuple(student_logits.shape)} and {tuple(teacher_logits.shape)}."
+        )
+    teacher_probs = F.softmax(
+        (teacher_logits.detach() - patch_center) / teacher_temp, dim=-1
+    )
+    student_log_probs = F.log_softmax(student_logits / student_temp, dim=-1)
     loss = -(teacher_probs * student_log_probs).sum(dim=-1).mean()
     return loss, teacher_probs
 

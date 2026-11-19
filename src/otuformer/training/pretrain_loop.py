@@ -68,8 +68,10 @@ from .dino import (
     validate_dino_prototype_layer,
 )
 from .loss import (
-    ibot_patch_loss,
+    ibot_selected_patch_loss,
     masked_patch_cosine_loss,
+    selected_patch_cosine_loss,
+    _validate_patch_mask,
 )
 from .model import (
     OTUFormerEncoder,
@@ -1305,7 +1307,6 @@ def run_pretrain(
 
             teacher_tokens: list[torch.Tensor] = []
             teacher_final_four: list[list[torch.Tensor] | None] = []
-            teacher_logits: list[torch.Tensor] = []
             center_before = teacher.center
             # Detached pre-center A/B teacher observations, cached for a
             # success-only queue commit; nothing is stored before the step wins.
@@ -1371,10 +1372,6 @@ def run_pretrain(
                         teacher_global.append(t_out.cls)
                     teacher_tokens.append(t_out.tokens)
                     teacher_final_four.append(t_out.final_four)
-                    if patch_mode == "ibot":
-                        teacher_logits.append(
-                            objective.teacher_ibot_head(t_out.tokens[:, prefix:])
-                        )
 
             temp_student = float(temp_student_schedule[iter_idx])
             temp_teacher = float(teacher_temp_schedule[iter_idx])
@@ -1460,8 +1457,10 @@ def run_pretrain(
                     )
                     step_masks.append(mask)
                     with torch.no_grad():
+                        # Gather each pointwise block to the selected rows first:
+                        # averaging and normalizing commute with the selection.
                         layers = [
-                            final_norm(block)[:, prefix:]
+                            final_norm(block)[:, prefix:][mask]
                             for block in teacher_final_four[index]
                         ]
                         target = F.normalize(
@@ -1470,11 +1469,13 @@ def run_pretrain(
                     masked_out = student.forward_pretrain(
                         gv, mask=mask, mask_token=objective.mask_token
                     )
+                    student_patches = masked_out.tokens[:, prefix:]
+                    _validate_patch_mask(mask, student_patches)
                     prediction = objective.predict_masked_features(
-                        masked_out.tokens[:, prefix:]
+                        student_patches[mask]
                     )
                     view_losses.append(
-                        masked_patch_cosine_loss(prediction, target, mask)
+                        selected_patch_cosine_loss(prediction, target)
                     )
                 patch_loss_raw = torch.stack(view_losses).mean()
             elif patch_mode == "ibot":
@@ -1487,19 +1488,29 @@ def run_pretrain(
                     masked_out = student.forward_pretrain(
                         gv, mask=mask, mask_token=objective.mask_token
                     )
-                    view_loss, view_probs = ibot_patch_loss(
-                        objective.student_ibot_head(
-                            masked_out.tokens[:, prefix:]
-                        ),
-                        teacher_logits[index],
-                        mask,
+                    student_patches = masked_out.tokens[:, prefix:]
+                    teacher_patches = teacher_tokens[index][:, prefix:]
+                    _validate_patch_mask(mask, student_patches)
+                    with torch.no_grad():
+                        # The teacher head is pointwise, so gathering the mask
+                        # before it skips the unselected tokenwise work without
+                        # touching either encoder forward or any RNG draw.
+                        teacher_selected = objective.teacher_ibot_head(
+                            teacher_patches[mask]
+                        )
+                    student_selected = objective.student_ibot_head(
+                        student_patches[mask]
+                    )
+                    view_loss, view_probs = ibot_selected_patch_loss(
+                        student_selected,
+                        teacher_selected,
                         objective.patch_center,
                         temp_student,
                         temp_teacher,
                     )
                     view_losses.append(view_loss)
                     ibot_probs.append(view_probs)
-                    center_logits.append(teacher_logits[index][mask].detach())
+                    center_logits.append(teacher_selected.detach())
                 patch_loss_raw = torch.stack(view_losses).mean()
 
             loss_mask = patch_loss_raw

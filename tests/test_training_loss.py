@@ -13,8 +13,10 @@ from otuformer.training.loss import (
     SubCenterArcFaceLoss,
     dino_distillation_loss,
     ibot_patch_loss,
+    ibot_selected_patch_loss,
     koleo_loss,
     masked_patch_cosine_loss,
+    selected_patch_cosine_loss,
     sinkhorn_knopp_targets,
 )
 
@@ -691,3 +693,52 @@ def test_koleo_singleton_batch_returns_differentiable_zero():
     assert loss.item() == 0.0
     loss.backward()
     assert features.grad is not None
+
+
+def _irregular_patch_mask(rows=3, patches=7, device=None):
+    mask = torch.zeros(rows, patches, dtype=torch.bool, device=device)
+    mask[0, 0] = True
+    mask[0, 5] = True
+    mask[1, 3] = True
+    if rows > 2:
+        mask[2, 6] = True
+    return mask
+
+
+def test_selected_patch_losses_match_the_masked_reference():
+    torch.manual_seed(3)
+    mask = _irregular_patch_mask()
+    student = torch.randn(3, 7, 4)
+    teacher = torch.randn(3, 7, 4)
+
+    torch.testing.assert_close(
+        selected_patch_cosine_loss(student[mask], teacher[mask]),
+        masked_patch_cosine_loss(student, teacher, mask),
+    )
+
+    k = 5
+    student_logits = torch.randn(3, 7, k)
+    teacher_logits = torch.randn(3, 7, k)
+    center = torch.randn(1, k)
+    loss, probs = ibot_selected_patch_loss(
+        student_logits[mask], teacher_logits[mask], center, 0.1, 0.04
+    )
+    reference_loss, reference_probs = ibot_patch_loss(
+        student_logits, teacher_logits, mask, center, 0.1, 0.04
+    )
+
+    torch.testing.assert_close(loss, reference_loss)
+    torch.testing.assert_close(probs, reference_probs)
+    assert not probs.requires_grad
+    assert probs.shape == (int(mask.sum()), k)
+
+
+def test_patch_head_is_pointwise_so_row_selection_commutes():
+    from otuformer.training.model import _build_patch_head
+
+    torch.manual_seed(4)
+    head = _build_patch_head(8, 5)
+    tokens = torch.randn(2, 7, 8)
+    mask = _irregular_patch_mask(rows=2)
+
+    torch.testing.assert_close(head(tokens)[mask], head(tokens[mask]))

@@ -32,7 +32,7 @@ _REAL_PATCH_OBJECTIVE = PatchObjective
 _REAL_UPDATE_TEACHER = pretrain_loop_module.update_teacher
 _REAL_SAMPLE_PATCH_MASKS = pretrain_loop_module._sample_patch_masks
 _REAL_UPDATE_PATCH_CENTER = pretrain_loop_module._update_patch_center
-_REAL_IBOT_PATCH_LOSS = pretrain_loop_module.ibot_patch_loss
+_REAL_IBOT_SELECTED_LOSS = pretrain_loop_module.ibot_selected_patch_loss
 
 
 def _patch_args(**overrides):
@@ -1121,6 +1121,8 @@ def _run_tiny_pretrain(tmp_path, monkeypatch, label="", on_first_step=None, **ov
         "ema_modules": [],
         "center_inputs": [],
         "ibot_logits": [],
+        "head_inputs": [],
+        "head_rng": [],
     }
 
     real_objective_cls = _REAL_PATCH_OBJECTIVE
@@ -1129,6 +1131,24 @@ def _run_tiny_pretrain(tmp_path, monkeypatch, label="", on_first_step=None, **ov
         def __init__(self, *a, **k):
             super().__init__(*a, **k)
             observations["objective"] = self
+            # Row counts and RNG states around each pointwise token head: the
+            # selection-before-head optimization is visible here, not in a diff.
+            for name in ("student_ibot_head", "teacher_ibot_head", "predictor"):
+                head = getattr(self, name, None)
+                if head is None:
+                    continue
+
+                def record_before(module, args, _name=name):
+                    observations["head_inputs"].append(
+                        (_name, int(args[0].shape[0]))
+                    )
+                    observations["head_rng"].append(torch.get_rng_state().clone())
+
+                def record_after(module, args, output):
+                    observations["head_rng"].append(torch.get_rng_state().clone())
+
+                head.register_forward_pre_hook(record_before)
+                head.register_forward_hook(record_after)
 
     monkeypatch.setattr(pretrain_loop_module, "PatchObjective", RecordingObjective)
 
@@ -1214,15 +1234,17 @@ def _run_tiny_pretrain(tmp_path, monkeypatch, label="", on_first_step=None, **ov
 
     monkeypatch.setattr(pretrain_loop_module, "_update_patch_center", spy_center)
 
-    real_ibot = _REAL_IBOT_PATCH_LOSS
+    real_ibot = _REAL_IBOT_SELECTED_LOSS
 
-    def spy_ibot(student_logits, teacher_logits, mask, center, s_temp, t_temp):
+    def spy_ibot(student_logits, teacher_logits, center, s_temp, t_temp):
         observations["events"].append("ibot_loss")
-        observations["ibot_logits"].append(teacher_logits[mask].detach().clone())
+        observations["ibot_logits"].append(teacher_logits.detach().clone())
         observations["ibot_center"] = center.detach().clone()
-        return real_ibot(student_logits, teacher_logits, mask, center, s_temp, t_temp)
+        return real_ibot(student_logits, teacher_logits, center, s_temp, t_temp)
 
-    monkeypatch.setattr(pretrain_loop_module, "ibot_patch_loss", spy_ibot)
+    monkeypatch.setattr(
+        pretrain_loop_module, "ibot_selected_patch_loss", spy_ibot
+    )
 
     real_step = torch.optim.AdamW.step
 
@@ -3505,3 +3527,55 @@ def test_fifo_resolved_log_separates_requested_and_effective(
     assert disabled_rows
     for name in reporting_module._PRETRAIN_RELATIONAL_QUEUE_FIELDS:
         assert all(row[name] == "" for row in disabled_rows), name
+
+
+def test_ibot_heads_receive_only_selected_rows(tmp_path, monkeypatch):
+    obs = _run_tiny_pretrain(tmp_path, monkeypatch, patch_loss="ibot")
+    selected = [int(m["mask"].sum()) for m in obs["masks"]]
+    assert len(selected) == 2  # one mask per global teacher view
+
+    student_rows = [
+        rows for name, rows in obs["head_inputs"] if name == "student_ibot_head"
+    ]
+    teacher_rows = [
+        rows for name, rows in obs["head_inputs"] if name == "teacher_ibot_head"
+    ]
+    assert student_rows == selected
+    assert teacher_rows == selected
+    assert all(rows < obs["masks"][0]["mask"].numel() for rows in student_rows)
+
+    # Both ordinary teacher encoders still ran in full, and the head call draws
+    # no randomness: every pre/post pair holds the same generator state.
+    teacher_forwards = [f for f in obs["forwards"] if f["tag"] == "teacher"]
+    assert len(teacher_forwards) >= 2
+    states = obs["head_rng"]
+    assert all(
+        torch.equal(before, after)
+        for before, after in zip(states[0::2], states[1::2])
+    )
+
+    # The center still averages exactly the selected pre-EMA teacher logits.
+    concatenated = torch.cat(obs["ibot_logits"], dim=0)
+    assert torch.allclose(obs["center_inputs"][0], concatenated)
+
+
+def test_masked_feature_predictor_and_target_see_only_selected_rows(
+    tmp_path, monkeypatch
+):
+    captured = []
+    real = pretrain_loop_module.selected_patch_cosine_loss
+
+    def spy(prediction, target):
+        captured.append((int(prediction.shape[0]), int(target.shape[0])))
+        return real(prediction, target)
+
+    monkeypatch.setattr(pretrain_loop_module, "selected_patch_cosine_loss", spy)
+    obs = _run_tiny_pretrain(tmp_path, monkeypatch, patch_loss="masked-feature")
+    selected = [int(m["mask"].sum()) for m in obs["masks"]]
+
+    assert [rows for rows, _ in captured] == selected
+    assert [rows for _, rows in captured] == selected
+    predictor_rows = [
+        rows for name, rows in obs["head_inputs"] if name == "predictor"
+    ]
+    assert predictor_rows == selected
