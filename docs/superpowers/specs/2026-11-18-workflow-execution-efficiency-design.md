@@ -286,8 +286,9 @@ several partial deliveries. Fixed with tests that failed first:
   published label keep agreeing with earlier outputs.
 
 Reuse and delivery gaps addressed in the same round: the queue-run carrier now
-carries ordered row references so queue runs reuse the manifest instead of
-re-resolving; overwrite protection reuses the training selection when
+carries the ordered row references from the same read that resolved its paths
+(`PreparedRelationalData.refs`), so queue runs reuse the manifest with a
+verifiable identity instead of a re-read; overwrite protection reuses the training selection when
 `--visualize-data` names the same CSV; a finetune run whose evaluation reads the
 same CSV reuses its training dataset's selection; a header-only evaluation CSV is
 rejected as unusable instead of producing an empty snapshot; the runner no
@@ -297,3 +298,18 @@ read. Test evidence was strengthened where the audit named gaps: an independent
 full-head reference with gradient comparison for C2, an independent
 reimplementation of the old monophyly algorithm for D2, and a real
 `cluster → annotate` artifact comparison for D3.
+
+### Fifth audit round (2026-11-19)
+
+The fourth-round fix for queue reuse still had a two-read window: the queue
+resolved its paths, `run_pretrain` re-read the CSV for references, and the
+manifest compared only those later two reads. `prepare_relational_data` now keeps
+the references from the read that produced its paths, so all three consumers
+share one manifest read. Cluster also drove its two metrics from different label
+sets when one id appeared twice (a dict kept the last label, the merge kept every
+row); labels are now deduplicated by `(id, label)` and a conflicting duplicate is
+rejected. Overwrite protection was made single-resolution for the remaining
+branches: a queue run whose `--visualize-data` names its training CSV, and a
+finetune run whose overwrite protection already resolved the manifest (handed to
+`MetricDataset` through `finetune_resolved_images`). The execution record gained
+per-round command/result tables and corrected consumer-chain citations.

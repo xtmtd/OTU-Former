@@ -65,12 +65,12 @@ Every row was run on the commit named above, after that task's changes.
 | 11 | cluster cli nodes + `test_partition.py` + `test_cluster_plot.py` | 20 passed |
 | 12 | `test_diversity.py`, diversity cli nodes | 49, 4 passed |
 | 13 | `test_cam.py` + output safety + cam cli nodes | 170 passed |
-| 14 | export + spatial export, export cli nodes, output safety | 46, 6, passed |
+| 14 | `tests/test_export.py` + `tests/test_spatial_export.py`, export cli nodes, `tests/test_output_safety.py` | 46 passed, 6 passed, output-safety export nodes passed |
 | 15/16 | full suite `python -m pytest -q -p no:randomly` | 2688 passed, 1 skipped (1336 s) |
 | review fix | startup phases + masked + alignment + checkpoint utils + extract records/data cli, targeted cli nodes | 538, 10 passed |
 | audit fix (2nd round) | cli smoke + startup phases + cam + docs + masked, alignment | 538, 202 passed |
 | audit fix (3rd round) | alignment + startup phases + cli smoke; then alignment+diversity+cam+partition+distance+annotate+masked+loss+startup | 444 passed; 595 passed |
-| audit fix (4th round, this record) | see below | recorded per row |
+| audit fix (4th round) | per-fix commands in the round tables below | recorded per fix |
 
 Every new contract was watched fail first: the changed production file was
 stashed, the new node was run, and only a real red run was accepted before the
@@ -78,14 +78,23 @@ implementation was restored.
 
 ## Final acceptance state
 
-- Full regression gate: `python -m pytest -q -p no:randomly` on `a46475a` →
-  2688 passed, 1 skipped. Later commits were verified with the focused suites
-  listed above plus `tests/test_docs.py`; the master policy's full-suite gate for
-  merge/release acceptance is re-run at release time, not here.
-- Consumer chains exercised by existing suites: `extract → cluster →
-  annotate → diversity` (`tests/test_examples_e2e.py`) and `export → extract`
-  (`tests/test_export.py`, `tests/test_spatial_export.py`); CAM prediction,
-  array and overlay alignment (`tests/test_cam.py`, cli cam nodes).
+- **Last full regression run:** `python -m pytest -q -p no:randomly` on
+  `a46475a` → 2688 passed, 1 skipped (1168 s). That is *not* a result for the
+  current HEAD: every later commit was verified with the focused suites listed in
+  the round tables below. The master testing policy's full-suite gate for
+  merge/release acceptance must be re-run on the acceptance commit.
+- Consumer chains actually exercised by existing suites:
+  - `extract → cluster → diversity`: `tests/test_examples_e2e.py` (this chain
+    contains no `annotate` step).
+  - `cluster → annotate` on real products:
+    `tests/test_cli_annotate.py::test_annotate_summary_matches_the_cluster_product`.
+  - spatial `export → extract` (ONNX handed to extract):
+    `tests/test_spatial_onnx.py::test_cli_runs_spatial_onnx_extraction_and_reads_it_back`
+    and `::test_onnx_and_checkpoint_share_spatial_product_semantics`;
+    `tests/test_export.py` / `tests/test_spatial_export.py` cover graph creation,
+    not the consumption chain.
+  - CAM prediction/array/overlay alignment: `tests/test_cam.py` plus the CAM
+    nodes in `tests/test_cli_smoke.py`.
 - `git diff --check` clean; `runs/` untouched; no benchmark or training artifact
   written by the implementation.
 
@@ -112,3 +121,55 @@ Recorded so acceptance reads them as deliberate, not silent:
   sampled) index set.
 - **E3**: `_evaluate_records` stays in the CLI because it publishes the UMAP
   artifact; the shared calculations it used moved to their owners instead.
+
+## Round tables
+
+Each round lists the fixes, their commits, the focused command and the result on
+the commit that contains them.
+
+### Round 1 — final whole-branch review
+
+| Fix | Commit | Command | Result |
+| --- | --- | --- | --- |
+| Nested manifest timer no longer overwrites the recovery phase; masked-feature teacher blocks gathered before the pointwise norm | `fda300d` | `tests/training/test_startup_phases.py`, `tests/training/test_masked_pretrain.py` (new nodes) | passed; both new nodes fail on the pre-fix source |
+| Finetune recovery timer; one loss readback per step | `0f2e921` | `tests/training/test_pretrain_alignment.py::test_finetune_reads_the_loss_once_per_step` | passed; 6 reads before the fix |
+| Extract deserializes its snapshotted checkpoint bytes | `008c888` | `tests/test_checkpoint_utils.py::test_load_checkpoint_bytes_deserializes_exactly_those_bytes` | passed |
+| Round-wide set | `fda300d..52cf25b` | startup phases + masked + alignment + checkpoint utils + extract records + extract data cli, then targeted cli/masked nodes | 538 passed, then 10 passed |
+
+### Round 2 — follow-up audit of the range
+
+| Fix | Commit | Command | Result |
+| --- | --- | --- | --- |
+| Fresh ordinary run resolves the training selection once for dataset + manifest | `fb38344` | `tests/training/test_startup_phases.py::test_ordinary_run_resolves_the_training_selection_once` | passed; 2 resolutions before the fix |
+| CAM collects the manifest once (directory and CSV) | `fb38344` | `tests/test_cli_smoke.py::test_cam_collects_the_manifest_once_for_directory_and_csv` | passed; 2 collections and 2 traversals before the fix |
+| Round-wide set | `fb38344..2eaef2c` | cli smoke + startup phases + cam + docs + masked, alignment | 538 passed, 202 passed |
+
+### Round 3 — label/path snapshot race
+
+| Fix | Commit | Command | Result |
+| --- | --- | --- | --- |
+| Ordered row references travel with the resolved paths; a same-length reorder is rejected | `73cb992` | `tests/training/test_pretrain_alignment.py::test_evaluation_manifest_rejects_a_reordered_rewrite` | passed; the pre-fix signature has no `refs` |
+| Round-wide set | `73cb992..5a32daf` | alignment + startup phases + cli smoke | 444 passed |
+
+### Round 4 — result-level audit
+
+| Fix | Commit | Command | Result |
+| --- | --- | --- | --- |
+| Finetune handoff bound to the requested path; CLI stops double-passing the payload; runner skips an already-done preflight | `5b75f87` | `tests/training/test_pretrain_alignment.py::test_run_finetune_reloads_a_handoff_bound_to_another_path` | passed; the stale 32 px payload was reused before the fix |
+| Cluster drops blank labels, dedupes identical duplicate ids, rejects conflicting ones, skips cohorts below two labeled rows, fills unavailable dashboard columns | `7a5c1e4` | `tests/test_cli_smoke.py::test_cluster_skips_blank_labels_and_one_labeled_row`, `::test_cluster_rejects_conflicting_duplicate_labels_and_dedupes_identical_ones` | passed; both fail on the pre-fix source |
+| Diversity rejects negative abundances | `74d620b` | `tests/test_diversity.py::test_otu_table_diversity_rejects_negative_abundance` | passed |
+| CAM keeps traversal-order resolution for duplicate names | `a36c5c8` | `tests/test_cam.py::test_selected_image_paths_keeps_the_traversal_order_for_duplicate_names` | passed |
+| Queue preparation keeps the row references from its own read; queue and finetune overwrite protection reuse the resolved selection; header-only manifest rejected | `d418469`, this round | `tests/training/test_relational_queue_recipe.py::test_queue_preparation_keeps_the_row_references_it_resolved`, `tests/test_cli_smoke.py::test_queue_overwrite_protection_reuses_the_queue_selection`, `::test_finetune_overwrite_protection_resolves_the_training_manifest_once`, `::test_dataset_ignores_a_carrier_for_different_rows`, `tests/training/test_pretrain_alignment.py::test_evaluation_manifest_rejects_an_empty_csv` | all passed; each fails on the pre-fix source |
+| C2 independent full-head gradient reference; D2 independent reimplementation of the old monophyly algorithm; D3 real `cluster → annotate` product comparison | `ae518ed` | the three new nodes | passed |
+
+Round 4 focused sets on the round's commits:
+
+- `tests/test_cli_smoke.py` → 234 passed (before the last two additions), then the
+  full file → 238 passed.
+- `tests/training/test_pretrain_alignment.py` +
+  `tests/training/test_masked_pretrain.py` + `tests/test_training_loss.py` → 453 passed.
+- `tests/test_docs.py` + `tests/test_cam.py` + `tests/test_diversity.py` +
+  `tests/test_partition.py` + `tests/test_distance.py` +
+  `tests/test_cli_annotate.py` + `tests/test_extract_records.py` +
+  `tests/test_spatial_extract.py` + `tests/training/test_startup_phases.py` →
+  266 passed.
