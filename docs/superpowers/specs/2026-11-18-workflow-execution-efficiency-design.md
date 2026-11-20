@@ -197,7 +197,7 @@ speed claim is made.
 | D4 | implemented — benefit unqualified (memory and timing not measured) | The OTU-table path filters counts directly with parity against the expanded reference; expansion is asserted absent; NJ base-tree copy reuse omitted for lack of exact topology/support proof. |
 | D5 | implemented — benefit unqualified (timing not measured) | One ordered selection serves protection and execution; selector call count 2 to 1 asserted; prediction/overlay/array alignment covered by existing tests. |
 | D6 | implemented — benefit unqualified (correctness gate only) | The embedding model and size are prepared before the overwrite boundary and reused by export; prior-publication sentinel verified for an invalid size. |
-| E1 | implemented — benefit unqualified (measurement not authorized) | Startup-once manifest, `_PretrainHandoff` slot lifecycle and the ordinary-run path-only carrier verified by tests. Inside the dataset phase one resolution now feeds both the dataset and the evaluation manifest for the same CSV and root (queue runs reuse their identity-checked selection); a resolution-count test asserts one call for an ordinary fresh run. Wall time not measured. |
+| E1 | implemented — benefit unqualified (measurement not authorized) | Startup-once manifest, `_PretrainHandoff` slot lifecycle and the ordinary-run path-only carrier verified by tests. Inside the dataset phase one resolution now feeds both the dataset and the evaluation manifest for the same CSV and root (queue runs reuse their identity-checked selection); a resolution-count test asserts one call for an ordinary fresh run. The carrier also keeps the ordered CSV row references, and the manifest rejects a same-length reordered rewrite instead of pairing old paths with new labels. Wall time not measured. |
 | E2 | implemented — benefit unqualified (correctness/duplicate-load gate) | Private path-bound finetune handoff with explicit-None versus unloaded semantics; reload on path change verified. |
 | E3 | not pursued (bounded moves executed elsewhere; `_evaluate_records` stays in CLI) | `_evaluate_records` reads a parsed bundle and publishes the UMAP artifact, so moving it would carry publication out of the CLI; the shared sampling rule and within-group summary moved to their owners under E4/D3. |
 | E4 | implemented — benefit unqualified (no timing claim) | One seeded sorted index rule under `otuformer.embedding` used by the manifest, extract (both callsites) and cluster; tree-bootstrap and stratified silhouette sampling left untouched. |
@@ -240,3 +240,16 @@ tests that failed first:
   now accepts the already-collected rows, both callers pass them, and the CLI
   test counts `collect_image_rows` calls and directory traversals (one each) for
   both directory and CSV input.
+
+### Third audit round (2026-11-19)
+
+Reusing the training paths while re-reading the CSV for labels left a race: a
+same-length rewrite that reordered rows paired the old paths with the new
+labels, and the row-count check could not see it. `ResolvedTrainingImages` now
+carries the ordered row references from the same read as the paths
+(`resolve_training_images`), and `prepare_evaluation_manifest` requires them,
+compares them with the CSV it reads for labels, and raises
+`CSV ... changed while it was being prepared: the row order differs` on a
+mismatch — which the startup warning path turns into one warning and no periodic
+evaluation for that invocation. A regression test reorders the CSV between the
+two reads and asserts the rejection; paths without references are refused.
