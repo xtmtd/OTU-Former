@@ -1738,6 +1738,8 @@ def prepare_evaluation_manifest(
             )
         paths = [Path(path) for path in image_paths]
         labels = _labels_for_rows(csv_path, len(paths), expected_refs=refs)
+    if not paths:
+        raise ValueError(f"CSV {csv_path} selected no evaluation rows")
     missing = [path for path in paths if not Path(path).is_file()]
     if missing:
         raise FileNotFoundError(

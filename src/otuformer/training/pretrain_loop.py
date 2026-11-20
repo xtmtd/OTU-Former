@@ -765,10 +765,17 @@ def run_pretrain(
     )
     if resolved_images is None and shares_training_source:
         if preparation.active and preparation.data is not None:
+            import pandas as pd
+
+            # The queue already identity-checked these paths; the ordered row
+            # references come from the CSV so the manifest can verify them
+            # instead of resolving the selection a second time.
+            frame = pd.read_csv(args.train_data)
             resolved_images = ResolvedTrainingImages(
                 csv_path=str(args.train_data),
                 images_dir=str(Path(args.input_images_dir)),
                 paths=tuple(preparation.data.image_paths),
+                refs=tuple(str(value) for value in frame["image"]),
             )
         else:
             resolved_images = resolve_training_images(

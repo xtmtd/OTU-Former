@@ -1677,11 +1677,12 @@ def _extract_embeddings_result(
 
         checkpoint_bytes, checkpoint_snapshot = snapshot_bytes(checkpoint_path)
         used_files.append(checkpoint_snapshot)
-        # Deserialize the bytes this invocation snapshotted, then re-read once as
-        # the drift check. Deserializing the second read held two live copies.
+        # Deserialize the bytes this invocation snapshotted, release them, then
+        # re-read once as the drift check: the two buffers are never live
+        # together with the deserialized model.
         checkpoint_payload = load_checkpoint_bytes(checkpoint_bytes)
-        read_verified_bytes(checkpoint_snapshot)
         del checkpoint_bytes
+        read_verified_bytes(checkpoint_snapshot)
     model, checkpoint_size = _load_model(
         checkpoint_path,
         model_name,

@@ -1004,7 +1004,16 @@ def pretrain(
             and visualize_data is not None and visualize_data.exists()
         ):
             protected.append(visualize_data)
-            protected.extend(resolve_dataset_image_paths(visualize_data, input_images_dir))
+            if (
+                resolved_training_images is not None
+                and str(visualize_data) == str(train_data)
+            ):
+                # Same source: protect the selection already resolved for it.
+                protected.extend(resolved_training_images.paths)
+            else:
+                protected.extend(
+                    resolve_dataset_image_paths(visualize_data, input_images_dir)
+                )
         prepare_output_dir(
             out_dir, overwrite=overwrite, allow_existing=bool(resume),
             protected_paths=protected,
