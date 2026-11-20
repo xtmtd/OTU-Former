@@ -609,6 +609,33 @@ def test_evaluation_manifest_leaves_the_torch_rng_alone(tmp_path):
     assert torch.equal(torch.get_rng_state(), state)
 
 
+def test_evaluation_manifest_rejects_a_reordered_rewrite(tmp_path):
+    """A same-length reorder must not pair old paths with new labels."""
+    from otuformer.training.dataset import resolve_training_images
+
+    csv_path, images = _eval_manifest_fixture(tmp_path, rows=4)
+    carrier = resolve_training_images(csv_path, images)
+    frame = pd.read_csv(csv_path)
+    frame.iloc[::-1].to_csv(csv_path, index=False)
+
+    with pytest.raises(ValueError, match="row order differs"):
+        reporting_module.prepare_evaluation_manifest(
+            csv_path,
+            images,
+            max_samples=0,
+            seed=1,
+            image_paths=carrier.paths,
+            refs=carrier.refs,
+        )
+
+    # Paths without their ordered references cannot be verified, so they are
+    # refused instead of trusted.
+    with pytest.raises(ValueError, match="refs are required"):
+        reporting_module.prepare_evaluation_manifest(
+            csv_path, images, max_samples=0, seed=1, image_paths=carrier.paths
+        )
+
+
 def test_prepared_manifest_does_not_reread_the_csv(tmp_path):
     """The snapshot survives a mid-run edit; only the next invocation refreshes."""
 

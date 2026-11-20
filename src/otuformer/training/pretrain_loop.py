@@ -62,6 +62,7 @@ from .augmentation import (
 from .dataset import (
     MultiCropDataset,
     ResolvedTrainingImages,
+    resolve_training_images,
 )
 from .dino import (
     DINOObjective,
@@ -770,16 +771,8 @@ def run_pretrain(
                 paths=tuple(preparation.data.image_paths),
             )
         else:
-            from otuformer.training.dataset import resolve_dataset_image_paths
-
-            resolved_images = ResolvedTrainingImages(
-                csv_path=str(args.train_data),
-                images_dir=str(Path(args.input_images_dir)),
-                paths=tuple(
-                    resolve_dataset_image_paths(
-                        Path(args.train_data), Path(args.input_images_dir)
-                    )
-                ),
+            resolved_images = resolve_training_images(
+                Path(args.train_data), Path(args.input_images_dir)
             )
     ds = MultiCropDataset(
         csv_path=Path(args.train_data) if getattr(args, "train_data", "") else None,
@@ -1046,6 +1039,7 @@ def run_pretrain(
             reuse = (
                 evaluation_csv == str(getattr(args, "train_data", "") or "")
                 and isinstance(resolved_training, ResolvedTrainingImages)
+                and bool(resolved_training.refs)
                 and resolved_training.csv_path == evaluation_csv
                 and resolved_training.images_dir == str(Path(args.input_images_dir))
             )
@@ -1055,6 +1049,7 @@ def run_pretrain(
                 max_samples=int(getattr(args, "metrics_sample_size", 10000)),
                 seed=int(args.seed),
                 image_paths=resolved_training.paths if reuse else None,
+                refs=resolved_training.refs if reuse else None,
             )
         except (ValueError, OSError, KeyError) as exc:
             manifest_unavailable = True

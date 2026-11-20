@@ -434,6 +434,7 @@ def test_pretrain_cli_resolves_the_training_selection_once(tmp_path, monkeypatch
     assert len(calls) == 1
     assert seen["carrier"] is not None
     assert len(seen["carrier"].paths) == 32
+    assert len(seen["carrier"].refs) == 32
 
 
 def test_pretrain_runs_one_epoch_without_train_data(tmp_path):

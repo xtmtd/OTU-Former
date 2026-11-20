@@ -423,7 +423,9 @@ def _resolve_image_path(
 class ResolvedTrainingImages:
     """Ordinary-run carrier: one already-resolved selection and its identity.
 
-    Only the ordered paths and the request they were resolved for travel here.
+    Only the ordered paths, the ordered row references they came from and the
+    request they were resolved for travel here: the references let a consumer
+    prove that a later read of the same CSV is still the same ordered rows.
     Queue runs use :class:`PreparedRelationalData` instead; that one also decodes,
     fingerprints and rejects duplicates, which ordinary runs must not start doing.
     """
@@ -431,6 +433,33 @@ class ResolvedTrainingImages:
     csv_path: str
     images_dir: str
     paths: tuple[Path, ...]
+    refs: tuple[str, ...] = ()
+
+
+def resolve_training_images(
+    csv_path: Path | None, images_dir: Path
+) -> ResolvedTrainingImages:
+    """Resolve one ordinary training selection and keep its ordered row refs.
+
+    The CSV is read once; the resolved paths and the references they came from
+    stay together so a second reader can verify the rows did not change order.
+    """
+    images_root = Path(images_dir)
+    refs: tuple[str, ...] = ()
+    if csv_path is not None:
+        frame = pd.read_csv(csv_path)
+        if "image" not in frame.columns:
+            raise ValueError(f"CSV {csv_path} missing required 'image' column")
+        refs = tuple(str(value) for value in frame["image"])
+    paths = resolve_dataset_image_paths(
+        csv_path, images_root, refs=list(refs) if refs else None
+    )
+    return ResolvedTrainingImages(
+        csv_path=str(csv_path or ""),
+        images_dir=str(images_root),
+        paths=tuple(paths),
+        refs=refs,
+    )
 
 
 def resolve_dataset_image_paths(

@@ -1704,6 +1704,7 @@ def prepare_evaluation_manifest(
     max_samples: int,
     seed: int,
     image_paths: tuple[Path, ...] | list[Path] | None = None,
+    refs: tuple[str, ...] | None = None,
 ) -> PreparedEvaluationManifest:
     """Resolve, validate and cap the evaluation rows before any image is opened.
 
@@ -1711,7 +1712,10 @@ def prepare_evaluation_manifest(
     outside the sample is a startup error, not a decode failure at save time.
     ``image_paths`` is an already identity-checked selection for the same CSV and
     root (an ordinary pretrain run reuses its training resolution); the cap and
-    the file checks still apply to it.
+    the file checks still apply to it. ``refs`` must accompany it: the labels are
+    read from the CSV again, so the ordered references are compared with the
+    ones the paths were resolved from and a reordered rewrite is rejected instead
+    of pairing correct labels with the wrong images.
     """
     import pandas as pd
 
@@ -1727,8 +1731,13 @@ def prepare_evaluation_manifest(
         if "label" in frame.columns:
             labels = frame["label"].astype(str).to_numpy()
     else:
+        if refs is None:
+            raise ValueError(
+                "refs are required with image_paths: they prove the CSV rows "
+                "still match the resolved selection."
+            )
         paths = [Path(path) for path in image_paths]
-        labels = _labels_for_rows(csv_path, len(paths))
+        labels = _labels_for_rows(csv_path, len(paths), expected_refs=refs)
     missing = [path for path in paths if not Path(path).is_file()]
     if missing:
         raise FileNotFoundError(
@@ -1748,13 +1757,26 @@ def prepare_evaluation_manifest(
     )
 
 
-def _labels_for_rows(csv_path: Path, rows: int) -> np.ndarray | None:
-    """Labels of an already resolved CSV, read once for the snapshot."""
+def _labels_for_rows(
+    csv_path: Path, rows: int, *, expected_refs: tuple[str, ...]
+) -> np.ndarray | None:
+    """Labels of an already resolved CSV, read once for the snapshot.
+
+    The ordered references must still match the ones the paths came from: a
+    same-length rewrite that reorders rows would otherwise pair labels with the
+    wrong images.
+    """
     import pandas as pd
 
     frame = pd.read_csv(csv_path)
     if "image" not in frame.columns:
         raise ValueError(f"CSV {csv_path} missing required 'image' column")
+    refs = tuple(str(value) for value in frame["image"])
+    if refs != tuple(expected_refs):
+        raise ValueError(
+            f"CSV {csv_path} changed while it was being prepared: the row order "
+            "differs from the resolved selection."
+        )
     if "label" not in frame.columns:
         return None
     labels = frame["label"].astype(str).to_numpy()

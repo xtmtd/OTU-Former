@@ -283,20 +283,15 @@ def test_evaluation_manifest_phase_keeps_the_recovery_timer(tmp_path, monkeypatc
 def test_evaluation_manifest_reuses_the_training_selection_when_it_matches(
     tmp_path, monkeypatch
 ):
-    from otuformer.training.dataset import (
-        ResolvedTrainingImages,
-        resolve_dataset_image_paths,
-    )
+    from otuformer.training.dataset import resolve_training_images
 
     args = _pretrain_args(tmp_path)
     args.compute_embedding_metrics = True
     args.visualize_data = str(tmp_path / "data.csv")
-    paths = tuple(resolve_dataset_image_paths(tmp_path / "data.csv", tmp_path / "images"))
-    args.pretrain_resolved_images = ResolvedTrainingImages(
-        csv_path=str(tmp_path / "data.csv"),
-        images_dir=str(tmp_path / "images"),
-        paths=paths,
+    args.pretrain_resolved_images = resolve_training_images(
+        tmp_path / "data.csv", tmp_path / "images"
     )
+    paths = args.pretrain_resolved_images.paths
     captured = {}
 
     def fake_prepare(csv_path, root_dir, **kwargs):
@@ -311,6 +306,7 @@ def test_evaluation_manifest_reuses_the_training_selection_when_it_matches(
     trainer.run_pretrain(args)
 
     assert captured["image_paths"] == paths
+    assert captured["refs"] == ("0.png", "1.png", "2.png", "3.png")
 
 
 def test_dataset_reuses_a_matching_prepared_selection(tmp_path, monkeypatch):
