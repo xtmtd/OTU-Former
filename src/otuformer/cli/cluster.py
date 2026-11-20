@@ -28,6 +28,53 @@ app = typer.Typer(
 )
 
 
+def _read_label_table(label_csv: Path):
+    """Parse, validate and deduplicate a label table before any output is cleared.
+
+    One row per id drives both metrics: a repeated identical label is the same
+    assignment, while two labels for one id are ambiguous and rejected here so a
+    run cannot delete an earlier result and only then discover the conflict.
+    """
+    import pandas as pd
+
+    lbl_df = pd.read_csv(label_csv)
+    if "label" not in lbl_df.columns:
+        raise ValueError("--label-csv must contain a 'label' column.")
+    if "id" in lbl_df.columns:
+        key_col = "id"
+    elif "image" in lbl_df.columns:
+        key_col = "image"
+    else:
+        key_candidates = [c for c in lbl_df.columns if c != "label"]
+        if not key_candidates:
+            raise ValueError(
+                "--label-csv must contain either 'id' or 'image' plus 'label'."
+            )
+        key_col = key_candidates[0]
+
+    labels_aligned = lbl_df[[key_col, "label"]].copy()
+    labels_aligned.rename(columns={key_col: "id"}, inplace=True)
+    labels_aligned["id"] = labels_aligned["id"].astype(str)
+    # A blank label is unlabeled, not a class named "": dropping it here keeps
+    # the fixed-tree score and the partition metrics on the same valid rows
+    # instead of turning NaN into a label.
+    label_text = labels_aligned["label"]
+    valid_label = label_text.notna() & label_text.astype(str).str.strip().ne("")
+    labels_aligned = labels_aligned[valid_label].copy()
+    labels_aligned["label"] = labels_aligned["label"].astype(str)
+
+    duplicates = labels_aligned["id"].duplicated(keep=False)
+    if duplicates.any():
+        repeated = labels_aligned[duplicates].drop_duplicates()
+        conflicts = repeated["id"][repeated["id"].duplicated()]
+        if len(conflicts):
+            raise ValueError(
+                "--label-csv assigns more than one label to the same id: "
+                + ", ".join(sorted(set(conflicts))[:3])
+            )
+    return labels_aligned.drop_duplicates(subset=["id", "label"]).reset_index(drop=True)
+
+
 def _distance_stats_frame(dist_matrix, name: str):
     import numpy as np
     import pandas as pd
@@ -935,6 +982,15 @@ def cluster(
     )
     save_distances_enabled = _parse_bool_option("save-distances", save_distances)
 
+    # Read and validate the label table before --overwrite can clear anything: a
+    # conflicting or malformed label file must not destroy an earlier result.
+    label_table = None
+    if label_csv is not None:
+        try:
+            label_table = _read_label_table(label_csv)
+        except (ValueError, OSError) as exc:
+            raise typer.BadParameter(str(exc)) from exc
+
     try:
         prepare_output_dir(
             out_dir, overwrite=overwrite, protected_paths=[embeddings, label_csv],
@@ -1063,46 +1119,8 @@ def cluster(
         x_for_metrics = None
         d_for_metrics = d
         z_metrics = z
-        if label_csv is not None:
-            lbl_df = read_csv(label_csv)
-            if "label" not in lbl_df.columns:
-                raise typer.BadParameter("--label-csv must contain a 'label' column.")
-            if "id" in lbl_df.columns:
-                key_col = "id"
-            elif "image" in lbl_df.columns:
-                key_col = "image"
-            else:
-                key_candidates = [c for c in lbl_df.columns if c != "label"]
-                if not key_candidates:
-                    raise typer.BadParameter(
-                        "--label-csv must contain either 'id' or 'image' plus 'label'."
-                    )
-                key_col = key_candidates[0]
-
-            labels_aligned = lbl_df[[key_col, "label"]].copy()
-            labels_aligned.rename(columns={key_col: "id"}, inplace=True)
-            labels_aligned["id"] = labels_aligned["id"].astype(str)
-            # A blank label is unlabeled, not a class named "": dropping it here
-            # keeps the fixed-tree score and the partition metrics on the same
-            # valid rows instead of turning NaN into a label.
-            label_text = labels_aligned["label"]
-            valid_label = label_text.notna() & label_text.astype(str).str.strip().ne("")
-            labels_aligned = labels_aligned[valid_label].copy()
-            labels_aligned["label"] = labels_aligned["label"].astype(str)
-            # One row per id drives both metrics: a repeated identical label is
-            # the same assignment, and two labels for one id are ambiguous
-            # rather than a reason for the fixed-tree score and the partition
-            # cohort to disagree.
-            duplicates = labels_aligned["id"].duplicated(keep=False)
-            if duplicates.any():
-                repeated = labels_aligned[duplicates].drop_duplicates()
-                conflicts = repeated["id"][repeated["id"].duplicated()]
-                if len(conflicts):
-                    raise typer.BadParameter(
-                        "--label-csv assigns more than one label to the same id: "
-                        + ", ".join(sorted(set(conflicts))[:3])
-                    )
-            labels_aligned = labels_aligned.drop_duplicates(subset=["id", "label"])
+        if label_table is not None:
+            labels_aligned = label_table
             id_to_label = dict(zip(labels_aligned["id"], labels_aligned["label"]))
             merged = emb_df[["id"]].merge(labels_aligned, on="id", how="inner")
             if len(merged) > 0:

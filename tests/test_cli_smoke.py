@@ -6592,3 +6592,106 @@ def test_queue_overwrite_protection_reuses_the_queue_selection(tmp_path, monkeyp
 
     assert result.exit_code == 0, result.output
     assert len(calls) == 1
+
+
+def test_cluster_label_conflict_is_rejected_before_overwrite(tmp_path):
+    """A conflicting label file must not clear an existing report first."""
+    emb_path, _ = _make_embeddings_and_labels(tmp_path)
+    out_dir = tmp_path / "cluster_existing"
+    (out_dir / "UPGMA").mkdir(parents=True)
+    sentinel = out_dir / "UPGMA" / "metrics.csv"
+    sentinel.write_text("keep", encoding="utf-8")
+    conflicting = tmp_path / "conflicting_before_overwrite.csv"
+    pd.DataFrame(
+        {"id": ["a", "a", "b", "c"], "label": ["A", "B", "A", "B"]}
+    ).to_csv(conflicting, index=False)
+
+    result = runner.invoke(
+        app,
+        [
+            "cluster",
+            "--embeddings", str(emb_path),
+            "--out-dir", str(out_dir),
+            "--labels", str(conflicting),
+            "--overwrite",
+            "--custom-cutoffs", "0.5",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "more than one label to the same id" in result.output
+    assert sentinel.read_text(encoding="utf-8") == "keep"
+
+
+def test_cluster_deduplicates_identical_rows_before_partition_metrics(tmp_path):
+    """Duplicate identical labels must leave one row per id for both metrics."""
+    emb_path, _ = _make_embeddings_and_labels(tmp_path)
+    duplicated = tmp_path / "duplicated.csv"
+    pd.DataFrame(
+        {"id": ["a", "a", "b", "b"], "label": ["A", "A", "B", "B"]}
+    ).to_csv(duplicated, index=False)
+    deduped = tmp_path / "deduped.csv"
+    pd.DataFrame({"id": ["a", "b"], "label": ["A", "B"]}).to_csv(deduped, index=False)
+
+    frames = {}
+    for name, table in (("duplicated", duplicated), ("deduped", deduped)):
+        out_dir = tmp_path / f"cluster_{name}"
+        result = runner.invoke(
+            app,
+            [
+                "cluster",
+                "--embeddings", str(emb_path),
+                "--out-dir", str(out_dir),
+                "--labels", str(table),
+                "--custom-cutoffs", "0.5",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        frames[name] = pd.read_csv(out_dir / "UPGMA" / "metrics.csv")
+
+    # Identical label rows collapse to the same cohort, not a doubled one.
+    shared = ["n_true_species", "n_OTUs", "ARI", "monophyly_proportion", "BCubed_fscore"]
+    pd.testing.assert_frame_equal(
+        frames["duplicated"][shared], frames["deduped"][shared]
+    )
+
+
+def test_finetune_refuses_a_manifest_changed_after_protection(tmp_path, monkeypatch):
+    """Training must consume the protected selection, not a re-resolved one."""
+    import otuformer.training.dataset as dataset_module
+
+    _make_tiny_finetune_data(tmp_path)
+    carrier = dataset_module.resolve_training_images(
+        tmp_path / "labels.csv", tmp_path
+    )
+    # Same file, reordered rows: the protected selection no longer matches.
+    frame = pd.read_csv(tmp_path / "labels.csv")
+    frame.iloc[::-1].to_csv(tmp_path / "labels.csv", index=False)
+
+    with pytest.raises(ValueError, match="changed after overwrite protection"):
+        dataset_module.MetricDataset(
+            csv_path=tmp_path / "labels.csv",
+            images_dir=tmp_path,
+            prepared_images=carrier,
+        )
+
+
+def test_resolve_training_images_reads_an_empty_csv_once(tmp_path, monkeypatch):
+    """A header-only CSV is an empty selection, not a reason to read it twice."""
+    import otuformer.training.dataset as dataset_module
+
+    csv_path = tmp_path / "empty.csv"
+    csv_path.write_text("image\n", encoding="utf-8")
+    reads = []
+    real_read = dataset_module.pd.read_csv
+    monkeypatch.setattr(
+        dataset_module.pd,
+        "read_csv",
+        lambda *a, **k: reads.append(1) or real_read(*a, **k),
+    )
+
+    carrier = dataset_module.resolve_training_images(csv_path, tmp_path)
+
+    assert carrier.paths == ()
+    assert carrier.refs == ()
+    assert len(reads) == 1
