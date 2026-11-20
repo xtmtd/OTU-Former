@@ -6432,3 +6432,163 @@ def test_pretrain_overwrite_protection_reuses_the_training_selection(tmp_path, m
 
     assert result.exit_code == 0, result.output
     assert len(calls) == 1
+
+
+def test_cluster_rejects_conflicting_duplicate_labels_and_dedupes_identical_ones(tmp_path):
+    emb_path, _ = _make_embeddings_and_labels(tmp_path)
+
+    identical = tmp_path / "same_labels.csv"
+    pd.DataFrame(
+        {"id": ["a", "a", "b", "b"], "label": ["A", "A", "B", "B"]}
+    ).to_csv(identical, index=False)
+    result = runner.invoke(
+        app,
+        [
+            "cluster",
+            "--embeddings", str(emb_path),
+            "--out-dir", str(tmp_path / "cluster_same"),
+            "--labels", str(identical),
+            "--custom-cutoffs", "0.5",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    metrics = pd.read_csv(tmp_path / "cluster_same" / "UPGMA" / "metrics.csv")
+    # One row per id, so each species is represented once in the denominator.
+    assert metrics["n_true_species"].iloc[0] == 2
+
+    conflicting = tmp_path / "conflicting_labels.csv"
+    pd.DataFrame(
+        {"id": ["a", "a", "b", "c"], "label": ["A", "B", "A", "B"]}
+    ).to_csv(conflicting, index=False)
+    result = runner.invoke(
+        app,
+        [
+            "cluster",
+            "--embeddings", str(emb_path),
+            "--out-dir", str(tmp_path / "cluster_conflict"),
+            "--labels", str(conflicting),
+            "--custom-cutoffs", "0.5",
+        ],
+    )
+    assert result.exit_code != 0
+    assert "more than one label to the same id" in result.output
+
+
+def test_finetune_overwrite_protection_resolves_the_training_manifest_once(
+    tmp_path, monkeypatch
+):
+    """Protection and the runner's dataset share one resolution."""
+    import otuformer.training.dataset as dataset_module
+
+    _make_tiny_finetune_data(tmp_path)
+    out_dir = tmp_path / "ft_protect"
+    (out_dir / "logs").mkdir(parents=True)
+    checkpoint = _write_init_checkpoint(tmp_path / "source.pth")
+    calls = []
+    real_resolve = dataset_module.resolve_dataset_image_paths
+    monkeypatch.setattr(
+        dataset_module,
+        "resolve_dataset_image_paths",
+        lambda *a, **k: calls.append(1) or real_resolve(*a, **k),
+    )
+    seen = {}
+    monkeypatch.setattr(
+        "otuformer.training.finetune_loop.run_finetune",
+        lambda args, **kwargs: seen.setdefault(
+            "carrier", getattr(args, "finetune_resolved_images", None)
+        ),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "finetune",
+            "--checkpoint", str(checkpoint),
+            "--train-data", str(tmp_path / "labels.csv"),
+            "--input-images-dir", str(tmp_path),
+            "--out-dir", str(out_dir),
+            "--overwrite",
+            "--device", "cpu",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert len(calls) == 1
+    assert seen["carrier"] is not None
+    assert len(seen["carrier"].paths) == 4
+
+
+def test_dataset_ignores_a_carrier_for_different_rows(tmp_path, monkeypatch):
+    import otuformer.training.dataset as dataset_module
+
+    _make_tiny_finetune_data(tmp_path)
+    carrier = dataset_module.resolve_training_images(
+        tmp_path / "labels.csv", tmp_path
+    )
+    calls = []
+    real_resolve = dataset_module.resolve_dataset_image_paths
+    monkeypatch.setattr(
+        dataset_module,
+        "resolve_dataset_image_paths",
+        lambda *a, **k: calls.append(1) or real_resolve(*a, **k),
+    )
+
+    # Matching identity: reused.
+    dataset_module.MetricDataset(
+        csv_path=tmp_path / "labels.csv",
+        images_dir=tmp_path,
+        prepared_images=carrier,
+    )
+    assert calls == []
+
+    # Rows that disagree with the carrier: resolved again.
+    dataset_module.MetricDataset(
+        rows=[{"image": "img_0.jpg", "label": "classA"}],
+        images_dir=tmp_path,
+        class_labels=["classA"],
+        prepared_images=carrier,
+    )
+    assert calls == [1]
+
+
+def test_queue_overwrite_protection_reuses_the_queue_selection(tmp_path, monkeypatch):
+    """A queue run never resolves the same CSV again for --visualize-data."""
+    import otuformer.training.dataset as dataset_module
+
+    # Queue-enabled data preparation decodes the selected images and needs one
+    # complete batch under the locked batch size.
+    csv_path = _make_resume_pretrain_csv(tmp_path)
+    for index in range(32):
+        Image.new("RGB", (224, 224), (index * 5 % 255, 10, 20)).save(
+            tmp_path / f"img_{index}.jpg"
+        )
+    out_dir = tmp_path / "queue_protect"
+    (out_dir / "logs").mkdir(parents=True)
+    calls = []
+    real_resolve = dataset_module.resolve_dataset_image_paths
+    monkeypatch.setattr(
+        dataset_module,
+        "resolve_dataset_image_paths",
+        lambda *a, **k: calls.append(1) or real_resolve(*a, **k),
+    )
+    monkeypatch.setattr(
+        pretrain_loop_module, "run_pretrain", lambda args, **kwargs: None
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "pretrain",
+            "--train-data", str(csv_path),
+            "--input-images-dir", str(tmp_path),
+            "--out-dir", str(out_dir),
+            "--overwrite",
+            "--relational-queue-size", "2",
+            "--visualize-data", str(csv_path),
+            "--batch-size", "32",
+            "--device", "cpu",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert len(calls) == 1

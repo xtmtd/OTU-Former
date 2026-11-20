@@ -1089,6 +1089,20 @@ def cluster(
             valid_label = label_text.notna() & label_text.astype(str).str.strip().ne("")
             labels_aligned = labels_aligned[valid_label].copy()
             labels_aligned["label"] = labels_aligned["label"].astype(str)
+            # One row per id drives both metrics: a repeated identical label is
+            # the same assignment, and two labels for one id are ambiguous
+            # rather than a reason for the fixed-tree score and the partition
+            # cohort to disagree.
+            duplicates = labels_aligned["id"].duplicated(keep=False)
+            if duplicates.any():
+                repeated = labels_aligned[duplicates].drop_duplicates()
+                conflicts = repeated["id"][repeated["id"].duplicated()]
+                if len(conflicts):
+                    raise typer.BadParameter(
+                        "--label-csv assigns more than one label to the same id: "
+                        + ", ".join(sorted(set(conflicts))[:3])
+                    )
+            labels_aligned = labels_aligned.drop_duplicates(subset=["id", "label"])
             id_to_label = dict(zip(labels_aligned["id"], labels_aligned["label"]))
             merged = emb_df[["id"]].merge(labels_aligned, on="id", how="inner")
             if len(merged) > 0:
