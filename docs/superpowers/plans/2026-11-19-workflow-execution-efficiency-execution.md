@@ -65,7 +65,7 @@ Every row was run on the commit named above, after that task's changes.
 | 11 | cluster cli nodes + `test_partition.py` + `test_cluster_plot.py` | 20 passed |
 | 12 | `test_diversity.py`, diversity cli nodes | 49, 4 passed |
 | 13 | `test_cam.py` + output safety + cam cli nodes | 170 passed |
-| 14 | `tests/test_export.py` + `tests/test_spatial_export.py`, export cli nodes, `tests/test_output_safety.py` | 46 passed, 6 passed, output-safety export nodes passed |
+| 14 | `tests/test_export.py` + `tests/test_spatial_export.py`, export cli nodes, `tests/test_output_safety.py` | 46 passed, 6 passed, 63 passed |
 | 15/16 | full suite `python -m pytest -q -p no:randomly` | 2688 passed, 1 skipped (1336 s) |
 | review fix | startup phases + masked + alignment + checkpoint utils + extract records/data cli, targeted cli nodes | 538, 10 passed |
 | audit fix (2nd round) | cli smoke + startup phases + cam + docs + masked, alignment | 538, 202 passed |
@@ -78,11 +78,12 @@ implementation was restored.
 
 ## Final acceptance state
 
-- **Last full regression run:** `python -m pytest -q -p no:randomly` on
-  `a46475a` → 2688 passed, 1 skipped (1168 s). That is *not* a result for the
-  current HEAD: every later commit was verified with the focused suites listed in
-  the round tables below. The master testing policy's full-suite gate for
-  merge/release acceptance must be re-run on the acceptance commit.
+- **Full regression runs, both on older commits, neither on the current HEAD:**
+  - before the review fixes, on `a46475a`: 2688 passed, 1 skipped (1336 s);
+  - after round 1, on `52cf25b`: 2696 passed, 1 skipped (1168 s).
+  Every later commit was verified with the focused suites in the round tables
+  below. The master testing policy's full-suite gate for merge/release
+  acceptance must be re-run on the acceptance commit.
 - Consumer chains actually exercised by existing suites:
   - `extract → cluster → diversity`: `tests/test_examples_e2e.py` (this chain
     contains no `annotate` step).
@@ -173,3 +174,22 @@ Round 4 focused sets on the round's commits:
   `tests/test_cli_annotate.py` + `tests/test_extract_records.py` +
   `tests/test_spatial_extract.py` + `tests/training/test_startup_phases.py` →
   266 passed.
+
+### Round 5 — queue snapshot, duplicate labels, remaining protection branches
+
+| Fix | Commit | Command | Result |
+| --- | --- | --- | --- |
+| Queue keeps the row references from its own manifest read | `631d30d` | `tests/training/test_relational_queue_recipe.py::test_queue_preparation_keeps_the_row_references_it_resolved` | passed; the pre-fix carrier has no `refs` |
+| One deduplicated label table drives both cluster metrics; conflicting duplicates rejected | `e00ea0f` | `tests/test_cli_smoke.py::test_cluster_skips_blank_labels_and_one_labeled_row`, `::test_cluster_rejects_conflicting_duplicate_labels_and_dedupes_identical_ones` | passed; both fail on the pre-fix source |
+| Queue and finetune overwrite protection resolve once | `f9ba5e0` | `tests/test_cli_smoke.py::test_queue_overwrite_protection_reuses_the_queue_selection`, `::test_finetune_overwrite_protection_resolves_the_training_manifest_once`, `::test_dataset_ignores_a_carrier_for_different_rows` | passed; all three fail on the pre-fix source |
+| Round-wide set | `631d30d..f9ba5e0` | `tests/test_cli_smoke.py`; queue + queue objectives + alignment + pseudo + lineage + provenance; docs + cam + diversity + partition + annotate + distance; queue recipe + startup phases + docs | 238 passed; 360 passed; 177 passed; 108 passed |
+
+### Round 6 — fifth audit (ordering and drift)
+
+| Fix | Commit | Command | Result |
+| --- | --- | --- | --- |
+| Label table read, blank filtering, dedup and conflict check moved before `prepare_output_dir` | this round | `tests/test_cli_smoke.py::test_cluster_label_conflict_is_rejected_before_overwrite` | passed; the sentinel survives, and the pre-fix source deletes it |
+| Duplicate-label dedup proved to reach the partition cohort | this round | `tests/test_cli_smoke.py::test_cluster_deduplicates_identical_rows_before_partition_metrics` | passed; duplicated and deduplicated tables produce identical metric rows |
+| A manifest changed after protection is refused instead of re-resolved | this round | `tests/test_cli_smoke.py::test_finetune_refuses_a_manifest_changed_after_protection` | passed; the pre-fix source re-resolves |
+| An empty (header-only) CSV is read once, not twice | this round | `tests/test_cli_smoke.py::test_resolve_training_images_reads_an_empty_csv_once` | passed; 2 reads before the fix |
+| Round-wide set | this round | `tests/test_cli_smoke.py` (cluster/finetune/pretrain/manifest nodes), `tests/test_output_safety.py` | 154 passed, 63 passed |

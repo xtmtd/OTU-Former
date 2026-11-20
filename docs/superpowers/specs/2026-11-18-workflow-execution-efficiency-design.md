@@ -313,3 +313,17 @@ branches: a queue run whose `--visualize-data` names its training CSV, and a
 finetune run whose overwrite protection already resolved the manifest (handed to
 `MetricDataset` through `finetune_resolved_images`). The execution record gained
 per-round command/result tables and corrected consumer-chain citations.
+
+### Sixth audit round (2026-11-19)
+
+The fifth round introduced a conflict check that ran after the output was
+prepared, so `--overwrite` could clear an earlier report before rejecting a
+label table. Label parsing, blank filtering, deduplication and the conflict check
+now run before `prepare_output_dir`; a sentinel test pins that an existing
+report survives the rejection. Two further gaps closed: a finetune run whose
+manifest changed after protection now refuses to continue instead of
+re-resolving a different selection behind a cleaned output, and an empty
+(header-only) CSV is read once because the carrier distinguishes an empty CSV
+from no CSV at all. The duplicate-label test was strengthened so a regression in
+deduplication cannot pass unnoticed: the duplicated and deduplicated tables must
+produce identical metric rows.
