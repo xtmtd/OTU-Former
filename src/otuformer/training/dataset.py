@@ -452,7 +452,10 @@ def resolve_training_images(
             raise ValueError(f"CSV {csv_path} missing required 'image' column")
         refs = tuple(str(value) for value in frame["image"])
     paths = resolve_dataset_image_paths(
-        csv_path, images_root, refs=list(refs) if refs else None
+        csv_path,
+        images_root,
+        # An empty CSV resolves no rows; passing None here would read it again.
+        refs=None if csv_path is None else list(refs),
     )
     return ResolvedTrainingImages(
         csv_path=str(csv_path or ""),
@@ -550,7 +553,9 @@ def prepare_relational_data(
             raise ValueError(f"CSV {csv_path} missing required 'image' column")
         refs = tuple(str(value) for value in frame["image"])
     paths = resolve_dataset_image_paths(
-        csv_path, images_root, refs=list(refs) if refs else None
+        csv_path,
+        images_root,
+        refs=None if csv_path is None else list(refs),
     )
     if not paths:
         raise ValueError(
@@ -1544,8 +1549,16 @@ class MetricDataset(Dataset):
             and prepared_images is not None
             and prepared_images.csv_path == str(csv_path or "")
             and prepared_images.images_dir == str(images_root)
-            and list(prepared_images.refs) == refs
         )
+        if reuse and list(prepared_images.refs) != refs:
+            # The protection boundary already ran on the prepared selection. A
+            # changed manifest must not be re-resolved into a different input
+            # after an overwrite could have removed the protected files.
+            raise ValueError(
+                "The training manifest changed after overwrite protection: its "
+                "rows no longer match the selection the run prepared. Re-run the "
+                "command so protection and training use one manifest."
+            )
         self.image_paths = (
             list(prepared_images.paths)
             if reuse
