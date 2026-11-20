@@ -608,6 +608,27 @@ def _plot_upgma_partition_tree_panel(
 def _plot_metrics_dashboard(metrics_df, out_path: Path) -> None:
     import matplotlib.pyplot as plt
 
+    # An unavailable metric is an empty field, not a missing column: a cohort
+    # that cannot produce a score must still plot the ones it has.
+    for name in (
+        "n_OTUs",
+        "ARI",
+        "NMI",
+        "AMI",
+        "BCubed_fscore",
+        "splitting_index",
+        "lumping_index",
+        "silhouette_species",
+        "silhouette_cluster",
+        "homogeneity",
+        "completeness",
+        "v_measure",
+        "WSS",
+        "purity",
+    ):
+        if name not in metrics_df.columns:
+            metrics_df[name] = float("nan")
+
     fig, axes = plt.subplots(3, 3, figsize=(18, 14))
 
     axes[0, 0].plot(metrics_df["cutoff"], metrics_df["n_OTUs"], "o-", color="#1f77b4")
@@ -1061,30 +1082,46 @@ def cluster(
             labels_aligned = lbl_df[[key_col, "label"]].copy()
             labels_aligned.rename(columns={key_col: "id"}, inplace=True)
             labels_aligned["id"] = labels_aligned["id"].astype(str)
+            # A blank label is unlabeled, not a class named "": dropping it here
+            # keeps the fixed-tree score and the partition metrics on the same
+            # valid rows instead of turning NaN into a label.
+            label_text = labels_aligned["label"]
+            valid_label = label_text.notna() & label_text.astype(str).str.strip().ne("")
+            labels_aligned = labels_aligned[valid_label].copy()
+            labels_aligned["label"] = labels_aligned["label"].astype(str)
             id_to_label = dict(zip(labels_aligned["id"], labels_aligned["label"]))
             merged = emb_df[["id"]].merge(labels_aligned, on="id", how="inner")
             if len(merged) > 0:
                 id_to_row = {v: i for i, v in enumerate(ids)}
-                merged_idx = [id_to_row[i] for i in merged["id"].astype(str)]
-                true_labels_arr = merged["label"].to_numpy()
-                x_for_metrics = x[merged_idx]
-                d_for_metrics = d[np.ix_(merged_idx, merged_idx)]
+                merged_idx = np.array(
+                    [id_to_row[i] for i in merged["id"].astype(str)], dtype=int
+                )
+                final_labels = merged["label"].astype(str).to_numpy()
+                final_idx = merged_idx
 
                 if (
                     metrics_sample_size > 0
-                    and len(true_labels_arr) > metrics_sample_size
+                    and len(final_idx) > metrics_sample_size
                 ):
                     from otuformer.embedding.sampling import sorted_sample_indices
 
                     sample_idx = sorted_sample_indices(
-                        len(true_labels_arr), metrics_sample_size, random_state
+                        len(final_idx), metrics_sample_size, random_state
                     )
-                    true_labels_arr = true_labels_arr[sample_idx]
-                    x_for_metrics = x_for_metrics[sample_idx]
-                    d_for_metrics = d_for_metrics[np.ix_(sample_idx, sample_idx)]
-                # One metrics linkage, from the already-computed distances of the
-                # aligned (and possibly sampled) cohort submatrix.
-                z_metrics = build_upgma(d_for_metrics)
+                    final_idx = merged_idx[sample_idx]
+                    final_labels = final_labels[sample_idx]
+                if len(final_idx) >= 2:
+                    true_labels_arr = final_labels
+                    # One slice of the already-computed distances for the final
+                    # cohort, then one metrics linkage from it.
+                    x_for_metrics = x[final_idx]
+                    d_for_metrics = d[np.ix_(final_idx, final_idx)]
+                    z_metrics = build_upgma(d_for_metrics)
+                else:
+                    typer.echo(
+                        "[Warning] Fewer than two labeled embeddings; skipping "
+                        "partition metrics."
+                    )
             else:
                 typer.echo(
                     "[Warning] No overlapping IDs between embeddings and --label-csv."
