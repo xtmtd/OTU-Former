@@ -1388,3 +1388,20 @@ def test_fifo_enabled_recipe_requires_preparation(tmp_path):
             None,
             settings=settings,
         )
+
+
+def test_queue_preparation_keeps_the_row_references_it_resolved(tmp_path):
+    import pathlib
+
+    csv, names = _write_images(tmp_path)
+    preparation = recipe.prepare_pretrain_relational_queue(
+        _request(tmp_path, csv, relational_queue_size=2,
+                 relational_queue_size_explicit=True),
+        None,
+    )
+
+    data = preparation.data
+    assert data is not None
+    # The references and the paths come from one read of the manifest.
+    assert data.refs == tuple(names)
+    assert [pathlib.Path(path).name for path in data.image_paths] == names

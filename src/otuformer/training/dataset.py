@@ -499,6 +499,9 @@ class PreparedRelationalData:
     image_keys: tuple[str, ...]
     data_fingerprint: str
     data_size_bytes: int
+    #: The ordered CSV row references these paths were resolved from, kept from
+    #: the same read so a later consumer can prove the file did not change.
+    refs: tuple[str, ...] = ()
 
 
 def _selected_identity_key(images_root: Path, path: Path) -> str:
@@ -537,7 +540,18 @@ def prepare_relational_data(
             f"batch_size must be a positive integer, got {batch_size!r}."
         )
 
-    paths = resolve_dataset_image_paths(csv_path, images_root)
+    # One read of the manifest drives both the selection and the references
+    # kept beside it; a later re-read cannot silently pair new rows with these
+    # paths.
+    refs: tuple[str, ...] = ()
+    if csv_path is not None:
+        frame = pd.read_csv(csv_path)
+        if "image" not in frame.columns:
+            raise ValueError(f"CSV {csv_path} missing required 'image' column")
+        refs = tuple(str(value) for value in frame["image"])
+    paths = resolve_dataset_image_paths(
+        csv_path, images_root, refs=list(refs) if refs else None
+    )
     if not paths:
         raise ValueError(
             "The relational queue needs at least one selected image; the CSV or "
@@ -622,6 +636,7 @@ def prepare_relational_data(
         image_keys=tuple(keys),
         data_fingerprint=fingerprint,
         data_size_bytes=total_bytes,
+        refs=refs,
     )
 
 
@@ -1506,6 +1521,7 @@ class MetricDataset(Dataset):
         *,
         rows: list[dict] | None = None,
         class_labels: list[str] | None = None,
+        prepared_images: ResolvedTrainingImages | None = None,
     ) -> None:
         # ``rows`` is the opt-in pseudo-mode path: already-validated in-memory
         # expert+accepted rows with an explicit ordered class table. The default
@@ -1523,7 +1539,18 @@ class MetricDataset(Dataset):
             )
         images_root = Path(images_dir)
         refs = [str(row) for row in df["image"]]
-        self.image_paths = resolve_dataset_image_paths(None, images_root, refs=refs)
+        reuse = (
+            rows is None
+            and prepared_images is not None
+            and prepared_images.csv_path == str(csv_path or "")
+            and prepared_images.images_dir == str(images_root)
+            and list(prepared_images.refs) == refs
+        )
+        self.image_paths = (
+            list(prepared_images.paths)
+            if reuse
+            else resolve_dataset_image_paths(None, images_root, refs=refs)
+        )
         if class_labels is None:
             classes = sorted(df["label"].unique())
             self.class_to_idx = {c: i for i, c in enumerate(classes)}
