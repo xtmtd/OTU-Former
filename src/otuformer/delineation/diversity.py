@@ -323,6 +323,13 @@ def diversity_table_from_counts(
     every threshold, and a threshold above 0 keeps only counts at or above it.
     """
     counts = np.asarray(counts, dtype=int)
+    if (counts < 0).any():
+        # The expanded-row reference refused a negative repeat count; filtering
+        # it away would turn a corrupt table into a plausible report.
+        raise ValueError(
+            "The OTU table contains a negative abundance; expected non-negative "
+            "integer counts."
+        )
     records: dict[str, dict[str, float]] = {}
     for min_ab in min_abundances:
         keep = counts > 0

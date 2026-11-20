@@ -582,3 +582,10 @@ def test_otu_table_diversity_matches_the_expanded_reference(tmp_path: Path):
             expanded(row), thresholds, tree_newick_path=tree_path
         )
         pd.testing.assert_frame_equal(per_sample[str(sample)], reference)
+
+
+def test_otu_table_diversity_rejects_negative_abundance():
+    otu = pd.DataFrame({"OTU_1": [3], "OTU_2": [-1]}, index=["s1"])
+
+    with pytest.raises(ValueError, match="negative abundance"):
+        build_diversity_tables_from_otu_table(otu, [0, 1], None)
