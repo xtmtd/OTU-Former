@@ -326,6 +326,9 @@ def run_finetune(
             image_size=finetune_image_size,
             augmentation_profile=profile,
             orientation_policy=policy,
+            # The CLI may already have resolved this manifest for overwrite
+            # protection; the row references prove it is still the same one.
+            prepared_images=getattr(args, "finetune_resolved_images", None),
         )
     expert_label_indices = (
         [

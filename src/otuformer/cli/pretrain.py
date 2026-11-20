@@ -1005,11 +1005,19 @@ def pretrain(
         ):
             protected.append(visualize_data)
             if (
-                resolved_training_images is not None
-                and str(visualize_data) == str(train_data)
+                str(visualize_data) == str(train_data)
+                and (
+                    resolved_training_images is not None
+                    or (
+                        relational_queue_preparation.active
+                        and relational_queue_preparation.data is not None
+                    )
+                )
             ):
-                # Same source: protect the selection already resolved for it.
-                protected.extend(resolved_training_images.paths)
+                # Same source: the selection already resolved for it is already
+                # protected (queue or ordinary), so nothing is resolved again.
+                if resolved_training_images is not None:
+                    protected.extend(resolved_training_images.paths)
             else:
                 protected.extend(
                     resolve_dataset_image_paths(visualize_data, input_images_dir)
