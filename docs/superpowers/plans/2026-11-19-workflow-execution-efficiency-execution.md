@@ -188,8 +188,8 @@ Round 4 focused sets on the round's commits:
 
 | Fix | Commit | Command | Result |
 | --- | --- | --- | --- |
-| Label table read, blank filtering, dedup and conflict check moved before `prepare_output_dir` | this round | `tests/test_cli_smoke.py::test_cluster_label_conflict_is_rejected_before_overwrite` | passed; the sentinel survives, and the pre-fix source deletes it |
+| Label table read, blank filtering, dedup and conflict check moved before `prepare_output_dir` | `802849c` | `tests/test_cli_smoke.py::test_cluster_label_conflict_is_rejected_before_overwrite` | passed; the sentinel survives, and the pre-fix source deletes it |
 | Duplicate-label dedup proved to reach the partition cohort | this round | `tests/test_cli_smoke.py::test_cluster_deduplicates_identical_rows_before_partition_metrics` | passed; duplicated and deduplicated tables produce identical metric rows |
-| A manifest changed after protection is refused instead of re-resolved | this round | `tests/test_cli_smoke.py::test_finetune_refuses_a_manifest_changed_after_protection` | passed; the pre-fix source re-resolves |
-| An empty (header-only) CSV is read once, not twice | this round | `tests/test_cli_smoke.py::test_resolve_training_images_reads_an_empty_csv_once` | passed; 2 reads before the fix |
-| Round-wide set | this round | `tests/test_cli_smoke.py` (cluster/finetune/pretrain/manifest nodes), `tests/test_output_safety.py` | 154 passed, 63 passed |
+| A manifest changed after protection is refused instead of re-resolved | `571eedc` | `tests/test_cli_smoke.py::test_finetune_refuses_a_manifest_changed_after_protection` | passed; the pre-fix source re-resolves |
+| An empty (header-only) CSV is read once, not twice | `571eedc` (both `dataset.py` fixes landed in that commit) | `tests/test_cli_smoke.py::test_resolve_training_images_reads_an_empty_csv_once` | passed; 2 reads before the fix |
+| Round-wide set | `802849c..571eedc` | `tests/test_cli_smoke.py` (cluster/finetune/pretrain/manifest nodes), `tests/test_output_safety.py`, then the whole cli smoke file and the queue/alignment/startup set | 154 passed, 63 passed; then 242 passed and 378 passed |
