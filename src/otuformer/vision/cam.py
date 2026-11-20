@@ -500,8 +500,12 @@ def selected_image_paths(
         rows = rows.head(max(0, max_images))
     image_map = {}
     if label_csv is not None:
-        for path in _image_files(images_dir):
-            image_map[path.name] = path
+        # Traversal order, not sorted order: two same-named files under different
+        # subdirectories resolved to the last one walked before this change, and
+        # protection, selection and the published label must keep agreeing.
+        for path in images_dir.rglob("*"):
+            if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS:
+                image_map[path.name] = path
     return [image_map.get(ref, images_dir / ref) for ref in rows["image"]]
 
 

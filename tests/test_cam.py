@@ -1191,3 +1191,27 @@ def test_cam_loads_arcface_embedding_head_checkpoint(tmp_path):
     assert name == "vit_tiny_patch16_224"
     assert size == 224
     assert isinstance(cam_model, torch.nn.Module)
+
+
+def test_selected_image_paths_keeps_the_traversal_order_for_duplicate_names(tmp_path):
+    """Two same-named files resolve by traversal order, as before."""
+    import pandas as pd
+
+    from otuformer.vision.cam import selected_image_paths
+
+    for name in ("z", "a"):
+        directory = tmp_path / name
+        directory.mkdir()
+        Image.new("RGB", (16, 16)).save(directory / "same.jpg")
+    labels = tmp_path / "labels.csv"
+    pd.DataFrame({"image": ["same.jpg"], "label": ["x"]}).to_csv(labels, index=False)
+
+    walked = sorted(
+        (path for path in tmp_path.rglob("*") if path.suffix.lower() == ".jpg"),
+    )
+    traversal = [
+        path for path in tmp_path.rglob("*") if path.suffix.lower() == ".jpg"
+    ]
+    assert selected_image_paths(tmp_path, labels) == [traversal[-1]]
+    if traversal != walked:
+        assert selected_image_paths(tmp_path, labels) != [walked[-1]]
