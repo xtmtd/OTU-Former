@@ -77,6 +77,7 @@ from .finetune_support import (
     _validate_finetune_resume_source,
     _warn_pseudo_resume_drift,
     _weighted_ce,
+    _UNLOADED,
     _write_pseudo_outputs,
     finetune_payload_for,
     preflight_finetune_source,
@@ -130,11 +131,14 @@ def run_finetune(
         ckpt_path = Path(pseudo_data["ssl_checkpoint"])
     else:
         ckpt_path = Path(args.checkpoint)
-    if source_checkpoint is not None:
-        # The CLI preflight already read this checkpoint; reusing it keeps the
-        # validation read and the training read from diverging.
-        ckpt = source_checkpoint
-        bound = handoff.source_checkpoint is source_checkpoint
+    if handoff.source_checkpoint is not _UNLOADED:
+        # The private handoff is path-bound and wins: a changed request reloads
+        # instead of serving a payload read from another file.
+        ckpt, bound = finetune_payload_for(handoff, ckpt_path)
+    elif source_checkpoint is not None:
+        # Independent callers may preload a payload themselves. Without the path
+        # it came from, only the payload is reusable, never the decisions.
+        ckpt, bound = source_checkpoint, False
     else:
         ckpt, bound = finetune_payload_for(handoff, ckpt_path)
     cfg = ckpt.get("config", {})
@@ -143,8 +147,13 @@ def run_finetune(
     if resume_path is not None:
         _validate_finetune_resume_source(ckpt)
     # Identity/lineage validation happens before the output directory can be
-    # created or cleared, for direct callers as well as the CLI.
-    preflight_finetune_source(ckpt, str(cfg.get("model_name") or args.model_name))
+    # created or cleared, for direct callers as well as the CLI. The CLI already
+    # did it for this bound path and handed the result over, so the projector
+    # validation model is not built twice.
+    if not (bound and handoff.source_preflighted):
+        preflight_finetune_source(
+            ckpt, str(cfg.get("model_name") or args.model_name)
+        )
     # Resume preserves the pair recorded in its own config; a new run derives it
     # from the loaded SSL/metric payload. Neither path reopens the SSL file.
     ssl_source_identity = _resolve_finetune_ssl_source(ckpt)
@@ -683,12 +692,22 @@ def run_finetune(
     if compute_embedding_metrics and evaluation_manifest is None and evaluation_csv:
         # A separate timer: the enclosing recovery phase is still open here.
         manifest_phase = _phase_start("evaluation manifest")
+        # The training dataset already resolved this CSV when evaluation reads the
+        # same manifest; reuse its ordered rows and paths instead of resolving a
+        # second time.
+        reuse_training = (
+            pseudo_rows is None
+            and evaluation_csv == str(getattr(args, "train_data", "") or "")
+            and bool(getattr(ds, "image_refs", None))
+        )
         try:
             evaluation_manifest = prepare_evaluation_manifest(
                 Path(evaluation_csv),
                 Path(args.input_images_dir),
                 max_samples=int(getattr(args, "metrics_sample_size", 10000)),
                 seed=int(args.seed),
+                image_paths=tuple(ds.image_paths) if reuse_training else None,
+                refs=tuple(ds.image_refs) if reuse_training else None,
             )
         except (ValueError, OSError, KeyError) as exc:
             manifest_unavailable = True

@@ -956,15 +956,11 @@ def finetune(
             source_path="" if source_path is None else str(source_path),
             source_checkpoint=source_checkpoint,
             loss_config=resolved_loss,
+            source_preflighted=True,
         )
-        # Hand over the checkpoint the preflight already read; passing it only
-        # when present keeps direct callers (and their mocks) unchanged.
-        extra = (
-            {"source_checkpoint": source_checkpoint}
-            if source_checkpoint is not None
-            else {}
-        )
-        finetune_loop_module.run_finetune(ns, explicit_options=explicit_options, **extra)
+        # The handoff is the only channel for the CLI's payload: the runner binds
+        # it to the requested path, so a patched path cannot serve a stale read.
+        finetune_loop_module.run_finetune(ns, explicit_options=explicit_options)
     except Exception:
         traceback.print_exc(file=tee)
         raise

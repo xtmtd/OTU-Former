@@ -4333,15 +4333,19 @@ def test_finetune_loss_mode_resume_hands_the_preloaded_checkpoint_to_the_trainer
     def fake_run_finetune(
         args, *, explicit_options=frozenset(), source_checkpoint=None
     ):
-        seen["preloaded"] = source_checkpoint
+        # The handoff is the only channel now: it carries the payload and the
+        # path it came from, so the runner can bind it.
+        seen["handoff"] = args.finetune_handoff
 
     monkeypatch.setattr("otuformer.training.finetune_loop.run_finetune", fake_run_finetune)
     result = runner.invoke(app, _finetune_cli_argv(tmp_path, "--resume", str(source)))
 
     assert result.exit_code == 0, result.output
     # The preflight read is handed over instead of being repeated in the trainer.
-    assert isinstance(seen["preloaded"], dict)
-    assert "model_state_dict" in seen["preloaded"]
+    handoff = seen["handoff"]
+    assert handoff.source_path == str(source)
+    assert "model_state_dict" in handoff.source_checkpoint
+    assert handoff.loss_config["loss"]
 
 
 def test_finetune_loss_mode_checkpoint_preflight_rejects_bad_sources_before_output(
@@ -6346,3 +6350,85 @@ def test_cam_collects_the_manifest_once_for_directory_and_csv(tmp_path, monkeypa
         assert result.exit_code == 0, result.output
         assert len(collects) == 1, extra
         assert len(walks) == 1, extra
+
+
+def test_cluster_skips_blank_labels_and_one_labeled_row(tmp_path):
+    emb_path, _ = _make_embeddings_and_labels(tmp_path)
+    labels = tmp_path / "blank_labels.csv"
+    pd.DataFrame(
+        {
+            "id": ["a", "b", "c", "d"],
+            "label": ["A", "", "A", None],
+        }
+    ).to_csv(labels, index=False)
+
+    out_dir = tmp_path / "cluster_blank"
+    result = runner.invoke(
+        app,
+        [
+            "cluster",
+            "--embeddings", str(emb_path),
+            "--out-dir", str(out_dir),
+            "--labels", str(labels),
+            "--custom-cutoffs", "0.5",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    metrics = pd.read_csv(out_dir / "UPGMA" / "metrics.csv")
+    # Only the two labeled rows (a, c) are scored; the blank and missing labels
+    # are not classes of their own.
+    assert metrics["monophyly_proportion"].nunique() == 1
+
+    single = tmp_path / "single_label.csv"
+    pd.DataFrame({"id": ["a", "b", "c", "d"], "label": ["A", "", "", None]}).to_csv(
+        single, index=False
+    )
+    out_single = tmp_path / "cluster_single"
+    result = runner.invoke(
+        app,
+        [
+            "cluster",
+            "--embeddings", str(emb_path),
+            "--out-dir", str(out_single),
+            "--labels", str(single),
+            "--custom-cutoffs", "0.5",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert not (out_single / "UPGMA" / "metrics.csv").exists()
+    assert "Fewer than two labeled embeddings" in result.output
+
+
+def test_pretrain_overwrite_protection_reuses_the_training_selection(tmp_path, monkeypatch):
+    """--visualize-data equal to --train-data must not be resolved again."""
+    import otuformer.training.dataset as dataset_module
+
+    csv_path = _make_resume_pretrain_csv(tmp_path)
+    out_dir = tmp_path / "protect_out"
+    (out_dir / "logs").mkdir(parents=True)
+    calls = []
+    real_resolve = dataset_module.resolve_dataset_image_paths
+    monkeypatch.setattr(
+        dataset_module,
+        "resolve_dataset_image_paths",
+        lambda *a, **k: calls.append(1) or real_resolve(*a, **k),
+    )
+    monkeypatch.setattr(
+        pretrain_loop_module, "run_pretrain", lambda args, **kwargs: None
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "pretrain",
+            "--train-data", str(csv_path),
+            "--input-images-dir", str(tmp_path),
+            "--out-dir", str(out_dir),
+            "--overwrite",
+            "--visualize-data", str(csv_path),
+            "--device", "cpu",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert len(calls) == 1

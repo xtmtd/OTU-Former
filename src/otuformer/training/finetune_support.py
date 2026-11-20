@@ -303,6 +303,9 @@ class _FinetuneHandoff:
     source_path: str | None = None
     source_checkpoint: Any = _UNLOADED
     loss_config: dict[str, Any] | None = None
+    #: The CLI already ran the source preflight for this path; the runner must
+    #: not build the validation model again.
+    source_preflighted: bool = False
 
 
 def take_finetune_handoff(args: argparse.Namespace) -> "_FinetuneHandoff":

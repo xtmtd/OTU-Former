@@ -4906,3 +4906,63 @@ def test_finetune_reads_the_loss_once_per_step(tmp_path, monkeypatch):
     # share it.
     assert len(reads) == 2
     assert len(set(reads)) == 2
+
+
+def test_run_finetune_reloads_a_handoff_bound_to_another_path(tmp_path):
+    """A handout from old.pth must not be used when the request is new.pth."""
+    from otuformer.training import finetune_support as finetune_support_module
+    from otuformer.training.model import OTUFormerEncoder
+    from otuformer.utils.checkpoint import load_checkpoint
+
+    args = _tiny_finetune_args(tmp_path, tmp_path / "ft_reload", 50)
+    old_path = Path(args.checkpoint)
+    old_payload = load_checkpoint(old_path)
+
+    encoder = OTUFormerEncoder(
+        model_name="vit_tiny_patch16_224", out_dim=16, pretrained=False, img_size=64
+    )
+    new_path = tmp_path / "source_64.pth"
+    torch.save(
+        {
+            "model_state_dict": encoder.state_dict(),
+            "config": {"model_name": "vit_tiny_patch16_224", "out_dim": 16},
+            "args": {"global_crop_size": 64},
+        },
+        new_path,
+    )
+    args.checkpoint = str(new_path)
+    args.finetune_handoff = finetune_support_module._FinetuneHandoff(
+        source_path=str(old_path),
+        source_checkpoint=old_payload,
+        loss_config={
+            "loss": "arcface",
+            "subcenters": None,
+            "compact_weight": None,
+            "compact_cap": None,
+            "supcon_temperature": None,
+        },
+    )
+
+    # Mirrors the CLI, which used to pass the payload it had read as well.
+    finetune_loop_module.run_finetune(args, source_checkpoint=old_payload)
+
+    saved = torch.load(
+        tmp_path / "ft_reload" / "finetune_latest.pth",
+        map_location="cpu",
+        weights_only=False,
+    )
+    # The 64 px source was read; the stale 32 px payload would report 32.
+    assert saved["config"]["image_size"] == 64
+
+
+def test_evaluation_manifest_rejects_an_empty_csv(tmp_path):
+    """A header-only manifest is unusable, not an empty evaluation set."""
+    images = tmp_path / "empty_images"
+    images.mkdir()
+    csv_path = tmp_path / "empty.csv"
+    csv_path.write_text("image,label\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="selected no evaluation rows"):
+        reporting_module.prepare_evaluation_manifest(
+            csv_path, images, max_samples=0, seed=1
+        )
