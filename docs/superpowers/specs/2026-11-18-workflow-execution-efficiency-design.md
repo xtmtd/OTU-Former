@@ -1,6 +1,11 @@
 # OTU-Former Workflow Execution Efficiency — Design
 
-**Status:** Draft for design review (2026-11-19). This single draft supersedes the earlier training-only draft and incorporates the operator's request to include the six downstream commands. Accepted decisions recorded to date: compute `monophyly_proportion` on the fixed output tree and only labeled tips under partial coverage; include bounded E1–E5 architecture scope; use path-bound finetune handoff; include C1–C7 as gated candidates; document worker flag scope without enabling workers; and extend, not overwrite, the throughput evidence schema. On 2026-11-19 the operator also accepted warning once and disabling periodic evaluation on manifest startup failure, skipping evaluation preparation under `--disable-embedding-metrics`, and snapshotting rows, paths and labels together for the invocation. Later accepted refinements are recorded in the body and not repeated here: A's benefit conditionality and its over-cap acceptance workload (§3, §8); the four-value implementation-disposition vocabulary and the §10 addendum location (§8, §9); the classification of D2's duplicate-linkage reuse as a parity change rather than a performance gate (§6.2, §8); E1's four-point startup resolution chain with an ordinary-run path-only carrier that excludes `PreparedRelationalData` (E1); and the narrowed evaluation-manifest phase boundary (E1). Acceptance of these items does not approve the whole design, a plan, implementation, profiling or training, or a commit or release.
+**Status:** Design accepted; implementation executed on 2026-11-19 — see
+[§10](#10-implementation-dispositions) for per-unit dispositions and
+[the execution record](../plans/2026-11-19-workflow-execution-efficiency-execution.md)
+for commits, commands and results. Every §8 performance gate remains
+`not measured: authorization pending`, so acceptance here is correctness-only.
+Original draft status (2026-11-19): This single draft supersedes the earlier training-only draft and incorporates the operator's request to include the six downstream commands. Accepted decisions recorded to date: compute `monophyly_proportion` on the fixed output tree and only labeled tips under partial coverage; include bounded E1–E5 architecture scope; use path-bound finetune handoff; include C1–C7 as gated candidates; document worker flag scope without enabling workers; and extend, not overwrite, the throughput evidence schema. On 2026-11-19 the operator also accepted warning once and disabling periodic evaluation on manifest startup failure, skipping evaluation preparation under `--disable-embedding-metrics`, and snapshotting rows, paths and labels together for the invocation. Later accepted refinements are recorded in the body and not repeated here: A's benefit conditionality and its over-cap acceptance workload (§3, §8); the four-value implementation-disposition vocabulary and the §10 addendum location (§8, §9); the classification of D2's duplicate-linkage reuse as a parity change rather than a performance gate (§6.2, §8); E1's four-point startup resolution chain with an ordinary-run path-only carrier that excludes `PreparedRelationalData` (E1); and the narrowed evaluation-manifest phase boundary (E1). Acceptance of these items does not approve the whole design, a plan, implementation, profiling or training, or a commit or release.
 
 ## 1. Intent and constraints
 
@@ -183,7 +188,7 @@ speed claim is made.
 | Unit | Disposition | Evidence or reason |
 | --- | --- | --- |
 | A | implemented — benefit unqualified (measurement not authorized; no over-cap workload authorized) | Startup manifest snapshot, select-before-decode, one-warning disable path, epoch-logger survival and disable bypass covered by focused tests; avoided decode/forward rows and paired timing not measured. |
-| B | implemented — benefit unqualified (no throughput claim; duplicate-load gate passed) | One resume deserialization in the CLI, one resolved loss decision handed over, path-bound reload verified by tests; correctness and duplicate-load gate only. |
+| B | implemented — benefit unqualified (no throughput claim; ordinary-resume duplicate-load gate passed only) | One resume deserialization in the CLI, one resolved loss decision handed over, path-bound reload verified for both the helper and the real runner entry (a handout bound to another path is reloaded), and the CLI no longer also passes the legacy payload argument. The runner skips its own source preflight only for a handoff the CLI already preflighted for that bound path. Not done: a new pseudo round still opens the pseudo-source separately for inheritance, pseudo validation and candidate features. |
 | C1 | implemented — benefit unqualified (authorization pending) | Non-FIFO teacher targets build once per used slot per step; parity with the per-pair reference and student gradients verified; target-build counts measured in tests, step time not measured. |
 | C2 | implemented — benefit unqualified (authorization pending) | iBOT and masked-feature heads receive only selected rows; selected row counts, center inputs, full encoder forwards and unchanged RNG verified; head row savings not timed. |
 | C3 | implemented — benefit unqualified (authorization pending) | Prototype counts batched into one host transfer; exact counts, ties, margin totals, one-class and SupCon no-op verified; per-sample readback count asserted, step time not measured. |
@@ -191,15 +196,15 @@ speed claim is made.
 | C5 | implemented — benefit unqualified (authorization pending) | The cosine value is materialized only on steps consumed by the CSV row or the postfix; call counts asserted; timing not measured. |
 | C6 | not pursued — not measured: authorization pending; no code change; claim open | The existing scan share of representative real step time was not measured, so the <1% close gate could not be applied. This is not a measured no-benefit result. |
 | C7 | implemented — benefit unqualified (authorization pending) | One host value per step feeds both consumers; total-loss readback count asserted; timing not measured. |
-| D1 | implemented — benefit unqualified (timing and peak memory not measured) | The spatial checkpoint digest, deserialized model and protected-input snapshot now come from one read (three reads to one); explicit-layer CLI preflight keeps its CPU probe rather than handing a live model to the device-placed extractor. |
-| D2 | implemented — benefit unqualified (correctness correction plus one-linkage parity; no performance gate at the default pair limit) | Monophyly is scored on the fixed output tree with labeled tips only; the pre-fix sampled-tree misalignment is pinned as a characterization value, not expected behavior; one metrics linkage asserted. |
+| D1 | implemented — benefit unqualified (timing and peak memory not measured) | The spatial checkpoint digest, deserialized model and protected-input snapshot now come from one read (three reads to one). The embedding record path deserializes the bytes it snapshotted and re-reads once afterwards purely as the drift check, releasing the first buffer before that read, so two byte buffers are no longer live with the payload; one verification read remains by design. Explicit-layer CLI preflight keeps its CPU probe rather than handing a live model to the device-placed extractor. |
+| D2 | implemented — benefit unqualified (correctness correction plus one-linkage parity; no performance gate at the default pair limit) | Monophyly is scored on the fixed output tree with labeled tips only, and blank labels are treated as unlabeled instead of becoming a `NaN` class; the pre-fix sampled-tree misalignment is pinned by an independent reimplementation of the old algorithm, not by the new code. One metrics linkage, built from a single distance slice for the final sampled cohort; a cohort with fewer than two labeled rows skips partition metrics with a warning instead of attempting a one-point tree. |
 | D3 | implemented — benefit unqualified (reuse/parity change, no timing claim) | One `within_group_summary` under `delineation`; cross-command column parity and singleton convention verified. |
 | D4 | implemented — benefit unqualified (memory and timing not measured) | The OTU-table path filters counts directly with parity against the expanded reference; expansion is asserted absent; NJ base-tree copy reuse omitted for lack of exact topology/support proof. |
 | D5 | implemented — benefit unqualified (timing not measured) | One ordered selection serves protection and execution; selector call count 2 to 1 asserted; prediction/overlay/array alignment covered by existing tests. |
 | D6 | implemented — benefit unqualified (correctness gate only) | The embedding model and size are prepared before the overwrite boundary and reused by export; prior-publication sentinel verified for an invalid size. |
 | E1 | implemented — benefit unqualified (measurement not authorized) | Startup-once manifest, `_PretrainHandoff` slot lifecycle and the ordinary-run path-only carrier verified by tests. Inside the dataset phase one resolution now feeds both the dataset and the evaluation manifest for the same CSV and root (queue runs reuse their identity-checked selection); a resolution-count test asserts one call for an ordinary fresh run. The carrier also keeps the ordered CSV row references, and the manifest rejects a same-length reordered rewrite instead of pairing old paths with new labels. Wall time not measured. |
 | E2 | implemented — benefit unqualified (correctness/duplicate-load gate) | Private path-bound finetune handoff with explicit-None versus unloaded semantics; reload on path change verified. |
-| E3 | not pursued (bounded moves executed elsewhere; `_evaluate_records` stays in CLI) | `_evaluate_records` reads a parsed bundle and publishes the UMAP artifact, so moving it would carry publication out of the CLI; the shared sampling rule and within-group summary moved to their owners under E4/D3. |
+| E3 | not pursued (bounded moves executed elsewhere; `_evaluate_records` stays in CLI) | `_evaluate_records` reads a parsed bundle and publishes the UMAP artifact, so moving it wholesale would carry publication out of the CLI. This is a real partial delivery: its pure calculation was not split out, and only the sampling rule and the within-group summary moved to their owners under E4/D3. |
 | E4 | implemented — benefit unqualified (no timing claim) | One seeded sorted index rule under `otuformer.embedding` used by the manifest, extract (both callsites) and cluster; tree-bootstrap and stratified silhouette sampling left untouched. |
 | E5 | implemented — benefit unqualified (documentation-only scope) | `--num-workers` scope is documented as training loaders only with serial evaluation; no worker implementation or `persistent_workers` change. |
 | E6 | implemented — benefit unqualified (fixture repair; no timing claim) | The six resume smoke nodes pass with no production-source change; the loader-step preflight keeps full resolution and reuses it where contracts match. |
@@ -253,3 +258,42 @@ compares them with the CSV it reads for labels, and raises
 mismatch — which the startup warning path turns into one warning and no periodic
 evaluation for that invocation. A regression test reorders the CSV between the
 two reads and asserts the rejection; paths without references are refused.
+
+### Fourth audit round (2026-11-19)
+
+A third-party audit of `2d37064..5a32daf` found four result-level defects and
+several partial deliveries. Fixed with tests that failed first:
+
+- **finetune path binding**: the CLI passed the preflight payload twice, and the
+  runner's legacy `source_checkpoint=` branch compared payload identity only, so
+  a request for a different path could still restore the old payload. The
+  runner now prefers the path-bound handoff and treats the legacy argument as an
+  unbound payload that may not reuse decisions; the CLI hands over the payload
+  only through the handoff. A test mirrors the CLI's old double-pass and asserts
+  the 64 px source is the one trained from.
+- **cluster partial labels**: blank labels were read as `NaN` yet counted as a
+  class. Blank or missing labels are now dropped before both the fixed-tree
+  score and the partition cohort, a cohort below two labeled rows skips partition
+  metrics with a warning instead of building a one-point tree, and the metrics
+  dashboard fills unavailable columns as `NaN` so it no longer raises on a
+  cohort that cannot produce every score.
+- **diversity negative abundances**: filtering `counts > 0` silently dropped a
+  negative abundance that the legacy expansion refused. Negative counts are now
+  rejected before threshold filtering.
+- **CAM duplicate names**: sorting the image index changed which of two
+  same-named files under different subdirectories was selected. The historical
+  traversal-order resolution is restored, so protection, selection and the
+  published label keep agreeing with earlier outputs.
+
+Reuse and delivery gaps addressed in the same round: the queue-run carrier now
+carries ordered row references so queue runs reuse the manifest instead of
+re-resolving; overwrite protection reuses the training selection when
+`--visualize-data` names the same CSV; a finetune run whose evaluation reads the
+same CSV reuses its training dataset's selection; a header-only evaluation CSV is
+rejected as unusable instead of producing an empty snapshot; the runner no
+longer repeats the CLI's source preflight for an already-validated bound path.
+The embedding record path releases its first byte buffer before the verification
+read. Test evidence was strengthened where the audit named gaps: an independent
+full-head reference with gradient comparison for C2, an independent
+reimplementation of the old monophyly algorithm for D2, and a real
+`cluster → annotate` artifact comparison for D3.

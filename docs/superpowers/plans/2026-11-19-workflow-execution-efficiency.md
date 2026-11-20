@@ -1,5 +1,11 @@
 # OTU-Former Workflow Execution Efficiency Implementation Plan
 
+> **Execution record:** this plan was executed on 2026-11-19. Commits, exact
+> commands and results are in
+> [2026-11-19-workflow-execution-efficiency-execution.md](2026-11-19-workflow-execution-efficiency-execution.md);
+> that record, not the checkboxes below, is the acceptance evidence. The
+> checkboxes remain as the pre-execution authorization artifact.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans for native inline execution. Use subagent-driven development only if the operator explicitly selects it. Execute tasks in dependency order. Complete and validate one task, then commit that task's explicitly staged changes with a Conventional Commit before starting the next task. This standing authorization covers only those task-sized implementation commits. Any additional/final/consolidation commit after the planned tasks requires separate operator approval. This plan does not authorize implementation, profiling, training, any commits, push, versioning or release until the operator explicitly approves execution.
 
 **Goal:** Reduce demonstrated repeated work across pretrain, finetune and six downstream commands while preserving checkpoint, CLI, logging and artifact contracts.
