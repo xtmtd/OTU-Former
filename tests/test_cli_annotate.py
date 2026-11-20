@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pandas as pd
+import pytest
 import otuformer.delineation.annotate as annotate_mod
 from typer.testing import CliRunner
 
@@ -228,3 +229,71 @@ def test_annotate_partitioning_bar_flag_defaults_off_and_can_enable(
     )
     assert enabled_run.exit_code == 0
     assert calls == [False, True]
+
+
+def test_annotate_summary_matches_the_cluster_product(tmp_path):
+    """Real artifacts: cluster's intra-class summary feeds the same statistic.
+
+    This is the cross-command parity check: run ``cluster`` on an embeddings
+    file, then read both products and compare the same-named within-group
+    columns for one shared label used in both commands.
+    """
+    from otuformer.cli.main import app as cli_app
+
+    cluster_out = tmp_path / "cluster_real"
+    emb_path = tmp_path / "embeddings.csv"
+    ids = ["img1.jpg", "img2.jpg", "img3.jpg", "img4.jpg"]
+    pd.DataFrame(
+        {
+            "id": ids,
+            "dim_0": [0.1, 0.1, 0.9, 0.8],
+            "dim_1": [0.1, 0.2, 0.8, 0.9],
+        }
+    ).to_csv(emb_path, index=False)
+    labels = tmp_path / "labels.csv"
+    pd.DataFrame({"id": ids, "label": ["S"] * 4}).to_csv(labels, index=False)
+
+    result = runner.invoke(
+        cli_app,
+        [
+            "cluster",
+            "--embeddings", str(emb_path),
+            "--out-dir", str(cluster_out),
+            "--labels", str(labels),
+            "--custom-cutoffs", "0.5",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    cluster_summary = pd.read_csv(
+        cluster_out
+        / "distance_statistics"
+        / "pairwise_distance_summary_intra-class_raw.csv"
+    )
+
+    # annotate on the same distance product, using the cluster assignments.
+    tables = cluster_out / "UPGMA" / "partitions" / "tables"
+    assignments = tables / "partition_0.5_assignments.csv"
+    corrections = tmp_path / "corrections.csv"
+    pd.read_csv(assignments)[["id", "cluster"]].to_csv(corrections, index=False)
+    annotate_out = tmp_path / "annotate_real"
+    result = runner.invoke(
+        cli_app,
+        [
+            "annotate",
+            "--raw-assignments", str(assignments),
+            "--corrections", str(corrections),
+            "--embeddings", str(emb_path),
+            "--out-dir", str(annotate_out),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    annotate_summary = pd.read_csv(
+        annotate_out / "pairwise_distance_summary_intra-class.csv"
+    )
+
+    shared = ["n_samples", "n_pairs", "mean", "median", "std", "min", "max", "q25", "q75"]
+    cluster_row = cluster_summary[cluster_summary["class"] == "S"].iloc[0]
+    annotate_row = annotate_summary.iloc[0]
+    for column in shared:
+        assert annotate_row[column] == pytest.approx(cluster_row[column]), column
+    assert annotate_row["n_samples"] == cluster_row["n_samples"] == 4

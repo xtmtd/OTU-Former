@@ -3668,3 +3668,101 @@ def test_masked_feature_teacher_norm_sees_only_selected_rows(tmp_path, monkeypat
     # Four teacher blocks per global view, each narrowed before the pointwise
     # final LayerNorm.
     assert rows == [selected[0]] * 4 + [selected[1]] * 4
+
+
+def test_gathered_head_paths_match_the_full_head_reference_with_gradients():
+    """Independent reference: run the heads on all tokens, then select rows.
+
+    The loop gathers rows before the pointwise heads. Loss, the teacher center
+    input, and the student/predictor gradients must equal the full-head
+    computation on the same tensors.
+    """
+    from otuformer.training.loss import ibot_patch_loss, masked_patch_cosine_loss
+    from otuformer.training.model import PatchObjective
+
+    torch.manual_seed(11)
+    mask = torch.zeros(2, 6, dtype=torch.bool)
+    mask[0, 1] = True
+    mask[0, 4] = True
+    mask[1, 3] = True
+
+    def compare(build, full, gathered, row_loss, selected_loss):
+        reference = build()
+        candidate = build()
+        full_out, full_aux = full(reference)
+        full_loss = row_loss(full_out, full_aux, mask)
+        full_loss.backward()
+        gathered_out, gathered_aux = gathered(candidate)
+        gathered_loss = selected_loss(gathered_out, gathered_aux)
+        gathered_loss.backward()
+        torch.testing.assert_close(gathered_loss, full_loss)
+        for left, right in zip(
+            reference.parameters(), candidate.parameters()
+        ):
+            if left.grad is None:
+                assert right.grad is None
+                continue
+            torch.testing.assert_close(right.grad, left.grad)
+
+    # iBOT: the teacher head is gathered too, and the center still sees the same
+    # selected pre-EMA teacher logits.
+    tokens_s = torch.randn(2, 6, 8)
+    tokens_t = torch.randn(2, 6, 8)
+    center = torch.randn(1, 4)
+
+    def build_ibot():
+        torch.manual_seed(5)
+        return PatchObjective("ibot", hidden_dim=8, ibot_prototypes=4)
+
+    def full_ibot(objective):
+        with torch.no_grad():
+            teacher_logits = objective.teacher_ibot_head(tokens_t)
+        return objective.student_ibot_head(tokens_s), teacher_logits
+
+    def gathered_ibot(objective):
+        with torch.no_grad():
+            teacher_logits = objective.teacher_ibot_head(tokens_t[mask])
+        return objective.student_ibot_head(tokens_s[mask]), teacher_logits
+
+    compare(
+        build_ibot,
+        full_ibot,
+        gathered_ibot,
+        lambda student, teacher, m: ibot_patch_loss(
+            student, teacher, m, center, 0.1, 0.04
+        )[0],
+        lambda student, teacher: loss_module.ibot_selected_patch_loss(
+            student, teacher, center, 0.1, 0.04
+        )[0],
+    )
+
+    # masked-feature: the four teacher blocks are gathered before the pointwise
+    # final LayerNorm, then averaged and normalized on the selected rows.
+    blocks_t = torch.randn(4, 2, 6, 8)
+    norm = torch.nn.LayerNorm(8)
+
+    def build_predictor():
+        torch.manual_seed(7)
+        return PatchObjective("masked-feature", hidden_dim=8)
+
+    def full_masked(objective):
+        with torch.no_grad():
+            layers = norm(blocks_t)
+            target = torch.nn.functional.normalize(layers.mean(dim=0), dim=-1)
+        return objective.predict_masked_features(tokens_s), target
+
+    def gathered_masked(objective):
+        with torch.no_grad():
+            layers = norm(blocks_t[:, mask])
+            target = torch.nn.functional.normalize(layers.mean(dim=0), dim=-1)
+        return objective.predict_masked_features(tokens_s[mask]), target
+
+    compare(
+        build_predictor,
+        full_masked,
+        gathered_masked,
+        lambda prediction, target, m: masked_patch_cosine_loss(
+            prediction, target, m
+        ),
+        loss_module.selected_patch_cosine_loss,
+    )

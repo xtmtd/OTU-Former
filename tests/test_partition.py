@@ -99,6 +99,34 @@ def _monophyly_mapping():
     return dict(zip(_MONOPHYLY_IDS, _MONOPHYLY_LABELS))
 
 
+def _old_monophyly(z, ids, true_labels):
+    """The pre-fix algorithm, reimplemented here as an independent reference.
+
+    It scored whatever topology it was given while reading leaf positions with
+    the caller's unsampled id list, so a sampled tree misaddressed specimens.
+    """
+    from scipy.cluster import hierarchy
+
+    id_to_label = {ids[i]: true_labels[i] for i in range(len(ids))}
+    unique_species = set(true_labels)
+    clades = []
+
+    def collect(node):
+        if node.left is None and node.right is None:
+            return {ids[node.id]}
+        clade = collect(node.left) | collect(node.right)
+        clades.append(clade)
+        return clade
+
+    collect(hierarchy.to_tree(z, rd=False))
+    hits = 0
+    for species in unique_species:
+        tips = {tip for tip, label in id_to_label.items() if label == species}
+        if len(tips) <= 1 or any(clade == tips for clade in clades):
+            hits += 1
+    return hits / len(unique_species)
+
+
 def test_monophyly_is_measured_on_the_fixed_output_tree():
     from otuformer.cli.cluster import _compute_monophyly_proportion_upgma
     from otuformer.delineation.tree import build_upgma
@@ -118,6 +146,22 @@ def test_monophyly_is_measured_on_the_fixed_output_tree():
         _monophyly_mapping(),
     )
     assert sampled == 0.5
+    # The pinned value is what the old algorithm produced on the sampled tree,
+    # reproduced by an independent reimplementation rather than by the new code.
+    assert (
+        _old_monophyly(
+            build_upgma(_MONOPHYLY_DISTANCES[np.ix_(sample, sample)]),
+            _MONOPHYLY_IDS,
+            _MONOPHYLY_LABELS,
+        )
+        == sampled
+    )
+    assert (
+        _old_monophyly(
+            build_upgma(_MONOPHYLY_DISTANCES), _MONOPHYLY_IDS, _MONOPHYLY_LABELS
+        )
+        == 0.75
+    )
 
 
 def test_monophyly_scores_only_labeled_tips_and_singletons():
