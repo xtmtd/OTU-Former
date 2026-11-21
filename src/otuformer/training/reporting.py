@@ -1355,7 +1355,11 @@ class InstantMetricsLogger:
                     lines_r, labels_r = ax_right.get_legend_handles_labels()
                     ax.legend(lines_l + lines_r, labels_l + labels_r, fontsize=7)
                 else:
-                    ax.legend(fontsize=7)
+                    # A panel whose metric cells are all empty draws no series: a
+                    # bare legend() would warn about having nothing to label.
+                    handles, labels = ax.get_legend_handles_labels()
+                    if handles:
+                        ax.legend(handles, labels, fontsize=7)
                 ax.grid(True, alpha=0.3)
                 plot_idx += 1
 

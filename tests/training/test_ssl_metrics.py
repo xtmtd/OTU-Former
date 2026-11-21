@@ -434,6 +434,42 @@ def test_optional_metric_plots_keep_historical_rows(tmp_path):
     assert captured["Training Losses"]["Total loss"] == pytest.approx([1.0, 0.5])
 
 
+def test_metric_panels_with_no_data_plot_without_an_empty_legend_warning(tmp_path):
+    """An epoch row whose metric cells are all empty still plots cleanly.
+
+    A run whose periodic evaluation produces no supervised metrics keeps an
+    epoch row with empty metric cells; those five panels have nothing to label,
+    so drawing them must not warn about an empty legend.
+    """
+    import warnings
+
+    logger, path = _logger(tmp_path)
+    row = {name: "" for name in reporting_module._PRETRAIN_CURRENT_FIELDS}
+    row.update(iteration="0", epoch="0", step="0", loss="1.0", lr="0.001")
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(
+            handle, fieldnames=list(reporting_module._PRETRAIN_CURRENT_FIELDS)
+        )
+        writer.writeheader()
+        writer.writerow(row)
+
+    metrics_path = tmp_path / "metrics.pretrain.csv"
+    with metrics_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["epoch", "split", *reporting_module._ENHANCED_METRIC_FIELDS])
+        writer.writerow(["1", "train", *[""] * len(reporting_module._ENHANCED_METRIC_FIELDS)])
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        logger.plot(tmp_path, metrics_path)
+
+    empty_legend = [
+        warning for warning in caught if "No artists with labels" in str(warning.message)
+    ]
+    assert empty_legend == []
+    assert (tmp_path / "training_curves_pretrain.pdf").exists()
+
+
 def test_plot_keeps_legacy_mask_loss_rows(tmp_path):
     """A mixed history must not drop the pre-patch-schema observations."""
     logger, path = _logger(tmp_path)
