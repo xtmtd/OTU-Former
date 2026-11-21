@@ -116,7 +116,11 @@ def compute_bootstrap_support(
         return _extract_clades(z_boot, ids), upgma_to_newick_string(z_boot, ids)
 
     rng = np.random.default_rng(random_state)
-    subset_size = max(2, int(round(x.shape[1] * subsample_ratio)))
+    subset_size = (
+        max(2, round(x.shape[1] * subsample_ratio))
+        if support_mode == "subsample"
+        else x.shape[1]
+    )
     ref_clades = _extract_clades(base_z, ids)
     counts: dict[frozenset, int] = {c: 0 for c in ref_clades}
     trees: list[str] = []

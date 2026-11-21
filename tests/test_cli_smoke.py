@@ -5356,3 +5356,834 @@ def test_pretrain_relational_log_separates_requests_and_resolved_recipe(tmp_path
     assert '"teacher_temp_warmup_ratio": 0.7' in log
     assert '"include_weak_teacher_views"' not in log
     assert '"pretrain_recipe"' not in log
+
+
+# --- Cluster monophyly on the fixed output tree ---------------------------------------
+
+# Two labeled species (x: e0,e1; y: e2,e3) plus two unlabeled samples. The output UPGMA
+# tree keeps both species as clades; a tree rebuilt from the labeled rows alone does not
+# (it reports 0.5), and a tree rebuilt from a seeded sample misreads the leaf positions.
+_PARTIAL_LABEL_EMBEDDINGS = {
+    "e0": [-0.458690, 0.873981, -0.160498],
+    "e1": [-0.320069, 0.932894, -0.165121],
+    "e2": [-0.261424, -0.897887, 0.354197],
+    "e3": [0.246504, 0.508374, 0.825101],
+    "e4": [0.375613, 0.027986, 0.926354],
+    "e5": [-0.855399, -0.081946, 0.511447],
+}
+
+
+def _partial_label_inputs(tmp_path):
+    emb_path = tmp_path / "partial_embeddings.csv"
+    keys = list(_PARTIAL_LABEL_EMBEDDINGS)
+    pd.DataFrame(
+        [
+            {"id": key, "dim_0": values[0], "dim_1": values[1], "dim_2": values[2]}
+            for key, values in _PARTIAL_LABEL_EMBEDDINGS.items()
+        ]
+    ).to_csv(emb_path, index=False)
+    labels_path = tmp_path / "partial_labels.csv"
+    pd.DataFrame(
+        {"id": keys[:4], "label": ["x", "x", "y", "y"]}
+    ).to_csv(labels_path, index=False)
+    return emb_path, labels_path
+
+
+def _cluster_monophyly(out_dir):
+    frame = pd.read_csv(out_dir / "UPGMA" / "metrics.csv")
+    values = set(frame["monophyly_proportion"].round(6).tolist())
+    assert len(values) == 1, "one value spans every cutoff row"
+    return values.pop()
+
+
+def test_cluster_monophyly_uses_the_output_tree_with_partial_labels(tmp_path):
+    emb_path, labels_path = _partial_label_inputs(tmp_path)
+    out_dir = tmp_path / "cluster_partial_labels"
+    result = runner.invoke(
+        app,
+        [
+            "cluster",
+            "--embeddings",
+            str(emb_path),
+            "--out-dir",
+            str(out_dir),
+            "--label-csv",
+            str(labels_path),
+        ],
+    )
+    assert result.exit_code == 0, (result.output, repr(result.exception))
+    assert _cluster_monophyly(out_dir) == 1.0
+
+
+def _expected_cohort_partition(cap, seed, cutoffs):
+    """The partition columns an independent recomputation expects.
+
+    The labeled rows keep the embedding order, the cap applies the seeded sorted
+    rule, and the partition metrics come from a linkage of that cohort alone.
+    """
+    import numpy as np
+    from scipy.cluster import hierarchy
+    from scipy.spatial.distance import squareform
+    from sklearn.metrics import adjusted_rand_score
+
+    keys = list(_PARTIAL_LABEL_EMBEDDINGS)
+    labeled = keys[:4]
+    matrix = np.array([_PARTIAL_LABEL_EMBEDDINGS[key] for key in labeled])
+    normalized = matrix / np.linalg.norm(matrix, axis=1, keepdims=True)
+    distances = 1.0 - normalized @ normalized.T
+    cohort = np.sort(
+        np.random.default_rng(int(seed)).choice(len(labeled), size=int(cap), replace=False)
+    )
+    labels = np.array(["x", "x", "y", "y"])[cohort]
+    submatrix = distances[np.ix_(cohort, cohort)]
+    linkage = hierarchy.linkage(squareform(submatrix, checks=False), method="average")
+    expected = {}
+    for cutoff in cutoffs:
+        assigned = hierarchy.fcluster(linkage, t=cutoff, criterion="distance")
+        expected[cutoff] = {
+            "n_OTUs": float(len(set(assigned))),
+            "n_true_species": float(len(set(labels.tolist()))),
+            "ARI": float(adjusted_rand_score(labels, assigned)),
+            "NMI": float(
+                __import__("sklearn.metrics", fromlist=["normalized_mutual_info_score"])
+                .normalized_mutual_info_score(labels, assigned)
+            ),
+            "BCubed_fscore": None,
+        }
+    return expected
+
+
+def test_cluster_monophyly_ignores_the_metrics_sample_cap_and_seed(tmp_path):
+    emb_path, labels_path = _partial_label_inputs(tmp_path)
+    cutoffs = [0.05, 0.3, 0.6]
+    cutoffs_argument = ",".join(str(value) for value in cutoffs)
+    values = []
+    for index, (cap, seed) in enumerate([("10000", "42"), ("3", "42"), ("3", "7")]):
+        out_dir = tmp_path / f"cluster_cap_{index}"
+        result = runner.invoke(
+            app,
+            [
+                "cluster",
+                "--embeddings",
+                str(emb_path),
+                "--out-dir",
+                str(out_dir),
+                "--label-csv",
+                str(labels_path),
+                "--metrics-sample-size",
+                cap,
+                "--random-state",
+                seed,
+                "--custom-cutoffs",
+                cutoffs_argument,
+            ],
+        )
+        assert result.exit_code == 0, (result.output, repr(result.exception))
+        frame = pd.read_csv(out_dir / "UPGMA" / "metrics.csv")
+        values.append(_cluster_monophyly(out_dir))
+        if cap != "3":
+            continue
+        # The partition columns must follow the sampled cohort, not the full table:
+        # compare them with an independent recomputation of that cohort.
+        expected = _expected_cohort_partition(cap, seed, cutoffs)
+        for _, row in frame.iterrows():
+            reference = expected[round(float(row["cutoff"]), 6)]
+            assert row["n_OTUs"] == reference["n_OTUs"]
+            assert row["n_true_species"] == reference["n_true_species"]
+            assert row["ARI"] == pytest.approx(reference["ARI"])
+            assert row["NMI"] == pytest.approx(reference["NMI"])
+    assert values == [1.0, 1.0, 1.0]
+
+
+def test_cluster_skips_the_metrics_report_when_the_cohort_is_too_small(tmp_path):
+    emb_path, labels_path = _partial_label_inputs(tmp_path)
+
+    # cap of one leaves a single sampled row: partition metrics need two.
+    capped = tmp_path / "cluster_cap_one"
+    result = runner.invoke(
+        app,
+        [
+            "cluster",
+            "--embeddings",
+            str(emb_path),
+            "--out-dir",
+            str(capped),
+            "--label-csv",
+            str(labels_path),
+            "--metrics-sample-size",
+            "1",
+        ],
+    )
+    assert result.exit_code == 0, (result.output, repr(result.exception))
+    assert not (capped / "UPGMA" / "metrics.csv").exists()
+    assert "Fewer than two labeled embeddings" in " ".join(result.output.split())
+
+    # A label table that matches exactly one embedding behaves the same way.
+    single_labels = tmp_path / "single_label.csv"
+    pd.DataFrame({"id": ["e0"], "label": ["x"]}).to_csv(single_labels, index=False)
+    single = tmp_path / "cluster_single_label"
+    result = runner.invoke(
+        app,
+        [
+            "cluster",
+            "--embeddings",
+            str(emb_path),
+            "--out-dir",
+            str(single),
+            "--label-csv",
+            str(single_labels),
+        ],
+    )
+    assert result.exit_code == 0, (result.output, repr(result.exception))
+    assert not (single / "UPGMA" / "metrics.csv").exists()
+    assert "Fewer than two labeled embeddings" in " ".join(result.output.split())
+
+
+def test_cluster_ignores_blank_labels_and_collapses_identical_rows(tmp_path):
+    emb_path, _ = _partial_label_inputs(tmp_path)
+    labels_path = tmp_path / "dirty_labels.csv"
+    pd.DataFrame(
+        {
+            "id": ["e0", "e1", "e1", "e2", "e3", "e4"],
+            "label": ["x", "x", "x", "", "y", "  "],
+        }
+    ).to_csv(labels_path, index=False)
+    out_dir = tmp_path / "cluster_dirty_labels"
+    result = runner.invoke(
+        app,
+        [
+            "cluster",
+            "--embeddings",
+            str(emb_path),
+            "--out-dir",
+            str(out_dir),
+            "--label-csv",
+            str(labels_path),
+        ],
+    )
+    assert result.exit_code == 0, (result.output, repr(result.exception))
+    frame = pd.read_csv(out_dir / "UPGMA" / "metrics.csv")
+    assert frame["n_true_species"].iloc[0] == 2
+    assert _cluster_monophyly(out_dir) == 1.0
+
+
+def test_cluster_rejects_a_conflicting_label_table_before_clearing_output(tmp_path):
+    emb_path, _ = _partial_label_inputs(tmp_path)
+    labels_path = tmp_path / "conflicting_labels.csv"
+    pd.DataFrame({"id": ["e0", "e0"], "label": ["x", "y"]}).to_csv(
+        labels_path, index=False
+    )
+    out_dir = tmp_path / "cluster_conflict"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    sentinel = out_dir / "metrics.csv"
+    sentinel.write_text("previous report", encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        [
+            "cluster",
+            "--embeddings",
+            str(emb_path),
+            "--out-dir",
+            str(out_dir),
+            "--label-csv",
+            str(labels_path),
+            "--overwrite",
+        ],
+    )
+    assert result.exit_code == 2, (result.output, repr(result.exception))
+    output = " ".join(result.output.replace("│", " ").split())
+    assert "more than one label" in output
+    assert "Traceback" not in output
+    assert sentinel.read_text(encoding="utf-8") == "previous report"
+
+
+def _small_embeddings_rows():
+    return [
+        {"id": "a", "dim_0": 1.0, "dim_1": 0.0},
+        {"id": "b", "dim_0": 0.9, "dim_1": 0.1},
+        {"id": "c", "dim_0": -1.0, "dim_1": 0.0},
+        {"id": "d", "dim_0": -0.9, "dim_1": -0.1},
+    ]
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["nonnumeric_dimension", "single_embedding", "missing_id_column", "blank_id", "duplicate_id"],
+)
+def test_cluster_rejects_unusable_embeddings_before_clearing_output(tmp_path, case):
+    rows = _small_embeddings_rows()
+    if case == "nonnumeric_dimension":
+        rows[0] = {**rows[0], "dim_0": "oops"}
+    elif case == "single_embedding":
+        rows = rows[:1]
+    elif case == "missing_id_column":
+        rows = [{key: value for key, value in row.items() if key != "id"} | {"name": "x"} for row in rows]
+    elif case == "blank_id":
+        rows[0] = {**rows[0], "id": "  "}
+    elif case == "duplicate_id":
+        rows[1] = {**rows[1], "id": "a"}
+
+    emb_path = tmp_path / f"bad_embeddings_{case}.csv"
+    pd.DataFrame(rows).to_csv(emb_path, index=False)
+    labels_path = tmp_path / f"bad_embeddings_{case}_labels.csv"
+    pd.DataFrame({"id": ["a", "b", "c", "d"], "label": ["x", "x", "y", "y"]}).to_csv(
+        labels_path, index=False
+    )
+
+    out_dir = tmp_path / f"cluster_bad_embeddings_{case}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    sentinel = out_dir / "metrics.csv"
+    sentinel.write_text("previous report", encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        [
+            "cluster",
+            "--embeddings",
+            str(emb_path),
+            "--out-dir",
+            str(out_dir),
+            "--label-csv",
+            str(labels_path),
+            "--overwrite",
+        ],
+    )
+    assert result.exit_code == 2, (result.output, repr(result.exception))
+    output = " ".join(result.output.replace("│", " ").split())
+    assert "Traceback" not in output
+    assert sentinel.read_text(encoding="utf-8") == "previous report"
+
+
+def test_cluster_keeps_a_single_species_cohort_plottable(tmp_path):
+    emb_path = tmp_path / "single_species_embeddings.csv"
+    pd.DataFrame(_small_embeddings_rows()).to_csv(emb_path, index=False)
+    labels_path = tmp_path / "single_species_labels.csv"
+    pd.DataFrame({"id": ["a", "b", "c", "d"], "label": ["x", "x", "x", "x"]}).to_csv(
+        labels_path, index=False
+    )
+
+    out_dir = tmp_path / "cluster_single_species"
+    result = runner.invoke(
+        app,
+        [
+            "cluster",
+            "--embeddings",
+            str(emb_path),
+            "--out-dir",
+            str(out_dir),
+            "--label-csv",
+            str(labels_path),
+            "--custom-cutoffs",
+            "0.2,0.5",
+        ],
+    )
+    assert result.exit_code == 0, (result.output, repr(result.exception))
+    # A cohort that cannot produce a species silhouette leaves the column out
+    # instead of recording an invented zero, and the dashboard still renders.
+    frame = pd.read_csv(out_dir / "UPGMA" / "metrics.csv")
+    assert "silhouette_species" not in frame.columns
+    assert (out_dir / "UPGMA" / "metrics_dashboard.pdf").exists()
+
+
+def test_cluster_plots_a_cohort_sampled_down_to_one_species(tmp_path):
+    emb_path = tmp_path / "sampled_one_species_embeddings.csv"
+    pd.DataFrame(_small_embeddings_rows()).to_csv(emb_path, index=False)
+    labels_path = tmp_path / "sampled_one_species_labels.csv"
+    pd.DataFrame({"id": ["a", "b", "c", "d"], "label": ["x", "x", "y", "y"]}).to_csv(
+        labels_path, index=False
+    )
+
+    out_dir = tmp_path / "cluster_sampled_one_species"
+    # seed 25 samples rows 0 and 1, both species x.
+    result = runner.invoke(
+        app,
+        [
+            "cluster",
+            "--embeddings",
+            str(emb_path),
+            "--out-dir",
+            str(out_dir),
+            "--label-csv",
+            str(labels_path),
+            "--metrics-sample-size",
+            "2",
+            "--random-state",
+            "25",
+            "--custom-cutoffs",
+            "0.2,0.5",
+        ],
+    )
+    assert result.exit_code == 0, (result.output, repr(result.exception))
+    frame = pd.read_csv(out_dir / "UPGMA" / "metrics.csv")
+    assert frame["n_true_species"].iloc[0] == 1
+    assert "silhouette_species" not in frame.columns
+    assert (out_dir / "UPGMA" / "metrics_dashboard.pdf").exists()
+
+
+def test_cluster_reads_label_categories_verbatim(tmp_path):
+    emb_path = tmp_path / "verbatim_embeddings.csv"
+    pd.DataFrame(_small_embeddings_rows()).to_csv(emb_path, index=False)
+    labels_path = tmp_path / "verbatim_labels.csv"
+    pd.DataFrame(
+        {"id": ["a", "b", "c", "d"], "label": ["NA", "01", "1", "x"]}
+    ).to_csv(labels_path, index=False)
+
+    out_dir = tmp_path / "cluster_verbatim_labels"
+    result = runner.invoke(
+        app,
+        [
+            "cluster",
+            "--embeddings",
+            str(emb_path),
+            "--out-dir",
+            str(out_dir),
+            "--label-csv",
+            str(labels_path),
+            "--custom-cutoffs",
+            "0.2",
+        ],
+    )
+    assert result.exit_code == 0, (result.output, repr(result.exception))
+    frame = pd.read_csv(out_dir / "UPGMA" / "metrics.csv")
+    # ``NA`` is a class name, and ``01`` stays distinct from ``1``.
+    assert frame["n_true_species"].iloc[0] == 4
+
+
+def _two_dim_rows(ids):
+    values = (1.0, 0.9, -1.0, -0.9)
+    return [{"id": key, "dim_0": value, "dim_1": 0.0} for key, value in zip(ids, values)]
+
+
+@pytest.mark.parametrize(
+    ("embedding_ids", "label_ids"),
+    [
+        (["01", "02", "03", "04"], ["1", "2", "3", "4"]),
+        (["1", "2", "3", "4"], ["01", "02", "03", "04"]),
+        (["01", "02", "03", "04"], ["1", "2", "3", "4", "external"]),
+    ],
+)
+def test_cluster_refuses_ids_a_numeric_read_would_rewrite(
+    tmp_path, embedding_ids, label_ids
+):
+    emb_path = tmp_path / "rewritten_ids_embeddings.csv"
+    pd.DataFrame(_two_dim_rows(embedding_ids)).to_csv(emb_path, index=False)
+    labels_path = tmp_path / "rewritten_ids_labels.csv"
+    pd.DataFrame(
+        {"id": label_ids, "label": ["x", "x", "y", "y", "z"][: len(label_ids)]}
+    ).to_csv(labels_path, index=False)
+
+    out_dir = tmp_path / "cluster_rewritten_ids"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    sentinel = out_dir / "metrics.csv"
+    sentinel.write_text("previous report", encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        [
+            "cluster",
+            "--embeddings",
+            str(emb_path),
+            "--out-dir",
+            str(out_dir),
+            "--label-csv",
+            str(labels_path),
+            "--overwrite",
+        ],
+    )
+    assert result.exit_code == 2, (result.output, repr(result.exception))
+    output = " ".join(result.output.replace("│", " ").split())
+    assert "literal" in output.lower()
+    assert "Traceback" not in output
+    assert sentinel.read_text(encoding="utf-8") == "previous report"
+
+
+def test_cluster_reports_no_overlap_when_ids_are_spelled_differently(tmp_path):
+    """Different spellings of the same number must never be paired silently."""
+    emb_path = tmp_path / "spelling_embeddings.csv"
+    pd.DataFrame(_two_dim_rows(["1.0", "2.0", "3.0", "4.0"])).to_csv(
+        emb_path, index=False
+    )
+    labels_path = tmp_path / "spelling_labels.csv"
+    pd.DataFrame({"id": ["1", "2", "3", "4"], "label": ["x", "x", "y", "y"]}).to_csv(
+        labels_path, index=False
+    )
+
+    out_dir = tmp_path / "cluster_spelling"
+    result = runner.invoke(
+        app,
+        [
+            "cluster",
+            "--embeddings",
+            str(emb_path),
+            "--out-dir",
+            str(out_dir),
+            "--label-csv",
+            str(labels_path),
+        ],
+    )
+    assert result.exit_code == 0, (result.output, repr(result.exception))
+    assert not (out_dir / "UPGMA" / "metrics.csv").exists()
+    assert "No overlapping IDs" in " ".join(result.output.split())
+
+
+def test_cluster_matches_plain_numeric_ids_without_rejecting_them(tmp_path):
+    emb_path = tmp_path / "plain_ids_embeddings.csv"
+    pd.DataFrame(_two_dim_rows(["1", "2", "3", "4"])).to_csv(emb_path, index=False)
+    labels_path = tmp_path / "plain_ids_labels.csv"
+    pd.DataFrame({"id": ["1", "2", "3", "4"], "label": ["x", "x", "y", "y"]}).to_csv(
+        labels_path, index=False
+    )
+
+    out_dir = tmp_path / "cluster_plain_ids"
+    result = runner.invoke(
+        app,
+        [
+            "cluster",
+            "--embeddings",
+            str(emb_path),
+            "--out-dir",
+            str(out_dir),
+            "--label-csv",
+            str(labels_path),
+            "--custom-cutoffs",
+            "0.2",
+        ],
+    )
+    assert result.exit_code == 0, (result.output, repr(result.exception))
+    frame = pd.read_csv(out_dir / "UPGMA" / "metrics.csv")
+    assert frame["n_true_species"].iloc[0] == 2
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        ["--custom-cutoffs", "0.15,oops"],
+        ["--custom-cutoffs", ","],
+        ["--metrics-sample-size", "2", "--random-state", "-1"],
+        ["--local-scaling", "true", "--local-k", "4"],
+    ],
+)
+def test_cluster_rejects_invalid_options_before_clearing_output(tmp_path, options):
+    emb_path = tmp_path / "option_embeddings.csv"
+    pd.DataFrame(_two_dim_rows(["a", "b", "c", "d"])).to_csv(emb_path, index=False)
+    labels_path = tmp_path / "option_labels.csv"
+    pd.DataFrame({"id": ["a", "b", "c", "d"], "label": ["x", "x", "y", "y"]}).to_csv(
+        labels_path, index=False
+    )
+
+    out_dir = tmp_path / "cluster_invalid_options"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    sentinel = out_dir / "metrics.csv"
+    sentinel.write_text("previous report", encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        [
+            "cluster",
+            "--embeddings",
+            str(emb_path),
+            "--out-dir",
+            str(out_dir),
+            "--label-csv",
+            str(labels_path),
+            "--overwrite",
+            *options,
+        ],
+    )
+    assert result.exit_code == 2, (result.output, repr(result.exception))
+    output = " ".join(result.output.replace("│", " ").split())
+    assert "Traceback" not in output
+    assert sentinel.read_text(encoding="utf-8") == "previous report"
+
+
+def test_cluster_rejects_a_ragged_label_csv_before_clearing_output(tmp_path):
+    emb_path = tmp_path / "ragged_embeddings.csv"
+    pd.DataFrame(_two_dim_rows(["orig1", "orig2", "orig3", "orig4"])).to_csv(
+        emb_path, index=False
+    )
+    labels_path = tmp_path / "ragged_labels.csv"
+    labels_path.write_text(
+        "id,label\norig1,a,X\norig2,b,Y\norig3,a,X\norig4,b,Y\n", encoding="utf-8"
+    )
+
+    out_dir = tmp_path / "cluster_ragged_labels"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    sentinel = out_dir / "metrics.csv"
+    sentinel.write_text("previous report", encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        [
+            "cluster",
+            "--embeddings",
+            str(emb_path),
+            "--out-dir",
+            str(out_dir),
+            "--label-csv",
+            str(labels_path),
+            "--overwrite",
+        ],
+    )
+    assert result.exit_code == 2, (result.output, repr(result.exception))
+    output = " ".join(result.output.replace("│", " ").split())
+    assert "fields" in output
+    assert "Traceback" not in output
+    assert sentinel.read_text(encoding="utf-8") == "previous report"
+
+
+def test_cluster_reports_missing_compression_library_before_clearing_output(tmp_path, monkeypatch):
+    import builtins
+
+    emb_path = tmp_path / "embeddings.csv.zst"
+    emb_path.write_text("not decompressed", encoding="utf-8")
+    out_dir = tmp_path / "cluster_missing_compression_library"
+    out_dir.mkdir()
+    sentinel = out_dir / "metrics.csv"
+    sentinel.write_text("previous report", encoding="utf-8")
+    real_import = builtins.__import__
+
+    def without_zstandard(name, *args, **kwargs):
+        if name == "zstandard":
+            raise ImportError("No module named 'zstandard'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", without_zstandard)
+    result = runner.invoke(
+        app,
+        ["cluster", "--embeddings", str(emb_path), "--out-dir", str(out_dir), "--overwrite"],
+    )
+    assert result.exit_code == 2, (result.output, repr(result.exception))
+    assert "zstandard" in result.output
+    assert "Cannot decompress" in result.output
+    assert "Traceback" not in result.output
+    assert sentinel.read_text(encoding="utf-8") == "previous report"
+
+
+def test_cluster_rejects_a_corrupt_archive_before_clearing_output(tmp_path):
+    emb_path = tmp_path / "corrupt_embeddings.zip"
+    emb_path.write_bytes(b"not a ZIP archive")
+    out_dir = tmp_path / "cluster_corrupt_archive"
+    out_dir.mkdir()
+    sentinel = out_dir / "metrics.csv"
+    sentinel.write_text("previous report", encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        ["cluster", "--embeddings", str(emb_path), "--out-dir", str(out_dir), "--overwrite"],
+    )
+    assert result.exit_code == 2, (result.output, repr(result.exception))
+    assert "zip" in result.output.lower()
+    assert "Traceback" not in result.output
+    assert sentinel.read_text(encoding="utf-8") == "previous report"
+
+
+@pytest.mark.parametrize("archived", [False, True], ids=["csv", "zip"])
+def test_cluster_rejects_a_ragged_embeddings_csv_before_clearing_output(tmp_path, archived):
+    data = "id,dim_0,dim_1\na,1,0,999\nb,0.9,0.1,999\nc,-1,0,999\nd,-0.9,-0.1,999\n"
+    if archived:
+        from zipfile import ZipFile
+
+        emb_path = tmp_path / "ragged_embeddings.zip"
+        with ZipFile(emb_path, "w") as archive:
+            archive.writestr("embeddings.csv", data)
+    else:
+        emb_path = tmp_path / "ragged_embeddings.csv"
+        emb_path.write_text(data, encoding="utf-8")
+    out_dir = tmp_path / "cluster_ragged_embeddings"
+    out_dir.mkdir()
+    sentinel = out_dir / "metrics.csv"
+    sentinel.write_text("previous report", encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        ["cluster", "--embeddings", str(emb_path), "--out-dir", str(out_dir), "--overwrite"],
+    )
+    assert result.exit_code == 2, (result.output, repr(result.exception))
+    output = " ".join(result.output.replace("│", " ").split())
+    assert "fields" in output
+    assert "Traceback" not in output
+    assert sentinel.read_text(encoding="utf-8") == "previous report"
+
+
+def test_cluster_tolerates_blank_lines_in_both_input_tables(tmp_path):
+    emb_path = tmp_path / "blank_line_embeddings.csv"
+    emb_path.write_text(
+        "\n" + "id,dim_0,dim_1\na,1,0\n\nb,0.9,0.1\nc,-1,0\nd,-0.9,-0.1\n\n",
+        encoding="utf-8",
+    )
+    labels_path = tmp_path / "blank_line_labels.csv"
+    labels_path.write_text(
+        "\nid,label\na,x\n\nb,x\nc,y\nd,y\n\n", encoding="utf-8"
+    )
+
+    out_dir = tmp_path / "cluster_blank_lines"
+    result = runner.invoke(
+        app,
+        [
+            "cluster",
+            "--embeddings",
+            str(emb_path),
+            "--out-dir",
+            str(out_dir),
+            "--label-csv",
+            str(labels_path),
+            "--custom-cutoffs",
+            "0.2",
+        ],
+    )
+    assert result.exit_code == 0, (result.output, repr(result.exception))
+    frame = pd.read_csv(out_dir / "UPGMA" / "metrics.csv")
+    assert frame["n_true_species"].iloc[0] == 2
+
+
+def test_cluster_rejects_invalid_pca_components_before_clearing_output(tmp_path):
+    emb_path = tmp_path / "pca_embeddings.csv"
+    pd.DataFrame(_two_dim_rows(["a", "b", "c", "d"])).to_csv(emb_path, index=False)
+    labels_path = tmp_path / "pca_labels.csv"
+    pd.DataFrame({"id": ["a", "b", "c", "d"], "label": ["x", "x", "y", "y"]}).to_csv(
+        labels_path, index=False
+    )
+
+    out_dir = tmp_path / "cluster_bad_pca"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    sentinel = out_dir / "metrics.csv"
+    sentinel.write_text("previous report", encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        [
+            "cluster",
+            "--embeddings",
+            str(emb_path),
+            "--out-dir",
+            str(out_dir),
+            "--label-csv",
+            str(labels_path),
+            "--pca-whitening",
+            "true",
+            "--pca-components",
+            "-1",
+            "--overwrite",
+        ],
+    )
+    assert result.exit_code == 2, (result.output, repr(result.exception))
+    output = " ".join(result.output.replace("│", " ").split())
+    assert "--pca-components" in output
+    assert "Traceback" not in output
+    assert sentinel.read_text(encoding="utf-8") == "previous report"
+
+
+@pytest.mark.parametrize("suffix", [".gz", ".zip"])
+def test_cluster_reads_compressed_input_tables(tmp_path, suffix):
+    emb_path = tmp_path / f"embeddings.csv{suffix}"
+    pd.DataFrame(_small_embeddings_rows()).to_csv(emb_path, index=False)
+    labels_path = tmp_path / f"labels.csv{suffix}"
+    pd.DataFrame({"id": ["a", "b", "c", "d"], "label": ["x", "x", "y", "y"]}).to_csv(
+        labels_path, index=False
+    )
+
+    out_dir = tmp_path / "cluster_compressed"
+    result = runner.invoke(
+        app,
+        [
+            "cluster",
+            "--embeddings",
+            str(emb_path),
+            "--out-dir",
+            str(out_dir),
+            "--label-csv",
+            str(labels_path),
+            "--custom-cutoffs",
+            "0.2",
+        ],
+    )
+    assert result.exit_code == 0, (result.output, repr(result.exception))
+    frame = pd.read_csv(out_dir / "UPGMA" / "metrics.csv")
+    assert frame["n_true_species"].iloc[0] == 2
+
+
+def test_cluster_tolerates_whitespace_only_lines_in_the_label_csv(tmp_path):
+    emb_path = tmp_path / "whitespace_embeddings.csv"
+    pd.DataFrame(_small_embeddings_rows()).to_csv(emb_path, index=False)
+    labels_path = tmp_path / "whitespace_labels.csv"
+    labels_path.write_text(
+        "id,label\na,x\n  \t\nb,x\n \nc,y\nd,y\n", encoding="utf-8"
+    )
+
+    out_dir = tmp_path / "cluster_whitespace_lines"
+    result = runner.invoke(
+        app,
+        [
+            "cluster",
+            "--embeddings",
+            str(emb_path),
+            "--out-dir",
+            str(out_dir),
+            "--label-csv",
+            str(labels_path),
+            "--custom-cutoffs",
+            "0.2",
+        ],
+    )
+    assert result.exit_code == 0, (result.output, repr(result.exception))
+    frame = pd.read_csv(out_dir / "UPGMA" / "metrics.csv")
+    assert frame["n_true_species"].iloc[0] == 2
+
+
+@pytest.mark.parametrize(
+    ("rows", "options"),
+    [
+        (
+            [{"id": key, "dim_0": value} for key, value in
+             zip(["a", "b", "c", "d"], (1.0, 0.9, -1.0, -0.9))],
+            ["--num-replicates", "1"],
+        ),
+        (
+            _two_dim_rows(["a", "b", "c", "d"]),
+            ["--num-replicates", "1", "--subsample-ratio", "2"],
+        ),
+        (
+            _two_dim_rows(["a", "b", "c", "d"]),
+            ["--num-replicates", "1", "--subsample-ratio", "inf"],
+        ),
+        (
+            _two_dim_rows(["a", "b", "c", "d"]),
+            ["--num-replicates", "1", "--subsample-ratio", "1e308"],
+        ),
+    ],
+)
+def test_cluster_rejects_impossible_subsample_dimensions_before_clearing_output(
+    tmp_path, rows, options
+):
+    emb_path = tmp_path / "subsample_embeddings.csv"
+    pd.DataFrame(rows).to_csv(emb_path, index=False)
+    labels_path = tmp_path / "subsample_labels.csv"
+    pd.DataFrame({"id": ["a", "b", "c", "d"], "label": ["x", "x", "y", "y"]}).to_csv(
+        labels_path, index=False
+    )
+
+    out_dir = tmp_path / "cluster_bad_subsample"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    sentinel = out_dir / "metrics.csv"
+    sentinel.write_text("previous report", encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        [
+            "cluster",
+            "--embeddings",
+            str(emb_path),
+            "--out-dir",
+            str(out_dir),
+            "--label-csv",
+            str(labels_path),
+            "--overwrite",
+            *options,
+        ],
+    )
+    assert result.exit_code == 2, (result.output, repr(result.exception))
+    output = " ".join(result.output.replace("│", " ").split())
+    assert "dimension" in output.lower()
+    assert "Traceback" not in output
+    assert sentinel.read_text(encoding="utf-8") == "previous report"

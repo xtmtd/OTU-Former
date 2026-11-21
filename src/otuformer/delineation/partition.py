@@ -21,6 +21,77 @@ def build_partitions_from_linkage(
     return parts
 
 
+def compute_monophyly_proportion(
+    z: np.ndarray, ids: list[str], id_to_label: dict[str, str]
+) -> Optional[float]:
+    """Monophyly of labeled species on this exact topology.
+
+    Only labeled tips are scored: a represented species is monophyletic when its
+    labeled tips are exactly the labeled descendants of some clade, so an
+    unlabeled tip neither joins nor breaks it. The denominator is the number of
+    species represented by a labeled tip in this tree. A represented singleton
+    counts as monophyletic (existing convention).
+
+    This is a definition stated for the tree it is handed - call it with the
+    output UPGMA linkage. It is deliberately not the tree-stage rule of
+    ``ref/embeddings_tree20260206.py``, which scored a separately built NJ tree
+    and let unlabeled tips inside the LCA break purity while also counting an
+    unlabeled class in the denominator.
+    """
+    present = [tip for tip in ids if tip in id_to_label]
+    if not present:
+        return None
+    present_set = set(present)
+    species = {id_to_label[tip] for tip in present}
+
+    clades: list[set[str]] = []
+
+    def _collect(node) -> set[str]:
+        if node.left is None and node.right is None:
+            tip = ids[node.id]
+            return {tip} if tip in present_set else set()
+        labeled = _collect(node.left) | _collect(node.right)
+        clades.append(labeled)
+        return labeled
+
+    _collect(hierarchy.to_tree(z, rd=False))
+
+    monophyletic = 0
+    for name in species:
+        tips = {tip for tip in present_set if id_to_label[tip] == name}
+        if len(tips) <= 1 or any(clade == tips for clade in clades):
+            monophyletic += 1
+    return monophyletic / len(species)
+
+
+def _sorted_sample_indices(count: int, max_samples: int, seed: int) -> np.ndarray:
+    """Indices of the same seeded, sorted subset the row cap always produced.
+
+    The same rule is shared by other consumers in this repository; it lives here
+    as a private copy until those callers get one owner.
+    """
+    if max_samples <= 0 or count <= max_samples:
+        return np.arange(count)
+    rng = np.random.default_rng(seed)
+    return np.sort(rng.choice(count, size=max_samples, replace=False))
+
+
+def select_labeled_cohort(
+    ids: list[str], label_table: pd.DataFrame, *, max_samples: int, seed: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """Match the validated label table to embedding rows, then apply the cap.
+
+    Rows keep the embedding order the merge produces, so the sampled cohort is
+    the same population the label-matched order always selected. The caller
+    keeps deciding what to do with a cohort smaller than two rows.
+    """
+    merged = pd.DataFrame({"id": ids, "row": np.arange(len(ids))}).merge(
+        label_table, on="id", how="inner"
+    )
+    selected = _sorted_sample_indices(len(merged), max_samples, seed)
+    return merged["row"].to_numpy()[selected], merged["label"].to_numpy()[selected]
+
+
 def export_partition_tables(
     ids: list[str],
     partitions: OrderedDict[float, np.ndarray],

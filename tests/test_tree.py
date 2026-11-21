@@ -78,6 +78,18 @@ def test_compute_bootstrap_support_uses_features_and_writes_trees(tmp_path):
     assert support
 
 
+def test_compute_bootstrap_support_ignores_subsample_ratio():
+    from otuformer.delineation.distance import compute_cosine_distances
+
+    x = np.array([[1.0], [0.9], [-1.0], [-0.9]])
+    z = build_upgma(compute_cosine_distances(x))
+    support = compute_bootstrap_support(
+        x, ["A", "B", "C", "D"], z,
+        support_mode="bootstrap", n_replicates=1, subsample_ratio=float("nan"),
+    )
+    assert support == {frozenset({"A", "B"}): 100.0, frozenset({"C", "D"}): 100.0}
+
+
 def test_build_nj_tree_returns_tree_node():
     skbio = pytest.importorskip("skbio")
     from otuformer.delineation.tree import build_nj_tree

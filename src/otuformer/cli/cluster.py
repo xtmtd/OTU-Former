@@ -7,6 +7,7 @@ import sys
 import traceback
 from pathlib import Path
 from typing import Literal
+from zipfile import BadZipFile
 
 import typer
 
@@ -614,6 +615,27 @@ def _plot_upgma_partition_tree_panel(
 def _plot_metrics_dashboard(metrics_df, out_path: Path) -> None:
     import matplotlib.pyplot as plt
 
+    # An unavailable metric is an empty field, not a missing column: a cohort that
+    # cannot produce a score must still plot the ones it has.
+    for name in (
+        "n_OTUs",
+        "ARI",
+        "NMI",
+        "AMI",
+        "BCubed_fscore",
+        "splitting_index",
+        "lumping_index",
+        "silhouette_species",
+        "silhouette_cluster",
+        "homogeneity",
+        "completeness",
+        "v_measure",
+        "WSS",
+        "purity",
+    ):
+        if name not in metrics_df.columns:
+            metrics_df[name] = float("nan")
+
     fig, axes = plt.subplots(3, 3, figsize=(18, 14))
 
     axes[0, 0].plot(metrics_df["cutoff"], metrics_df["n_OTUs"], "o-", color="#1f77b4")
@@ -733,45 +755,144 @@ def _plot_metrics_dashboard(metrics_df, out_path: Path) -> None:
     plt.close(fig)
 
 
-def _compute_monophyly_proportion_upgma(
-    z, ids: list[str], true_labels: list[str]
-) -> float | None:
-    from scipy.cluster import hierarchy
+def _require_rectangular_csv(path, *, role):
+    """Refuse a table whose records cannot line up with its header.
 
-    if len(ids) != len(true_labels):
-        return None
+    Pandas would answer a short or long row by shifting the header (or truncating
+    it), which silently renames the samples this command scores. Blank and
+    whitespace-only lines are skipped, exactly as the reader skips them.
+    """
+    import csv as _csv
 
-    id_to_label = {ids[i]: true_labels[i] for i in range(len(ids))}
-    unique_species = set(true_labels)
-    if not unique_species:
-        return None
+    # Keep pandas' internal opener here so validation uses read_csv's compression rules.
+    from pandas.io.common import get_handle
 
-    root = hierarchy.to_tree(z, rd=False)
-    all_clades = []
+    try:
+        source = get_handle(path, "r", encoding="utf-8-sig", compression="infer")
+    except ImportError as exc:
+        raise ValueError(f"Cannot decompress {path}: {exc}") from exc
+    with source:
+        reader = _csv.reader(source.handle)
+        width = None
+        for row in reader:
+            if not row or (len(row) == 1 and not row[0].strip()):
+                continue
+            if width is None:
+                width = len(row)
+            elif len(row) != width:
+                raise ValueError(
+                    f"{role} line {reader.line_num} has {len(row)} fields; the header "
+                    f"declares {width}. Quote or drop the extra separator."
+                )
+        if width is None:
+            raise ValueError(f"{role} is empty.")
 
-    def _collect(node):
-        if node.left is None and node.right is None:
-            return {ids[node.id]}
-        left = _collect(node.left)
-        right = _collect(node.right)
-        clade = left | right
-        all_clades.append(clade)
-        return clade
 
-    _collect(root)
+def _parse_cutoffs(custom_cutoffs, cutoff_min, cutoff_max, cutoff_step):
+    """Resolve the cutoff list, refusing values that cannot produce a scan."""
+    import numpy as np
 
-    monophyletic = 0
-    for species in unique_species:
-        species_tips = {
-            tip_id for tip_id, label in id_to_label.items() if label == species
-        }
-        if len(species_tips) <= 1:
-            monophyletic += 1
-            continue
-        if any(clade == species_tips for clade in all_clades):
-            monophyletic += 1
+    if custom_cutoffs:
+        values = []
+        for item in custom_cutoffs.split(","):
+            text = item.strip()
+            if not text:
+                continue
+            try:
+                values.append(float(text))
+            except ValueError:
+                raise ValueError(
+                    "--custom-cutoffs must be a comma-separated list of numbers; "
+                    f"{text!r} is not one."
+                ) from None
+        if not values:
+            raise ValueError("--custom-cutoffs selected no cutoff values.")
+        if any(not np.isfinite(value) for value in values):
+            raise ValueError("--custom-cutoffs must be finite numbers.")
+        return values
 
-    return monophyletic / len(unique_species)
+    if cutoff_step <= 0:
+        raise ValueError("--cutoff-step must be a positive number.")
+    values = np.arange(cutoff_min, cutoff_max + 1e-9, cutoff_step)
+    values = np.round(values, 6).tolist()
+    if not values:
+        raise ValueError(
+            "The cutoff range produced no values; check --cutoff-min, --cutoff-max "
+            "and --cutoff-step."
+        )
+    return values
+
+
+def _reject_rewritten_ids(path, column, parsed_values, *, role):
+    """Refuse IDs that a type-inferred read would rewrite before any matching.
+
+    The label join compares parsed values, so ``01`` and ``1`` would silently
+    become the same specimen. Matching still uses the parsed value for now, so a
+    run only proceeds when every raw ID is already literal text.
+    """
+    import pandas as pd
+
+    raw = pd.read_csv(path, usecols=[column], dtype=str, keep_default_na=False)
+    raw_values = raw[column].tolist()
+    if len(raw_values) != len(parsed_values):
+        return
+    for text, parsed in zip(raw_values, parsed_values):
+        if text != parsed:
+            raise ValueError(
+                f"{role} IDs must be literal text: {text!r} would be read as "
+                f"{parsed!r}, so different specimens could be matched. Rename the "
+                "IDs so a numeric read cannot rewrite them."
+            )
+
+
+def _read_label_table(label_csv: Path):
+    """Parse, validate and deduplicate a label table before any output is cleared.
+
+    One row per id drives both metrics: a repeated identical label is the same
+    assignment, while two labels for one id are ambiguous and rejected here so a
+    run cannot delete an earlier result and only then discover the conflict. A
+    blank label is unlabeled, not a class: dropping it keeps the fixed-tree score
+    and the partition metrics on the same valid rows.
+    """
+    import pandas as pd
+
+    _require_rectangular_csv(label_csv, role="The --label-csv file")
+    lbl_df = pd.read_csv(label_csv, converters={"label": str}, index_col=False)
+    if "label" not in lbl_df.columns:
+        raise ValueError("--label-csv must contain a 'label' column.")
+    if "id" in lbl_df.columns:
+        key_col = "id"
+    elif "image" in lbl_df.columns:
+        key_col = "image"
+    else:
+        key_candidates = [c for c in lbl_df.columns if c != "label"]
+        if not key_candidates:
+            raise ValueError(
+                "--label-csv must contain either 'id' or 'image' plus 'label'."
+            )
+        key_col = key_candidates[0]
+
+    labels_aligned = lbl_df[[key_col, "label"]].copy()
+    labels_aligned.rename(columns={key_col: "id"}, inplace=True)
+    labels_aligned["id"] = labels_aligned["id"].astype(str)
+    _reject_rewritten_ids(
+        label_csv, key_col, labels_aligned["id"].tolist(), role="--label-csv"
+    )
+    label_text = labels_aligned["label"]
+    valid = label_text.notna() & label_text.astype(str).str.strip().ne("")
+    labels_aligned = labels_aligned[valid].copy()
+    labels_aligned["label"] = labels_aligned["label"].astype(str)
+
+    duplicates = labels_aligned["id"].duplicated(keep=False)
+    if duplicates.any():
+        repeated = labels_aligned[duplicates].drop_duplicates()
+        conflicts = repeated["id"][repeated["id"].duplicated()]
+        if len(conflicts):
+            raise ValueError(
+                "--label-csv assigns more than one label to the same id: "
+                + ", ".join(sorted(set(conflicts))[:3])
+            )
+    return labels_aligned.drop_duplicates(subset=["id", "label"]).reset_index(drop=True)
 
 
 def _parse_bool_option(name: str, value: str) -> bool:
@@ -902,8 +1023,10 @@ def cluster(
 
     from otuformer.delineation.partition import (
         build_partitions_from_linkage,
+        compute_monophyly_proportion,
         compute_partition_metrics,
         export_partition_tables,
+        select_labeled_cohort,
     )
     from otuformer.delineation.tree import (
         build_upgma,
@@ -921,11 +1044,93 @@ def cluster(
     )
     save_distances_enabled = _parse_bool_option("save-distances", save_distances)
 
+    # Read and validate the inputs before --overwrite can clear anything: a
+    # malformed or ambiguous label file, or an embedding table that cannot be
+    # clustered, must not destroy an earlier result.
     try:
+        label_table = _read_label_table(label_csv) if label_csv is not None else None
+        _require_rectangular_csv(embeddings, role="The embeddings file")
+        emb_df = read_csv(embeddings, index_col=False)
+        if "id" not in emb_df.columns:
+            raise ValueError("Embeddings must contain an 'id' column.")
+        ids = emb_df["id"].astype(str).tolist()
+        if emb_df["id"].isna().any() or any(not value.strip() for value in ids):
+            raise ValueError(
+                "Embeddings must contain nonempty IDs in the 'id' column."
+            )
+        if len(set(ids)) != len(ids):
+            raise ValueError(
+                "Found a duplicate embedding ID; each embedding must have a unique ID."
+            )
+        if len(ids) < 2:
+            raise ValueError("Clustering requires at least two embeddings.")
+        dim_cols = [c for c in emb_df.columns if c.startswith("dim_")]
+        if not dim_cols:
+            raise ValueError(
+                "No embedding dimensions found. Expected columns prefixed with 'dim_'."
+            )
+        try:
+            x = emb_df[dim_cols].to_numpy(dtype=float)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Embedding dimensions must be numeric; {exc}"
+            ) from None
+        if not np.isfinite(x).all():
+            raise ValueError("Embedding dimensions must contain only finite values.")
+        n_pairs = len(ids) * (len(ids) - 1) // 2
+        if n_pairs > max_distance_pairs:
+            raise ValueError(
+                f"Pair count {n_pairs} exceeds --max-distance-pairs={max_distance_pairs}. "
+                "Increase --max-distance-pairs or reduce input size."
+            )
+        if label_table is not None:
+            # Matching pairs parsed values, so an ID the reader rewrites would pair
+            # different specimens; only a labeled run needs this guard.
+            _reject_rewritten_ids(embeddings, "id", ids, role="Embedding")
+        if random_state < 0:
+            raise ValueError("--random-state must be a non-negative integer.")
+        if pca_whitening_enabled and pca_components <= 0:
+            raise ValueError("--pca-components must be a positive integer.")
+        effective_dims = len(dim_cols)
+        if pca_whitening_enabled:
+            effective_dims = min(pca_components, effective_dims, len(ids))
+        if num_replicates > 0 and support_mode == "subsample":
+            # Support replicates draw whole embedding dimensions without
+            # replacement, so an impossible draw fails mid-run unless it is
+            # refused here.
+            if effective_dims < 2:
+                raise ValueError(
+                    "Support estimation needs at least two embedding dimensions; "
+                    f"got {effective_dims}."
+                )
+            requested_dims = effective_dims * subsample_ratio
+            if not np.isfinite(requested_dims):
+                raise ValueError("--subsample-ratio must produce a finite number of dimensions.")
+            drawn = max(2, round(requested_dims))
+            if drawn > effective_dims:
+                raise ValueError(
+                    f"--subsample-ratio={subsample_ratio} draws {drawn} dimensions from "
+                    f"{effective_dims}; lower it or add dimensions."
+                )
+        cutoffs = _parse_cutoffs(
+            custom_cutoffs, cutoff_min, cutoff_max, cutoff_step
+        )
+        local_k_resolved = None
+        if local_scaling_enabled:
+            local_k_resolved = (
+                local_k
+                if local_k > 0
+                else auto_select_k(len(ids), strategy=local_k_strategy)
+            )
+            if local_k_resolved >= len(ids):
+                raise ValueError(
+                    f"--local-k={local_k_resolved} needs more than that many "
+                    f"embeddings; got {len(ids)}."
+                )
         prepare_output_dir(
             out_dir, overwrite=overwrite, protected_paths=[embeddings, label_csv],
         )
-    except (ValueError, OSError) as exc:
+    except (ValueError, OSError, BadZipFile) as exc:
         raise typer.BadParameter(str(exc)) from exc
     tee = TeeLogger(out_dir / "logs" / "cluster.log")
     original_stderr = sys.stderr
@@ -964,9 +1169,7 @@ def cluster(
         print(json.dumps(params, ensure_ascii=False, indent=2, sort_keys=True))
         print("-" * 80)
 
-        emb_df = read_csv(embeddings)
         print("[1/7] Loaded embeddings")
-        ids = emb_df["id"].astype(str).tolist()
         id_to_sample = None
         if "sample" in emb_df.columns:
             id_to_sample = {
@@ -975,20 +1178,6 @@ def cluster(
                     emb_df["id"].astype(str), emb_df["sample"].astype(str)
                 )
             }
-        dim_cols = [c for c in emb_df.columns if c.startswith("dim_")]
-        if not dim_cols:
-            raise typer.BadParameter(
-                "No embedding dimensions found. Expected columns prefixed with 'dim_'."
-            )
-        x = emb_df[dim_cols].to_numpy()
-
-        n = len(ids)
-        n_pairs = n * (n - 1) // 2
-        if n_pairs > max_distance_pairs:
-            raise typer.BadParameter(
-                f"Pair count {n_pairs} exceeds --max-distance-pairs={max_distance_pairs}. "
-                "Increase --max-distance-pairs or reduce input size."
-            )
 
         if pca_whitening_enabled:
             n_comp = min(pca_components, x.shape[1], x.shape[0])
@@ -1008,13 +1197,8 @@ def cluster(
             print("[3/7] Distance matrix computed")
 
         if local_scaling_enabled:
-            k = (
-                local_k
-                if local_k > 0
-                else auto_select_k(len(ids), strategy=local_k_strategy)
-            )
-            d, _ = apply_local_scaling(d, k=k)
-            print(f"[4/7] Local scaling applied (k={k})")
+            d, _ = apply_local_scaling(d, k=local_k_resolved)
+            print(f"[4/7] Local scaling applied (k={local_k_resolved})")
         else:
             print("[4/7] SKIP local scaling")
 
@@ -1045,69 +1229,29 @@ def cluster(
         print("[6/7] UPGMA tree built")
 
         true_labels_arr = None
-        ids_for_metrics = None
-        labels_for_metrics = None
         id_to_label = None
         x_for_metrics = None
         d_for_metrics = d
         z_metrics = z
-        if label_csv is not None:
-            lbl_df = read_csv(label_csv)
-            if "label" not in lbl_df.columns:
-                raise typer.BadParameter("--label-csv must contain a 'label' column.")
-            if "id" in lbl_df.columns:
-                key_col = "id"
-            elif "image" in lbl_df.columns:
-                key_col = "image"
-            else:
-                key_candidates = [c for c in lbl_df.columns if c != "label"]
-                if not key_candidates:
-                    raise typer.BadParameter(
-                        "--label-csv must contain either 'id' or 'image' plus 'label'."
-                    )
-                key_col = key_candidates[0]
-
-            labels_aligned = lbl_df[[key_col, "label"]].copy()
-            labels_aligned.rename(columns={key_col: "id"}, inplace=True)
-            labels_aligned["id"] = labels_aligned["id"].astype(str)
-            id_to_label = dict(zip(labels_aligned["id"], labels_aligned["label"]))
-            merged = emb_df[["id"]].merge(labels_aligned, on="id", how="inner")
-            if len(merged) > 0:
-                id_to_row = {v: i for i, v in enumerate(ids)}
-                merged_idx = [id_to_row[i] for i in merged["id"].astype(str)]
-                true_labels_arr = merged["label"].to_numpy()
-                ids_for_metrics = merged["id"].astype(str).tolist()
-                labels_for_metrics = merged["label"].astype(str).tolist()
-                x_for_metrics = x[merged_idx]
-                d_for_metrics = d[np.ix_(merged_idx, merged_idx)]
+        if label_table is not None:
+            id_to_label = dict(zip(label_table["id"], label_table["label"]))
+            final_idx, final_labels = select_labeled_cohort(
+                ids, label_table, max_samples=metrics_sample_size, seed=random_state
+            )
+            if len(final_idx) >= 2:
+                true_labels_arr = final_labels
+                x_for_metrics = x[final_idx]
+                d_for_metrics = d[np.ix_(final_idx, final_idx)]
                 z_metrics = build_upgma(d_for_metrics)
-
-                if (
-                    metrics_sample_size > 0
-                    and len(true_labels_arr) > metrics_sample_size
-                ):
-                    rng = np.random.default_rng(random_state)
-                    sample_idx = np.sort(
-                        rng.choice(
-                            len(true_labels_arr),
-                            size=metrics_sample_size,
-                            replace=False,
-                        )
-                    )
-                    true_labels_arr = true_labels_arr[sample_idx]
-                    x_for_metrics = x_for_metrics[sample_idx]
-                    d_for_metrics = d_for_metrics[np.ix_(sample_idx, sample_idx)]
-                    z_metrics = build_upgma(d_for_metrics)
+            elif len(final_idx):
+                typer.echo(
+                    "[Warning] Fewer than two labeled embeddings; skipping "
+                    "partition metrics."
+                )
             else:
                 typer.echo(
                     "[Warning] No overlapping IDs between embeddings and --label-csv."
                 )
-
-        if custom_cutoffs:
-            cutoffs = [float(v.strip()) for v in custom_cutoffs.split(",") if v.strip()]
-        else:
-            cutoffs = np.arange(cutoff_min, cutoff_max + 1e-9, cutoff_step)
-            cutoffs = np.round(cutoffs, 6).tolist()
 
         partitions = build_partitions_from_linkage(z, cutoffs)
         partition_scan_rows = [
@@ -1171,11 +1315,10 @@ def cluster(
         print("[7/7] Partition tables and tree panels saved")
 
         if true_labels_arr is not None:
-            monophyly_prop = _compute_monophyly_proportion_upgma(
-                z_metrics,
-                ids_for_metrics,
-                labels_for_metrics,
-            )
+            # Monophyly is a property of the fixed output topology and the
+            # labels, independent of --metrics-sample-size and the cutoff. The
+            # partition metrics below keep their own aligned cohort linkage.
+            monophyly_prop = compute_monophyly_proportion(z, ids, id_to_label or {})
             parts_for_metrics = build_partitions_from_linkage(z_metrics, cutoffs)
             metrics = compute_partition_metrics(
                 parts_for_metrics,

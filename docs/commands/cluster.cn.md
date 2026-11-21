@@ -140,13 +140,13 @@ subsample 模式的特征比例（bootstrap 模式下忽略）。
 
 **默认值：** `None`
 
-用于划分质量评估的可选标签 CSV（支持 id/label 或 image/label）。
+用于划分质量评估的可选标签 CSV（支持 id/label 或 image/label）。空白标签视为未标注并被忽略；同一 ID 的相同标签行会合并为一条分配；同一 ID 出现两个不同标签时，会在 `--overwrite` 清空既有报告之前报错。带标签运行还会拒绝会被数值读取改写的 ID（例如 `01` 被读成 `1`），否则匹配可能把不同标本配成一对；cutoff、抽样种子、`--pca-components` 与 local-scaling 的 `k` 也会在清空任何内容之前完成校验。两张输入表都必须列数规整：字段数与表头不一致的记录会被拒绝，而不是被移位解释；空行与仅含空白字符的行会被忽略。压缩表的校验和读取使用相同的解压规则；使用 subsample 估计分支支持度时，抽样维数若不是有限值，或超过 PCA 后的有效维数，会在清空任何内容之前被拒绝。
 
 ### `--metrics-sample-size`
 
 **默认值：** `10000`
 
-指标计算的最大样本数。
+指标计算的最大样本数。该上限决定分区列所使用的标签匹配队列；`monophyly_proportion` 在固定输出树上评分，只要写出报告，其数值就不随上限变化。应用上限后仍少于两个带标签样本时不会生成报告。
 
 ### `--cpus`
 
@@ -179,6 +179,13 @@ CPU 线程数。
 - `UPGMA/metrics.csv` — 分区质量指标（提供 `--label-csv` 时）
 - `UPGMA/metrics_dashboard.pdf` — 指标面板（提供 `--label-csv` 时）
 - `distance_statistics/` — 距离统计与分布图
+
+`UPGMA/metrics.csv` 每个 cutoff 一行，只有当应用 `--metrics-sample-size` 上限后仍有至少两个带标签嵌入匹配时才写出。字段分组如下：
+
+| 字段组 | 定义 |
+| --- | --- |
+| `NMI`、`ARI`、`AMI`、`V_measure`、`BCubed_*`、`purity`、`n_OTUs`、`OTU_species_ratio`、`splitting_index`、`lumping_index`、`silhouette_*`、`WSS` | 单个 cutoff 的分区质量，在 `--metrics-sample-size` 上限作用后的带标签队列上计算。 |
+| `monophyly_proportion` | 带标签物种中，其带标签叶恰好构成固定输出树某一演化支全部带标签后代的物种占比。只评估带标签的叶，因此未标注的叶既不会并入也不会拆散某个物种；被表示的单一物种仍计为单系；分母为被匹配标签表示的物种数。与 `--metrics-sample-size`、`--random-state` 和 cutoff 无关。 |
 
 ## 示例
 

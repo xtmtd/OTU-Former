@@ -140,13 +140,27 @@ Max pairs to store.
 
 **Default:** `None`
 
-Optional label CSV for partition metrics (supports id/label or image/label).
+Optional label CSV for partition metrics (supports id/label or image/label). A blank
+label is unlabeled and is dropped, identical rows for one ID collapse into one
+assignment, and two different labels for one ID are rejected before `--overwrite`
+can clear an existing report. A labeled run also refuses an ID that a numeric read
+would rewrite (`01` read as `1`), because matching would otherwise pair different
+specimens; cutoffs, the sampling seed, `--pca-components` and local-scaling `k` are
+validated before anything is cleared as well. Both input tables must be rectangular:
+a record with more or fewer fields than its header is rejected instead of being
+shifted, while blank and whitespace-only lines are ignored. Compressed tables
+use the same decompression for both checks and reading. For subsample support, a
+draw whose size is non-finite or exceeds the post-PCA dimensions is rejected
+before anything is cleared.
 
 ### `--metrics-sample-size`
 
 **Default:** `10000`
 
-Max samples for metrics.
+Max samples for metrics. The cap selects the label-matched cohort behind the
+partition columns; `monophyly_proportion` is scored on the fixed output tree and
+stays the same whatever the cap is when a report is written. A cohort that still
+has fewer than two labeled embeddings after the cap produces no report.
 
 ### `--cpus`
 
@@ -179,6 +193,14 @@ Clear an existing non-empty output directory.
 - `UPGMA/metrics.csv` — Partition quality metrics (when `--label-csv` is provided)
 - `UPGMA/metrics_dashboard.pdf` — Metrics dashboard (when `--label-csv` is provided)
 - `distance_statistics/` — Distance statistics and distribution plots
+
+`UPGMA/metrics.csv` keeps one row per cutoff and is written only when at least two
+labeled embeddings match after the `--metrics-sample-size` cap. Its field groups are:
+
+| Field group | Definition |
+| --- | --- |
+| `NMI`, `ARI`, `AMI`, `V_measure`, `BCubed_*`, `purity`, `n_OTUs`, `OTU_species_ratio`, `splitting_index`, `lumping_index`, `silhouette_*`, `WSS` | Partition quality of one cutoff, computed on the labeled cohort after the `--metrics-sample-size` cap. |
+| `monophyly_proportion` | Share of labeled species whose labeled tips are exactly the labeled descendants of one clade of the fixed output tree. Only labeled tips are scored, so an unlabeled tip neither joins nor breaks a species; a represented singleton counts as monophyletic; the denominator is the number of species a matched label represents. Independent of `--metrics-sample-size`, `--random-state` and the cutoff. |
 
 ## Examples
 
