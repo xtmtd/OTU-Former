@@ -140,7 +140,7 @@ Max pairs to store.
 
 **Default:** `None`
 
-Optional label CSV for partition metrics (supports id/label or image/label).
+Optional label CSV for partition metrics (supports id/label or image/label). IDs and labels are read as text, so `01` and `1` are distinct. Embedding IDs must be nonempty and unique. Blank labels are ignored; identical label rows are collapsed, and conflicting labels for one ID are rejected before `--overwrite` can clear an existing report.
 
 ### `--metrics-sample-size`
 

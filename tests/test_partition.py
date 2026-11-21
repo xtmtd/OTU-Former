@@ -128,33 +128,26 @@ def _old_monophyly(z, ids, true_labels):
 
 
 def test_monophyly_is_measured_on_the_fixed_output_tree():
-    from otuformer.cli.cluster import _compute_monophyly_proportion_upgma
+    from otuformer.delineation.partition import compute_monophyly_proportion
     from otuformer.delineation.tree import build_upgma
 
-    fixed = _compute_monophyly_proportion_upgma(
+    fixed = compute_monophyly_proportion(
         build_upgma(_MONOPHYLY_DISTANCES), _MONOPHYLY_IDS, _monophyly_mapping()
     )
-    assert fixed == 0.75  # B is not a clade on this topology
+    assert fixed == 0.75  # A is not a clade on this topology
 
     # Characterization of the pre-fix call: the sampled linkage was scored with
     # the unsampled id/label list, so leaf positions addressed other specimens.
     # 0.5 is that old wrong value, not expected behavior.
     sample = [2, 4, 5]
-    sampled = _compute_monophyly_proportion_upgma(
-        build_upgma(_MONOPHYLY_DISTANCES[np.ix_(sample, sample)]),
-        _MONOPHYLY_IDS,
-        _monophyly_mapping(),
-    )
-    assert sampled == 0.5
-    # The pinned value is what the old algorithm produced on the sampled tree,
-    # reproduced by an independent reimplementation rather than by the new code.
+    # Pin it only with the independent reference, not the corrected scorer.
     assert (
         _old_monophyly(
             build_upgma(_MONOPHYLY_DISTANCES[np.ix_(sample, sample)]),
             _MONOPHYLY_IDS,
             _MONOPHYLY_LABELS,
         )
-        == sampled
+        == 0.5
     )
     assert (
         _old_monophyly(
@@ -165,28 +158,37 @@ def test_monophyly_is_measured_on_the_fixed_output_tree():
 
 
 def test_monophyly_scores_only_labeled_tips_and_singletons():
-    from otuformer.cli.cluster import _compute_monophyly_proportion_upgma
+    from otuformer.delineation.partition import compute_monophyly_proportion
     from otuformer.delineation.tree import build_upgma
 
     mapping = {key: value for key, value in _monophyly_mapping().items() if key != "e2"}
-    # e2's unlabeled tip does not break B's labeled pair e3 alone: B becomes a
-    # singleton (monophyletic) and the denominator counts represented species.
-    partial = _compute_monophyly_proportion_upgma(
+    # B is now a represented singleton and still counts as monophyletic.
+    partial = compute_monophyly_proportion(
         build_upgma(_MONOPHYLY_DISTANCES), _MONOPHYLY_IDS, mapping
     )
     assert partial == 0.75
 
     # No labels at all: there is no score.
     assert (
-        _compute_monophyly_proportion_upgma(
+        compute_monophyly_proportion(
             build_upgma(_MONOPHYLY_DISTANCES), _MONOPHYLY_IDS, {}
         )
         is None
     )
 
 
+def test_monophyly_ignores_an_unlabeled_tip_inside_a_pure_clade():
+    from otuformer.delineation.partition import compute_monophyly_proportion
+
+    linkage = np.array([[0, 1, 0.1, 2], [2, 4, 0.2, 3], [3, 5, 0.3, 4]])
+    ids = ["first", "unknown", "second", "singleton"]
+    assert compute_monophyly_proportion(
+        linkage, ids, {"first": "A", "second": "A", "singleton": "B"}
+    ) == 1.0
+
+
 def test_monophyly_ignores_a_rebuilt_labeled_tree_topology():
-    from otuformer.cli.cluster import _compute_monophyly_proportion_upgma
+    from otuformer.delineation.partition import compute_monophyly_proportion
     from otuformer.delineation.tree import build_upgma
 
     labeled = [0, 1, 2, 3]
@@ -194,9 +196,9 @@ def test_monophyly_ignores_a_rebuilt_labeled_tree_topology():
     # The rebuilt labeled-only tree resolves differently (A stops being a
     # clade), so scoring it would report another value. The fixed output tree is
     # the one that is scored.
-    assert _compute_monophyly_proportion_upgma(
+    assert compute_monophyly_proportion(
         build_upgma(subset), [_MONOPHYLY_IDS[i] for i in labeled], _monophyly_mapping()
     ) == 0.5
-    assert _compute_monophyly_proportion_upgma(
+    assert compute_monophyly_proportion(
         build_upgma(_MONOPHYLY_DISTANCES), _MONOPHYLY_IDS, _monophyly_mapping()
     ) == 0.75

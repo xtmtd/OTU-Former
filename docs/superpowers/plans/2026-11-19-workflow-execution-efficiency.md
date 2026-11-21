@@ -1,10 +1,9 @@
 # OTU-Former Workflow Execution Efficiency Implementation Plan
 
-> **Execution record:** this plan was executed on 2026-11-19. Commits, exact
-> commands and results are in
-> [2026-11-19-workflow-execution-efficiency-execution.md](2026-11-19-workflow-execution-efficiency-execution.md);
-> that record, not the checkboxes below, is the acceptance evidence. The
-> checkboxes remain as the pre-execution authorization artifact.
+> **Status:** Initial implementation began on 2026-11-19. Use Git history
+> for committed task changes and [Verification status](#verification-status)
+> for the remaining gates. The checkboxes preserve the original plan. This
+> plan does not authorize staging or committing the audit follow-up.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans for native inline execution. Use subagent-driven development only if the operator explicitly selects it. Execute tasks in dependency order. Complete and validate one task, then commit that task's explicitly staged changes with a Conventional Commit before starting the next task. This standing authorization covers only those task-sized implementation commits. Any additional/final/consolidation commit after the planned tasks requires separate operator approval. This plan does not authorize implementation, profiling, training, any commits, push, versioning or release until the operator explicitly approves execution.
 
@@ -27,7 +26,7 @@
 - No generic trainer, fast-mode flag, new dependency, new workers, finetune `persistent_workers`, or `drop_last` change.
 - Keep private invocation state out of saved args, `Parameters:`, checkpoints, and CSV artifacts.
 - Every task uses a focused red/green test cycle. Do not repeatedly run unrelated suites. Do not default-deselect tests. The full refactor gate applies to cross-command ownership moves as specified by the testing policy.
-- Correctness and performance are separate acceptance decisions. A candidate without measurable benefit or with meaningful regression is omitted; do not claim performance on an unavailable or silently-fallback device.
+- Correctness and performance are separate acceptance decisions. A measured candidate with no useful benefit, or a candidate with a meaningful regression, is omitted. When measurement is not authorized, leave the performance claim unqualified; do not claim performance on an unavailable or silently-fallback device.
 - Preserve prior user data, output-protection checks, error handling, and unrelated worktree changes. No destructive git operations.
 - Development documents remain English-only. Update affected bilingual user docs, CLI help, README and workflow skill guidance only in the tasks whose user-visible semantics change.
 - The six E6 smoke nodes belong only to standalone Task 0, which repairs test fixtures/monkeypatch signatures and has an independent commit boundary. Task 0 was proposed as Task 3a and is deliberately numbered separately to make that boundary explicit. It must pass before Task 3b or any pretrain handoff/loader-preflight source change; Tasks 4 and 16 only require and verify that gate. No production check may be weakened to make them pass.
@@ -165,7 +164,7 @@ Do not add a generic workflow state container. E1 adds a private manifest field 
 - [ ] Add parity tests for all four callsites, documenting population, seed, cap, ordering and duplicate ID/label behavior; preserve excluded complement for visualization. Explicitly test that tree bootstrap/subsample and stratified silhouette sampling are not routed through the helper.
 - [ ] Add a shared sorted-index helper to the existing `otuformer.embedding` owner, which owns two evaluation/extraction callsites; `delineation` consumes indices for cluster cohort semantics but does not own cross-domain sampling policy. Migrate the three direct-call/monkeypatch tests in `tests/training/test_pretrain_alignment.py` to test the shared helper or public caller, then delete `_maybe_subsample_for_metrics` and its wrapper in this task. Do not retain dead private code solely as a test seam.
 - [ ] Move pure `_evaluate_records` calculation to the narrow verified domain owner; keep CLI provenance, safety, publication and orchestration. List real callers and compatibility needs before moving it.
-- [ ] Run focused tests plus the master policy's full-refactor regression gate because this is a cross-command move. Document the exact gate in execution records; don't run unrelated suite repeatedly during iteration.
+- [ ] Run focused tests plus the master policy's full-refactor regression gate because this is a cross-command move. Record the gate with the implementing revision; don't rerun unrelated suites during iteration.
 
 ## Task 10: Share Within-Group Distance Summary (D3)
 
@@ -227,3 +226,45 @@ Do not add a generic workflow state container. E1 adds a private manifest field 
 - [ ] Run `python -m pytest -q tests/test_docs.py`, all exact changed-area tests, six E6 resume nodes, the authorized full refactor gate, and applicable extract/export consumer chains. This plan ends at feature acceptance; merge/release acceptance is separate and, when authorized, must run the full suite required by the master testing policy.
 - [ ] Run `git diff --check`, inspect rendered help/schema/docs where changed, inspect `git status`, and verify no benchmark/training artifacts or user data were overwritten.
 - [ ] Record each design unit's final disposition in the dated `## 10. Implementation dispositions` addendum at the end of `docs/superpowers/specs/2026-11-18-workflow-execution-efficiency-design.md` using exactly one of: `implemented — measured benefit`; `implemented — benefit unqualified (<reason>)`; `closed-no-benefit`; or `not pursued`, with evidence or reason including C6. An unmeasured or unavailable result must use `implemented — benefit unqualified`, never `closed-no-benefit`. Keep unsupported performance/device claims explicitly open. Commit each completed task before starting another after plan execution is approved; no extra commit after the planned tasks without separate operator approval. No push, version bump, tag or release under this plan.
+
+## Verification status
+
+Historical full runs: `a46475a` (2,688 passed, 1 skipped) and `52cf25b`
+(2,696 passed, 1 skipped). Neither qualifies the Round 7 changes. The
+historical task-to-commit and per-round notes are archived in Git, not tracked
+as a separate document. Some historical command entries are abbreviated, not
+complete run transcripts:
+
+```sh
+git show bea0a30:docs/superpowers/plans/2026-11-19-workflow-execution-efficiency-execution.md
+```
+
+Round 7 (2026-11-20, uncommitted worktree based on `bea0a30`): the following
+three focused invocations passed 700 (three plot-legend warnings), 115, and
+308 tests respectively. The selections overlap. The second includes the real
+`extract → cluster → annotate → diversity` and spatial ONNX `export → extract`
+artifact handoffs.
+
+```sh
+export PYTHONDONTWRITEBYTECODE=1 MPLBACKEND=Agg HF_HUB_OFFLINE=1
+python -m pytest -q -p no:randomly -p no:cacheprovider --tb=short \
+  tests/test_cli_smoke.py tests/test_output_safety.py \
+  tests/training/test_pretrain_alignment.py tests/training/test_startup_phases.py \
+  tests/training/test_relational_queue_recipe.py tests/training/test_finetune_provenance.py \
+  tests/test_pseudo_label.py tests/test_docs.py
+python -m pytest -q --tb=short -p no:randomly -p no:cacheprovider \
+  tests/test_cli_smoke.py::test_cluster_uses_one_metrics_linkage_and_fixed_tree_monophyly \
+  tests/test_cli_annotate.py tests/test_partition.py tests/test_distance.py \
+  tests/test_diversity.py tests/test_extract_data_cli.py tests/test_examples_e2e.py \
+  tests/test_spatial_onnx.py::test_cli_runs_spatial_onnx_extraction_and_reads_it_back
+python -m pytest -q -p no:randomly -p no:cacheprovider --tb=short \
+  tests/training/test_masked_pretrain.py tests/training/test_relational_queue_objectives.py \
+  tests/test_training_loss.py tests/test_docs.py
+```
+
+Full refactor and merge/release regression gates remain open in this record.
+An external audit reported 2,725 passes. The supplied review did not include
+an exact invocation, result transcript, or revision plus worktree identity,
+so the report does not close either gate. Performance remains
+`not measured: authorization pending`. See [design §10](../specs/2026-11-18-workflow-execution-efficiency-design.md#10-implementation-dispositions)
+for individual dispositions and partial deliveries.

@@ -135,6 +135,7 @@ from .reporting import (
     _mask_ratio_diagnostics,
     _relational_queue_metrics,
     prepare_evaluation_manifest,
+    protected_evaluation_inputs,
 )
 from .runtime import (
     _capture_rng_state,
@@ -754,7 +755,7 @@ def run_pretrain(
     # with the evaluation manifest. Queue runs reuse the selection they already
     # identity-checked. Path/CSV resolution therefore never happens twice for one
     # source inside this phase.
-    resolved_images = getattr(args, "pretrain_resolved_images", None)
+    resolved_images = handoff.training_images
     evaluation_csv = getattr(args, "visualize_data", "") or getattr(
         args, "train_data", ""
     )
@@ -1039,21 +1040,19 @@ def run_pretrain(
         # A separate timer: the enclosing recovery phase is still open here.
         manifest_phase = _phase_start("evaluation manifest")
         try:
-            resolved_training = resolved_images
-            reuse = (
-                evaluation_csv == str(getattr(args, "train_data", "") or "")
-                and isinstance(resolved_training, ResolvedTrainingImages)
-                and bool(resolved_training.refs)
-                and resolved_training.csv_path == evaluation_csv
-                and resolved_training.images_dir == str(Path(args.input_images_dir))
-            )
+            selection = handoff.evaluation_images
+            if selection is None and (
+                isinstance(resolved_images, ResolvedTrainingImages)
+                and resolved_images.csv_path == str(Path(evaluation_csv))
+                and resolved_images.images_dir == str(Path(args.input_images_dir))
+            ):
+                selection = resolved_images
             evaluation_manifest = prepare_evaluation_manifest(
                 Path(evaluation_csv),
                 Path(args.input_images_dir),
                 max_samples=int(getattr(args, "metrics_sample_size", 10000)),
                 seed=int(args.seed),
-                image_paths=resolved_training.paths if reuse else None,
-                refs=resolved_training.refs if reuse else None,
+                **protected_evaluation_inputs(selection, evaluation_csv, args.input_images_dir),
             )
         except (ValueError, OSError, KeyError) as exc:
             manifest_unavailable = True

@@ -95,6 +95,7 @@ from .reporting import (
     _compute_grad_norm,
     _compute_instant_metrics,
     prepare_evaluation_manifest,
+    protected_evaluation_inputs,
 )
 from .runtime import (
     _phase_done,
@@ -318,6 +319,7 @@ def run_finetune(
             orientation_policy=policy,
             rows=pseudo_rows,
             class_labels=pseudo_class_labels,
+            prepared_images=handoff.training_images,
         )
     else:
         ds = MetricDataset(
@@ -328,7 +330,7 @@ def run_finetune(
             orientation_policy=policy,
             # The CLI may already have resolved this manifest for overwrite
             # protection; the row references prove it is still the same one.
-            prepared_images=getattr(args, "finetune_resolved_images", None),
+            prepared_images=handoff.training_images,
         )
     expert_label_indices = (
         [
@@ -704,13 +706,21 @@ def run_finetune(
             and bool(getattr(ds, "image_refs", None))
         )
         try:
+            if handoff.evaluation_images is not None:
+                inputs = protected_evaluation_inputs(
+                    handoff.evaluation_images, evaluation_csv, args.input_images_dir
+                )
+            else:
+                inputs = {
+                    "image_paths": tuple(ds.image_paths) if reuse_training else None,
+                    "refs": tuple(ds.image_refs) if reuse_training else None,
+                }
             evaluation_manifest = prepare_evaluation_manifest(
                 Path(evaluation_csv),
                 Path(args.input_images_dir),
                 max_samples=int(getattr(args, "metrics_sample_size", 10000)),
                 seed=int(args.seed),
-                image_paths=tuple(ds.image_paths) if reuse_training else None,
-                refs=tuple(ds.image_refs) if reuse_training else None,
+                **inputs,
             )
         except (ValueError, OSError, KeyError) as exc:
             manifest_unavailable = True

@@ -649,3 +649,9 @@ Evidence limits: `/tmp/restore-run5.log` (`1740 passed, 1 skipped`, 2026-11-08
 18:13 UTC+8) predates the fixes recorded above and is historical only. Later
 checks were targeted selections per the impact-based policy, not a full-suite
 run, and overlapping selections must not be added together as full coverage.
+
+**Follow-up (2026-11-19):** The [workflow execution efficiency design](2026-11-18-workflow-execution-efficiency-design.md#7-e--architecture-boundaries)
+extends the existing invocation-private handoffs with startup evaluation
+snapshots and a path-bound finetune payload. It keeps CLI output protection and
+the `trainer.py` compatibility boundary; it does not change the acceptance
+status described here.

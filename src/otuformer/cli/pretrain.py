@@ -86,6 +86,7 @@ _CLI_HANDOFF_ARGS = frozenset(
         "pretrain_dense_settings",
         "pretrain_dense_dependency",
         "pretrain_resolved_images",
+        "pretrain_evaluation_images",
     }
 )
 
@@ -970,12 +971,10 @@ def pretrain(
         raise typer.BadParameter(str(exc)) from exc
     ns.pretrain_dense_settings = dense_settings
     ns.pretrain_dense_dependency = dense_dependency
+    evaluation_images = None
 
     try:
-        from otuformer.training.dataset import (
-            resolve_dataset_image_paths,
-            resolve_training_images,
-        )
+        from otuformer.training.dataset import resolve_training_images
 
         protected = [input_images_dir, train_data, resume]
         if prepared_initialization is not None:
@@ -1001,7 +1000,7 @@ def pretrain(
             protected.extend(resolved_training_images.paths)
         if (
             overwrite and out_dir.exists() and not disable_embedding_metrics
-            and visualize_data is not None and visualize_data.exists()
+            and visualize_data is not None
         ):
             protected.append(visualize_data)
             if (
@@ -1019,9 +1018,15 @@ def pretrain(
                 if resolved_training_images is not None:
                     protected.extend(resolved_training_images.paths)
             else:
-                protected.extend(
-                    resolve_dataset_image_paths(visualize_data, input_images_dir)
-                )
+                try:
+                    selection = resolve_training_images(visualize_data, input_images_dir)
+                except (ValueError, OSError) as exc:
+                    # Report invalid optional inputs at startup, without retrying
+                    # the selection after overwrite. The CSV itself stays protected.
+                    evaluation_images = exc
+                else:
+                    evaluation_images = selection
+                    protected.extend(selection.paths)
         prepare_output_dir(
             out_dir, overwrite=overwrite, allow_existing=bool(resume),
             protected_paths=protected,
@@ -1029,6 +1034,7 @@ def pretrain(
     except (ValueError, OSError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     ns.pretrain_resolved_images = resolved_training_images
+    ns.pretrain_evaluation_images = evaluation_images
     tee = TeeLogger(
         out_dir / "logs" / "pretrain.log",
         append=bool(resume),

@@ -43,6 +43,7 @@ from otuformer.training.dataset import (
     build_weak_teacher_augmentation_config,
     center_crop_eval_transform,
     prepare_relational_data,
+    ResolvedTrainingImages,
 )
 from otuformer.training.dino import (
     DINOObjective,
@@ -2274,6 +2275,8 @@ def take_pretrain_handoff(args: argparse.Namespace) -> "_PretrainHandoff":
             else None
         ),
         evaluation_manifest=evaluation_manifest,
+        evaluation_images=vars(args).pop("pretrain_evaluation_images", None),
+        training_images=vars(args).pop("pretrain_resolved_images", None),
     )
 
 
@@ -2285,6 +2288,8 @@ class _PretrainHandoff:
     settings: "PretrainSettings | None"
     relational_queue_preparation: "_RelationalQueuePreparation | None" = None
     evaluation_manifest: Any | None = None
+    evaluation_images: ResolvedTrainingImages | Exception | None = None
+    training_images: ResolvedTrainingImages | None = None
 
 
 def resume_payload_for(
@@ -2350,6 +2355,7 @@ _UNSAVED_ARGS = frozenset(
         "relational_queue_preparation",
         "evaluation_manifest",
         "pretrain_resolved_images",
+        "pretrain_evaluation_images",
     }
 )
 

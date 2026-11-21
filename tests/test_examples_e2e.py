@@ -137,13 +137,28 @@ def test_examples_epidorcus_e2e_low_memory(tmp_path: Path):
     assert assignments.exists()
     assert not (cluster_out / "partition_0.5_assignments.csv").exists()
 
+    corrections = tmp_path / "corrections.csv"
+    assigned = pd.read_csv(assignments, dtype={"id": str})
+    assigned.assign(cluster="OTU_edited")[["id", "cluster"]].to_csv(corrections, index=False)
+    annotated_out = tmp_path / "annotate_out"
+    res = runner.invoke(app, [
+        "annotate", "--raw-assignments", str(assignments),
+        "--corrections", str(corrections), "--embeddings", str(emb_path),
+        "--out-dir", str(annotated_out),
+    ])
+    assert res.exit_code == 0, res.output
+    corrected = annotated_out / assignments.name
+    result = pd.read_csv(corrected, dtype={"id": str})
+    assert result["id"].tolist() == assigned["id"].tolist()
+    assert result["cluster"].tolist() == ["OTU_edited"] * len(assigned)
+
     diversity_out = tmp_path / "diversity_out"
     res = runner.invoke(
         app,
         [
             "diversity",
             "--assignments",
-            str(assignments),
+            str(corrected),
             "--out-dir",
             str(diversity_out),
             "--min-abundance",
@@ -151,7 +166,8 @@ def test_examples_epidorcus_e2e_low_memory(tmp_path: Path):
         ],
     )
     assert res.exit_code == 0
-    assert (diversity_out / "diversity_indices.csv").exists()
+    diversity = pd.read_csv(diversity_out / "diversity_indices.csv").set_index("metric")
+    assert diversity.loc["Richness", "min_abundance_0"] == 1
 
     export_out = tmp_path / "export_out"
     res = runner.invoke(

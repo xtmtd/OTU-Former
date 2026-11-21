@@ -11,6 +11,57 @@ import pandas as pd
 from scipy.cluster import hierarchy
 
 
+def compute_monophyly_proportion(
+    z: np.ndarray, ids: list[str], id_to_label: dict[str, str]
+) -> float | None:
+    """Monophyly of labeled species on this exact topology.
+
+    Only labeled tips are scored: a represented species is monophyletic when its
+    labeled tips are exactly the labeled descendants of some clade, so an
+    unlabeled tip neither joins nor breaks it. The denominator is the number of
+    species represented by a labeled tip in this tree. A represented singleton
+    counts as monophyletic (existing convention).
+    """
+    present = [tip for tip in ids if tip in id_to_label]
+    if not present:
+        return None
+    present_set = set(present)
+    species = {id_to_label[tip] for tip in present}
+
+    root = hierarchy.to_tree(z, rd=False)
+    clades: list[set[str]] = []
+
+    def _collect(node) -> set[str]:
+        if node.left is None and node.right is None:
+            tip = ids[node.id]
+            return {tip} if tip in present_set else set()
+        labeled = _collect(node.left) | _collect(node.right)
+        clades.append(labeled)
+        return labeled
+
+    _collect(root)
+
+    monophyletic = 0
+    for name in species:
+        tips = {tip for tip in present_set if id_to_label[tip] == name}
+        if len(tips) <= 1 or any(clade == tips for clade in clades):
+            monophyletic += 1
+    return monophyletic / len(species)
+
+
+def select_labeled_cohort(
+    ids: list[str], labels: pd.DataFrame, *, max_samples: int, seed: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """Match the validated label table to embedding rows, then apply the cap."""
+    from otuformer.embedding.sampling import sorted_sample_indices
+
+    merged = pd.DataFrame({"id": ids, "row": np.arange(len(ids))}).merge(
+        labels, on="id", how="inner"
+    )
+    selected = sorted_sample_indices(len(merged), max_samples, seed)
+    return merged["row"].to_numpy()[selected], merged["label"].to_numpy()[selected]
+
+
 def build_partitions_from_linkage(
     z: np.ndarray,
     thresholds: list[float],

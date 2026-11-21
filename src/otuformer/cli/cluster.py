@@ -37,7 +37,7 @@ def _read_label_table(label_csv: Path):
     """
     import pandas as pd
 
-    lbl_df = pd.read_csv(label_csv)
+    lbl_df = pd.read_csv(label_csv, dtype=str, keep_default_na=False)
     if "label" not in lbl_df.columns:
         raise ValueError("--label-csv must contain a 'label' column.")
     if "id" in lbl_df.columns:
@@ -54,14 +54,8 @@ def _read_label_table(label_csv: Path):
 
     labels_aligned = lbl_df[[key_col, "label"]].copy()
     labels_aligned.rename(columns={key_col: "id"}, inplace=True)
-    labels_aligned["id"] = labels_aligned["id"].astype(str)
-    # A blank label is unlabeled, not a class named "": dropping it here keeps
-    # the fixed-tree score and the partition metrics on the same valid rows
-    # instead of turning NaN into a label.
-    label_text = labels_aligned["label"]
-    valid_label = label_text.notna() & label_text.astype(str).str.strip().ne("")
-    labels_aligned = labels_aligned[valid_label].copy()
-    labels_aligned["label"] = labels_aligned["label"].astype(str)
+    # A blank label is unlabeled; the remaining text is a literal class name.
+    labels_aligned = labels_aligned[labels_aligned["label"].str.strip().ne("")]
 
     duplicates = labels_aligned["id"].duplicated(keep=False)
     if duplicates.any():
@@ -795,46 +789,6 @@ def _plot_metrics_dashboard(metrics_df, out_path: Path) -> None:
     plt.close(fig)
 
 
-def _compute_monophyly_proportion_upgma(
-    z, ids: list[str], id_to_label: dict[str, str]
-) -> float | None:
-    """Monophyly of labeled species on this exact topology.
-
-    Only labeled tips are scored: a represented species is monophyletic when its
-    labeled tips are exactly the labeled descendants of some clade, so an
-    unlabeled tip neither joins nor breaks it. The denominator is the number of
-    species represented by a labeled tip in this tree. A represented singleton
-    counts as monophyletic (existing convention).
-    """
-    from scipy.cluster import hierarchy
-
-    present = [tip for tip in ids if tip in id_to_label]
-    if not present:
-        return None
-    present_set = set(present)
-    species = {id_to_label[tip] for tip in present}
-
-    root = hierarchy.to_tree(z, rd=False)
-    clades: list[set[str]] = []
-
-    def _collect(node) -> set[str]:
-        if node.left is None and node.right is None:
-            tip = ids[node.id]
-            return {tip} if tip in present_set else set()
-        labeled = _collect(node.left) | _collect(node.right)
-        clades.append(labeled)
-        return labeled
-
-    _collect(root)
-
-    monophyletic = 0
-    for name in species:
-        tips = {tip for tip in present_set if id_to_label[tip] == name}
-        if len(tips) <= 1 or any(clade == tips for clade in clades):
-            monophyletic += 1
-    return monophyletic / len(species)
-
-
 def _parse_bool_option(name: str, value: str) -> bool:
     try:
         return validate_bool_literal(name, value)
@@ -963,8 +917,10 @@ def cluster(
 
     from otuformer.delineation.partition import (
         build_partitions_from_linkage,
+        compute_monophyly_proportion,
         compute_partition_metrics,
         export_partition_tables,
+        select_labeled_cohort,
     )
     from otuformer.delineation.tree import (
         build_upgma,
@@ -984,14 +940,29 @@ def cluster(
 
     # Read and validate the label table before --overwrite can clear anything: a
     # conflicting or malformed label file must not destroy an earlier result.
-    label_table = None
-    if label_csv is not None:
-        try:
-            label_table = _read_label_table(label_csv)
-        except (ValueError, OSError) as exc:
-            raise typer.BadParameter(str(exc)) from exc
-
     try:
+        label_table = _read_label_table(label_csv) if label_csv is not None else None
+        emb_df = read_csv(embeddings, converters={"id": str})
+        if "id" not in emb_df or emb_df["id"].str.strip().eq("").any():
+            raise ValueError("Embeddings must contain nonempty IDs in the 'id' column.")
+        if emb_df["id"].duplicated().any():
+            raise ValueError("Found a duplicate embedding ID; each embedding must have a unique ID.")
+        ids = emb_df["id"].tolist()
+        dim_cols = [c for c in emb_df.columns if c.startswith("dim_")]
+        if not dim_cols:
+            raise ValueError("No embedding dimensions found. Expected columns prefixed with 'dim_'.")
+        n = len(ids)
+        if n < 2:
+            raise ValueError("Clustering requires at least two embeddings.")
+        n_pairs = n * (n - 1) // 2
+        if n_pairs > max_distance_pairs:
+            raise ValueError(
+                f"Pair count {n_pairs} exceeds --max-distance-pairs={max_distance_pairs}. "
+                "Increase --max-distance-pairs or reduce input size."
+            )
+        x = emb_df[dim_cols].to_numpy(dtype=float)
+        if not np.isfinite(x).all():
+            raise ValueError("Embedding dimensions must contain only finite values.")
         prepare_output_dir(
             out_dir, overwrite=overwrite, protected_paths=[embeddings, label_csv],
         )
@@ -1034,31 +1005,12 @@ def cluster(
         print(json.dumps(params, ensure_ascii=False, indent=2, sort_keys=True))
         print("-" * 80)
 
-        emb_df = read_csv(embeddings)
         print("[1/7] Loaded embeddings")
-        ids = emb_df["id"].astype(str).tolist()
-        id_to_sample = None
-        if "sample" in emb_df.columns:
-            id_to_sample = {
-                row_id: str(row_sample)
-                for row_id, row_sample in zip(
-                    emb_df["id"].astype(str), emb_df["sample"].astype(str)
-                )
-            }
-        dim_cols = [c for c in emb_df.columns if c.startswith("dim_")]
-        if not dim_cols:
-            raise typer.BadParameter(
-                "No embedding dimensions found. Expected columns prefixed with 'dim_'."
-            )
-        x = emb_df[dim_cols].to_numpy()
-
-        n = len(ids)
-        n_pairs = n * (n - 1) // 2
-        if n_pairs > max_distance_pairs:
-            raise typer.BadParameter(
-                f"Pair count {n_pairs} exceeds --max-distance-pairs={max_distance_pairs}. "
-                "Increase --max-distance-pairs or reduce input size."
-            )
+        id_to_sample = (
+            dict(zip(ids, emb_df["sample"].astype(str)))
+            if "sample" in emb_df.columns
+            else None
+        )
 
         if pca_whitening_enabled:
             n_comp = min(pca_components, x.shape[1], x.shape[0])
@@ -1120,40 +1072,20 @@ def cluster(
         d_for_metrics = d
         z_metrics = z
         if label_table is not None:
-            labels_aligned = label_table
-            id_to_label = dict(zip(labels_aligned["id"], labels_aligned["label"]))
-            merged = emb_df[["id"]].merge(labels_aligned, on="id", how="inner")
-            if len(merged) > 0:
-                id_to_row = {v: i for i, v in enumerate(ids)}
-                merged_idx = np.array(
-                    [id_to_row[i] for i in merged["id"].astype(str)], dtype=int
+            id_to_label = dict(zip(label_table["id"], label_table["label"]))
+            final_idx, final_labels = select_labeled_cohort(
+                ids, label_table, max_samples=metrics_sample_size, seed=random_state
+            )
+            if len(final_idx) >= 2:
+                true_labels_arr = final_labels
+                x_for_metrics = x[final_idx]
+                d_for_metrics = d[np.ix_(final_idx, final_idx)]
+                z_metrics = build_upgma(d_for_metrics)
+            elif len(final_idx):
+                typer.echo(
+                    "[Warning] Fewer than two labeled embeddings; skipping "
+                    "partition metrics."
                 )
-                final_labels = merged["label"].astype(str).to_numpy()
-                final_idx = merged_idx
-
-                if (
-                    metrics_sample_size > 0
-                    and len(final_idx) > metrics_sample_size
-                ):
-                    from otuformer.embedding.sampling import sorted_sample_indices
-
-                    sample_idx = sorted_sample_indices(
-                        len(final_idx), metrics_sample_size, random_state
-                    )
-                    final_idx = merged_idx[sample_idx]
-                    final_labels = final_labels[sample_idx]
-                if len(final_idx) >= 2:
-                    true_labels_arr = final_labels
-                    # One slice of the already-computed distances for the final
-                    # cohort, then one metrics linkage from it.
-                    x_for_metrics = x[final_idx]
-                    d_for_metrics = d[np.ix_(final_idx, final_idx)]
-                    z_metrics = build_upgma(d_for_metrics)
-                else:
-                    typer.echo(
-                        "[Warning] Fewer than two labeled embeddings; skipping "
-                        "partition metrics."
-                    )
             else:
                 typer.echo(
                     "[Warning] No overlapping IDs between embeddings and --label-csv."
@@ -1230,7 +1162,7 @@ def cluster(
             # Monophyly is a property of the fixed output topology and the
             # labels, independent of --metrics-sample-size and the cutoff. The
             # partition metrics below keep their own aligned cohort linkage.
-            monophyly_prop = _compute_monophyly_proportion_upgma(
+            monophyly_prop = compute_monophyly_proportion(
                 z,
                 ids,
                 id_to_label or {},

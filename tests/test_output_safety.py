@@ -143,6 +143,9 @@ def test_extract_missing_model_preserves_old_output(tmp_path):
     assert keep.read_text() == "keep"
 
 
+_EMBEDDINGS_CSV = b"id,dim_0,dim_1\na,1,0\nb,0,1\n"
+
+
 @pytest.mark.parametrize("error_type", [None, FileExistsError, PermissionError])
 @pytest.mark.parametrize("command,option,name", [
     ("cluster", "--embeddings", "embeddings.csv"),
@@ -155,7 +158,9 @@ def test_downstream_cleanup_oserror_is_a_cli_error(
     from otuformer.utils import io
 
     source = tmp_path / name
-    if command != "export":
+    if command == "cluster":
+        source.write_bytes(_EMBEDDINGS_CSV)
+    elif command != "export":
         source.write_text("image,cluster,sample\na.png,A,S1\n")
     assert source.is_file()
     original_input = source.read_bytes()
@@ -208,7 +213,10 @@ def test_downstream_inputs_survive_overwrite(tmp_path, checkpoint, command, opti
         source.parent.mkdir(parents=True)
         (out / "logs").mkdir()
         (out / "logs" / "cluster.log").write_text("original log")
-    source.write_bytes(checkpoint.read_bytes() if name.endswith(".pth") else b"image,cluster,sample\na.png,A,S1\n")
+    if command == "cluster":
+        source.write_bytes(_EMBEDDINGS_CSV)
+    else:
+        source.write_bytes(checkpoint.read_bytes() if name.endswith(".pth") else b"image,cluster,sample\na.png,A,S1\n")
     argv = [command, "--out-dir", str(out), "--overwrite"]
     for option in options:
         argv += [option, str(source)]

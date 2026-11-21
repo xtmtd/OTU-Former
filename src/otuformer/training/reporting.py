@@ -28,6 +28,7 @@ from otuformer.training.dataset import (
     IndexedDataset,
     MetricDataset,
     MultiCropDataset,
+    ResolvedTrainingImages,
     _build_recursive_index,
     _resolve_image_path,
     _supports_recursive_lookup,
@@ -1695,6 +1696,24 @@ class PreparedEvaluationManifest:
     csv_path: Path
     paths: tuple[Path, ...]
     labels: np.ndarray | None
+
+
+def protected_evaluation_inputs(
+    selection: ResolvedTrainingImages | Exception | None,
+    csv_path: str | Path,
+    root_dir: str | Path,
+) -> dict:
+    """Use the protected paths, or refuse to resolve a different request."""
+    if selection is None:
+        return {}
+    if isinstance(selection, Exception):
+        raise ValueError(str(selection)) from selection
+    if (
+        selection.csv_path != str(Path(csv_path))
+        or selection.images_dir != str(Path(root_dir))
+    ):
+        raise ValueError("The evaluation manifest request changed after overwrite protection.")
+    return {"image_paths": selection.paths, "refs": selection.refs}
 
 
 def prepare_evaluation_manifest(

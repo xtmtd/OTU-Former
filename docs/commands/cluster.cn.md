@@ -140,7 +140,7 @@ subsample 模式的特征比例（bootstrap 模式下忽略）。
 
 **默认值：** `None`
 
-用于划分质量评估的可选标签 CSV（支持 id/label 或 image/label）。
+用于划分质量评估的可选标签 CSV（支持 id/label 或 image/label）。ID 和标签按文本读取，因此 `01` 与 `1` 不同。嵌入 ID 必须非空且唯一。空标签不参与评估；相同的标签行会去重，同一 ID 对应冲突标签时会在 `--overwrite` 清理旧报告前报错。
 
 ### `--metrics-sample-size`
 

@@ -36,6 +36,7 @@ from otuformer.training.dataset import (
     IndexedDataset,
     MetricDataset,
     MultiCropDataset,
+    ResolvedTrainingImages,
     _build_recursive_index,
     _resolve_image_path,
     _supports_recursive_lookup,
@@ -306,6 +307,8 @@ class _FinetuneHandoff:
     #: The CLI already ran the source preflight for this path; the runner must
     #: not build the validation model again.
     source_preflighted: bool = False
+    evaluation_images: ResolvedTrainingImages | Exception | None = None
+    training_images: ResolvedTrainingImages | None = None
 
 
 def take_finetune_handoff(args: argparse.Namespace) -> "_FinetuneHandoff":

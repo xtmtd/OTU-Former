@@ -1545,8 +1545,7 @@ class MetricDataset(Dataset):
         images_root = Path(images_dir)
         refs = [str(row) for row in df["image"]]
         reuse = (
-            rows is None
-            and prepared_images is not None
+            prepared_images is not None
             and prepared_images.csv_path == str(csv_path or "")
             and prepared_images.images_dir == str(images_root)
         )

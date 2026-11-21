@@ -1350,20 +1350,30 @@ def test_cluster_respects_max_distance_pairs(tmp_path):
 
 
 def test_cluster_uses_one_metrics_linkage_and_fixed_tree_monophyly(tmp_path, monkeypatch):
+    import numpy as np
     import otuformer.delineation.tree as tree_module
+    from otuformer.delineation.distance import compute_cosine_distances
+    from otuformer.delineation.partition import (
+        build_partitions_from_linkage,
+        compute_partition_metrics,
+    )
 
     emb_path, labels_path = _make_embeddings_and_labels(tmp_path)
+    x = pd.read_csv(emb_path).filter(like="dim_").to_numpy()
+    y = pd.read_csv(labels_path)["label"].to_numpy()
+    distances = compute_cosine_distances(x)
     calls = []
     real_build = tree_module.build_upgma
 
-    def counting_build(*args, **kwargs):
-        calls.append(1)
-        return real_build(*args, **kwargs)
+    def counting_build(matrix):
+        calls.append(matrix.copy())
+        return real_build(matrix)
 
     monkeypatch.setattr(tree_module, "build_upgma", counting_build)
 
     values = {}
-    for label, sample_size in (("capped", "2"), ("full", "0")):
+    trees = []
+    for label, sample_size, seed in (("capped", 2, 42), ("other", 3, 7), ("full", 0, 42)):
         out_dir = tmp_path / f"cluster_mono_{label}"
         result = runner.invoke(
             app,
@@ -1372,20 +1382,34 @@ def test_cluster_uses_one_metrics_linkage_and_fixed_tree_monophyly(tmp_path, mon
                 "--embeddings", str(emb_path),
                 "--out-dir", str(out_dir),
                 "--labels", str(labels_path),
-                "--custom-cutoffs", "0.5",
-                "--metrics-sample-size", sample_size,
+                "--custom-cutoffs", "0.15,0.5",
+                "--metrics-sample-size", str(sample_size),
+                "--random-state", str(seed),
             ],
         )
         assert result.exit_code == 0, result.output
-        # The full output tree plus exactly one metrics linkage.
+        # Independent original sampling/linkage rule; labels and x must follow it.
+        idx = (
+            np.sort(np.random.default_rng(seed).choice(len(x), sample_size, replace=False))
+            if sample_size else np.arange(len(x))
+        )
+        cohort = distances[np.ix_(idx, idx)]
         assert len(calls) == 2
+        np.testing.assert_array_equal(calls[0], distances)
+        np.testing.assert_array_equal(calls[1], cohort)
         calls.clear()
+        by_cutoff = compute_partition_metrics(
+            build_partitions_from_linkage(real_build(cohort), [0.15, 0.5]), y[idx], x=x[idx],
+        )
+        expected = pd.DataFrame.from_dict(by_cutoff, orient="index").rename_axis("cutoff")
+        expected = expected.drop(columns="monophyly_proportion")
         metrics = pd.read_csv(out_dir / "UPGMA" / "metrics.csv")
-        assert metrics["monophyly_proportion"].nunique() == 1
+        pd.testing.assert_frame_equal(metrics.set_index("cutoff")[expected.columns], expected, check_dtype=False)
         values[label] = set(metrics["monophyly_proportion"])
+        trees.append((out_dir / "UPGMA" / "UPGMA_Cosine.nwk").read_text())
 
-    # Sampling and cutoffs do not change the fixed-output-tree value.
-    assert values["capped"] == values["full"]
+    assert len(set(trees)) == 1
+    assert values["capped"] == values["other"] == values["full"] == {1.0}
 
 
 def test_cluster_without_label_csv_skips_partition_metrics(tmp_path):
@@ -1793,15 +1817,16 @@ def test_diversity_command(tmp_path):
 
 
 def test_diversity_log_command_uses_flag_style_for_bools(tmp_path):
+    ids = ["1", "01", "001", "NA"]
     assignments = pd.DataFrame(
         {
-            "id": ["img1", "img2", "img3", "img4"],
+            " Image ": ids,
             "cluster": ["OTU_1", "OTU_1", "OTU_2", "OTU_3"],
         }
     )
     embeddings = pd.DataFrame(
         {
-            "id": ["img1", "img2", "img3", "img4"],
+            "id": ids,
             "dim_0": [1.0, 0.9, 0.0, 0.0],
             "dim_1": [0.0, 0.1, 1.0, 0.9],
         }
@@ -1826,6 +1851,7 @@ def test_diversity_log_command_uses_flag_style_for_bools(tmp_path):
             "--embeddings",
             str(emb_path),
             "--save-nj-tree",
+            "--save-nj-centroids",
         ],
     )
 
@@ -1838,6 +1864,9 @@ def test_diversity_log_command_uses_flag_style_for_bools(tmp_path):
     assert "--save-nj-tree" in command_line
     assert "--phylo true" not in command_line
     assert "--save-nj-tree true" not in command_line
+    centroids = pd.read_csv(out_dir / "NJ_OTU_centroids.csv").set_index("cluster")
+    assert centroids.loc["OTU_2", ["dim_0", "dim_1"]].tolist() == [0.0, 1.0]
+    assert centroids.loc["OTU_3", ["dim_0", "dim_1"]].tolist() == [0.0, 1.0]
 
 
 def test_cam_command(tmp_path):
@@ -6434,6 +6463,61 @@ def test_pretrain_overwrite_protection_reuses_the_training_selection(tmp_path, m
     assert len(calls) == 1
 
 
+@pytest.mark.parametrize("command", ["pretrain", "finetune"])
+@pytest.mark.parametrize("invalid", [False, True])
+def test_overwrite_binds_independent_evaluation_to_protected_rows(tmp_path, monkeypatch, command, invalid):
+    """A post-cleanup edit cannot select unprotected evaluation inputs."""
+    from otuformer.training import finetune_support, pretrain_recipe, reporting
+    from otuformer.utils import io
+
+    _make_tiny_finetune_data(tmp_path)
+    train = tmp_path / "labels.csv"
+    eval_csv = tmp_path / "eval.csv"
+    frame = pd.read_csv(train)
+    if invalid:
+        eval_csv.write_text("not_image\nbroken\n", encoding="utf-8")
+    else:
+        frame.iloc[:2].to_csv(eval_csv, index=False)
+    out_dir = tmp_path / "prior"
+    out_dir.mkdir()
+    real_prepare = io.prepare_output_dir
+
+    def rewrite_after_cleanup(*args, **kwargs):
+        assert eval_csv in kwargs["protected_paths"]
+        real_prepare(*args, **kwargs)
+        frame.iloc[2:].to_csv(eval_csv, index=False)
+
+    def check_handoff(args, **kwargs):
+        handoff = (
+            pretrain_recipe.take_pretrain_handoff(args)
+            if command == "pretrain"
+            else finetune_support.take_finetune_handoff(args)
+        )
+        protected = handoff.evaluation_images
+        if invalid:
+            with pytest.raises(ValueError, match="missing required 'image' column"):
+                reporting.protected_evaluation_inputs(protected, eval_csv, tmp_path)
+            return
+        assert protected.refs == tuple(frame["image"].iloc[:2])
+        with pytest.raises(ValueError, match="changed while it was being prepared"):
+            reporting.prepare_evaluation_manifest(
+                eval_csv, tmp_path, max_samples=1, seed=42,
+                image_paths=protected.paths, refs=protected.refs,
+            )
+
+    monkeypatch.setattr(io, "prepare_output_dir", rewrite_after_cleanup)
+    monkeypatch.setattr(f"otuformer.training.{command}_loop.run_{command}", check_handoff)
+    extra = []
+    if command == "finetune":
+        extra = ["--checkpoint", str(_write_init_checkpoint(tmp_path / "source.pth"))]
+    result = runner.invoke(app, [
+        command, "--train-data", str(train), "--visualize-data", str(eval_csv),
+        "--input-images-dir", str(tmp_path), "--out-dir", str(out_dir),
+        "--overwrite", "--device", "cpu", *extra,
+    ])
+    assert result.exit_code == 0, (result.output, result.exception)
+
+
 def test_cluster_rejects_conflicting_duplicate_labels_and_dedupes_identical_ones(tmp_path):
     emb_path, _ = _make_embeddings_and_labels(tmp_path)
 
@@ -6495,7 +6579,7 @@ def test_finetune_overwrite_protection_resolves_the_training_manifest_once(
     monkeypatch.setattr(
         "otuformer.training.finetune_loop.run_finetune",
         lambda args, **kwargs: seen.setdefault(
-            "carrier", getattr(args, "finetune_resolved_images", None)
+            "carrier", args.finetune_handoff.training_images
         ),
     )
 
@@ -6516,6 +6600,26 @@ def test_finetune_overwrite_protection_resolves_the_training_manifest_once(
     assert len(calls) == 1
     assert seen["carrier"] is not None
     assert len(seen["carrier"].paths) == 4
+
+
+def test_pseudo_dataset_reuses_matching_protected_rows(tmp_path, monkeypatch):
+    from otuformer.training import dataset as dataset_module
+
+    _make_tiny_finetune_data(tmp_path)
+    rows = pd.read_csv(tmp_path / "labels.csv").to_dict("records")
+    refs = tuple(row["image"] for row in rows)
+    paths = tuple(dataset_module.resolve_dataset_image_paths(None, tmp_path, refs=list(refs)))
+    carrier = dataset_module.ResolvedTrainingImages("", str(tmp_path), paths, refs)
+    monkeypatch.setattr(
+        dataset_module, "resolve_dataset_image_paths",
+        lambda *a, **k: pytest.fail("Pseudo rows were resolved after overwrite protection"),
+    )
+    ds = dataset_module.MetricDataset(images_dir=tmp_path, rows=rows, prepared_images=carrier)
+    assert ds.image_paths == list(paths)
+    with pytest.raises(ValueError, match="changed after overwrite protection"):
+        dataset_module.MetricDataset(
+            images_dir=tmp_path, rows=rows[::-1], prepared_images=carrier,
+        )
 
 
 def test_dataset_ignores_a_carrier_for_different_rows(tmp_path, monkeypatch):
@@ -6623,8 +6727,18 @@ def test_cluster_label_conflict_is_rejected_before_overwrite(tmp_path):
     assert sentinel.read_text(encoding="utf-8") == "keep"
 
 
-def test_cluster_deduplicates_identical_rows_before_partition_metrics(tmp_path):
-    """Duplicate identical labels must leave one row per id for both metrics."""
+def test_cluster_partition_cohort_has_one_row_per_deduplicated_id(tmp_path, monkeypatch):
+    """Deduplication must reach the partition metrics, not only the tree."""
+    import otuformer.delineation.partition as partition_module
+
+    seen = []
+    real = partition_module.compute_partition_metrics
+
+    def spy(partitions, labels_true, *, x, monophyly_proportion):
+        seen.append((len(labels_true), x.shape[0]))
+        return real(partitions, labels_true, x=x, monophyly_proportion=monophyly_proportion)
+
+    monkeypatch.setattr(partition_module, "compute_partition_metrics", spy)
     emb_path, _ = _make_embeddings_and_labels(tmp_path)
     duplicated = tmp_path / "duplicated.csv"
     pd.DataFrame(
@@ -6649,6 +6763,7 @@ def test_cluster_deduplicates_identical_rows_before_partition_metrics(tmp_path):
         assert result.exit_code == 0, result.output
         frames[name] = pd.read_csv(out_dir / "UPGMA" / "metrics.csv")
 
+    assert seen == [(2, 2), (2, 2)]
     # Identical label rows collapse to the same cohort, not a doubled one.
     shared = ["n_true_species", "n_OTUs", "ARI", "monophyly_proportion", "BCubed_fscore"]
     pd.testing.assert_frame_equal(
@@ -6676,7 +6791,8 @@ def test_finetune_refuses_a_manifest_changed_after_protection(tmp_path, monkeypa
         )
 
 
-def test_resolve_training_images_reads_an_empty_csv_once(tmp_path, monkeypatch):
+@pytest.mark.parametrize("queue", [False, True])
+def test_resolve_training_images_reads_an_empty_csv_once(tmp_path, monkeypatch, queue):
     """A header-only CSV is an empty selection, not a reason to read it twice."""
     import otuformer.training.dataset as dataset_module
 
@@ -6690,8 +6806,64 @@ def test_resolve_training_images_reads_an_empty_csv_once(tmp_path, monkeypatch):
         lambda *a, **k: reads.append(1) or real_read(*a, **k),
     )
 
-    carrier = dataset_module.resolve_training_images(csv_path, tmp_path)
-
-    assert carrier.paths == ()
-    assert carrier.refs == ()
+    if queue:
+        with pytest.raises(ValueError, match="at least one selected image"):
+            dataset_module.prepare_relational_data(csv_path, tmp_path, batch_size=1)
+    else:
+        carrier = dataset_module.resolve_training_images(csv_path, tmp_path)
+        assert carrier.paths == ()
+        assert carrier.refs == ()
     assert len(reads) == 1
+
+
+def test_cluster_rejects_duplicate_embedding_ids_before_overwrite(tmp_path):
+    emb_path, labels = _make_embeddings_and_labels(tmp_path)
+    frame = pd.read_csv(emb_path)
+    frame.loc[1, "id"] = frame.loc[0, "id"]
+    frame.to_csv(emb_path, index=False)
+    out_dir = tmp_path / "prior_cluster"
+    out_dir.mkdir()
+    sentinel = out_dir / "prior.csv"
+    sentinel.write_text("keep", encoding="utf-8")
+
+    result = runner.invoke(app, [
+        "cluster", "--embeddings", str(emb_path), "--labels", str(labels),
+        "--out-dir", str(out_dir), "--overwrite", "--custom-cutoffs", "0.5",
+    ])
+
+    assert result.exit_code == 2, result.output
+    assert "duplicate embedding ID" in result.output
+    assert sentinel.read_text(encoding="utf-8") == "keep"
+
+
+@pytest.mark.parametrize("ids", [["1", "2", "3", "4"], ["1", "01", "001", "0001"]])
+def test_cluster_accepts_purely_numeric_ids(tmp_path, ids):
+    """Numeric-looking IDs are text, including significant leading zeros."""
+    emb_path = tmp_path / "numeric_embeddings.csv"
+    pd.DataFrame(
+        {
+            "id": ids,
+            "dim_0": [0.1, 0.1, 0.9, 0.8],
+            "dim_1": [0.1, 0.2, 0.8, 0.9],
+        }
+    ).to_csv(emb_path, index=False)
+    labels = tmp_path / "numeric_labels.csv"
+    pd.DataFrame({"id": ids, "label": ["01", "01", "1", "1"]}).to_csv(
+        labels, index=False
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "cluster",
+            "--embeddings", str(emb_path),
+            "--out-dir", str(tmp_path / "cluster_numeric"),
+            "--labels", str(labels),
+            "--custom-cutoffs", "0.5",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    metrics = pd.read_csv(tmp_path / "cluster_numeric" / "UPGMA" / "metrics.csv")
+    assert metrics["n_true_species"].iloc[0] == 2
+    assert metrics["monophyly_proportion"].nunique() == 1

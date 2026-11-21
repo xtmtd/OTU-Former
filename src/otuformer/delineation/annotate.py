@@ -281,7 +281,7 @@ def compute_distance_matrix_for_ids(
         compute_euclidean_distances,
     )
 
-    emb_df = pd.read_csv(embeddings_path)
+    emb_df = pd.read_csv(embeddings_path, converters={"id": str})
     id_to_row = {rid: i for i, rid in enumerate(emb_df["id"].astype(str))}
     missing = [rid for rid in ids if rid not in id_to_row]
     if missing:
@@ -364,7 +364,7 @@ def load_partitions_from_tables(
         if m is None:
             continue
         th = float(m.group("cutoff"))
-        df = pd.read_csv(path)
+        df = pd.read_csv(path, converters={"id": str})
         if "id" not in df.columns or "cluster" not in df.columns:
             continue
         map_row = dict(zip(df["id"].astype(str), df["cluster"].astype(str)))

@@ -425,6 +425,46 @@ def compute_linear_probing_metrics(
     }
 
 
+# Metric-family name to the key a failed family is recorded under.
+_FAMILY_KEY = {
+    "recall_at_k": "Recall@K",
+    "knn_accuracy": "kNN_Accuracy",
+    "linear_probing": "Linear_Probing",
+    "map": "mAP",
+    "clustering": "Clustering",
+}
+
+
+def evaluate_labeled_embeddings(
+    feats: np.ndarray, labels: np.ndarray, *, report=print
+) -> tuple[dict[str, MetricOutcome], str | None]:
+    """Evaluate optional metric families without reading or writing artifacts."""
+    outcomes: dict[str, MetricOutcome] = {}
+    if len(labels) == 0:
+        return outcomes, "no nonempty labels in the evaluated rows"
+    if len(np.unique(labels)) < 2:
+        return outcomes, "fewer than two label classes in the evaluated rows"
+
+    report(f"[Metrics] Computing metrics on {len(labels)} labelled samples ...")
+    families = (
+        ("recall_at_k", _compute_recall_at_k_result),
+        ("knn_accuracy", _compute_knn_accuracy_result),
+        ("linear_probing", _compute_linear_probing_metrics_result),
+        ("map", lambda x, y: {"mAP": _compute_map_result(x, y)}),
+        ("clustering", _compute_clustering_metrics_result),
+    )
+    for family, compute in families:
+        try:
+            outcomes.update(compute(feats, labels))
+        except Exception as exc:  # noqa: BLE001 - optional evaluation
+            report(f"[Warning] {family} metrics failed: {exc}")
+            outcomes[_FAMILY_KEY[family]] = MetricOutcome(
+                None, "failed", f"{family} metric family raised {type(exc).__name__}",
+                {"family": family},
+            )
+    return outcomes, None
+
+
 def run_umap(
     embeddings: np.ndarray,
     labels: Optional[np.ndarray],

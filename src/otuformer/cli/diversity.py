@@ -186,8 +186,7 @@ def diversity(
         tree_path = None
         if phylo:
             if embeddings is not None:
-                import pandas as pd
-                embeddings_df = pd.read_csv(embeddings)
+                embeddings_df = read_csv(embeddings, converters={"id": str})
             elif tree is not None:
                 tree_path = tree
             else:
@@ -204,7 +203,7 @@ def diversity(
 
         if assignments is not None:
             assignments_df = normalize_assignments(
-                read_csv(assignments, encoding="utf-8-sig")
+                read_csv(assignments, encoding="utf-8-sig", dtype=str, keep_default_na=False)
             )
             table = diversity_table(
                 assignments_df, min_values,

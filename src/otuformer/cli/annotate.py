@@ -159,8 +159,10 @@ def annotate(
         typer.echo(f"Cluster run: {cluster_run_dir}")
         typer.echo(f"Detected partition cutoff: {cutoff_tag}")
 
-        assignments_df = validate_raw_assignments(read_csv(raw_assignments))
-        corrections_df = read_csv(corrections)
+        assignments_df = validate_raw_assignments(
+            read_csv(raw_assignments, converters={"id": str})
+        )
+        corrections_df = read_csv(corrections, converters={"id": str, "image": str})
         result_df = apply_corrections(assignments_df, corrections_df)
         summary = build_annotation_summary(assignments_df, result_df)
         changed_df = build_changed_only_table(assignments_df, result_df)
@@ -199,9 +201,9 @@ def annotate(
                 cluster_run_dir / "distance_statistics" / "distance_matrix.csv"
             )
             if distance_matrix_path.exists():
-                dist_df = read_csv(distance_matrix_path, index_col=0)
-                dist_df.index = dist_df.index.astype(str)
-                dist_df.columns = dist_df.columns.astype(str)
+                # Set the index after parsing so pandas cannot coerce text IDs.
+                dist_df = read_csv(distance_matrix_path, converters={0: str})
+                dist_df = dist_df.set_index(dist_df.columns[0])
                 missing = [rid for rid in ids if rid not in dist_df.index]
                 if missing:
                     raise ValueError(

@@ -971,24 +971,6 @@ class _RecordedFailure(Exception):
     """A failure whose run record was already written by the caller."""
 
 
-# Metric-family name to the key a failed family is recorded under.
-_FAMILY_KEY = {
-    "recall_at_k": "Recall@K",
-    "knn_accuracy": "kNN_Accuracy",
-    "linear_probing": "Linear_Probing",
-    "map": "mAP",
-    "clustering": "Clustering",
-}
-
-
-def _failed_outcome(family: str, error: BaseException):
-    from otuformer.embedding.evaluator import MetricOutcome
-
-    return MetricOutcome(
-        None, "failed", f"{family} metric family raised {type(error).__name__}", {"family": family}
-    )
-
-
 def _new_data_inputs(*, label_csv=None, **values) -> dict[str, Path]:
     """Reader inputs for the shared path; the CSV is the ``manifest`` selector."""
     merged = {"manifest": label_csv, **values}
@@ -1032,14 +1014,7 @@ def _evaluate_records(
     import numpy as np
     import pandas as pd
 
-    from otuformer.embedding.evaluator import (
-        _compute_clustering_metrics_result,
-        _compute_knn_accuracy_result,
-        _compute_linear_probing_metrics_result,
-        _compute_map_result,
-        _compute_recall_at_k_result,
-        run_umap,
-    )
+    from otuformer.embedding.evaluator import evaluate_labeled_embeddings, run_umap
 
     dim_cols = [column for column in frame.columns if column.startswith("dim_")]
     embeddings = frame[dim_cols].to_numpy()
@@ -1064,30 +1039,7 @@ def _evaluate_records(
     labelled_feats = feats[labelled_mask]
     labelled = labels[labelled_mask]
 
-    outcomes: dict = {}
-    skipped_reason = None
-    if len(labelled) == 0:
-        skipped_reason = "no nonempty labels in the evaluated rows"
-    elif len(np.unique(labelled)) < 2:
-        skipped_reason = "fewer than two label classes in the evaluated rows"
-    else:
-        print(f"[Metrics] Computing metrics on {len(labelled)} labelled samples ...")
-        # One optional metric family must never discard a finished extraction: a
-        # failing family is recorded as failed and the others still run.
-        families = (
-            ("recall_at_k", _compute_recall_at_k_result),
-            ("knn_accuracy", _compute_knn_accuracy_result),
-            ("linear_probing", _compute_linear_probing_metrics_result),
-            ("map", lambda x, y: {"mAP": _compute_map_result(x, y)}),
-            ("clustering", _compute_clustering_metrics_result),
-        )
-        for family, compute in families:
-            try:
-                outcomes.update(compute(labelled_feats, labelled))
-            except Exception as exc:  # noqa: BLE001 - optional evaluation
-                print(f"[Warning] {family} metrics failed: {exc}")
-                outcome = _failed_outcome(family, exc)
-                outcomes[_FAMILY_KEY[family]] = outcome
+    outcomes, skipped_reason = evaluate_labeled_embeddings(labelled_feats, labelled)
 
     metrics_path = None
     if outcomes:

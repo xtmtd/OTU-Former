@@ -1352,15 +1352,23 @@ def test_fifo_handoff_is_consumed_once_and_retry_is_clean(tmp_path):
         resume_state=None,
         resume_state_path=None,
         evaluation_manifest="manifest-sentinel",
+        pretrain_evaluation_images="protected-paths-sentinel",
+        pretrain_resolved_images="training-paths-sentinel",
     )
     handoff = recipe.take_pretrain_handoff(args)
     assert handoff.relational_queue_preparation is preparation
     assert handoff.evaluation_manifest == "manifest-sentinel"
+    assert handoff.evaluation_images == "protected-paths-sentinel"
+    assert handoff.training_images == "training-paths-sentinel"
     assert not hasattr(args, "relational_queue_preparation")
     assert not hasattr(args, "evaluation_manifest")
+    assert not hasattr(args, "pretrain_evaluation_images")
+    assert not hasattr(args, "pretrain_resolved_images")
     retry = recipe.take_pretrain_handoff(args)
     assert retry.relational_queue_preparation is None
     assert retry.evaluation_manifest is None
+    assert retry.evaluation_images is None
+    assert retry.training_images is None
 
     # A request change invalidates the reused preparation instead of silently
     # serving the old data.

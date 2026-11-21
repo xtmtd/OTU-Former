@@ -836,8 +836,10 @@ def finetune(
         raise typer.BadParameter(str(exc)) from exc
     requested_extract_size = _parse_size(extract_size, stage="--extract-size")
     resolved_training_images = None
+    evaluation_images = None
     try:
         from otuformer.training.dataset import (
+            ResolvedTrainingImages,
             resolve_dataset_image_paths,
             resolve_training_images,
         )
@@ -846,7 +848,11 @@ def finetune(
         if overwrite and out_dir.exists():
             if pseudo_round_data is not None:
                 refs = [str(row["image"]) for row in pseudo_round_data["rows"]]
-                protected.extend(resolve_dataset_image_paths(None, input_images_dir, refs=refs))
+                paths = resolve_dataset_image_paths(None, input_images_dir, refs=refs)
+                resolved_training_images = ResolvedTrainingImages(
+                    "", str(input_images_dir), tuple(paths), tuple(refs)
+                )
+                protected.extend(paths)
             elif train_data.exists():
                 # Resolved once here and handed to the runner's dataset, so the
                 # manifest is not resolved again for the same rows.
@@ -856,18 +862,22 @@ def finetune(
                 protected.extend(resolved_training_images.paths)
         if (
             overwrite and out_dir.exists() and not disable_embedding_metrics
-            and visualize_data is not None and visualize_data.exists()
+            and visualize_data is not None
         ):
             protected.append(visualize_data)
             if (
                 resolved_training_images is not None
-                and str(visualize_data) == str(train_data)
+                and resolved_training_images.csv_path == str(visualize_data)
             ):
                 protected.extend(resolved_training_images.paths)
             else:
-                protected.extend(
-                    resolve_dataset_image_paths(visualize_data, input_images_dir)
-                )
+                try:
+                    selection = resolve_training_images(visualize_data, input_images_dir)
+                except (ValueError, OSError) as exc:
+                    evaluation_images = exc
+                else:
+                    evaluation_images = selection
+                    protected.extend(selection.paths)
         prepare_output_dir(
             out_dir, overwrite=overwrite, allow_existing=bool(resume),
             protected_paths=protected,
@@ -933,14 +943,8 @@ def finetune(
             umap_metric=umap_metric,
             visualize_class_number=visualize_class_number,
             compute_embedding_metrics=not disable_embedding_metrics,
-            finetune_resolved_images=resolved_training_images,
         )
-        # Private handoff state: never printed and never saved.
-        params = {
-            key: value
-            for key, value in vars(ns).items()
-            if key != "finetune_resolved_images"
-        }
+        params = vars(ns)
         # Echo the effective loss settings so an inapplicable flag reads null
         # instead of its CLI default, matching the recorded checkpoint config.
         displayed = {
@@ -980,6 +984,8 @@ def finetune(
             source_checkpoint=source_checkpoint,
             loss_config=resolved_loss,
             source_preflighted=True,
+            evaluation_images=evaluation_images,
+            training_images=resolved_training_images,
         )
         # The handoff is the only channel for the CLI's payload: the runner binds
         # it to the requested path, so a patched path cannot serve a stale read.

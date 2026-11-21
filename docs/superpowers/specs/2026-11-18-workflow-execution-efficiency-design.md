@@ -1,10 +1,10 @@
 # OTU-Former Workflow Execution Efficiency — Design
 
-**Status:** Design accepted; implementation executed on 2026-11-19 — see
-[§10](#10-implementation-dispositions) for per-unit dispositions and
-[the execution record](../plans/2026-11-19-workflow-execution-efficiency-execution.md)
-for commits, commands and results. Every §8 performance gate remains
-`not measured: authorization pending`, so acceptance here is correctness-only.
+**Status:** Design accepted; initial implementation executed on 2026-11-19.
+See [§10](#10-implementation-dispositions) for per-unit outcomes and the
+[plan](../plans/2026-11-19-workflow-execution-efficiency.md#verification-status)
+for verification status. Full regression on the Round 7 changes remains open;
+every §8 performance gate is `not measured: authorization pending`.
 Original draft status (2026-11-19): This single draft supersedes the earlier training-only draft and incorporates the operator's request to include the six downstream commands. Accepted decisions recorded to date: compute `monophyly_proportion` on the fixed output tree and only labeled tips under partial coverage; include bounded E1–E5 architecture scope; use path-bound finetune handoff; include C1–C7 as gated candidates; document worker flag scope without enabling workers; and extend, not overwrite, the throughput evidence schema. On 2026-11-19 the operator also accepted warning once and disabling periodic evaluation on manifest startup failure, skipping evaluation preparation under `--disable-embedding-metrics`, and snapshotting rows, paths and labels together for the invocation. Later accepted refinements are recorded in the body and not repeated here: A's benefit conditionality and its over-cap acceptance workload (§3, §8); the four-value implementation-disposition vocabulary and the §10 addendum location (§8, §9); the classification of D2's duplicate-linkage reuse as a parity change rather than a performance gate (§6.2, §8); E1's four-point startup resolution chain with an ordinary-run path-only carrier that excludes `PreparedRelationalData` (E1); and the narrowed evaluation-manifest phase boundary (E1). Acceptance of these items does not approve the whole design, a plan, implementation, profiling or training, or a commit or release.
 
 ## 1. Intent and constraints
@@ -26,9 +26,9 @@ The design is one document with independent acceptance units: A (evaluation), B 
 
 ## 3. A — Select evaluation rows before image decoding and forward
 
-**Current path.** The CLI default for `--metrics-sample-size` is 10,000 in both pretrain and finetune; the user documentation agrees, and all 24 available local run logs record 10,000. At each eligible save epoch, `training/reporting.py` rereads the evaluation CSV, resolves paths, opens images serially, and runs raw backbone CLS for every row before applying the cap to features and labels. Thus a manifest larger than the effective cap is still fully decoded and forwarded before sampling (for example, 20,000 rows with the default cap decodes and forwards all 20,000); selection-before-decode can avoid work only when the cap is active. For manifests at or below the cap, sampling changes nothing. The 230-row `examples/Epidorcus/figs.csv` (230 image files) is such a case: potential savings there are repeated CSV reading and path resolution, including recursive image-index construction when bare filenames cannot resolve directly, not skipped image decodes or forwards. Evaluation failures warn and skip that epoch's metrics. `num_workers` does not parallelize this evaluator.
+**Baseline path.** The CLI default for `--metrics-sample-size` is 10,000 in both pretrain and finetune, as documented in their command references. Before this change, at each eligible save epoch, `training/reporting.py` rereads the evaluation CSV, resolves paths, opens images serially, and runs raw backbone CLS for every row before applying the cap to features and labels. Thus a manifest larger than the effective cap is still fully decoded and forwarded before sampling (for example, 20,000 rows with the default cap decodes and forwards all 20,000); selection-before-decode can avoid work only when the cap is active. For manifests at or below the cap, sampling changes nothing. The 230-row `examples/Epidorcus/figs.csv` (230 image files) is such a case: potential savings there are repeated CSV reading and path resolution, including recursive image-index construction when bare filenames cannot resolve directly, not skipped image decodes or forwards. Evaluation failures warn and skip that epoch's metrics. `num_workers` does not parallelize this evaluator.
 
-**Proposed behavior.** If embedding metrics are enabled and an evaluation CSV is configured (`visualize_data` or `train_data`), prepare it once at training startup under E1. Preserve `pretrain_loop._compute_and_log_all_metrics`, `reporting._compute_embeddings_from_csv`, and `reporting._maybe_subsample_for_metrics` with their current module-level names and old calling forms; if an optional prepared-manifest argument is added, preserve direct legacy calls. The known direct-call and monkeypatch contracts are in `test_pretrain_alignment.py` (four `_compute_and_log_all_metrics` calls at 392, 460, 505, 553; `_compute_embeddings_from_csv` call/patch at 343, 369, 439, 484, 526; `_maybe_subsample_for_metrics` direct/patch at 411, 533, 1852). If E4 sampling ownership changes one of these symbols, keep a compatibility wrapper or update all listed nodes in the same task. Use the existing lookup rules and require every resolved path to be an existing file before sampling; an unresolved fallback cannot be hidden by sampling. Freeze the ordered rows, resolved paths and labels together. Do not deduplicate or reorder rows. Apply the same seeded, sorted selection without replacement to paths and labels before decoding, using the same sorted-index semantics as the current implementation. Task 9 later extracts the shared index rule in E4 after parity checks. Nonpositive caps or caps at least as large as the manifest still evaluate every row.
+**Proposed behavior.** If embedding metrics are enabled and an evaluation CSV is configured (`visualize_data` or `train_data`), prepare it once at training startup under E1. Preserve the module-level entry points and direct calling forms of `pretrain_loop._compute_and_log_all_metrics` and `reporting._compute_embeddings_from_csv`. Their direct-call and monkeypatch coverage is in `tests/training/test_pretrain_alignment.py` (for example `test_pretrain_periodic_evaluation_uses_cls_token_features` and `test_unlabeled_periodic_evaluation_uses_sampled_umap_features`). Task 3b retained `reporting._maybe_subsample_for_metrics` temporarily; Task 9 migrated its callers and tests to the shared index rule and removed the private helper. Use the existing lookup rules and require every resolved path to be an existing file before sampling; an unresolved fallback cannot be hidden by sampling. Freeze the ordered rows, resolved paths and labels together. Do not deduplicate or reorder rows. Apply the same seeded, sorted selection without replacement to paths and labels before decoding, using the same sorted-index semantics as the current implementation. Task 9 later extracts the shared index rule in E4 after parity checks. Nonpositive caps or caps at least as large as the manifest still evaluate every row.
 
 **Accepted boundary.** An unusable manifest emits one startup warning and skips periodic embedding evaluation for this invocation without stopping training. This is not the same as `--disable-embedding-metrics`: retain the epoch metrics logger (and its header-only CSV if no epoch succeeds) and pass its path to the training-curves plot as today. The explicit disable flag continues to omit the epoch logger and bypasses evaluation-manifest parsing and path checks entirely; independent training and output-safety validation still runs. Mid-run CSV edits or repairs do not take effect until the next invocation, including resume. After successful preparation, sampled files are still opened at evaluation time; decode failures warn and skip that epoch's metrics, while unsampled corrupt or removed files are not checked again. No images are cached and evaluation remains serial. Keep raw CLS, preprocessing, image size, conditions for supervised metrics and plots, and both linear-probe schedules. Keep teacher evaluation in `pretrain` before the checkpoint RNG snapshot and model evaluation in `finetune` after saving.
 
@@ -181,9 +181,8 @@ For downstream performance evidence, use small deterministic inputs in regressio
 Added 2026-11-19 after executing
 [the implementation plan](../plans/2026-11-19-workflow-execution-efficiency.md).
 Performance measurement was not authorized for this execution, so every §8
-performance gate below records `not measured: authorization pending`; the
-correctness gates were run and are the accepted evidence. No device-specific
-speed claim is made.
+performance gate below records `not measured: authorization pending`. No
+device-specific speed claim is made.
 
 | Unit | Disposition | Evidence or reason |
 | --- | --- | --- |
@@ -204,7 +203,7 @@ speed claim is made.
 | D6 | implemented — benefit unqualified (correctness gate only) | The embedding model and size are prepared before the overwrite boundary and reused by export; prior-publication sentinel verified for an invalid size. |
 | E1 | implemented — benefit unqualified (measurement not authorized) | Startup-once manifest, `_PretrainHandoff` slot lifecycle and the ordinary-run path-only carrier verified by tests. Inside the dataset phase one resolution now feeds both the dataset and the evaluation manifest for the same CSV and root (queue runs reuse their identity-checked selection); a resolution-count test asserts one call for an ordinary fresh run. The carrier also keeps the ordered CSV row references, and the manifest rejects a same-length reordered rewrite instead of pairing old paths with new labels. Wall time not measured. |
 | E2 | implemented — benefit unqualified (correctness/duplicate-load gate) | Private path-bound finetune handoff with explicit-None versus unloaded semantics; reload on path change verified. |
-| E3 | not pursued (bounded moves executed elsewhere; `_evaluate_records` stays in CLI) | `_evaluate_records` reads a parsed bundle and publishes the UMAP artifact, so moving it wholesale would carry publication out of the CLI. This is a real partial delivery: its pure calculation was not split out, and only the sampling rule and the within-group summary moved to their owners under E4/D3. |
+| E3 | implemented — benefit unqualified (bounded moves only; full-refactor gate open) | Round 7 moved fixed-tree scoring and labeled-cohort selection to `delineation.partition` and the metric-family calculation to `embedding.evaluator`. This is not a move of all per-record processing: `_evaluate_records` stays in the CLI and still assembles the selected features and labels, orchestrates UMAP, and publishes artifacts. Sampling and within-group calculations retain their E4/D3 owners. |
 | E4 | implemented — benefit unqualified (no timing claim) | One seeded sorted index rule under `otuformer.embedding` used by the manifest, extract (both callsites) and cluster; tree-bootstrap and stratified silhouette sampling left untouched. |
 | E5 | implemented — benefit unqualified (documentation-only scope) | `--num-workers` scope is documented as training loaders only with serial evaluation; no worker implementation or `persistent_workers` change. |
 | E6 | implemented — benefit unqualified (fixture repair; no timing claim) | The six resume smoke nodes pass with no production-source change; the loader-step preflight keeps full resolution and reuses it where contracts match. |
@@ -311,8 +310,7 @@ row); labels are now deduplicated by `(id, label)` and a conflicting duplicate i
 rejected. Overwrite protection was made single-resolution for the remaining
 branches: a queue run whose `--visualize-data` names its training CSV, and a
 finetune run whose overwrite protection already resolved the manifest (handed to
-`MetricDataset` through `finetune_resolved_images`). The execution record gained
-per-round command/result tables and corrected consumer-chain citations.
+`MetricDataset` through `finetune_resolved_images`).
 
 ### Sixth audit round (2026-11-19)
 
@@ -324,6 +322,31 @@ report survives the rejection. Two further gaps closed: a finetune run whose
 manifest changed after protection now refuses to continue instead of
 re-resolving a different selection behind a cleaned output, and an empty
 (header-only) CSV is read once because the carrier distinguishes an empty CSV
-from no CSV at all. The duplicate-label test was strengthened so a regression in
-deduplication cannot pass unnoticed: the duplicated and deduplicated tables must
-produce identical metric rows.
+from no CSV at all. The duplicate-label test compared metrics from duplicated
+and deduplicated tables. Round 7 showed that those particular metrics were
+insensitive to the duplicated cohort and replaced the guard.
+
+### Seventh audit round (2026-11-20)
+
+- **D2–D4:** Read specimen IDs and cluster label CSV values as text before type
+  inference can merge identifiers such as `01` and `1`. Validate embedding IDs
+  and dimensions before overwrite. The cohort spy asserts two label and
+  embedding rows for two IDs; the independent capped reference verifies the
+  distance slice and non-monophyly metrics. Real cluster products are checked
+  through annotate with both a saved distance matrix and recomputation, and
+  the diversity centroid test verifies exact specimen alignment.
+- **A/E1/B:** A separate visualization CSV that participates in overwrite
+  protection now hands its resolved paths and ordered row references to the
+  existing startup evaluation phase. If the request or ordered rows change,
+  disable evaluation instead of resolving an unprotected selection. Fresh
+  pseudo finetune likewise consumes the ordered rows resolved for protection;
+  regular and pseudo training path carriers are cleared with the other
+  invocation-private handoff fields. Queue and ordinary header-only CSV cases
+  both have read-count tests. The pseudo-source checkpoint's independent
+  reads are unchanged.
+- **E3:** The previously deferred calculation moves are bounded to the
+  `delineation.partition` and `embedding.evaluator` owners; publication,
+  compatibility, and error presentation stay in the CLI. The small real
+  example now exercises `extract → cluster → annotate → diversity` end to end.
+  The earlier full runs are historical and do not close the full-refactor
+  gate for these changes. No performance gating was run.

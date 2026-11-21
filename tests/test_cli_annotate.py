@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import click
 import pandas as pd
 import pytest
 import otuformer.delineation.annotate as annotate_mod
@@ -109,7 +110,7 @@ def test_annotate_rejects_nonstandard_raw_assignments_path(tmp_path):
         ],
     )
     assert result.exit_code != 0
-    assert "partition_<cutoff>_assignments.csv" in result.output
+    assert "partition_<cutoff>_assignments.csv" in click.unstyle(result.output)
 
 
 def test_annotate_happy_path_outputs(tmp_path):
@@ -231,7 +232,8 @@ def test_annotate_partitioning_bar_flag_defaults_off_and_can_enable(
     assert calls == [False, True]
 
 
-def test_annotate_summary_matches_the_cluster_product(tmp_path):
+@pytest.mark.parametrize("save_distances", ["true", "false"])
+def test_annotate_summary_matches_the_cluster_product(tmp_path, save_distances):
     """Real artifacts: cluster's intra-class summary feeds the same statistic.
 
     This is the cross-command parity check: run ``cluster`` on an embeddings
@@ -242,7 +244,7 @@ def test_annotate_summary_matches_the_cluster_product(tmp_path):
 
     cluster_out = tmp_path / "cluster_real"
     emb_path = tmp_path / "embeddings.csv"
-    ids = ["img1.jpg", "img2.jpg", "img3.jpg", "img4.jpg"]
+    ids = ["1", "01", "001", "0001"]
     pd.DataFrame(
         {
             "id": ids,
@@ -261,6 +263,7 @@ def test_annotate_summary_matches_the_cluster_product(tmp_path):
             "--out-dir", str(cluster_out),
             "--labels", str(labels),
             "--custom-cutoffs", "0.5",
+            "--save-distances", save_distances,
         ],
     )
     assert result.exit_code == 0, result.output
@@ -274,7 +277,11 @@ def test_annotate_summary_matches_the_cluster_product(tmp_path):
     tables = cluster_out / "UPGMA" / "partitions" / "tables"
     assignments = tables / "partition_0.5_assignments.csv"
     corrections = tmp_path / "corrections.csv"
-    pd.read_csv(assignments)[["id", "cluster"]].to_csv(corrections, index=False)
+    assigned = pd.read_csv(assignments, dtype={"id": str})
+    assert assigned["id"].tolist() == ids
+    assigned[["id", "cluster"]].rename(columns={"id": "image"}).to_csv(
+        corrections, index=False
+    )
     annotate_out = tmp_path / "annotate_real"
     result = runner.invoke(
         cli_app,
